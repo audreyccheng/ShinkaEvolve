@@ -12,8 +12,8 @@ RED='\033[0;31m'
 YELLOW='\033[1;33m'
 NC='\033[0m'
 
-SHINKA_DIR="/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve"
-RESULTS_BASE_DIR="/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/zresults"
+SHINKA_DIR="/home/ubuntu/ShinkaEvolve"
+RESULTS_BASE_DIR="/home/ubuntu/zresults"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 echo -e "${BLUE}========================================${NC}"

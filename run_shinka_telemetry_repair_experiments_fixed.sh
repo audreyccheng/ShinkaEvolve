@@ -13,10 +13,10 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 # Directory setup
-SHINKA_DIR="/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve"
+SHINKA_DIR="/home/ubuntu/ShinkaEvolve"
 TELEMETRY_DIR="${SHINKA_DIR}/examples/telemetry_repair"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
-RESULTS_BASE_DIR="/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/zresults"
+RESULTS_BASE_DIR="/home/ubuntu/zresults"
 
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}ShinkaEvolve Telemetry Repair Experiments (FIXED)${NC}"
