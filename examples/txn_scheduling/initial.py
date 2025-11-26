@@ -25,7 +25,8 @@ def find_repo_root(start_path):
         script_dir,  # Current directory
         os.path.dirname(script_dir),  # Parent
         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
-        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
     ]
     for root in possible_roots:
         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
