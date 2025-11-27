@@ -83,7 +83,7 @@ run_experiment() {
         evo_config.llm_models="[${model_name}]" \
         evo_config.meta_llm_models="[${model_name}]" \
         evo_config.llm_dynamic_selection='null' \
-        +job_config.time=600 \
+        +job_config.time="00:10:00" \
         results_dir="${RESULTS_BASE_DIR}" \
         exp_name="shinka_txn_scheduling_${config_name}_run${run_number}_${TIMESTAMP}" \
         variant_suffix="" \
