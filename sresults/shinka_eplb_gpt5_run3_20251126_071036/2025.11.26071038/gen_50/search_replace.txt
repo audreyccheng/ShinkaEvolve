@@ -1,0 +1,342 @@
+<NAME>
+two_stage_fixup_and_broadened_refine
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements that increase load balance while keeping the algorithm fast and deterministic:
+
+1) Replication stage (water-filling): upgrade the one-step donor→receiver fix-up to a bounded two-step procedure. We encapsulate the search into a helper that evaluates the top-2 donors and bottom-2 receivers, apply the best single move, and optionally perform a second guarded move when the first improvement is shallow or when skew remains high (delta/mean > 0.12). This preserves speed but smooths peaks more effectively.
+
+2) GPU packing stage:
+   a) Make the greedy assignment prioritize projected load as the primary objective and use label repeat and count as tie-breakers. This reduces imbalance directly while retaining diversity pressure where it matters (near ties).
+   b) Broaden the bounded refinement search to include swaps for (heaviest↔lightest), (heaviest↔second-lightest), and (second-heaviest↔lightest). We evaluate all candidates and apply the single best swap that strictly reduces the global peak. Additionally, we adaptively allow up to two refinement passes only when the imbalance ratio is high.
+
+Both changes are lightweight (mostly constant-factor overhead), deterministic, and aim to improve the balancedness_score without sacrificing the speed_score.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # One-step strengthened fix-up: evaluate top-2 donors vs bottom-2 receivers
+        if num_log > 1:
+            counts_safe = torch.clamp(counts, min=1)
+            avg = w / counts_safe.to(w.dtype)
+            cur_max = float(avg.max().item())
+
+            can_donate = (counts > 1)
+            num_can = int(can_donate.sum().item())
+            if num_can > 0:
+                k_d = int(min(2, num_can))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=k_d).indices.tolist()
+
+                k_r = int(min(2, num_log))
+                receivers = torch.topk(-avg, k=k_r).indices.tolist()
+
+                best_pair = None
+                best_peak = cur_max
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = counts.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        peak = float((w / c_try.to(w.dtype)).max().item())
+                        if peak + 1e-9 < best_peak:
+                            best_peak = peak
+                            best_pair = (d, r)
+                if best_pair is not None:
+                    d, r = best_pair
+                    counts[d] -= 1
+                    counts[r] += 1
+=======
+        # Bounded fix-up: up to two moves chosen among top-2 donors and bottom-2 receivers
+        if num_log > 1:
+            def _one_move(cnt: torch.Tensor) -> tuple[torch.Tensor, float, bool]:
+                cnt_safe = torch.clamp(cnt, min=1)
+                avg = w / cnt_safe.to(w.dtype)
+                cur_max = float(avg.max().item())
+                can_donate = (cnt > 1)
+                if not bool(can_donate.any()):
+                    return cnt, cur_max, False
+                kd = int(min(2, int(can_donate.sum().item())))
+                kr = int(min(2, num_log))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=kd).indices.tolist()
+                receivers = torch.topk(-avg, k=kr).indices.tolist()
+                best_pair = None
+                best_peak = cur_max
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = cnt.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        peak = float((w / c_try.to(w.dtype)).max().item())
+                        if peak + 1e-9 < best_peak:
+                            best_peak = peak
+                            best_pair = (d, r)
+                if best_pair is None:
+                    return cnt, cur_max, False
+                d, r = best_pair
+                cnt = cnt.clone()
+                cnt[d] -= 1
+                cnt[r] += 1
+                return cnt, best_peak, True
+
+            # first move
+            counts_before = counts
+            peak_before = float((w / counts_before.to(w.dtype)).max().item())
+            counts_after, peak_after, changed = _one_move(counts_before)
+            if changed:
+                counts = counts_after
+                # decide whether to attempt a second move
+                # shallow improvement or still high skew
+                avg_after = w / torch.clamp(counts, min=1).to(w.dtype)
+                mean_after = float(avg_after.mean().item())
+                delta_after = float(avg_after.max().item() - avg_after.min().item())
+                high_skew = (mean_after > 0.0 and delta_after / max(mean_after, 1e-12) > 0.12)
+                shallow = peak_after > 0.9 * peak_before
+                if shallow or high_skew:
+                    counts2, peak2, changed2 = _one_move(counts)
+                    if changed2 and peak2 + 1e-12 < peak_after:
+                        counts = counts2
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Greedy diversity-aware placement with tie-breaking by current load and count
+        for g in sorted_idx:
+            lab = int(row_labels[g].item())
+            wv = float(row_w[g].item())
+
+            best_p = None
+            best_key = None
+            for p in range(num_packs):
+                if counts[p] >= cap:
+                    continue
+                rep = label_counts[p].get(lab, 0)
+                key = (rep, loads[p], counts[p])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_p = p
+
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = counts[best_p]
+            counts[best_p] += 1
+            loads[best_p] += wv
+            label_counts[best_p][lab] += 1
+=======
+        # Greedy placement: projected load as primary, diversity as tie-breaker
+        eps = 1e-6 * float(row_w.mean().item() if row_w.numel() > 0 else 1.0)
+        for g in sorted_idx:
+            lab = int(row_labels[g].item())
+            wv = float(row_w[g].item())
+
+            best_p = None
+            best_base = None
+            best_rep = None
+            best_cnt = None
+            for p in range(num_packs):
+                if counts[p] >= cap:
+                    continue
+                base = loads[p] + wv
+                rep = label_counts[p].get(lab, 0)
+                if best_p is None:
+                    best_p = p
+                    best_base = base
+                    best_rep = rep
+                    best_cnt = counts[p]
+                    continue
+                if base + eps < best_base:
+                    best_p = p
+                    best_base = base
+                    best_rep = rep
+                    best_cnt = counts[p]
+                elif abs(base - best_base) <= eps:
+                    if rep < best_rep or (rep == best_rep and counts[p] < best_cnt):
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = counts[p]
+
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = counts[best_p]
+            counts[best_p] += 1
+            loads[best_p] += wv
+            label_counts[best_p][lab] += 1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # One micro refinement: swap heaviest with best of two lightest (top-2 vs bottom-2)
+        if num_packs >= 2:
+            # Build pack membership lists for this row
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(n_items):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+
+            h = max(range(num_packs), key=lambda k: loads[k])
+            other_packs = [p for p in range(num_packs) if p != h]
+            if other_packs:
+                # pick lightest and second-lightest if exist
+                light_sorted = sorted(other_packs, key=lambda k: loads[k])
+                cand_lights = light_sorted[:min(2, len(light_sorted))]
+                cur_peak = max(loads)
+
+                best_swap = None  # (new_peak, h, l, ai, bi, a_item, b_item, wa, wb)
+                # Precompute heavy items and weights
+                if pack_groups[h]:
+                    h_idx_tensor = torch.tensor(pack_groups[h], dtype=torch.int64, device=row_w.device)
+                    h_w = row_w[h_idx_tensor]
+                    kh = min(2, h_w.numel())
+                    if kh > 0:
+                        top_h = torch.topk(h_w, kh).indices.tolist()
+                        # Evaluate candidates
+                        for l in cand_lights:
+                            if not pack_groups[l] or loads[h] <= loads[l]:
+                                continue
+                            l_idx_tensor = torch.tensor(pack_groups[l], dtype=torch.int64, device=row_w.device)
+                            l_w = row_w[l_idx_tensor]
+                            kl = min(2, l_w.numel())
+                            if kl == 0:
+                                continue
+                            bot_l = torch.topk(l_w, kl, largest=False).indices.tolist()
+
+                            # other packs peak excluding h and l
+                            other_max = max([loads[p] for p in range(num_packs) if p != h and p != l], default=float("-inf"))
+
+                            for ai in top_h:
+                                a_item = int(h_idx_tensor[ai].item())
+                                wa = float(h_w[ai].item())
+                                for bi in bot_l:
+                                    b_item = int(l_idx_tensor[bi].item())
+                                    wb = float(l_w[bi].item())
+
+                                    new_h = loads[h] - wa + wb
+                                    new_l = loads[l] - wb + wa
+                                    new_peak = max(new_h, new_l, other_max)
+                                    if new_peak + 1e-9 < cur_peak:
+                                        cand = (new_peak, h, l, ai, bi, a_item, b_item, wa, wb)
+                                        if best_swap is None or new_peak < best_swap[0]:
+                                            best_swap = cand
+
+                # Apply best swap if any
+                if best_swap is not None:
+                    _, h_sel, l_sel, ai, bi, a_item, b_item, wa, wb = best_swap
+                    # Update loads
+                    loads[h_sel] = loads[h_sel] - wa + wb
+                    loads[l_sel] = loads[l_sel] - wb + wa
+                    # Update membership and indices
+                    # Rebuild pack_groups for selected packs if not present
+                    # pack_groups already built above
+                    pack_groups[h_sel][ai] = b_item
+                    pack_groups[l_sel][bi] = a_item
+                    pack_index[i, a_item] = l_sel
+                    pack_index[i, b_item] = h_sel
+                    # Update ranks for affected packs only
+                    for r, g in enumerate(pack_groups[h_sel]):
+                        rank_in_pack[i, g] = r
+                    for r, g in enumerate(pack_groups[l_sel]):
+                        rank_in_pack[i, g] = r
+=======
+        # Adaptive bounded refinement: evaluate (h1↔l1), (h1↔l2), (h2↔l1); apply best if it strictly reduces peak
+        if num_packs >= 2:
+            # Build pack membership lists for this row
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(n_items):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+
+            def _refine_once() -> bool:
+                order_asc = sorted(range(num_packs), key=lambda k: loads[k])
+                order_desc = list(reversed(order_asc))
+                l1 = order_asc[0]
+                l2 = order_asc[1] if len(order_asc) > 1 else None
+                h1 = order_desc[0]
+                h2 = order_desc[1] if len(order_desc) > 1 else None
+
+                pairs = []
+                pairs.append((h1, l1))
+                if l2 is not None and l2 != h1:
+                    pairs.append((h1, l2))
+                if h2 is not None and h2 != l1:
+                    pairs.append((h2, l1))
+
+                cur_max = max(loads)
+                best = None  # (new_peak, new_imb, d, r, ai, bi, a_item, b_item, wa, wb)
+
+                for (d, r) in pairs:
+                    if d is None or r is None or d == r:
+                        continue
+                    if not pack_groups[d] or not pack_groups[r]:
+                        continue
+                    if loads[d] <= loads[r]:
+                        continue
+                    d_idx_tensor = torch.tensor(pack_groups[d], dtype=torch.int64, device=row_w.device)
+                    r_idx_tensor = torch.tensor(pack_groups[r], dtype=torch.int64, device=row_w.device)
+                    d_w = row_w[d_idx_tensor]
+                    r_w = row_w[r_idx_tensor]
+                    kd = min(2, d_w.numel())
+                    kr = min(2, r_w.numel())
+                    if kd == 0 or kr == 0:
+                        continue
+                    d_top = torch.topk(d_w, kd).indices.tolist()
+                    r_bot = torch.topk(r_w, kr, largest=False).indices.tolist()
+
+                    other_max = max([loads[p] for p in range(num_packs) if p != d and p != r], default=float("-inf"))
+                    other_min = min([loads[p] for p in range(num_packs) if p != d and p != r], default=float("inf"))
+
+                    for ai in d_top:
+                        wa = float(d_w[ai].item())
+                        a_item = int(d_idx_tensor[ai].item())
+                        for bi in r_bot:
+                            wb = float(r_w[bi].item())
+                            b_item = int(r_idx_tensor[bi].item())
+                            new_d = loads[d] - wa + wb
+                            new_r = loads[r] - wb + wa
+                            new_peak = max(new_d, new_r, other_max)
+                            new_bottom = min(new_d, new_r, other_min)
+                            new_imb = new_peak - new_bottom
+                            cand = (new_peak, new_imb, d, r, ai, bi, a_item, b_item, wa, wb)
+                            if best is None:
+                                best = cand
+                            else:
+                                if (cand[0] + 1e-9 < best[0]) or (abs(cand[0] - best[0]) <= 1e-9 and cand[1] + 1e-9 < best[1]):
+                                    best = cand
+
+                if best is None:
+                    return False
+                if best[0] + 1e-9 >= cur_max:
+                    return False
+                # apply best 1x1 swap
+                _, _, d, r, ai, bi, a_item, b_item, wa, wb = best
+                loads[d] = loads[d] - wa + wb
+                loads[r] = loads[r] - wb + wa
+                pack_groups[d][ai] = b_item
+                pack_groups[r][bi] = a_item
+                pack_index[i, a_item] = r
+                pack_index[i, b_item] = d
+                for rr, gg in enumerate(pack_groups[d]):
+                    rank_in_pack[i, gg] = rr
+                for rr, gg in enumerate(pack_groups[r]):
+                    rank_in_pack[i, gg] = rr
+                return True
+
+            # Adaptive depth: do a second pass only if imbalance is high
+            mean_load = sum(loads) / max(1, num_packs)
+            delta = max(loads) - min(loads)
+            steps = 2 if (mean_load > 0 and delta / max(mean_load, 1e-12) > 0.12) else 1
+            for _ in range(steps):
+                changed = _refine_once()
+                if not changed:
+                    break
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,162 @@
+<NAME>
+sqrt_noise_and_weighted_confidence
+</NAME>
+
+<DESCRIPTION>
+1. Replaces linear Gaussian noise model with a Square Root (Poisson-like) model. This provides looser tolerance for low-bandwidth flows (filtering noise) and tighter tolerance for high-bandwidth flows, aligning better with physical counter characteristics.
+2. Replaces the heuristic decision-tree confidence calibration in Phase 3 with a continuous Weighted Consensus score. This calculates confidence as the weighted average of similarities between the final repaired value and all available signals (Self, Peer, Flow), weighted by their reliability. This ensures confidence accurately reflects the structural support for the repair.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Helper: Similarity Score ---
+    def gaussian_similarity(v1, v2):
+        if v1 is None or v2 is None: return 0.0
+        diff = abs(v1 - v2)
+        # Sigma scales with value magnitude (Heteroscedastic noise model)
+        # Using linear scaling matching the 2% tolerance assumption
+        sigma = max(ABS_TOL, max(abs(v1), abs(v2)) * REL_TOL)
+        # Gaussian curve: exp(-x^2 / 2sigma^2)
+        return math.exp(- (diff**2) / (2 * (sigma**2)))
+=======
+    # --- Helper: Similarity Score ---
+    def gaussian_similarity(v1, v2):
+        if v1 is None or v2 is None: return 0.0
+        diff = abs(v1 - v2)
+        # Square Root Noise Model: sigma proportional to sqrt of magnitude
+        # This models physical counting processes better than linear scaling
+        mag = max(abs(v1), abs(v2))
+        sigma = max(ABS_TOL, math.sqrt(mag) * 0.5)
+        return math.exp(- (diff**2) / (2 * (sigma**2)))
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Phase 3: Final Output Construction ---
+    for if_id, d in working_state.items():
+        res = telemetry[if_id].copy()
+
+        if d['status'] == 'down':
+            # Confidence high if measured values are near zero
+            c_rx = 0.95 if d['s_rx'] > ABS_TOL else 1.0
+            c_tx = 0.95 if d['s_tx'] > ABS_TOL else 1.0
+            res['rx_rate'] = (d['s_rx'], 0.0, c_rx)
+            res['tx_rate'] = (d['s_tx'], 0.0, c_tx)
+        else:
+            # Calculate final confidence based on agreement
+            final_rx = d['est_rx']
+            final_tx = d['est_tx']
+
+            # Confidence logic:
+            # 1. Identify primary supporter (Peer > Flow > Self)
+            # 2. Calculate distance to primary supporter
+
+            # RX Confidence
+            conf_rx = 0.5
+            dist_p = gaussian_similarity(final_rx, d['p_tx']) if d['p_tx'] is not None else 0.0
+            dist_s = gaussian_similarity(final_rx, d['s_rx'])
+
+            if d['has_peer']:
+                if dist_p > 0.8: # Strong agreement with Peer
+                    conf_rx = 0.9 + (0.1 * dist_p)
+                elif dist_p > 0.4:
+                    conf_rx = 0.8
+                else:
+                    # Peer disagrees. Check Self/Flow.
+                    conf_rx = 0.7 # Low confidence repair
+            else:
+                # No peer. Rely on Self/Flow.
+                if dist_s > 0.9: conf_rx = 0.9 # Trust self if isolated
+                else: conf_rx = 0.6 # Changed from self -> likely Flow repair
+
+            # TX Confidence
+            conf_tx = 0.5
+            dist_p_tx = gaussian_similarity(final_tx, d['p_rx']) if d['p_rx'] is not None else 0.0
+
+            if d['has_peer']:
+                if dist_p_tx > 0.8:
+                    conf_tx = 0.9 + (0.1 * dist_p_tx)
+                elif dist_p_tx > 0.4:
+                    conf_tx = 0.8
+                else:
+                    conf_tx = 0.7
+            else:
+                dist_s_tx = gaussian_similarity(final_tx, d['s_tx'])
+                if dist_s_tx > 0.9: conf_tx = 0.9
+                else: conf_tx = 0.6
+
+            res['rx_rate'] = (d['s_rx'], final_rx, min(1.0, conf_rx))
+            res['tx_rate'] = (d['s_tx'], final_tx, min(1.0, conf_tx))
+
+        res['interface_status'] = (d['orig_status'], d['status'], d['status_conf'])
+        results[if_id] = res
+=======
+    # --- Phase 3: Final Output Construction ---
+    # 1. Calculate Final Router Context for Confidence Scoring
+    final_router_context = {}
+    for r_id, if_list in topology.items():
+        valid_ifs = [i for i in if_list if i in working_state]
+        s_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+        s_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+        imb = abs(s_in - s_out)
+        mag = max(s_in, s_out, 1.0)
+        rel = math.exp(-(imb/mag) * 20.0)
+        final_router_context[r_id] = {'sum_in': s_in, 'sum_out': s_out, 'rel': rel}
+
+    # 2. Construct Results with Calibrated Confidence
+    for if_id, d in working_state.items():
+        res = telemetry[if_id].copy()
+
+        if d['status'] == 'down':
+            c_rx = 0.95 if d['s_rx'] > ABS_TOL else 1.0
+            c_tx = 0.95 if d['s_tx'] > ABS_TOL else 1.0
+            res['rx_rate'] = (d['s_rx'], 0.0, c_rx)
+            res['tx_rate'] = (d['s_tx'], 0.0, c_tx)
+        else:
+            # Flow context for this interface
+            r_id = telemetry[if_id].get('local_router')
+            f_rx, f_tx, f_rel = None, None, 0.0
+
+            if r_id in final_router_context:
+                rc = final_router_context[r_id]
+                f_rel = rc['rel']
+                # Infer flow target from final router state
+                other_in = rc['sum_in'] - d['est_rx']
+                f_rx = max(0.0, rc['sum_out'] - other_in)
+                other_out = rc['sum_out'] - d['est_tx']
+                f_tx = max(0.0, rc['sum_in'] - other_out)
+
+            # Confidence Calculator: Weighted Consensus
+            def get_conf(val, s_val, p_val, f_val, f_rel, has_peer):
+                # Weights for sources
+                w_s = 1.0 # Self baseline
+                w_p = 2.0 if has_peer else 0.0 # Peer is strong
+                w_f = 1.5 * f_rel # Flow depends on router balance reliability
+
+                # Similarities
+                sim_s = gaussian_similarity(val, s_val)
+                sim_p = gaussian_similarity(val, p_val) if has_peer else 0.0
+                sim_f = gaussian_similarity(val, f_val) if f_val is not None else 0.0
+
+                weighted_sim = (sim_s * w_s) + (sim_p * w_p) + (sim_f * w_f)
+                total_weight = w_s + w_p + w_f
+
+                if total_weight < 0.1: return 0.5
+
+                return weighted_sim / total_weight
+
+            final_rx = d['est_rx']
+            final_tx = d['est_tx']
+
+            conf_rx = get_conf(final_rx, d['s_rx'], d['p_tx'], f_rx, f_rel, d['has_peer'])
+            conf_tx = get_conf(final_tx, d['s_tx'], d['p_rx'], f_tx, f_rel, d['has_peer'])
+
+            # Boost confidence slightly if it's very high (rounding/precision)
+            if conf_rx > 0.95: conf_rx = 1.0
+            if conf_tx > 0.95: conf_tx = 1.0
+
+            res['rx_rate'] = (d['s_rx'], final_rx, conf_rx)
+            res['tx_rate'] = (d['s_tx'], final_tx, conf_tx)
+
+        res['interface_status'] = (d['orig_status'], d['status'], d['status_conf'])
+        results[if_id] = res
+>>>>>>> REPLACE
+</DIFF>

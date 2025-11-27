@@ -1,0 +1,327 @@
+<NAME>
+antibuddy_gating_and_filters
+</NAME>
+
+<DESCRIPTION>
+I introduce anti-buddy gating driven by measured pairwise marginal costs to avoid expanding or selecting strongly conflicting adjacencies. Specifically:
+- Extend build_buddies to also compute an anti-buddy threshold per transaction (75th percentile of positive marginal deltas cost([a,b]) - cost([a])) and return it.
+- Add is_antibuddy(last, cand) and use it to filter candidate extensions in beam search, greedy completions, and GRASP construction, allowing exceptions within 1% of the best immediate extension cost to prevent over-pruning.
+- This directly targets makespan by reducing high-conflict adjacencies early in construction and during search, improving beam quality and guiding diversification without large runtime overhead since it reuses already computed extension costs and cached pairwise deltas.
+
+These anti-buddy filters complement the existing prefix-dominance and lookahead, focusing search effort on low-conflict orderings, which typically reduce delays from read/write conflicts and thus improve makespan. The changes are localized and maintain determinism and runtime budget.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def build_buddies(max_buddies=8):
+        buddies = {t: [] for t in all_txns}
+        # Candidate pools per t
+        singles_sorted = sorted(all_txns, key=lambda x: singleton_cost.get(x, float('inf')))
+        for t in all_txns:
+            if not time_left():
+                break
+            # Candidate sample: mix of top by singleton and random
+            cand_pool = []
+            top_slice = singles_sorted[:min(20, max(8, N // 6))]
+            cand_pool.extend(top_slice)
+            if N > 1:
+                extra = min(24, N - 1)
+                cand_pool.extend(rng.sample([x for x in all_txns if x != t], min(extra, max(10, N // 5))))
+            # Deduplicate and remove t
+            pool = []
+            seen_l = set()
+            for u in cand_pool:
+                if u == t or u in seen_l:
+                    continue
+                seen_l.add(u)
+                pool.append(u)
+            scored = []
+            base = singleton_cost.get(t)
+            prefix_tuple = (t,)  # singleton prefix
+            for u in pool:
+                if not time_left():
+                    break
+                c2 = eval_ext_cost(prefix_tuple, u)
+                scored.append((c2 - base, u))  # delta over singleton
+            scored.sort(key=lambda x: x[0])
+            buddies[t] = [u for _d, u in scored[:max_buddies]]
+        return buddies
+=======
+    def build_buddies(max_buddies=8):
+        buddies = {t: [] for t in all_txns}
+        anti_thresh = {t: float('inf') for t in all_txns}
+        # Candidate pools per t
+        singles_sorted = sorted(all_txns, key=lambda x: singleton_cost.get(x, float('inf')))
+        for t in all_txns:
+            if not time_left():
+                break
+            # Candidate sample: mix of top by singleton and random
+            cand_pool = []
+            top_slice = singles_sorted[:min(20, max(8, N // 6))]
+            cand_pool.extend(top_slice)
+            if N > 1:
+                extra = min(24, N - 1)
+                cand_pool.extend(rng.sample([x for x in all_txns if x != t], min(extra, max(10, N // 5))))
+            # Deduplicate and remove t
+            pool = []
+            seen_l = set()
+            for u in cand_pool:
+                if u == t or u in seen_l:
+                    continue
+                seen_l.add(u)
+                pool.append(u)
+            scored = []
+            pos_deltas = []
+            base = singleton_cost.get(t)
+            prefix_tuple = (t,)  # singleton prefix
+            for u in pool:
+                if not time_left():
+                    break
+                c2 = eval_ext_cost(prefix_tuple, u)
+                delta = c2 - base
+                scored.append((delta, u))  # delta over singleton
+                if delta > 0:
+                    pos_deltas.append(delta)
+            scored.sort(key=lambda x: x[0])
+            buddies[t] = [u for _d, u in scored[:max_buddies]]
+            # 75th percentile threshold among positive deltas (if any)
+            if pos_deltas:
+                pos_deltas.sort()
+                idx = int(0.75 * (len(pos_deltas) - 1))
+                anti_thresh[t] = pos_deltas[idx]
+        return buddies, anti_thresh
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    buddies = build_buddies(max_buddies=8)
+=======
+    buddies, anti_buddy_thresh = build_buddies(max_buddies=8)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Pairwise adjacency surrogate using true two-step marginal delta
+    pair_cost_cache = {}
+    def pair_cost(a, b):
+        key = (a, b)
+        c = pair_cost_cache.get(key)
+        if c is not None:
+            return c
+        base = singleton_cost.get(a)
+        if base is None:
+            base = eval_seq_cost([a])
+            singleton_cost[a] = base
+        ec = eval_ext_cost((a,), b)
+        delta = ec - base
+        pair_cost_cache[key] = delta
+        return delta
+=======
+    # Pairwise adjacency surrogate using true two-step marginal delta
+    pair_cost_cache = {}
+    def pair_cost(a, b):
+        key = (a, b)
+        c = pair_cost_cache.get(key)
+        if c is not None:
+            return c
+        base = singleton_cost.get(a)
+        if base is None:
+            base = eval_seq_cost([a])
+            singleton_cost[a] = base
+        ec = eval_ext_cost((a,), b)
+        delta = ec - base
+        pair_cost_cache[key] = delta
+        return delta
+
+    # Anti-buddy gate using learned threshold per 'last'
+    def is_antibuddy(last, cand):
+        if last is None:
+            return False
+        thr = anti_buddy_thresh.get(last, float('inf'))
+        if thr == float('inf'):
+            return False
+        pc = pair_cost(last, cand)
+        return pc > 0 and pc >= thr
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            prefix_tuple = tuple(seq_out)
+            best_t = None
+            best_c = float('inf')
+            for t in cand_pool:
+                c = eval_ext_cost(prefix_tuple, t)
+                if c < best_c:
+                    best_c = c
+                    best_t = t
+            if best_t is None:
+                # Time exhausted; append remaining arbitrarily
+                seq_out.extend(rem)
+                cur_cost = eval_seq_cost(seq_out)
+                return cur_cost, seq_out
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+=======
+            prefix_tuple = tuple(seq_out)
+            scored = []
+            best_immediate = float('inf')
+            for t in cand_pool:
+                c = eval_ext_cost(prefix_tuple, t)
+                scored.append((c, t))
+                if c < best_immediate:
+                    best_immediate = c
+            if not scored:
+                # Time exhausted; append remaining arbitrarily
+                seq_out.extend(rem)
+                cur_cost = eval_seq_cost(seq_out)
+                return cur_cost, seq_out
+            # Anti-buddy filtering: skip strongly disfavored unless near-best
+            tol = best_immediate * 1.01 if best_immediate < float('inf') else float('inf')
+            filtered = []
+            last_txn = seq_out[-1] if seq_out else None
+            for c, t in scored:
+                if is_antibuddy(last_txn, t) and c > tol:
+                    continue
+                filtered.append((c, t))
+            if not filtered:
+                filtered = scored
+            filtered.sort(key=lambda x: x[0])
+            best_c, best_t = filtered[0]
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                # Score by marginal delta and shallow lookahead biased by buddies
+                prefix_tuple = tuple(seq)
+                scored = []
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(prefix_tuple, cand)
+                    if ec >= best_full_cost:
+                        # immediate prune by incumbent
+                        continue
+                    # shallow lookahead: prefer buddy-next of cand first
+                    la_best = ec
+                    if rem and time_left():
+                        new_rem = rem.copy()
+                        if cand in new_rem:
+                            new_rem.remove(cand)
+                        la_pool = []
+                        if cand in buddies:
+                            for v in buddies[cand]:
+                                if v in new_rem:
+                                    la_pool.append(v)
+                        if not la_pool:
+                            la_pool = list(new_rem)
+                        # sample top 'lookahead_top'
+                        if len(la_pool) > lookahead_top:
+                            la_pool = rng.sample(la_pool, lookahead_top)
+                        new_prefix_tuple = tuple(seq + [cand])
+                        for nxt in la_pool:
+                            c2 = eval_ext_cost(new_prefix_tuple, nxt)
+                            if c2 < la_best:
+                                la_best = c2
+                    scored.append((ec - cost_so_far, la_best, ec, cand))
+=======
+                # Score by marginal delta and shallow lookahead biased by buddies with anti-buddy gating
+                prefix_tuple = tuple(seq)
+                tmp = []
+                best_immediate = float('inf')
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(prefix_tuple, cand)
+                    tmp.append((ec, cand))
+                    if ec < best_immediate:
+                        best_immediate = ec
+                scored = []
+                tol = best_immediate * 1.01 if best_immediate < float('inf') else float('inf')
+                for ec, cand in tmp:
+                    if ec >= best_full_cost:
+                        # immediate prune by incumbent
+                        continue
+                    if is_antibuddy(last, cand) and ec > tol:
+                        continue
+                    # shallow lookahead: prefer buddy-next of cand first
+                    la_best = ec
+                    if rem and time_left():
+                        new_rem = rem.copy()
+                        if cand in new_rem:
+                            new_rem.remove(cand)
+                        la_pool = [v for v in buddies.get(cand, []) if v in new_rem]
+                        if not la_pool:
+                            la_pool = list(new_rem)
+                        # sample top 'lookahead_top'
+                        if len(la_pool) > lookahead_top:
+                            la_pool = rng.sample(la_pool, lookahead_top)
+                        new_prefix_tuple = tuple(seq + [cand])
+                        for nxt in la_pool:
+                            c2 = eval_ext_cost(new_prefix_tuple, nxt)
+                            if c2 < la_best:
+                                la_best = c2
+                    scored.append((ec - cost_so_far, la_best, ec, cand))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            scored = []
+            pt = tuple(seq)
+            for t in cand_pool:
+                if not time_left():
+                    break
+                c = eval_ext_cost(pt, t)
+                scored.append((c, t))
+            if not scored:
+                # fallback append random
+                t = rng.choice(rem_list)
+                seq.append(t)
+                rem.remove(t)
+                cur_cost = eval_seq_cost(seq)
+                continue
+            scored.sort(key=lambda x: x[0])
+            top_k = min(grasp_top_k, len(scored))
+            chosen_cost, chosen_t = rng.choice(scored[:top_k])
+=======
+            scored = []
+            pt = tuple(seq)
+            best_immediate = float('inf')
+            for t in cand_pool:
+                if not time_left():
+                    break
+                c = eval_ext_cost(pt, t)
+                scored.append((c, t))
+                if c < best_immediate:
+                    best_immediate = c
+            if not scored:
+                # fallback append random
+                t = rng.choice(rem_list)
+                seq.append(t)
+                rem.remove(t)
+                cur_cost = eval_seq_cost(seq)
+                continue
+            # Anti-buddy filter: skip strongly disfavored unless near-best
+            tol = best_immediate * 1.01 if best_immediate < float('inf') else float('inf')
+            filtered = []
+            last_txn = seq[-1]
+            for c, t in scored:
+                if is_antibuddy(last_txn, t) and c > tol:
+                    continue
+                filtered.append((c, t))
+            if not filtered:
+                filtered = scored
+            filtered.sort(key=lambda x: x[0])
+            top_k = min(grasp_top_k, len(filtered))
+            chosen_cost, chosen_t = rng.choice(filtered[:top_k])
+>>>>>>> REPLACE
+
+</DIFF>

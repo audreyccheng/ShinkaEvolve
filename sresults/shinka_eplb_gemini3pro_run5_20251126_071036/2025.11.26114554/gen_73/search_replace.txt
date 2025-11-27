@@ -1,0 +1,146 @@
+<NAME>
+all_pairs_refinement
+</NAME>
+
+<DESCRIPTION>
+Replace the "Max-Min" pairwise swap refinement with a "Variance-Minimizing All-Pairs" refinement.
+Instead of only attempting to swap items between the heaviest and lightest packs, this modification evaluates all possible 1-for-1 swaps between all pairs of packs simultaneously.
+It calculates the potential reduction in variance (Sum of Squares of weights) for every possible swap and greedily applies the best one per layer.
+This allows the algorithm to resolve imbalances that require intermediate moves (e.g., swapping between medium-load packs) to unlock better global configurations, preventing it from getting stuck in local optima where Max and Min packs cannot directly exchange items beneficially.
+The operation is fully vectorized as a tensor operation of shape `[Batch, NumGroups, NumGroups]`, which fits within GPU memory for typical Expert Parallelism configurations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Refinement iterations (Max vs Min pack)
+    for _ in range(20):
+        # Current weights
+        p_weights = pack_contents.sum(dim=-1)
+
+        max_val, max_pack = p_weights.max(dim=1)
+        min_val, min_pack = p_weights.min(dim=1)
+        diff = max_val - min_val
+
+        active_mask = diff > 1e-4
+        if not active_mask.any():
+            break
+
+        # Extract items from max and min packs: [B, G]
+        items_max = pack_contents[row_indices, max_pack]
+        items_min = pack_contents[row_indices, min_pack]
+
+        # Compute delta for all pairs: w_max - w_min
+        # [B, G, G]
+        delta = items_max.unsqueeze(2) - items_min.unsqueeze(1)
+
+        # Improvement: minimize |new_diff| where new_diff = diff - 2*delta
+        # Maximize gain = diff - |diff - 2*delta|
+        diff_view = diff.view(-1, 1, 1)
+        gain = diff_view - (diff_view - 2 * delta).abs()
+
+        # Find best swap
+        best_gain, best_idx_flat = gain.view(batch_size, -1).max(dim=1)
+
+        # Determine who swaps
+        do_swap = (best_gain > 1e-5) & active_mask
+
+        if not do_swap.any():
+            break
+
+        swap_indices = best_idx_flat[do_swap]
+        batch_indices_swap = row_indices[do_swap]
+
+        idx_max = swap_indices // groups_per_pack
+        idx_min = swap_indices % groups_per_pack
+
+        p_max_swap = max_pack[do_swap]
+        p_min_swap = min_pack[do_swap]
+
+        # Execute swaps
+        val_max = pack_contents[batch_indices_swap, p_max_swap, idx_max]
+        val_min = pack_contents[batch_indices_swap, p_min_swap, idx_min]
+
+        pack_contents[batch_indices_swap, p_max_swap, idx_max] = val_min
+        pack_contents[batch_indices_swap, p_min_swap, idx_min] = val_max
+
+        id_max = pack_item_ids[batch_indices_swap, p_max_swap, idx_max]
+        id_min = pack_item_ids[batch_indices_swap, p_min_swap, idx_min]
+
+        pack_item_ids[batch_indices_swap, p_max_swap, idx_max] = id_min
+        pack_item_ids[batch_indices_swap, p_min_swap, idx_min] = id_max
+=======
+    # Refinement iterations (All-Pairs Variance Descent)
+    for _ in range(20):
+        # Current weights [B, P]
+        p_weights = pack_contents.sum(dim=-1)
+
+        # Check if we should continue
+        spread = p_weights.max(dim=1).values - p_weights.min(dim=1).values
+        active_mask = spread > 1e-4
+        if not active_mask.any():
+            break
+
+        # Prepare for All-Pairs comparison
+        # We need W_i - W_j for all i, j
+        # W_i: [B, P, 1, 1, 1]
+        # W_j: [B, 1, 1, P, 1]
+        W_i = p_weights.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        W_j = p_weights.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+
+        # Items
+        # v_i: [B, P, G, 1, 1]
+        # v_j: [B, 1, 1, P, G]
+        v_i = pack_contents.unsqueeze(3).unsqueeze(4)
+        v_j = pack_contents.unsqueeze(1).unsqueeze(2)
+
+        # Delta: [B, P, G, P, G]
+        delta = v_i - v_j
+
+        # Gain computation: Maximize reduction in Sum of Squares
+        # Gain = 2 * delta * (W_i - W_j) - 2 * delta^2
+        # We can drop the factor of 2 for maximization/selection
+        diff_packs = W_i - W_j
+        gain = delta * diff_packs - delta.square()
+
+        # Flatten pack/group dimensions: [B, (P*G)*(P*G)]
+        gain_flat = gain.view(batch_size, -1)
+
+        best_gain, best_idx_flat = gain_flat.max(dim=1)
+
+        # Filter insignificant gains
+        # Self-swaps (i==j) have gain <= 0, so they are filtered by threshold
+        do_swap = (best_gain > 1e-5) & active_mask
+
+        if not do_swap.any():
+            break
+
+        # Indices to swap
+        b_swap = row_indices[do_swap]
+        idx_val = best_idx_flat[do_swap]
+
+        # Decode indices
+        total_slots = num_packs * groups_per_pack
+
+        src_flat = idx_val // total_slots
+        dst_flat = idx_val % total_slots
+
+        p_i = src_flat // groups_per_pack
+        g_i = src_flat % groups_per_pack
+
+        p_j = dst_flat // groups_per_pack
+        g_j = dst_flat % groups_per_pack
+
+        # Perform swap
+        val_i = pack_contents[b_swap, p_i, g_i]
+        val_j = pack_contents[b_swap, p_j, g_j]
+
+        pack_contents[b_swap, p_i, g_i] = val_j
+        pack_contents[b_swap, p_j, g_j] = val_i
+
+        id_i = pack_item_ids[b_swap, p_i, g_i]
+        id_j = pack_item_ids[b_swap, p_j, g_j]
+
+        pack_item_ids[b_swap, p_i, g_i] = id_j
+        pack_item_ids[b_swap, p_j, g_j] = id_i
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,279 @@
+<NAME>
+adaptive_refine_and_replication_fixup_k2
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements that keep the algorithm fast while improving load balance:
+
+1) Replace the searchsorted-based refinement in CapacityPacker with a bounded k-candidate (k=2) best-improvement swap between the heaviest and lightest packs. We evaluate all up to 4 pair swaps (top-2 heaviest items in the heavy pack vs bottom-2 lightest in the light pack) and apply the best swap if it strictly reduces imbalance. Additionally, we add an adaptive policy for refine_steps>=2: after the first swap, if the imbalance drops by at least 20%, we stop early; otherwise we attempt one more swap. This implements the recommended bounded-k refinement and adaptive second swap for the physical→GPU stage (refine_steps=2), keeping speed while extracting extra balance.
+
+2) Strengthen the replication fix-up: after the D’Hondt→Sainte-Laguë allocation, for each row consider top-2 donors (by per-replica average) and bottom-2 receivers, evaluate all valid donor→receiver moves (at most 4). Choose the single move that minimizes the new peak load and apply it only if it strictly reduces the current peak. This preserves speed and often improves the worst-case load.
+
+Both changes are minimal, maintain deterministic behavior, and adhere to the existing interfaces.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Targeted refinement by swapping one item between heaviest and lightest packs
+        per iteration (up to self.refine_steps). Uses a searchsorted-based best-swap
+        selection for improved reduction of max imbalance.
+        """
+        if self.refine_steps <= 0:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for _ in range(self.refine_steps):
+            h = int(torch.argmax(pack_w).item())
+            l = int(torch.argmin(pack_w).item())
+            if h == l:
+                break
+            delta = float(pack_w[h] - pack_w[l])
+            if delta <= 1e-9:
+                break
+
+            heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+            light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+            if heavy_idx.numel() == 0 or light_idx.numel() == 0:
+                break
+
+            w = weights
+            hw = w[heavy_idx]
+            lw = w[light_idx]
+            lw_sorted, lw_perm = torch.sort(lw)  # ascending
+
+            if lw_sorted.numel() == 0 or hw.numel() == 0:
+                break
+
+            # For each heavy item, find light item closest to target = hw - delta/2
+            target = hw - (delta / 2.0)
+            pos = torch.searchsorted(lw_sorted, target)
+            pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+            cand_pos = torch.stack(
+                [pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1
+            )  # [H, 2]
+            cand_lw = lw_sorted[cand_pos]  # [H, 2]
+            resid = (delta - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+            best_flat = int(torch.argmin(resid).item())
+            best_h_index = best_flat // 2
+            best_option = best_flat % 2
+            j_sorted_idx = int(cand_pos[best_h_index, best_option].item())
+
+            wi = float(hw[best_h_index].item())
+            wj = float(lw_sorted[j_sorted_idx].item())
+            new_delta = abs(delta - 2.0 * (wi - wj))
+            if new_delta < delta - 1e-9:
+                hi = heavy_idx[best_h_index]
+                lj = light_idx[lw_perm[j_sorted_idx]]
+                pack_idx[hi] = l
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l] = pack_w[l] - wj + wi
+            else:
+                break
+
+        return pack_idx
+=======
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Targeted refinement using bounded k-candidate (k=2) best-improvement swaps:
+        - Consider top-2 heaviest items from the heaviest pack and bottom-2 lightest
+          items from the lightest pack; evaluate all 4 swaps and apply the best
+          improving one.
+        - Adaptive: if the first swap reduces imbalance by >=20%, stop early;
+          otherwise attempt one more swap when allowed (refine_steps >= 2).
+        """
+        if self.refine_steps <= 0:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for step in range(self.refine_steps):
+            h = int(torch.argmax(pack_w).item())
+            l = int(torch.argmin(pack_w).item())
+            if h == l:
+                break
+            delta = float(pack_w[h] - pack_w[l])
+            if delta <= 1e-9:
+                break
+
+            heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+            light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+            if heavy_idx.numel() == 0 or light_idx.numel() == 0:
+                break
+
+            # Select top-2 from heavy pack and bottom-2 from light pack
+            hw_all = weights[heavy_idx]
+            lw_all = weights[light_idx]
+            kh = min(2, hw_all.numel())
+            kl = min(2, lw_all.numel())
+            if kh == 0 or kl == 0:
+                break
+
+            h_sel_local = torch.topk(hw_all, k=kh, largest=True).indices
+            l_sel_local = torch.topk(lw_all, k=kl, largest=False).indices
+            h_sel = heavy_idx[h_sel_local]
+            l_sel = light_idx[l_sel_local]
+
+            hw = weights[h_sel].unsqueeze(1)  # [kh, 1]
+            lw = weights[l_sel].unsqueeze(0)  # [1, kl]
+
+            cand_new_delta = torch.abs(delta - 2.0 * (hw - lw))  # [kh, kl]
+            best_flat = int(torch.argmin(cand_new_delta).item())
+            ih = best_flat // kl
+            jl = best_flat % kl
+
+            wi = float(hw[ih, 0].item())
+            wj = float(lw[0, jl].item())
+            new_delta = float(cand_new_delta.view(-1)[best_flat].item())
+
+            if new_delta < delta - 1e-9:
+                hi = h_sel[ih]
+                lj = l_sel[jl]
+                # Perform swap
+                pack_idx[hi] = l
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l] = pack_w[l] - wj + wi
+
+                # Adaptive policy: after first swap, stop if >=20% reduction
+                if step == 0 and self.refine_steps >= 2:
+                    if new_delta <= 0.8 * delta:
+                        break
+                    else:
+                        continue
+            else:
+                break
+
+        return pack_idx
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # One-step replication fix-up per row:
+    # Move one replica from the heaviest-per-replica expert to the lightest if it strictly
+    # reduces the global maximum average load.
+    if num_log > 1 and num_redundant > 0:
+        avg = weight / logcnt.to(weight.dtype)  # [n, num_log]
+        top2_vals, top2_idx = torch.topk(avg, k=2, dim=-1)
+        cur_max = top2_vals[:, 0]
+        second = top2_vals[:, 1]
+        donor = top2_idx[:, 0]
+        receiver = torch.argmin(avg, dim=-1)
+
+        cd = logcnt[arangen, donor]  # donor counts
+        cr = logcnt[arangen, receiver]  # receiver counts
+        valid = (donor != receiver) & (cd > 1)
+
+        # Compute new peak after moving 1 replica
+        new_d = weight[arangen, donor] / (cd.to(weight.dtype) - 1)
+        new_r = weight[arangen, receiver] / (cr.to(weight.dtype) + 1)
+        new_peak = torch.maximum(second, torch.maximum(new_d, new_r))
+        improve = valid & (new_peak + 1e-12 < cur_max)
+
+        rows = torch.nonzero(improve, as_tuple=False).squeeze(1)
+        if rows.numel() > 0:
+            for ri in rows.tolist():
+                d = int(donor[ri].item())
+                r = int(receiver[ri].item())
+                # Choose a physical column corresponding to donor's highest rank (prefer the last replica)
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                # Assign this physical replica to receiver with new rank equal to current receiver count
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                # Update counts
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+=======
+    # Strengthened replication fix-up per row:
+    # Evaluate moves from top-2 donors (by avg load) to bottom-2 receivers and
+    # apply the single best move if it strictly reduces the peak.
+    if num_log > 1 and num_redundant > 0:
+        avg = weight / logcnt.to(weight.dtype)  # [n, num_log]
+        kdon = min(2, num_log)
+        krec = min(2, num_log)
+        top2_vals, top2_idx = torch.topk(avg, k=kdon, dim=-1, largest=True)
+        bot2_vals, bot2_idx = torch.topk(avg, k=krec, dim=-1, largest=False)
+        cur_max = avg.max(dim=-1).values
+        argmax_idx = avg.argmax(dim=-1)
+
+        rows = torch.arange(n, dtype=torch.int64, device=device)
+        for ri in rows.tolist():
+            best_new_peak = None
+            best_pair = None
+
+            # Candidates
+            donors = top2_idx[ri].tolist()
+            receivers = bot2_idx[ri].tolist()
+
+            for d in donors:
+                cd = int(logcnt[ri, d].item())
+                if cd <= 1:
+                    continue
+                for r in receivers:
+                    if d == r:
+                        continue
+                    cr = int(logcnt[ri, r].item())
+
+                    # Baseline peak ignoring donor if donor is current max
+                    baseline_other = float(cur_max[ri].item())
+                    if d == int(argmax_idx[ri].item()):
+                        # second-best under current configuration
+                        baseline_other = float(torch.topk(avg[ri], k=2, largest=True).values[1].item())
+
+                    new_d = float(weight[ri, d].item()) / float(cd - 1)
+                    new_r = float(weight[ri, r].item()) / float(cr + 1)
+                    candidate_peak = max(baseline_other, new_d, new_r)
+
+                    # Track best improving move
+                    if candidate_peak + 1e-12 < float(cur_max[ri].item()):
+                        if best_new_peak is None or candidate_peak < best_new_peak:
+                            best_new_peak = candidate_peak
+                            best_pair = (d, r)
+
+            if best_pair is not None:
+                d, r = best_pair
+                # Choose a physical column corresponding to donor's highest rank (prefer the last replica)
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                # Assign this physical replica to receiver with new rank equal to current receiver count
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                # Update counts
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,357 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import math
+import heapq
+
+GPU_MEM_SIZE = 80.0  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Architecture:
+    1. Beam Search Construction: Explores multiple placement paths simultaneously 
+       using different sorting strategies and pruning symmetric states.
+    2. Binary Search refinement: Solves the Min-Max problem by converting it to 
+       Bin Packing with variable item sizes, using Best Fit Decreasing.
+    3. Local Search: Optimizes the best found solution using Move and Swap operations.
+    """
+
+    # 0. Preprocessing
+    if not models:
+        return {i: [] for i in range(gpu_num)}
+
+    m_data = []
+    total_w = 0.0
+    total_s = 0.0
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        m_data.append({
+            'id': i,
+            'w': w,
+            's': s,
+            'obj': m
+        })
+        total_w += w
+        total_s += s
+
+    # Helper to calculate max KVPR from a placement list (list of lists of indices)
+    def calculate_score(placement_indices):
+        max_p = 0.0
+        for indices in placement_indices:
+            cur_w = sum(m_data[idx]['w'] for idx in indices)
+            cur_s = sum(m_data[idx]['s'] for idx in indices)
+            rem = GPU_MEM_SIZE - cur_s
+            
+            if rem <= 1e-9:
+                if cur_w > 0: return float('inf')
+                else: continue
+            
+            p = cur_w / rem
+            if p > max_p: max_p = p
+        return max_p
+
+    best_placement_indices = None
+    best_max_kvpr = float('inf')
+
+    # ---------------------------------------------------------
+    # 1. Beam Search Construction
+    # ---------------------------------------------------------
+    # We use beam search with limited width to explore placements.
+    # To handle identical GPUs, we prune states that are permutations of each other.
+    
+    BEAM_WIDTH = 8
+    
+    # Sorting strategies dictate the order models are added
+    strategies = [
+        lambda x: x['w'],                           # Weight Descending
+        lambda x: x['s'],                           # Size Descending
+        lambda x: x['w'] / (x['s'] + 1e-6),         # Density Descending
+        lambda x: x['w'] / (GPU_MEM_SIZE - x['s'] + 1e-6) # Isolated Pressure Descending
+    ]
+
+    for sort_key in strategies:
+        sorted_indices = sorted(range(len(m_data)), key=lambda i: sort_key(m_data[i]), reverse=True)
+        
+        # State: (current_max_kvpr, gpu_states_tuple, placement_tuple)
+        # gpu_states_tuple: tuple of (w, s) for each GPU
+        # placement_tuple: tuple of tuples of model indices
+        
+        init_states = tuple([(0.0, 0.0)] * gpu_num)
+        init_placement = tuple([() for _ in range(gpu_num)])
+        
+        # Beam: list of states
+        beam = [(0.0, init_states, init_placement)]
+        
+        for m_idx in sorted_indices:
+            item = m_data[m_idx]
+            w, s = item['w'], item['s']
+            
+            candidates = []
+            seen_configs = set()
+            
+            for score, states, pl in beam:
+                # Try placing on each unique GPU state to avoid symmetry redundancy
+                # (e.g., if GPU 0 and GPU 1 are empty, placing on 0 is same as 1)
+                
+                # To efficiently implement symmetry breaking:
+                # We iterate all GPUs, but we track the (w,s) state of the GPU we placed on.
+                # Actually, simpler: Generate all valid children, then filter duplicates by sorting states.
+                
+                current_step_candidates = []
+                
+                for g in range(gpu_num):
+                    gw, gs = states[g]
+                    if gs + s > GPU_MEM_SIZE: continue
+                    
+                    new_gs = gs + s
+                    new_gw = gw + w
+                    
+                    # Calculate new local pressure
+                    rem = GPU_MEM_SIZE - new_gs
+                    if rem <= 1e-9:
+                        if new_gw > 0: local_p = float('inf')
+                        else: local_p = 0.0
+                    else:
+                        local_p = new_gw / rem
+                    
+                    new_score = max(score, local_p)
+                    
+                    # Update state structures
+                    # Tuples are immutable, create new ones
+                    new_states_list = list(states)
+                    new_states_list[g] = (new_gw, new_gs)
+                    new_states = tuple(new_states_list)
+                    
+                    new_pl_list = list(pl)
+                    new_pl_list[g] = pl[g] + (m_idx,)
+                    new_pl = tuple(new_pl_list)
+                    
+                    # Canonical representation for symmetry pruning: sorted states
+                    canonical = tuple(sorted(new_states))
+                    if canonical in seen_configs:
+                        continue
+                    seen_configs.add(canonical)
+                    
+                    current_step_candidates.append((new_score, new_states, new_pl))
+                
+                candidates.extend(current_step_candidates)
+            
+            if not candidates:
+                beam = []
+                break
+            
+            # Prune beam - keep top K best scores
+            # If many candidates, use nsmallest for efficiency
+            if len(candidates) > BEAM_WIDTH:
+                beam = heapq.nsmallest(BEAM_WIDTH, candidates, key=lambda x: x[0])
+            else:
+                beam = candidates
+
+        # Evaluate final beam states
+        for score, states, pl in beam:
+            # Re-verify score just to be safe (though tracked incrementally)
+            if score < best_max_kvpr:
+                best_max_kvpr = score
+                best_placement_indices = [list(x) for x in pl]
+
+    # ---------------------------------------------------------
+    # 2. Binary Search (Bin Packing Transformation)
+    # ---------------------------------------------------------
+    # Check if we can fit models with KVPR <= K.
+    # Logic: item size v_i = w_i + K * s_i, Bin Capacity = K * GPU_MEM_SIZE
+    # We use "Best Fit Decreasing" on these virtual sizes.
+    
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    low = total_w / rem_global if rem_global > 1e-6 else best_max_kvpr
+    high = best_max_kvpr if best_max_kvpr != float('inf') else 1000.0
+
+    if high > low + 1e-4:
+        for _ in range(15):
+            mid = (low + high) / 2.0
+            
+            # Sort by effective size for this K
+            # s + w/K is proportional to w + K*s
+            check_indices = sorted(range(len(m_data)), 
+                                 key=lambda i: m_data[i]['s'] + m_data[i]['w']/mid, 
+                                 reverse=True)
+            
+            temp_alloc = [[] for _ in range(gpu_num)]
+            temp_states = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+            possible = True
+            
+            for idx in check_indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+                
+                best_g = None
+                min_slack = float('inf')
+                
+                # Best Fit Decreasing on "Effective Capacity"
+                # Constraint: w_new + mid*s_new <= mid*C_new
+                # <=> w + mid*s <= mid * (C - current_s) - current_w (Wait, this is wrong)
+                # Correct: (current_w + w) / (C - current_s - s) <= mid
+                # <=> current_w + w <= mid * (C - current_s - s)
+                
+                for g in range(gpu_num):
+                    st = temp_states[g]
+                    if st['s'] + s > GPU_MEM_SIZE: continue
+                    
+                    phys_rem = GPU_MEM_SIZE - st['s'] - s
+                    if phys_rem < 0: phys_rem = 0.0
+                    
+                    lhs = st['w'] + w
+                    rhs = mid * phys_rem
+                    
+                    if lhs <= rhs + 1e-7:
+                        # Feasible
+                        # Minimize slack (Best Fit) to pack tightly
+                        slack = rhs - lhs
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_g = g
+                
+                if best_g is None:
+                    possible = False
+                    break
+                
+                temp_alloc[best_g].append(idx)
+                temp_states[best_g]['w'] += w
+                temp_states[best_g]['s'] += s
+            
+            if possible:
+                score = calculate_score(temp_alloc)
+                if score < best_max_kvpr:
+                    best_max_kvpr = score
+                    best_placement_indices = temp_alloc
+                high = mid
+            else:
+                low = mid
+
+    if best_placement_indices is None:
+        raise ValueError("Unable to place models on GPUs with available memory.")
+
+    # ---------------------------------------------------------
+    # 3. Local Search Refinement
+    # ---------------------------------------------------------
+    # Convert best placement to mutable format
+    # best_placement_indices is list of lists
+    
+    # Precompute GPU states
+    current_states = []
+    for g in range(gpu_num):
+        indices = best_placement_indices[g]
+        w = sum(m_data[i]['w'] for i in indices)
+        s = sum(m_data[i]['s'] for i in indices)
+        rem = GPU_MEM_SIZE - s
+        p = w / rem if rem > 1e-9 else float('inf')
+        current_states.append({'w': w, 's': s, 'p': p})
+
+    # Optimization Loop
+    for _ in range(200):
+        # Identify bottleneck
+        max_p = -1.0
+        src_g = -1
+        for g in range(gpu_num):
+            if current_states[g]['p'] > max_p:
+                max_p = current_states[g]['p']
+                src_g = g
+        
+        if src_g == -1 or max_p < 1e-9: break
+        
+        improved = False
+        src_indices = best_placement_indices[src_g]
+        
+        # 3.1 MOVE Operation
+        for i, m_idx in enumerate(src_indices):
+            m = m_data[m_idx]
+            
+            # Helper to predict p
+            def predict_p(w, s):
+                rem = GPU_MEM_SIZE - s
+                return w / rem if rem > 1e-9 else float('inf')
+
+            # Hypo src
+            src_new_w = current_states[src_g]['w'] - m['w']
+            src_new_s = current_states[src_g]['s'] - m['s']
+            src_new_p = predict_p(src_new_w, src_new_s)
+            
+            best_dst = None
+            
+            for dst_g in range(gpu_num):
+                if dst_g == src_g: continue
+                if current_states[dst_g]['s'] + m['s'] > GPU_MEM_SIZE: continue
+                
+                dst_new_w = current_states[dst_g]['w'] + m['w']
+                dst_new_s = current_states[dst_g]['s'] + m['s']
+                dst_new_p = predict_p(dst_new_w, dst_new_s)
+                
+                # Improvement criteria: Reduce global max
+                if max(src_new_p, dst_new_p) < max_p - 1e-6:
+                    # Apply move
+                    src_indices.pop(i)
+                    best_placement_indices[dst_g].append(m_idx)
+                    
+                    current_states[src_g].update({'w': src_new_w, 's': src_new_s, 'p': src_new_p})
+                    current_states[dst_g].update({'w': dst_new_w, 's': dst_new_s, 'p': dst_new_p})
+                    improved = True
+                    break
+            if improved: break
+        
+        if improved: continue
+
+        # 3.2 SWAP Operation
+        # Only swap if move didn't work.
+        for i, m1_idx in enumerate(src_indices):
+            m1 = m_data[m1_idx]
+            
+            for dst_g in range(gpu_num):
+                if dst_g == src_g: continue
+                # Optimization: Skip if dst is also high pressure
+                if current_states[dst_g]['p'] > max_p - 1.0: continue
+                
+                dst_indices = best_placement_indices[dst_g]
+                for j, m2_idx in enumerate(dst_indices):
+                    m2 = m_data[m2_idx]
+                    
+                    # Capacity Check
+                    new_src_s = current_states[src_g]['s'] - m1['s'] + m2['s']
+                    new_dst_s = current_states[dst_g]['s'] - m2['s'] + m1['s']
+                    
+                    if new_src_s > GPU_MEM_SIZE or new_dst_s > GPU_MEM_SIZE: continue
+                    
+                    # Pressure Check
+                    new_src_w = current_states[src_g]['w'] - m1['w'] + m2['w']
+                    new_dst_w = current_states[dst_g]['w'] - m2['w'] + m1['w']
+                    
+                    # Recalculate pressures
+                    rem_src = GPU_MEM_SIZE - new_src_s
+                    p_src = new_src_w / rem_src if rem_src > 1e-9 else float('inf')
+                    
+                    rem_dst = GPU_MEM_SIZE - new_dst_s
+                    p_dst = new_dst_w / rem_dst if rem_dst > 1e-9 else float('inf')
+                    
+                    if max(p_src, p_dst) < max_p - 1e-6:
+                        # Apply Swap
+                        src_indices[i] = m2_idx
+                        dst_indices[j] = m1_idx
+                        
+                        current_states[src_g].update({'w': new_src_w, 's': new_src_s, 'p': p_src})
+                        current_states[dst_g].update({'w': new_dst_w, 's': new_dst_s, 'p': p_dst})
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+            
+        if not improved: break
+
+    # Final result mapping
+    final_placement = {}
+    for g in range(gpu_num):
+        final_placement[g] = [m_data[i]['obj'] for i in best_placement_indices[g]]
+
+    return final_placement
+
+# EVOLVE-BLOCK-END

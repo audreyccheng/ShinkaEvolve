@@ -1,0 +1,290 @@
+Based on the recommendations and the goal to improve combined score (specifically counter repair accuracy and confidence calibration), I will introduce **Inferred Flow Consensus** candidates to the repair logic.
+
+This change does the following:
+1.  Calculates "budget" values for each link: the specific flow rate that would perfectly balance the router on each end, derived from flow conservation (Sum In = Sum Out).
+2.  If the budgets from both the local and remote routers agree (within a tolerance), a "consensus" candidate is added. This allows the algorithm to infer the correct flow rate even if both the local and peer measurements are corrupted, by relying on the broader network topology.
+3.  Evaluates these inferred candidates alongside the raw telemetry measurements (`c_tx`, `c_prx`) to find the value that minimizes total network imbalance.
+4.  Refines the variable setup for confidence calibration to use the "cost of the rejected measurement" as the baseline for comparison (`loser_cost`), improving the accuracy of the resulting confidence scores.
+
+<NAME>
+inferred_flow_consensus
+</NAME>
+
+<DESCRIPTION>
+Introduce "Inferred Flow Consensus" candidates to the repair logic.
+For each link, calculate the "budget" (flow rate) required to perfectly balance the local and remote routers (Flow Conservation).
+If these inferred budgets from both ends agree, create a consensus candidate that is prioritized.
+This allows the algorithm to reconstruct the correct flow even if both interface measurements are corrupted, provided the surrounding network topology is stable.
+Also updates the candidate selection logic to evaluating these new candidates alongside the raw measurements, and refining the cost comparison for confidence calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # --- 1. Fix Direction A: Local TX -> Peer RX ---
+            # Candidates
+            c_tx = s['tx']
+            c_prx = peer['rx']
+
+            # Context
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local) # Current imbalance including c_tx
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote) # Current imbalance including c_prx
+
+            # Scoring Function
+            # We want to pick value 'v' that minimizes router imbalances
+            # New_Imb_Local = (Old_Imb - c_tx) + v   (Removing old contribution, adding new)
+            # New_Imb_Remote = (Old_Imb + c_prx) - v (Removing old contribution (which was negative in imbalance), adding new subtraction)
+            # Wait: Imbalance = In - Out.
+            # Local TX is Out. Imb = In - Out. So contribution is -TX.
+            # New Imb = (Current_Imb - (-c_tx)) + (-v) = Current_Imb + c_tx - v.
+            # Remote RX is In. Imb = In - Out. Contribution is +RX.
+            # New Imb = (Current_Imb - c_prx) + v.
+
+            def eval_direction_a(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    cost += abs(imb_local + c_tx - v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    cost += abs(imb_remote - c_prx + v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            cost_tx, n_tx = eval_direction_a(c_tx)
+            cost_prx, n_prx = eval_direction_a(c_prx)
+
+            # Decision Logic
+            best_val = c_tx
+            conf = 1.0
+
+            # If signals agree, trust them
+            denom = max(c_tx, c_prx, 1.0)
+            if abs(c_tx - c_prx) / denom <= HARDENING_THRESHOLD:
+                best_val = (c_tx + c_prx) / 2.0
+                conf = 1.0
+            elif n_tx == 0:
+                # No topology info, fallback to average but low confidence
+                best_val = (c_tx + c_prx) / 2.0
+                conf = 0.5
+            else:
+                # Topology info available, check costs
+                if cost_tx < cost_prx:
+                    best_val = c_tx
+                    winner_cost = cost_tx
+                    loser_cost = cost_prx
+                else:
+                    best_val = c_prx
+                    winner_cost = cost_prx
+                    loser_cost = cost_tx
+=======
+            # --- 1. Fix Direction A: Local TX -> Peer RX ---
+            # Candidates
+            c_tx = s['tx']
+            c_prx = peer['rx']
+
+            # Context
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local) # Current imbalance including c_tx
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote) # Current imbalance including c_prx
+
+            # Inferred Budgets (Flow Conservation Targets)
+            # What value would balance each router perfectly?
+            budget_local = None
+            if imb_local is not None:
+                # Imb = In - Out. Out includes c_tx.
+                # Wanted: In - (Out_others + v) = 0 => v = Imb + c_tx
+                budget_local = max(0.0, imb_local + c_tx)
+
+            budget_remote = None
+            if imb_remote is not None:
+                # Imb = In - Out. In includes c_prx.
+                # Wanted: (In_others + v) - Out = 0 => v = c_prx - Imb
+                budget_remote = max(0.0, c_prx - imb_remote)
+
+            # Build Candidates List
+            candidates = [c_tx, c_prx]
+
+            # 1. Consensus Candidate: Both routers agree on a value
+            if budget_local is not None and budget_remote is not None:
+                avg_budget = (budget_local + budget_remote) / 2.0
+                # If budgets agree within tolerance, this is a very strong signal
+                if abs(budget_local - budget_remote) / max(avg_budget, 1.0) < HARDENING_THRESHOLD * 2:
+                    candidates.append(avg_budget)
+
+            # 2. Individual Budgets (to see if they confirm a measurement)
+            if budget_local is not None: candidates.append(budget_local)
+            if budget_remote is not None: candidates.append(budget_remote)
+
+            # Scoring Function
+            def eval_direction_a(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    cost += abs(imb_local + c_tx - v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    cost += abs(imb_remote - c_prx + v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            # Decision Logic
+            best_val = c_tx
+            conf = 1.0
+
+            # Check for Link Symmetry first (Ground Truth if consistent)
+            denom = max(c_tx, c_prx, 1.0)
+            if abs(c_tx - c_prx) / denom <= HARDENING_THRESHOLD:
+                best_val = (c_tx + c_prx) / 2.0
+                winner_cost, _ = eval_direction_a(best_val)
+                # Calculate loser cost based on hypothetical deviation (not used for high conf)
+                loser_cost = winner_cost
+                conf = 1.0
+            else:
+                # Check for Topology Availability
+                _, n_checks = eval_direction_a(0.0)
+                if n_checks == 0:
+                    best_val = (c_tx + c_prx) / 2.0
+                    winner_cost = 0; loser_cost = 0
+                    conf = 0.5
+                else:
+                    # Evaluate all candidates
+                    min_cost = float('inf')
+                    unique_candidates = sorted(list(set(candidates)))
+
+                    for cand in unique_candidates:
+                        cost, _ = eval_direction_a(cand)
+                        if cost < min_cost:
+                            min_cost = cost
+                            best_val = cand
+
+                    winner_cost = min_cost
+                    # Loser cost is the max cost of the raw measurements
+                    # This represents the "cost of being wrong" if we picked the wrong measurement
+                    cost_tx, _ = eval_direction_a(c_tx)
+                    cost_prx, _ = eval_direction_a(c_prx)
+                    loser_cost = max(cost_tx, cost_prx)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # --- 2. Fix Direction B: Local RX <- Peer TX ---
+            c_rx = s['rx']
+            c_ptx = peer['tx']
+
+            # Re-fetch imbalances as they might have changed from previous step
+            imb_local = get_router_imbalance(r_local)
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Local RX is In. Imb = In - Out. Contribution +RX.
+            # New Imb = (Current_Imb - c_rx) + v.
+            # Remote TX is Out. Imb = In - Out. Contribution -TX.
+            # New Imb = (Current_Imb - (-c_ptx)) - v = Current_Imb + c_ptx - v.
+
+            def eval_direction_b(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    cost += abs(imb_local - c_rx + v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    cost += abs(imb_remote + c_ptx - v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            cost_rx, n_rx = eval_direction_b(c_rx)
+            cost_ptx, n_ptx = eval_direction_b(c_ptx)
+
+            best_val_b = c_rx
+            conf_b = 1.0
+
+            denom_b = max(c_rx, c_ptx, 1.0)
+            if abs(c_rx - c_ptx) / denom_b <= HARDENING_THRESHOLD:
+                best_val_b = (c_rx + c_ptx) / 2.0
+                conf_b = 1.0
+            elif n_rx == 0:
+                best_val_b = (c_rx + c_ptx) / 2.0
+                conf_b = 0.5
+            else:
+                if cost_rx < cost_ptx:
+                    best_val_b = c_rx
+                    winner_cost = cost_rx
+                    loser_cost = cost_ptx
+                else:
+                    best_val_b = c_ptx
+                    winner_cost = cost_ptx
+                    loser_cost = cost_rx
+=======
+            # --- 2. Fix Direction B: Local RX <- Peer TX ---
+            c_rx = s['rx']
+            c_ptx = peer['tx']
+
+            # Re-fetch imbalances as they might have changed from previous step
+            imb_local = get_router_imbalance(r_local)
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Inferred Budgets
+            budget_local_b = None
+            if imb_local is not None:
+                # Imb = In - Out. In includes c_rx.
+                # Wanted: (In_others + v) - Out = 0 => v = c_rx - Imb
+                budget_local_b = max(0.0, c_rx - imb_local)
+
+            budget_remote_b = None
+            if imb_remote is not None:
+                # Imb = In - Out. Out includes c_ptx.
+                # Wanted: In - (Out_others + v) = 0 => v = Imb + c_ptx
+                budget_remote_b = max(0.0, imb_remote + c_ptx)
+
+            candidates_b = [c_rx, c_ptx]
+            if budget_local_b is not None and budget_remote_b is not None:
+                avg_budget = (budget_local_b + budget_remote_b) / 2.0
+                if abs(budget_local_b - budget_remote_b) / max(avg_budget, 1.0) < HARDENING_THRESHOLD * 2:
+                    candidates_b.append(avg_budget)
+            if budget_local_b is not None: candidates_b.append(budget_local_b)
+            if budget_remote_b is not None: candidates_b.append(budget_remote_b)
+
+            def eval_direction_b(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    cost += abs(imb_local - c_rx + v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    cost += abs(imb_remote + c_ptx - v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            best_val_b = c_rx
+            conf_b = 1.0
+
+            denom_b = max(c_rx, c_ptx, 1.0)
+            if abs(c_rx - c_ptx) / denom_b <= HARDENING_THRESHOLD:
+                best_val_b = (c_rx + c_ptx) / 2.0
+                winner_cost, _ = eval_direction_b(best_val_b)
+                loser_cost = winner_cost
+                conf_b = 1.0
+            else:
+                _, n_checks = eval_direction_b(0.0)
+                if n_checks == 0:
+                    best_val_b = (c_rx + c_ptx) / 2.0
+                    winner_cost = 0; loser_cost = 0
+                    conf_b = 0.5
+                else:
+                    min_cost = float('inf')
+                    unique_candidates = sorted(list(set(candidates_b)))
+
+                    for cand in unique_candidates:
+                        cost, _ = eval_direction_b(cand)
+                        if cost < min_cost:
+                            min_cost = cost
+                            best_val_b = cand
+
+                    winner_cost = min_cost
+                    cost_rx, _ = eval_direction_b(c_rx)
+                    cost_ptx, _ = eval_direction_b(c_ptx)
+                    loser_cost = max(cost_rx, cost_ptx)
+>>>>>>> REPLACE
+</DIFF>

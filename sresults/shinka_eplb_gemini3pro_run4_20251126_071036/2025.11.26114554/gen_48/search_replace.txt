@@ -1,0 +1,381 @@
+<NAME>
+improved_lns_packing
+</NAME>
+
+<DESCRIPTION>
+I propose to overhaul the `balanced_packing` function to implement a more robust Large Neighborhood Search (LNS) strategy, inspired by the recommendation to use 3-Way Cyclic Swaps and Optimal Re-partitioning.
+
+The changes are:
+1.  **Initialization**: Retain the Randomized Greedy initialization but ensure sufficient restarts.
+2.  **LNS Loop**: Replace the separate swap and pairwise-rebalance phases with a unified LNS loop.
+    -   In each step, we select a subset of packs to "ruin" (empty) and "recreate" (refill).
+    -   **Candidate Selection**: We always pick the heaviest pack (`max_p`) and the lightest pack (`min_p`). Crucially, with some probability, we also add 1 or 2 **random packs**. This enables 3-way or 4-way exchanges, allowing the algorithm to escape local optima where simple pairwise swaps are impossible (addressing Recommendation 2).
+    -   **Sub-problem Solver**: The items from the selected packs are pooled and re-distributed using a randomized greedy heuristic with multiple restarts (internal loop). This effectively performs "Optimal Re-partitioning" on the subset of packs (Recommendation 3).
+    -   **Acceptance Criterion**: We accept the new configuration if it reduces the maximum load of the subset, or if it reduces the sum of squared loads (variance) while keeping the max load the same.
+
+This approach provides a more powerful local search capability than pairwise swaps, utilizing the available time budget to find better balanced configurations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    device = weight.device
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Use CPU weights
+    weight_cpu = weight.cpu()
+
+    # Outputs on CPU to avoid device synchronization during fill
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64)
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64)
+
+    # Number of restarts for the randomized heuristic
+    # Increased to 50 as we have computational budget and random greedy is effective
+    NUM_RESTARTS = 50
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+
+        best_max_load = float('inf')
+        best_assignment = None
+
+        for attempt in range(NUM_RESTARTS):
+            # 1. Candidate Generation
+            if attempt == 0:
+                # Deterministic LPT
+                indices = layer_w.argsort(descending=True).tolist()
+            else:
+                # Randomized LPT (Perturbed weights)
+                # Slightly wider noise range for better exploration
+                noise = torch.rand(num_groups) * 0.4 + 0.8  # 0.8 to 1.2
+                indices = (layer_w * noise).argsort(descending=True).tolist()
+
+            # 2. Greedy Construction
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for g_idx in indices:
+                w = layer_w[g_idx].item()
+                # Best fit among non-full packs (min current load)
+                best_p = -1
+                min_w = float('inf')
+
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+
+                packs[best_p].append(g_idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+
+            # 3. Refinement (Local Search)
+            # Try to swap items from the heaviest packs to lighter packs.
+            # We consider top 3 heaviest packs to avoid getting stuck if the max pack cannot swap.
+            for _ in range(25):
+                # Sort packs by weight descending
+                sorted_packs = sorted(range(num_packs), key=lambda x: pack_weights[x], reverse=True)
+
+                improved = False
+
+                # Try to improve the heaviest packs
+                for p_idx in range(min(3, num_packs)):
+                    max_p = sorted_packs[p_idx]
+                    max_w = pack_weights[max_p]
+
+                    best_swap = None
+                    best_gain = 0.0
+
+                    u_nodes = packs[max_p]
+                    w_u = layer_w[u_nodes]
+
+                    for p in range(num_packs):
+                        if p == max_p:
+                            continue
+
+                        w_p = pack_weights[p]
+                        if w_p >= max_w:
+                            continue
+
+                        diff = max_w - w_p
+                        if diff < 1e-6:
+                            continue
+
+                        v_nodes = packs[p]
+                        w_v = layer_w[v_nodes]
+
+                        # Deltas: w_u[i] - w_v[j]
+                        deltas = w_u.unsqueeze(1) - w_v.unsqueeze(0)
+
+                        # Valid swaps: 0 < delta < diff
+                        mask = (deltas > 1e-6) & (deltas < diff)
+                        if not mask.any():
+                            continue
+
+                        # Gain metric: maximize delta * (diff - delta)
+                        gains = deltas * (diff - deltas)
+                        gains = torch.where(mask, gains, -1.0)
+
+                        curr_max_gain, curr_idx = gains.flatten().max(0)
+
+                        if curr_max_gain.item() > best_gain:
+                            best_gain = curr_max_gain.item()
+                            idx = curr_idx.item()
+                            u_idx = idx // len(v_nodes)
+                            v_idx = idx % len(v_nodes)
+                            best_swap = (max_p, p, u_idx, v_idx, deltas.flatten()[idx].item())
+
+                    if best_swap:
+                        p1, p2, u_i, v_i, delta = best_swap
+                        val_u = packs[p1][u_i]
+                        val_v = packs[p2][v_i]
+                        packs[p1][u_i] = val_v
+                        packs[p2][v_i] = val_u
+
+                        pack_weights[p1] -= delta
+                        pack_weights[p2] += delta
+                        improved = True
+                        break # Re-sort and restart logic
+
+                if not improved:
+                    break
+
+            # 4. Evaluation
+            current_max = max(pack_weights)
+            if current_max < best_max_load - 1e-6:
+                best_max_load = current_max
+                best_assignment = [list(p) for p in packs]
+
+        # 5. Final assignment for this layer
+        for p, nodes in enumerate(best_assignment):
+            for r, g_idx in enumerate(nodes):
+                pack_index[i, g_idx] = p
+                rank_in_pack[i, g_idx] = r
+
+    return pack_index.to(device), rank_in_pack.to(device)
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    device = weight.device
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Use CPU weights for fast scalar access
+    weight_cpu = weight.cpu()
+
+    # Outputs on CPU
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64)
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64)
+
+    # Number of restarts for the randomized heuristic
+    NUM_RESTARTS = 20
+
+    import random
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+        layer_w_list = layer_w.tolist()
+
+        best_max_load = float('inf')
+        best_ss = float('inf')
+        best_assignment = None
+
+        for attempt in range(NUM_RESTARTS):
+            # 1. Candidate Generation
+            if attempt == 0:
+                # Deterministic LPT
+                indices = sorted(range(num_groups), key=lambda x: layer_w_list[x], reverse=True)
+            else:
+                # Randomized LPT
+                indices = sorted(range(num_groups),
+                                 key=lambda x: layer_w_list[x] * (0.8 + 0.4 * random.random()),
+                                 reverse=True)
+
+            # 2. Greedy Construction (Least Loaded)
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for g_idx in indices:
+                w = layer_w_list[g_idx]
+                best_p = -1
+                min_w = float('inf')
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+                packs[best_p].append(g_idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+
+            # 3. Refinement: Ruin & Recreate (LNS)
+            LNS_STEPS = 50 if num_packs > 1 else 0
+
+            for step in range(LNS_STEPS):
+                # Identify max and min packs
+                max_p = -1
+                min_p = -1
+                max_w = -1.0
+                min_w = float('inf')
+
+                for p_idx, pw in enumerate(pack_weights):
+                    if pw > max_w:
+                        max_w = pw
+                        max_p = p_idx
+                    if pw < min_w:
+                        min_w = pw
+                        min_p = p_idx
+
+                if max_p == min_p or (max_w - min_w < 1e-6):
+                    break
+
+                # Candidates for Ruin: Max, Min, and potentially Randoms
+                candidates = [max_p, min_p]
+
+                # Add random packs for 3-way/4-way cyclic shifts
+                if num_packs > 2:
+                    num_extra = 1 if (num_packs == 3) else random.randint(1, 2)
+                    for _ in range(num_extra):
+                        rand_p = random.randint(0, num_packs - 1)
+                        if rand_p not in candidates:
+                            candidates.append(rand_p)
+
+                # Pool items
+                items = []
+                for p in candidates:
+                    items.extend(packs[p])
+
+                # Recreate: Solve sub-problem (minimize max load of these packs)
+                current_sub_max = max(pack_weights[p] for p in candidates)
+                current_sub_ss = sum(pack_weights[p]**2 for p in candidates)
+
+                best_sub_packs = None
+                best_sub_weights = None
+                found_better = False
+
+                # Sort LPT for sub-problem
+                item_data = [(layer_w_list[idx], idx) for idx in items]
+                item_data.sort(key=lambda x: x[0], reverse=True)
+
+                # Sub-problem restarts
+                SUB_RESTARTS = 20
+                for sub_attempt in range(SUB_RESTARTS):
+                    if sub_attempt == 0:
+                        sub_items = item_data
+                    else:
+                        # Perturbed LPT
+                        sub_items = sorted(item_data, key=lambda x: x[0] * (0.85 + 0.3 * random.random()), reverse=True)
+
+                    temp_packs = {p: [] for p in candidates}
+                    temp_weights = {p: 0.0 for p in candidates}
+                    temp_counts = {p: 0 for p in candidates}
+
+                    possible = True
+                    for w, idx in sub_items:
+                        # Greedy Best Fit on Subset
+                        best_local_p = -1
+                        min_local_w = float('inf')
+                        for p in candidates:
+                            if temp_counts[p] < groups_per_pack:
+                                if temp_weights[p] < min_local_w:
+                                    min_local_w = temp_weights[p]
+                                    best_local_p = p
+
+                        if best_local_p == -1:
+                            possible = False
+                            break
+
+                        temp_packs[best_local_p].append(idx)
+                        temp_weights[best_local_p] += w
+                        temp_counts[best_local_p] += 1
+
+                    if possible:
+                        new_max = max(temp_weights.values())
+                        new_ss = sum(v**2 for v in temp_weights.values())
+
+                        # Accept if better
+                        if new_max < current_sub_max - 1e-6:
+                            current_sub_max = new_max
+                            current_sub_ss = new_ss
+                            best_sub_packs = temp_packs
+                            best_sub_weights = temp_weights
+                            found_better = True
+                        elif abs(new_max - current_sub_max) < 1e-6:
+                            if new_ss < current_sub_ss - 1e-6:
+                                current_sub_ss = new_ss
+                                best_sub_packs = temp_packs
+                                best_sub_weights = temp_weights
+                                found_better = True
+
+                if found_better:
+                    for p in candidates:
+                        packs[p] = best_sub_packs[p]
+                        pack_weights[p] = best_sub_weights[p]
+
+            # 4. Evaluation
+            current_max = max(pack_weights)
+            current_ss = sum(w**2 for w in pack_weights)
+
+            if current_max < best_max_load - 1e-6:
+                best_max_load = current_max
+                best_ss = current_ss
+                best_assignment = [list(p) for p in packs]
+            elif abs(current_max - best_max_load) < 1e-6:
+                if current_ss < best_ss - 1e-6:
+                    best_ss = current_ss
+                    best_assignment = [list(p) for p in packs]
+
+        # 5. Final assignment for this layer
+        for p, nodes in enumerate(best_assignment):
+            for r, g_idx in enumerate(nodes):
+                pack_index[i, g_idx] = p
+                rank_in_pack[i, g_idx] = r
+
+    return pack_index.to(device), rank_in_pack.to(device)
+>>>>>>> REPLACE
+</DIFF>

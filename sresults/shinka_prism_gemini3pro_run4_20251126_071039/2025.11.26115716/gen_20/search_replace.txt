@@ -1,0 +1,159 @@
+<NAME>
+beam_search_placement
+</NAME>
+
+<DESCRIPTION>
+Replaces the greedy packing with randomized repair in the `solve` function with a deterministic Beam Search. This search uses the linearized cost (Weight + K * Size) as the sorting key and maximizes the sum of squares of bin loads (Best-Fit-Decreasing heuristic) to minimize fragmentation. This robust constructive method reduces the need for random restarts and repair logic, improving placement feasibility for tight KVPR constraints.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def solve(k_target, attempt_limit=5):
+        limit_val = k_target * GPU_MEM_SIZE
+
+        def pack(ordered_items):
+            # bins: list of dicts {w, s, items}
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for item in ordered_items:
+                item_lin = item['w'] + k_target * item['s']
+
+                best_idx = -1
+                best_fill = -1.0 # Best Fit: Maximize current load (tightest packing)
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    if b['s'] + item['s'] > GPU_MEM_SIZE: continue
+
+                    current_lin = b['w'] + k_target * b['s']
+                    if current_lin + item_lin > limit_val + 1e-5: continue
+
+                    if current_lin > best_fill:
+                        best_fill = current_lin
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['items'].append(item)
+                    bins[best_idx]['w'] += item['w']
+                    bins[best_idx]['s'] += item['s']
+                else:
+                    # Repair: Swap
+                    # Try to find a victim in bin 'v_idx' that, if replaced by 'item',
+                    # allows 'item' to fit, AND 'victim' fits elsewhere.
+                    repaired = False
+                    for i in range(gpu_num):
+                        b = bins[i]
+                        for v_idx, victim in enumerate(b['items']):
+                            # Can we swap item into b replacing victim?
+                            # Check size
+                            if b['s'] - victim['s'] + item['s'] > GPU_MEM_SIZE: continue
+                            # Check KVPR (linear)
+                            new_lin_i = (b['w'] - victim['w'] + item['w']) + k_target * (b['s'] - victim['s'] + item['s'])
+                            if new_lin_i > limit_val + 1e-5: continue
+
+                            # Victim needs a new home
+                            victim_lin = victim['w'] + k_target * victim['s']
+                            for k in range(gpu_num):
+                                if i == k: continue
+                                bk = bins[k]
+                                if bk['s'] + victim['s'] > GPU_MEM_SIZE: continue
+                                new_lin_k = (bk['w'] + k_target * bk['s']) + victim_lin
+                                if new_lin_k <= limit_val + 1e-5:
+                                    # Swap
+                                    b['items'][v_idx] = item
+                                    b['w'] += (item['w'] - victim['w'])
+                                    b['s'] += (item['s'] - victim['s'])
+
+                                    bk['items'].append(victim)
+                                    bk['w'] += victim['w']
+                                    bk['s'] += victim['s']
+                                    repaired = True
+                                    break
+                            if repaired: break
+                        if repaired: break
+
+                    if not repaired:
+                        return None
+
+            return [b['items'] for b in bins]
+
+        # 1. Deterministic
+        # Sort by linear cost descending
+        res = pack(sorted(items, key=lambda x: x['w'] + k_target * x['s'], reverse=True))
+        if res: return res
+
+        # Sort by Size descending
+        res = pack(sorted(items, key=lambda x: x['s'], reverse=True))
+        if res: return res
+
+        # 2. Noisy Randomized
+        if attempt_limit > 0:
+            rng = random.Random(42 + int(k_target * 100))
+            base_key = lambda x: x['w'] + k_target * x['s']
+            for _ in range(attempt_limit):
+                # Add noise to sort key
+                noisy_items = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+                res = pack(noisy_items)
+                if res: return res
+
+        return None
+=======
+    def solve(k_target, attempt_limit=5):
+        limit_val = k_target * GPU_MEM_SIZE
+
+        # Beam Search Construction
+        # Sort by linear cost descending (w + k*s)
+        sorted_items = sorted(items, key=lambda x: x['w'] + k_target * x['s'], reverse=True)
+
+        # State: (loads_tuple, placement_list)
+        # loads_tuple: ((w, s), ...) for each GPU
+        beam = [(tuple((0.0, 0.0) for _ in range(gpu_num)), [[] for _ in range(gpu_num)])]
+        BEAM_WIDTH = 8
+
+        for item in sorted_items:
+            item_lin = item['w'] + k_target * item['s']
+            candidates = []
+
+            for loads, placement in beam:
+                seen_loads = set()
+
+                for i in range(gpu_num):
+                    w, s = loads[i]
+                    # Symmetry breaking: if multiple GPUs have exact same state, only try one
+                    if (w, s) in seen_loads: continue
+                    seen_loads.add((w, s))
+
+                    # Capacity Check
+                    if s + item['s'] > GPU_MEM_SIZE: continue
+
+                    # KVPR Check (Linearized: w + k*s <= k*Cap)
+                    # Use slight tolerance for float precision
+                    current_lin = w + k_target * s
+                    if current_lin + item_lin > limit_val + 1e-5: continue
+
+                    # Construct new state
+                    new_w = w + item['w']
+                    new_s = s + item['s']
+
+                    new_loads = list(loads)
+                    new_loads[i] = (new_w, new_s)
+
+                    new_placement = [list(p) for p in placement]
+                    new_placement[i].append(item)
+
+                    # Score: Sum of squares of linearized load.
+                    # Maximizes "clumpiness" (Best Fit), reducing fragmentation.
+                    score = sum((lw + k_target * ls)**2 for lw, ls in new_loads)
+
+                    candidates.append((score, tuple(new_loads), new_placement))
+
+            if not candidates:
+                return None
+
+            # Keep top K candidates
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = [(c[1], c[2]) for c in candidates[:BEAM_WIDTH]]
+
+        return beam[0][2]
+>>>>>>> REPLACE
+</DIFF>

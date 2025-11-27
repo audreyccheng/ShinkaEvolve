@@ -1,0 +1,231 @@
+<NAME>
+improve_strategies_and_localsearch
+</NAME>
+
+<DESCRIPTION>
+1. Adds a "Density" (load/size) sorting strategy to the binary search feasibility check. This strategy orders models by their intensity density, which often yields better packing efficiency for models with varying resource requirements.
+2. Enhances the Local Search Refinement phase by implementing a "Variance Reduction" tie-breaking mechanism. Instead of only accepting moves that strictly lower the global maximum pressure, the algorithm now accepts moves that maintain the maximum pressure but reduce the sum of squared pressures. This helps to balance the load among non-bottleneck GPUs and resolves deadlock situations where multiple GPUs share the maximum pressure, enabling the algorithm to escape local optima that simple Hill Climbing would get stuck in.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Strategies: Virtual Size, Physical Size, Load
+        strategies = [
+            lambda x: x['w'] + mid * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w']
+        ]
+
+        for key_func in strategies:
+=======
+        # Strategies: Virtual Size, Physical Size, Load, Density
+        strategies = [
+            lambda x: x['w'] + mid * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+
+        for key_func in strategies:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- 3. Local Search Refinement ---
+    current_placement = final_placement
+
+    # Reconstruct load/used stats
+    loads = [0.0] * gpu_num
+    used = [0.0] * gpu_num
+    for g in range(gpu_num):
+        for m in current_placement[g]:
+            loads[g] += m.req_rate / m.slo
+            used[g] += m.model_size
+
+    # Hill Climbing: Minimize Max Pressure
+    iter_limit = 100
+    for _ in range(iter_limit):
+        max_p = -1.0
+        bottleneck = -1
+
+        # Identify bottleneck
+        for g in range(gpu_num):
+            rem = GPU_MEM_SIZE - used[g]
+            p = loads[g] / rem if rem > 1e-6 else float('inf')
+            if p > max_p:
+                max_p = p
+                bottleneck = g
+
+        if bottleneck == -1: break
+
+        improved = False
+        bn_items = list(current_placement[bottleneck])
+
+        # Try Moving an item out of bottleneck
+        for m in bn_items:
+            w = m.req_rate / m.slo
+            s = m.model_size
+
+            src_l = loads[bottleneck] - w
+            src_u = used[bottleneck] - s
+
+            for dst in range(gpu_num):
+                if dst == bottleneck: continue
+                if used[dst] + s >= GPU_MEM_SIZE - 1e-6: continue
+
+                dst_l = loads[dst] + w
+                dst_u = used[dst] + s
+                dst_p = dst_l / (GPU_MEM_SIZE - dst_u) if (GPU_MEM_SIZE - dst_u) > 1e-6 else float('inf')
+
+                # Accept if target GPU stays below current max pressure
+                if dst_p < max_p - 1e-6:
+                    current_placement[bottleneck].remove(m)
+                    current_placement[dst].append(m)
+
+                    loads[bottleneck] = src_l
+                    used[bottleneck] = src_u
+                    loads[dst] = dst_l
+                    used[dst] = dst_u
+
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # Try Swapping an item from bottleneck with another
+        for dst in range(gpu_num):
+            if dst == bottleneck: continue
+
+            dst_items = list(current_placement[dst])
+            for m_src in bn_items:
+                ws = m_src.req_rate / m_src.slo
+                ss = m_src.model_size
+
+                for m_dst in dst_items:
+                    wd = m_dst.req_rate / m_dst.slo
+                    sd = m_dst.model_size
+
+                    # New bottleneck state
+                    n_src_u = used[bottleneck] - ss + sd
+                    if n_src_u >= GPU_MEM_SIZE - 1e-6: continue
+                    n_src_l = loads[bottleneck] - ws + wd
+                    n_src_p = n_src_l / (GPU_MEM_SIZE - n_src_u)
+
+                    # New dest state
+                    n_dst_u = used[dst] - sd + ss
+                    if n_dst_u >= GPU_MEM_SIZE - 1e-6: continue
+                    n_dst_l = loads[dst] - wd + ws
+                    n_dst_p = n_dst_l / (GPU_MEM_SIZE - n_dst_u)
+
+                    # Accept if both result in lower pressure than current max
+                    if n_src_p < max_p - 1e-6 and n_dst_p < max_p - 1e-6:
+                        current_placement[bottleneck].remove(m_src)
+                        current_placement[bottleneck].append(m_dst)
+                        current_placement[dst].remove(m_dst)
+                        current_placement[dst].append(m_src)
+
+                        loads[bottleneck] = n_src_l
+                        used[bottleneck] = n_src_u
+                        loads[dst] = n_dst_l
+                        used[dst] = n_dst_u
+
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if not improved: break
+
+    return current_placement
+=======
+    # --- 3. Local Search Refinement ---
+    current_placement = final_placement
+
+    # Reconstruct load/used stats
+    loads = [0.0] * gpu_num
+    used = [0.0] * gpu_num
+    for g in range(gpu_num):
+        for m in current_placement[g]:
+            loads[g] += m.req_rate / m.slo
+            used[g] += m.model_size
+
+    # Iterated Local Search with Variance Reduction
+    def get_pressure(g_idx):
+        rem = GPU_MEM_SIZE - used[g_idx]
+        if rem <= 1e-6: return float('inf')
+        return loads[g_idx] / rem
+
+    iter_limit = 500
+    for _ in range(iter_limit):
+        max_p = -1.0
+        bottleneck = -1
+
+        # Identify bottleneck
+        for g in range(gpu_num):
+            p = get_pressure(g)
+            if p > max_p:
+                max_p = p
+                bottleneck = g
+
+        if bottleneck == -1: break
+
+        improved = False
+        bn_items = list(current_placement[bottleneck])
+
+        # Helper to decide if we should accept a new state involving src and dst
+        def accept_move(p_src_new, p_dst_new, p_src_old, p_dst_old):
+            local_max_new = max(p_src_new, p_dst_new)
+
+            # Strict improvement on global max constraint (locally)
+            if local_max_new < max_p - 1e-6:
+                return True
+
+            # Tie-breaking / Variance reduction
+            # If we are at the global max level (approx), check if we reduced sum of squares
+            if local_max_new < max_p + 1e-6:
+                old_sq = p_src_old**2 + p_dst_old**2
+                new_sq = p_src_new**2 + p_dst_new**2
+                if new_sq < old_sq - 1e-6:
+                    return True
+            return False
+
+        # Try Moving an item out of bottleneck
+        for m in bn_items:
+            w = m.req_rate / m.slo
+            s = m.model_size
+
+            src_l = loads[bottleneck] - w
+            src_u = used[bottleneck] - s
+            p_src_new = src_l / (GPU_MEM_SIZE - src_u)
+
+            for dst in range(gpu_num):
+                if dst == bottleneck: continue
+                if used[dst] + s >= GPU_MEM_SIZE - 1e-6: continue
+
+                dst_l = loads[dst] + w
+                dst_u = used[dst] + s
+                p_dst_new = dst_l / (GPU_MEM_SIZE - dst_u)
+
+                # Check acceptance
+                if accept_move(p_src_new, p_dst_new, max_p, get_pressure(dst)):
+                    current_placement[bottleneck].remove(m)
+                    current_placement[dst].append(m)
+
+                    loads[bottleneck] = src_l
+                    used[bottleneck] = src_u
+                    loads[dst] = dst_l
+                    used[dst] = dst_u
+
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # Try Swapping an item from bottleneck with another
+        for dst in range(gpu_num):
+            if dst == bottleneck: continue
+
+            dst_items = list(current_placement[dst])
+            for m_src in bn_items:
+                ws = m_src.req_rate / m_src.slo
+                ss = m_src.model_size

@@ -1,0 +1,164 @@
+<NAME>
+router_coupled_symmetry_solver
+</NAME>
+
+<DESCRIPTION>
+I propose a targeted improvement to the pairwise link repair step by coupling both directions of a link (A.tx=B.rx and B.tx=A.rx) and solving a small closed-form optimization that jointly enforces link symmetry and reduces router-level imbalances (flow conservation).
+
+Specifically:
+- Precompute initial per-router TX/RX sums and imbalances from raw telemetry using the provided topology.
+- Replace the simple averaging used when symmetry violations occur with a 2-variable least-squares solution that balances:
+  - Staying close to the symmetric means of the two measurements per direction, and
+  - Minimizing per-router imbalance contributions of the two endpoint routers.
+- Use a dynamic regularization λ that is large when symmetry differences are small (favoring measured means) and smaller when differences are large (allowing flow-based correction), within [0.5, 4.0].
+- Calibrate per-direction confidence by combining the measurement deviation from symmetric means and the router-imbalance improvement. When measurements are already within tolerance, keep the original high confidence.
+
+This should improve counter repair accuracy by avoiding over-smoothing when one side is correct and by pushing repairs that better satisfy flow conservation, while maintaining solid confidence calibration. The rest of the pipeline, including the existing dangling-interface router balancing and final router-penalized confidence scaling, remains unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+    # Prior strength for sticking to measured symmetric means vs fixing router imbalances
+    LAMBDA_MIN = 0.5
+    LAMBDA_MAX = 4.0
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build link pairs
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            # Store canonical orientation (A=if_id, B=peer) for deterministic processing
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+=======
+    # Precompute initial router-level TX/RX sums and imbalances using raw telemetry
+    router_tx0: Dict[str, float] = {}
+    router_rx0: Dict[str, float] = {}
+    for router, if_list in topology.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in telemetry:
+                d = telemetry[if_id]
+                sum_tx += float(d.get('tx_rate', 0.0) or 0.0)
+                sum_rx += float(d.get('rx_rate', 0.0) or 0.0)
+        router_tx0[router] = sum_tx
+        router_rx0[router] = sum_rx
+    router_imbalance0: Dict[str, float] = {r: router_tx0.get(r, 0.0) - router_rx0.get(r, 0.0) for r in topology.keys()}
+
+    # Build link pairs
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            # Store canonical orientation (A=if_id, B=peer) for deterministic processing
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            # Link is up: enforce link symmetry with hardening threshold
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+                rep_a_tx = avg_ab
+                rep_b_rx = avg_ab
+            # Confidence decreases with magnitude of violation; if unchanged, slightly boost
+            conf_ab = max(0.0, 1.0 - diff_ab)
+            if diff_ab <= HARDENING_THRESHOLD:
+                conf_ab = min(1.0, max(conf_ab, 0.98))
+            tx_conf_a = conf_ab
+            rx_conf_b = conf_ab
+
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+                rep_b_tx = avg_ba
+                rep_a_rx = avg_ba
+            conf_ba = max(0.0, 1.0 - diff_ba)
+            if diff_ba <= HARDENING_THRESHOLD:
+                conf_ba = min(1.0, max(conf_ba, 0.98))
+            tx_conf_b = conf_ba
+            rx_conf_a = conf_ba
+=======
+        else:
+            # Link is up: coupled symmetry solver with router-aware regularization
+            # If both directions are within tolerance, keep originals and boost confidence
+            if (diff_ab <= HARDENING_THRESHOLD) and (diff_ba <= HARDENING_THRESHOLD):
+                conf_ab = min(1.0, max(0.98, 1.0 - diff_ab))
+                conf_ba = min(1.0, max(0.98, 1.0 - diff_ba))
+                tx_conf_a = conf_ab
+                rx_conf_b = conf_ab
+                tx_conf_b = conf_ba
+                rx_conf_a = conf_ba
+            else:
+                # Set up least-squares objective:
+                # minimize (I_i')^2 + (I_j')^2 + λ[(x - m_x)^2 + (y - m_y)^2]
+                # where x=A.tx=B.rx, y=B.tx=A.rx
+                ri = a.get('local_router')
+                rj = b.get('local_router')
+                Ii0 = float(router_imbalance0.get(ri, 0.0))
+                Ij0 = float(router_imbalance0.get(rj, 0.0))
+                m_x = 0.5 * (a_tx + b_rx)
+                m_y = 0.5 * (b_tx + a_rx)
+                C_i = Ii0 - (a_tx - a_rx)
+                C_j = Ij0 - (b_tx - b_rx)
+
+                # Dynamic regularization λ based on average symmetry deviation
+                avg_diff = 0.5 * (diff_ab + diff_ba)
+                frac = min(1.0, max(0.0, avg_diff / 0.5))  # map up to 50% diff into [0,1]
+                lam = LAMBDA_MAX - (LAMBDA_MAX - LAMBDA_MIN) * frac
+                Acoef = 2.0 + lam
+                D = Acoef * Acoef - 4.0  # determinant of [[A,-2],[-2,A]], A>2 ensures D>0
+
+                r1 = lam * m_x - (C_i - C_j)
+                r2 = lam * m_y - (C_j - C_i)
+
+                x = (Acoef * r1 + 2.0 * r2) / D
+                y = (2.0 * r1 + Acoef * r2) / D
+
+                # Enforce non-negativity for rates
+                x = max(0.0, x)
+                y = max(0.0, y)
+
+                rep_a_tx = x
+                rep_b_rx = x
+                rep_b_tx = y
+                rep_a_rx = y
+
+                # Confidence calibration: combine deviation from symmetric means and flow improvement
+                dev_x_rel = abs(x - m_x) / max(abs(m_x), 1.0)
+                dev_y_rel = abs(y - m_y) / max(abs(m_y), 1.0)
+
+                Ii_post = Ii0 + (x - a_tx) - (y - a_rx)
+                Ij_post = Ij0 + (y - b_tx) - (x - b_rx)
+                pre_L1 = abs(Ii0) + abs(Ij0)
+                post_L1 = abs(Ii_post) + abs(Ij_post)
+                improvement = 0.0 if pre_L1 <= 1e-12 else max(0.0, (pre_L1 - post_L1) / pre_L1)
+
+                conf_x = max(0.0, min(1.0, 0.6 * (1.0 - min(1.0, dev_x_rel)) + 0.4 * improvement))
+                conf_y = max(0.0, min(1.0, 0.6 * (1.0 - min(1.0, dev_y_rel)) + 0.4 * improvement))
+
+                tx_conf_a = conf_x
+                rx_conf_b = conf_x
+                tx_conf_b = conf_y
+                rx_conf_a = conf_y
+>>>>>>> REPLACE
+
+</DIFF>

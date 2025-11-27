@@ -1,0 +1,201 @@
+<NAME>
+rate_repair_with_synthesis
+</NAME>
+
+<DESCRIPTION>
+Updates the rate repair logic to use a more robust "Candidate Expansion" and "Continuous Scoring" approach.
+1. Generates "Synthetic" candidates using flow conservation (Residual Synthesis) to help recover links where both endpoints are corrupted (e.g. double-dead links) but connected routers imply traffic.
+2. Replaces the binary voting system with a continuous scoring function (`min(err*10, 2.0)`) to better distinguish between minor measurement noise and major data corruption.
+3. Explicitly includes the average value as a candidate to handle high-variance but valid signals.
+4. Uses a relative heuristic to penalize "dead" (zero) candidates only when strictly better active candidates exist.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = avg
+            else:
+                # Disagreement: Resolve conflict using Flow Conservation constraints
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # Calculate errors if we chose TX value
+                err_local_tx = get_flow_error(rid_local, if_id, 'tx', val_tx)
+                err_remote_tx = get_flow_error(rid_remote, peer_id, 'rx', val_tx)
+
+                # Calculate errors if we chose RX value
+                err_local_rx = get_flow_error(rid_local, if_id, 'tx', val_rx)
+                err_remote_rx = get_flow_error(rid_remote, peer_id, 'rx', val_rx)
+
+                # Scoring (Lower is better)
+                # 0.0 = Verified Good, 0.5 = Unverifiable, 1.0 = Verified Bad
+                def get_vote(err):
+                    if err is None: return 0.5
+                    if err < FLOW_TOLERANCE: return 0.0
+                    return 1.0
+
+                score_tx = get_vote(err_local_tx) + get_vote(err_remote_tx)
+                score_rx = get_vote(err_local_rx) + get_vote(err_remote_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                if val_tx < MIN_ACTIVITY and val_rx > MIN_ACTIVITY: score_tx += 0.4
+                if val_rx < MIN_ACTIVITY and val_tx > MIN_ACTIVITY: score_rx += 0.4
+
+                # Selection
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = avg # Tie -> Average
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+=======
+    # --- 3. Rate Repair (Iterative Consensus) ---
+
+    def get_balancing_value(rid, if_target, field):
+        """Calculates the rate required to perfectly balance the router."""
+        if rid not in verifiable_routers: return None
+        sum_in, sum_out = 0.0, 0.0
+        for iface in router_map[rid]:
+            sum_in += state[iface]['rx']
+            sum_out += state[iface]['tx']
+
+        # Subtract current value of the field we are solving for
+        current = state[if_target][field]
+        if field == 'rx': sum_in -= current
+        else: sum_out -= current
+
+        # Balance: Rx_total = Tx_total
+        val = sum_out - sum_in if field == 'rx' else sum_in - sum_out
+        return max(val, 0.0)
+
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            val_tx = s['tx']
+            val_rx = state[peer_id]['rx']
+
+            # Candidates to consider
+            candidates = {val_tx, val_rx}
+
+            # 1. Add Average (for smoothing)
+            avg = (val_tx + val_rx) / 2.0
+            candidates.add(avg)
+
+            # 2. Add Synthetic candidates (Residual Synthesis)
+            # If a router is verifiable, what value does it "want"?
+            rid_local = s['local_router']
+            rid_remote = s['remote_router']
+
+            synth_tx = get_balancing_value(rid_local, if_id, 'tx')
+            if synth_tx is not None: candidates.add(synth_tx)
+
+            synth_rx = get_balancing_value(rid_remote, peer_id, 'rx')
+            if synth_rx is not None: candidates.add(synth_rx)
+
+            # Evaluate Candidates
+            best_val = val_tx
+            best_score = float('inf')
+
+            # Filter close duplicates to save time
+            unique_cands = sorted(list(candidates))
+            # Determine max candidate for heuristic
+            max_cand_val = unique_cands[-1] if unique_cands else 0.0
+
+            for cand in unique_cands:
+                # Local Score
+                err_loc = get_flow_error(rid_local, if_id, 'tx', cand)
+                if err_loc is None:
+                    # Unverifiable: mild penalty (prefer verified)
+                    score_loc = 0.05
+                else:
+                    # Continuous penalty: small error is fine, large error is bad
+                    # Scale: 5% error -> 0.5 score.
+                    score_loc = min(err_loc * 10, 2.0)
+
+                # Remote Score
+                err_rem = get_flow_error(rid_remote, peer_id, 'rx', cand)
+                if err_rem is None:
+                    score_rem = 0.05
+                else:
+                    score_rem = min(err_rem * 10, 2.0)
+
+                total_score = score_loc + score_rem
+
+                # Heuristic: Trust Non-Zero (Anti-Dead-Counter)
+                # If this candidate is dead (0) but others are active, penalize it.
+                if cand < MIN_ACTIVITY and max_cand_val > MIN_ACTIVITY:
+                    total_score += 0.5
+
+                if total_score < best_score:
+                    best_score = total_score
+                    best_val = cand
+
+            # Tie-breaking/Smoothing:
+            # If the best value is very close to the average of original signals, use average
+            # This helps noise reduction if both signals were roughly correct
+            if abs(best_val - avg) < max(avg * 0.05, MIN_ACTIVITY):
+                best_val = avg
+
+            # Update state
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+calibrate_trust_nonzero
+</NAME>
+
+<DESCRIPTION>
+Refine confidence calibration for unverified repairs. Increases confidence for "Trust Non-Zero" repairs when the signal magnitude is significant (High SNR), as these are statistically less likely to be noise than small corrections.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85
+
+            # Total guess / forced agreement
+=======
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                # High magnitude recovery is more trustworthy (High SNR)
+                if final > 5.0: return 0.9
+                return 0.85
+
+            # Total guess / forced agreement
+>>>>>>> REPLACE
+</DIFF>

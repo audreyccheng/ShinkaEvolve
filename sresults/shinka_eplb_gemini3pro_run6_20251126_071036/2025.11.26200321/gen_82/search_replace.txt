@@ -1,0 +1,185 @@
+<NAME>
+topk_destruct_reconstruct
+</NAME>
+
+<DESCRIPTION>
+Replaces the expensive and limited Max-Min Pair Swap (Phase B) with a more robust Top-K Destruct-Reconstruct refinement.
+This new phase identifies the Top-2 Heaviest and Top-2 Lightest packs (for M>=4), pools their items, and redistributes them using a balanced ZigZag pattern (e.g., 0,1,2,3,3,2,1,0). This acts as a localized large-neighborhood search that can effectively balance outliers and is not limited by K (items per pack).
+For M=2 or 3, it falls back to a Top-1 Max/Min Destruct-Reconstruct with ABBA pattern.
+This approach scales better with K and M and avoids the combinatorial explosion of pair swaps.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Phase B: Max-Min Pair Swap (2-Item)
+    if K >= 2 and K <= 24: # Limit to avoid OOM
+        pairs = torch.combinations(torch.arange(K, device=device), r=2) # [NumPairs, 2]
+
+        num_iters_2 = 10
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total_problems, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            val_max, idx_max = pack_sums.max(dim=1)
+            val_min, idx_min = pack_sums.min(dim=1)
+
+            gather_max = idx_max.view(-1, 1, 1).expand(-1, 1, K)
+            gather_min = idx_min.view(-1, 1, 1).expand(-1, 1, K)
+
+            items_max = torch.gather(curr_w, 1, gather_max).squeeze(1)
+            items_min = torch.gather(curr_w, 1, gather_min).squeeze(1)
+
+            # Sum pairs: [LC, NumPairs]
+            pair_sum_max = items_max[:, pairs[:, 0]] + items_max[:, pairs[:, 1]]
+            pair_sum_min = items_min[:, pairs[:, 0]] + items_min[:, pairs[:, 1]]
+
+            # Diffs: [LC, NumPairs, NumPairs]
+            diffs = pair_sum_max.unsqueeze(2) - pair_sum_min.unsqueeze(1)
+
+            val_max_exp = val_max.view(-1, 1, 1)
+            val_min_exp = val_min.view(-1, 1, 1)
+
+            # New max load approximation (conservative: assume max pack becomes val_max - diff)
+            # Actually, max pack load becomes val_max - diff.
+            # Min pack load becomes val_min + diff.
+            # New max of these two is max(val_max - diff, val_min + diff).
+            new_peak = torch.max(val_max_exp - diffs, val_min_exp + diffs)
+            improvement = val_max_exp - new_peak
+
+            valid = (diffs > 0) & (improvement > 1e-5)
+
+            scores = torch.where(valid, improvement, torch.tensor(float('-inf'), device=device))
+            best_imp, flat_idx = scores.view(num_total_problems, -1).max(dim=1)
+
+            if not (best_imp > float('-inf')).any():
+                break
+
+            active = torch.nonzero(best_imp > float('-inf')).squeeze(1)
+            if len(active) == 0: break
+
+            f_idx = flat_idx[active]
+            num_pairs = pairs.size(0)
+            pidx_max = f_idx // num_pairs
+            pidx_min = f_idx % num_pairs
+
+            p_max = idx_max[active]
+            p_min = idx_min[active]
+
+            # Swap pair 1
+            idx1_m = pairs[pidx_max, 0]
+            idx1_n = pairs[pidx_min, 0]
+            v1_m = pack_contents[active, p_max, idx1_m].clone()
+            v1_n = pack_contents[active, p_min, idx1_n].clone()
+            pack_contents[active, p_max, idx1_m] = v1_n
+            pack_contents[active, p_min, idx1_n] = v1_m
+
+            # Swap pair 2
+            idx2_m = pairs[pidx_max, 1]
+            idx2_n = pairs[pidx_min, 1]
+            v2_m = pack_contents[active, p_max, idx2_m].clone()
+            v2_n = pack_contents[active, p_min, idx2_n].clone()
+            pack_contents[active, p_max, idx2_m] = v2_n
+            pack_contents[active, p_min, idx2_n] = v2_m
+=======
+    # Phase B: Top-K Destruct-Reconstruct (4-Pack ZigZag)
+    # Pools items from Top-2 Heaviest and Top-2 Lightest packs and redistributes them.
+    if num_packs >= 4:
+        num_iters_2 = 10
+        num_t = 4
+        num_pooled = num_t * K
+
+        # Precompute ZigZag Map for 4 Packs: 0, 1, 2, 3, 3, 2, 1, 0 ...
+        base_pat = torch.cat([torch.arange(num_t, device='cpu'), torch.arange(num_t - 1, -1, -1, device='cpu')])
+        reps = (num_pooled + len(base_pat) - 1) // len(base_pat)
+        zigzag_indices = base_pat.repeat(reps)[:num_pooled]
+
+        source_map_cpu = torch.empty(num_t, K, dtype=torch.long)
+        c = torch.zeros(num_t, dtype=torch.long)
+        for i, p in enumerate(zigzag_indices):
+            idx = p.item()
+            if c[idx] < K:
+                source_map_cpu[idx, c[idx]] = i
+                c[idx] += 1
+        gather_map_base = source_map_cpu.view(-1).unsqueeze(0).to(device) # Flattened for gather [1, 4*K]
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total_problems, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            # Select Top-2 Max and Top-2 Min using argsort (noisy to break ties)
+            noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-4
+            _, sorted_pack_idx = noisy_sums.sort(dim=1)
+
+            # Indices: [Min1, Min2, ..., Max2, Max1]
+            # Select 0, 1 (Lightest) and -2, -1 (Heaviest)
+            target_packs = torch.stack([
+                sorted_pack_idx[:, 0],
+                sorted_pack_idx[:, 1],
+                sorted_pack_idx[:, -2],
+                sorted_pack_idx[:, -1]
+            ], dim=1) # [Batch, 4]
+
+            gather_idx = target_packs.unsqueeze(2).expand(-1, -1, K)
+
+            pooled_contents = torch.gather(pack_contents, 1, gather_idx) # [Batch, 4, K]
+            pooled_flat = pooled_contents.view(num_total_problems, -1) # [Batch, 4*K]
+            pooled_weights = torch.gather(sorted_weight, 1, pooled_flat)
+
+            # Sort items descending
+            _, sort_order = pooled_weights.sort(dim=1, descending=True)
+            sorted_pooled_contents = torch.gather(pooled_flat, 1, sort_order)
+
+            # Redistribute using precomputed map
+            g_map = gather_map_base.expand(num_total_problems, -1)
+            new_contents_flat = torch.gather(sorted_pooled_contents, 1, g_map)
+            new_contents_grouped = new_contents_flat.view(num_total_problems, 4, K)
+
+            # Write back
+            pack_contents.scatter_(1, gather_idx, new_contents_grouped)
+
+    elif num_packs >= 2:
+        # Fallback to 2-Pack ABBA
+        num_iters_2 = 10
+        num_t = 2
+        num_pooled = num_t * K
+        base_pat = torch.tensor([0, 1, 1, 0], device='cpu')
+        reps = (num_pooled + 3) // 4
+        zigzag_indices = base_pat.repeat(reps)[:num_pooled]
+
+        source_map_cpu = torch.empty(num_t, K, dtype=torch.long)
+        c = torch.zeros(num_t, dtype=torch.long)
+        for i, p in enumerate(zigzag_indices):
+            idx = p.item()
+            if c[idx] < K:
+                source_map_cpu[idx, c[idx]] = i
+                c[idx] += 1
+        gather_map_base = source_map_cpu.view(-1).unsqueeze(0).to(device)
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total_problems, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-4
+            _, sorted_pack_idx = noisy_sums.sort(dim=1)
+
+            target_packs = torch.stack([sorted_pack_idx[:, 0], sorted_pack_idx[:, -1]], dim=1)
+
+            gather_idx = target_packs.unsqueeze(2).expand(-1, -1, K)
+            pooled_contents = torch.gather(pack_contents, 1, gather_idx)
+            pooled_flat = pooled_contents.view(num_total_problems, -1)
+            pooled_weights = torch.gather(sorted_weight, 1, pooled_flat)
+
+            _, sort_order = pooled_weights.sort(dim=1, descending=True)
+            sorted_pooled_contents = torch.gather(pooled_flat, 1, sort_order)
+
+            g_map = gather_map_base.expand(num_total_problems, -1)
+            new_contents_flat = torch.gather(sorted_pooled_contents, 1, g_map)
+            new_contents_grouped = new_contents_flat.view(num_total_problems, 2, K)
+
+            pack_contents.scatter_(1, gather_idx, new_contents_grouped)
+>>>>>>> REPLACE
+
+</DIFF>

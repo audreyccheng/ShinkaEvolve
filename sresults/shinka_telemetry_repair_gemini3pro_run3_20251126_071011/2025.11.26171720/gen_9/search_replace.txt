@@ -1,0 +1,260 @@
+<NAME>
+soft_consensus_arbitration
+</NAME>
+
+<DESCRIPTION>
+Introduces a continuous confidence scoring mechanism ("Soft Consensus") in the arbitration phase and refines the Flow Conservation logic to account for router-level flow reliability.
+
+1.  **Flow Reliability**: In Phase 2, we now calculate `router_flow_reliability` based on the imbalance of "clean" estimates. If a router is significantly imbalanced (e.g., >5%), the flow signal is considered less reliable. This prevents a single bad interface from corrupting the repair of all other interfaces on the same router.
+2.  **Continuous Arbitration**: Replaces the discrete `arbitrate` function with `arbitrate_continuous`. This new function calculates continuous "distances" between the three signals (Self, Peer, Flow).
+    *   Confidence scores are now derived from how closely the signals agree (e.g., `1.0 - k * distance`), providing much better calibration than fixed values like 0.95 or 0.60.
+    *   It weighs the Flow signal based on the calculated `router_flow_reliability`. High reliability flow signals can boost confidence in repairs, while low reliability flow signals are down-weighted.
+    *   Prioritizes Link Symmetry (Peer) but allows robust Flow signals to corroborate or (in rare cases) challenge Peer signals, improving repair accuracy and confidence estimation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 2: Flow Target Calculation ---
+    # For every interface, calculate what the rate SHOULD be based on Flow Conservation
+    # utilizing the "Clean" estimates from other interfaces.
+
+    flow_targets = {} # if_id -> {'rx': val, 'tx': val}
+
+    for router_id, interfaces in topology.items():
+        # Filter for known interfaces
+        valid_ifs = [i for i in interfaces if i in state]
+
+        # Calculate Router-wide totals (using clean estimates)
+        total_in = sum(state[i]['clean_rx'] for i in valid_ifs)
+        total_out = sum(state[i]['clean_tx'] for i in valid_ifs)
+
+        # Calculate individual flow targets
+        # Conservation: Sum(Incoming) = Sum(Outgoing)
+        # For interface i: RX_i + Other_RXs = TX_i + Other_TXs
+        # Therefore: RX_i = (TX_i + Other_TXs) - Other_RXs
+        # Wait, simple flow conservation is Total_In = Total_Out.
+        # So we estimate RX_i to be the value that balances the equation.
+        # RX_i_target = Total_Out - (Total_In - RX_i_current)
+
+        for if_id in valid_ifs:
+            curr = state[if_id]
+
+            # Estimate RX target
+            # What RX is needed to balance the Total Output?
+            # other_rx = total_in - curr['clean_rx']
+            # target_rx = total_out - other_rx
+            rx_target = max(0.0, total_out - (total_in - curr['clean_rx']))
+
+            # Estimate TX target
+            # What TX is needed to balance the Total Input?
+            # other_tx = total_out - curr['clean_tx']
+            # target_tx = total_in - other_tx
+            tx_target = max(0.0, total_in - (total_out - curr['clean_tx']))
+
+            flow_targets[if_id] = {'rx': rx_target, 'tx': tx_target}
+
+    # --- Phase 3: Arbitration & Repair ---
+
+    for if_id, d in state.items():
+        # Get Flow Signals (fallback to self if calculation failed/missing)
+        f_sig = flow_targets.get(if_id, {'rx': d['clean_rx'], 'tx': d['clean_tx']})
+
+        # --- Repair RX ---
+        if d['status'] == 'down':
+            final_rx = 0.0
+            # Confidence is high unless we are suppressing significant noise
+            conf_rx = 1.0 if d['s_rx'] < ABS_TOL else 0.9
+        else:
+            # Inputs: Self (s_rx), Peer (p_tx), Flow (f_sig['rx'])
+            # Note: Peer TX is the source for My RX
+            final_rx, conf_rx = arbitrate(d['s_rx'], d['p_tx'], f_sig['rx'], agrees)
+
+        # --- Repair TX ---
+        if d['status'] == 'down':
+            final_tx = 0.0
+            conf_tx = 1.0 if d['s_tx'] < ABS_TOL else 0.9
+        else:
+            # Inputs: Self (s_tx), Peer (p_rx), Flow (f_sig['tx'])
+            # Note: Peer RX is the destination for My TX
+            final_tx, conf_tx = arbitrate(d['s_tx'], d['p_rx'], f_sig['tx'], agrees)
+=======
+    # --- Phase 2: Flow Target Calculation ---
+    # For every interface, calculate what the rate SHOULD be based on Flow Conservation
+    # utilizing the "Clean" estimates from other interfaces.
+
+    flow_targets = {} # if_id -> {'rx': val, 'tx': val, 'reliability': val}
+
+    for router_id, interfaces in topology.items():
+        # Filter for known interfaces
+        valid_ifs = [i for i in interfaces if i in state]
+
+        # Calculate Router-wide totals (using clean estimates)
+        total_in = sum(state[i]['clean_rx'] for i in valid_ifs)
+        total_out = sum(state[i]['clean_tx'] for i in valid_ifs)
+
+        # Evaluate Router-level Flow Consistency
+        # If the aggregate "clean" estimates don't balance, the Flow signal is noisy.
+        # We calculate a reliability score for this router's flow context.
+        imbalance = abs(total_in - total_out)
+        max_traffic = max(total_in, total_out, 1.0)
+
+        # Reliability degrades as imbalance grows.
+        # If imbalance > 5%, reliability drops significantly.
+        router_flow_reliability = max(0.0, 1.0 - (imbalance / (max_traffic * 0.05)))
+        # Clamp to a reasonable baseline (even messy flow has some value)
+        router_flow_reliability = 0.5 + 0.5 * router_flow_reliability
+
+        for if_id in valid_ifs:
+            curr = state[if_id]
+
+            # RX Target: Balances the output
+            rx_target = max(0.0, total_out - (total_in - curr['clean_rx']))
+
+            # TX Target: Balances the input
+            tx_target = max(0.0, total_in - (total_out - curr['clean_tx']))
+
+            flow_targets[if_id] = {
+                'rx': rx_target,
+                'tx': tx_target,
+                'reliability': router_flow_reliability
+            }
+
+    # --- Phase 3: Arbitration & Repair ---
+
+    for if_id, d in state.items():
+        # Get Flow Signals
+        f_sig = flow_targets.get(if_id, {
+            'rx': d['clean_rx'], 'tx': d['clean_tx'], 'reliability': 0.0
+        })
+
+        # --- Repair RX ---
+        if d['status'] == 'down':
+            final_rx = 0.0
+            # Confidence is high unless we are suppressing significant noise
+            conf_rx = 1.0 if d['s_rx'] < ABS_TOL else 0.9
+        else:
+            # Inputs: Self (s_rx), Peer (p_tx), Flow (f_sig['rx'])
+            # Peer TX is the source for My RX
+            final_rx, conf_rx = arbitrate_continuous(
+                d['s_rx'], d['p_tx'], f_sig['rx'], f_sig['reliability'],
+                REL_TOL, ABS_TOL
+            )
+
+        # --- Repair TX ---
+        if d['status'] == 'down':
+            final_tx = 0.0
+            conf_tx = 1.0 if d['s_tx'] < ABS_TOL else 0.9
+        else:
+            # Inputs: Self (s_tx), Peer (p_rx), Flow (f_sig['tx'])
+            # Peer RX is the destination for My TX
+            final_tx, conf_tx = arbitrate_continuous(
+                d['s_tx'], d['p_rx'], f_sig['tx'], f_sig['reliability'],
+                REL_TOL, ABS_TOL
+            )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def arbitrate(v_self: float, v_peer: float, v_flow: float, agree_func) -> Tuple[float, float]:
+    """
+    Arbitrates between three signals: Self, Peer, and Flow.
+    Returns (repaired_value, confidence).
+    """
+    # 1. Handle Missing Peer (No redundancy from Link Symmetry)
+    if v_peer is None:
+        if agree_func(v_self, v_flow):
+            return (v_self + v_flow) / 2.0, 0.9
+        else:
+            # Low confidence fallback to Self
+            return v_self, 0.6
+
+    # 2. Check Consensus Agreements
+    sp = agree_func(v_self, v_peer) # Self-Peer
+    pf = agree_func(v_peer, v_flow) # Peer-Flow
+    sf = agree_func(v_self, v_flow) # Self-Flow
+
+    # 3. Decision Logic
+
+    # CASE A: Unanimous Agreement
+    if sp and pf:
+        return (v_self + v_peer + v_flow) / 3.0, 1.0
+
+    # CASE B: Self & Peer agree (Flow is outlier)
+    # Common case: One bad interface elsewhere on router corrupts Flow.
+    # Link Symmetry is very strong.
+    if sp:
+        return (v_self + v_peer) / 2.0, 0.95
+
+    # CASE C: Peer & Flow agree (Self is outlier)
+    # Strong evidence that local sensor is broken.
+    if pf:
+        return (v_peer + v_flow) / 2.0, 0.90
+
+    # CASE D: Self & Flow agree (Peer is outlier)
+    # Ambiguous: Either Peer is broken, OR I am forwarding noise/amplification.
+    # "I see it (Self) and I forwarded it (Flow), but Peer didn't send/receive it".
+    # Since Peer is usually the ground truth for what is on the wire, this is lower confidence.
+    if sf:
+        return (v_self + v_flow) / 2.0, 0.80
+
+    # CASE E: Total Disagreement
+    # Fallback to Peer. Link Symmetry is the most robust physical invariant.
+    return v_peer, 0.60
+=======
+def arbitrate_continuous(v_self: float, v_peer: float, v_flow: float,
+                        flow_trust: float, rel_tol: float, abs_tol: float) -> Tuple[float, float]:
+    """
+    Arbitrates between Self, Peer, and Flow with continuous confidence scaling.
+    """
+
+    # Helper to get normalized difference (0.0 = identical, >1.0 = disagreement)
+    def get_diff_ratio(v1, v2):
+        if v1 is None or v2 is None: return 999.0
+        diff = abs(v1 - v2)
+        if diff < abs_tol: return 0.0 # Effective zero difference
+        denom = max(abs(v1), abs(v2))
+        return diff / (denom * rel_tol)
+
+    # 1. Calculate Consensus Distances
+    d_sp = get_diff_ratio(v_self, v_peer)
+    d_pf = get_diff_ratio(v_peer, v_flow)
+    d_sf = get_diff_ratio(v_self, v_flow)
+
+    # 2. Decision Logic with Calibration
+
+    # Case A: Unanimous (All agree)
+    if d_sp <= 1.0 and d_pf <= 1.0:
+        avg_val = (v_self + v_peer + v_flow) / 3.0
+        max_d = max(d_sp, d_pf, d_sf)
+        conf = 1.0 - (0.05 * max_d) # 0.95 to 1.0
+        return avg_val, max(0.5, conf)
+
+    # Case B: Self & Peer Agree (Flow outlier)
+    if d_sp <= 1.0:
+        avg_val = (v_self + v_peer) / 2.0
+        conf = 0.95 - (0.1 * d_sp)
+        # If Flow strongly disagrees but Flow is trusted, reduce confidence
+        if flow_trust > 0.8 and d_pf > 2.0:
+            conf -= 0.1
+        return avg_val, max(0.5, conf)
+
+    # Case C: Peer & Flow Agree (Self outlier)
+    if d_pf <= 1.0:
+        avg_val = (v_peer + v_flow) / 2.0
+        base = 0.80 + (0.15 * flow_trust)
+        conf = base - (0.1 * d_pf)
+        return avg_val, max(0.5, conf)
+
+    # Case D: Self & Flow Agree (Peer outlier)
+    if d_sf <= 1.0:
+        avg_val = (v_self + v_flow) / 2.0
+        base = 0.70 + (0.15 * flow_trust)
+        conf = base - (0.1 * d_sf)
+        return avg_val, max(0.5, conf)
+
+    # Case E: Total Disagreement
+    if v_peer is not None:
+        return v_peer, 0.5 # Low confidence
+    else:
+        if flow_trust > 0.8: return v_flow, 0.6
+        return v_self, 0.4
+>>>>>>> REPLACE
+</DIFF>

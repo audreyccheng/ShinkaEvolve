@@ -1,0 +1,251 @@
+<NAME>
+diversify_packing_and_deepen_search
+</NAME>
+
+<DESCRIPTION>
+1.  **Introduce 'Worst Fit' Packing Strategy**: Modify `try_pack` to support both "Best Fit" (minimize slack) and "Worst Fit" (maximize slack). While Best Fit is superior for tight packing, Worst Fit can help balance the load and create different configurations during stochastic search, potentially avoiding local optima where one GPU is overly constrained.
+2.  **Adaptive Stochastic Packing**: In the random trials of the feasibility check, randomly select between Best Fit and Worst Fit (with a bias towards Best Fit) to diversify the search space.
+3.  **Increase Search Depth**: Given the low execution time (0.006s), significantly increase the number of Binary Search iterations (24 -> 32) and the number of random trials per check (20 -> 32). Also increase Local Search iterations (50 -> 250) to fine-tune the solution further.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # -------------------------------------------------------
+    # Helper: Feasibility Check for Pressure K
+    # -------------------------------------------------------
+    def try_pack(target_k, max_random_trials=0):
+        """
+        Attempts to pack all models such that for every GPU:
+        sum(w) / (C - sum(s)) <= target_k
+        Equivalent to: sum(w + target_k * s) <= target_k * C
+        Returns placement dict if successful, else None.
+        """
+
+        # Strategies to determine order of packing
+        # Each strategy is (key_function, reverse_bool)
+        strategies = [
+            (lambda x: x['w'] + target_k * x['s'], True),
+            (lambda x: x['s'], True),
+            (lambda x: x['w'], True),
+            (lambda x: x['w'] / (x['s'] + 1e-9), True),
+        ]
+
+        # Indices for trials
+        trials = list(range(len(strategies)))
+        if max_random_trials > 0:
+            trials.extend(['rand'] * max_random_trials)
+
+        failed_items = set()
+
+        for t in trials:
+            # Sort indices based on strategy
+            if isinstance(t, int):
+                key_func, reverse = strategies[t]
+                ordered_indices = sorted(range(len(m_data)), key=lambda i: key_func(m_data[i]), reverse=reverse)
+            else:
+                # Stochastic: Perturbed Virtual Size with Failure Feedback
+                # Boost priority of items that failed in previous attempts
+                def sort_key(i):
+                    item = m_data[i]
+                    # Base value: Virtual Size
+                    val = (item['w'] + target_k * item['s'])
+                    # Noise (0.85 to 1.15)
+                    val *= random.uniform(0.85, 1.15)
+                    # Boost if failed previously
+                    if item['id'] in failed_items:
+                        val += 1e9  # Push to front
+                    return val
+
+                ordered_indices = sorted(range(len(m_data)), key=sort_key, reverse=True)
+
+            # Perform Packing (Best Fit Decreasing on Virtual Slack)
+            bins = [{'w': 0.0, 's': 0.0, 'idxs': []} for _ in range(gpu_num)]
+            possible = True
+            first_fail_idx = None
+
+            for idx in ordered_indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+
+                best_bin = None
+                min_virtual_slack = float('inf')
+
+                # Best Fit strategy on virtual slack
+                for b_idx in range(gpu_num):
+                    b = bins[b_idx]
+
+                    # 1. Physical Fit
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    # 2. Pressure Fit
+                    # w_new / rem_new <= K  <=>  w_new <= K * rem_new
+                    rem_new = GPU_MEM_SIZE - (b['s'] + s)
+                    if rem_new < 0: rem_new = 0.0
+
+                    max_w = target_k * rem_new
+                    new_w = b['w'] + w
+
+                    if new_w <= max_w + 1e-5:
+                        # Feasible. Calculate slack (virtual remaining capacity)
+                        slack = max_w - new_w
+                        if slack < min_virtual_slack:
+                            min_virtual_slack = slack
+                            best_bin = b_idx
+
+                if best_bin is None:
+                    possible = False
+                    first_fail_idx = idx
+                    break
+
+                bins[best_bin]['idxs'].append(idx)
+                bins[best_bin]['w'] += w
+                bins[best_bin]['s'] += s
+
+            if possible:
+                return {i: bins[i]['idxs'] for i in range(gpu_num)}
+            else:
+                if first_fail_idx is not None:
+                    failed_items.add(m_data[first_fail_idx]['id'])
+
+        return None
+=======
+    # -------------------------------------------------------
+    # Helper: Feasibility Check for Pressure K
+    # -------------------------------------------------------
+    def try_pack(target_k, max_random_trials=0):
+        """
+        Attempts to pack all models such that for every GPU:
+        sum(w) / (C - sum(s)) <= target_k
+        Equivalent to: sum(w + target_k * s) <= target_k * C
+        Returns placement dict if successful, else None.
+        """
+
+        # Strategies: (key_function, reverse_bool, packing_mode)
+        # packing_mode: 'best_fit' (min slack) or 'worst_fit' (max slack/load balancing)
+        strategies = [
+            (lambda x: x['w'] + target_k * x['s'], True, 'best_fit'),
+            (lambda x: x['s'], True, 'best_fit'),
+            (lambda x: x['w'], True, 'best_fit'),
+            (lambda x: x['w'] / (x['s'] + 1e-9), True, 'best_fit'),
+        ]
+
+        # Indices for trials
+        trials = list(range(len(strategies)))
+        if max_random_trials > 0:
+            trials.extend(['rand'] * max_random_trials)
+
+        failed_items = set()
+
+        for t in trials:
+            mode = 'best_fit'
+            # Sort indices based on strategy
+            if isinstance(t, int):
+                key_func, reverse, mode = strategies[t]
+                ordered_indices = sorted(range(len(m_data)), key=lambda i: key_func(m_data[i]), reverse=reverse)
+            else:
+                # Stochastic: Perturbed Virtual Size with Failure Feedback
+                # Randomly choose between best_fit and worst_fit to diversify search
+                if random.random() < 0.15:
+                    mode = 'worst_fit'
+
+                def sort_key(i):
+                    item = m_data[i]
+                    val = (item['w'] + target_k * item['s'])
+                    val *= random.uniform(0.85, 1.15)
+                    # Boost if failed previously
+                    if item['id'] in failed_items:
+                        val += 1e9
+                    return val
+
+                ordered_indices = sorted(range(len(m_data)), key=sort_key, reverse=True)
+
+            # Perform Packing
+            bins = [{'w': 0.0, 's': 0.0, 'idxs': []} for _ in range(gpu_num)]
+            possible = True
+            first_fail_idx = None
+
+            for idx in ordered_indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+
+                best_bin = None
+
+                # Initialize comparison metric
+                if mode == 'best_fit':
+                    best_metric = float('inf') # Minimize slack
+                else:
+                    best_metric = -1.0 # Maximize slack
+
+                for b_idx in range(gpu_num):
+                    b = bins[b_idx]
+
+                    # 1. Physical Fit
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    # 2. Pressure Fit
+                    rem_new = GPU_MEM_SIZE - (b['s'] + s)
+                    if rem_new < 0: rem_new = 0.0
+
+                    max_w = target_k * rem_new
+                    new_w = b['w'] + w
+
+                    if new_w <= max_w + 1e-5:
+                        # Feasible
+                        slack = max_w - new_w
+                        if mode == 'best_fit':
+                            if slack < best_metric:
+                                best_metric = slack
+                                best_bin = b_idx
+                        else:
+                            if slack > best_metric:
+                                best_metric = slack
+                                best_bin = b_idx
+
+                if best_bin is None:
+                    possible = False
+                    first_fail_idx = idx
+                    break
+
+                bins[best_bin]['idxs'].append(idx)
+                bins[best_bin]['w'] += w
+                bins[best_bin]['s'] += s
+
+            if possible:
+                return {i: bins[i]['idxs'] for i in range(gpu_num)}
+            else:
+                if first_fail_idx is not None:
+                    failed_items.add(m_data[first_fail_idx]['id'])
+
+        return None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    if high > low + 1e-4:
+        # Number of BS iterations
+        for _ in range(24):
+            mid = (low + high) / 2.0
+
+            # Use randomization to try harder to fit into 'mid'
+            # Increased trials to leverage failure-driven adaptation
+            sol = try_pack(mid, max_random_trials=20)
+=======
+    if high > low + 1e-4:
+        # Number of BS iterations
+        for _ in range(32):
+            mid = (low + high) / 2.0
+
+            # Use randomization to try harder to fit into 'mid'
+            # Increased trials to leverage failure-driven adaptation and new packing modes
+            sol = try_pack(mid, max_random_trials=32)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Optimization Loop
+    for _ in range(50):
+        # Identify bottleneck
+        max_p = -1.0
+=======
+    # Optimization Loop
+    for _ in range(250):
+        # Identify bottleneck
+        max_p = -1.0
+>>>>>>> REPLACE
+</DIFF>

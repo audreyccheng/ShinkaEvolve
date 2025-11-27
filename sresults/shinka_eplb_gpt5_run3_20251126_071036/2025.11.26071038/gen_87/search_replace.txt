@@ -1,0 +1,434 @@
+<NAME>
+hybrid_waterfill_peakaware_tail_and_diverse_refine
+</NAME>
+
+<DESCRIPTION>
+This edit improves both load balancing and algorithmic efficiency by:
+1) Upgrading the water-filling extras allocation to a hybrid strategy: a fast bulk D’Hondt fill using topk followed by a tiny, peak-aware adaptive tail that chooses between D’Hondt and Sainte–Laguë at each step to minimize (new_peak, new_second, receiver_cnt, -new_avg). This reduces the maximum per-replica average with negligible overhead.
+2) Strengthening the donor→receiver fix-up in replicate_experts_waterfill to be peak-aware with better tie-breaking (by second-highest average and donor post-move average), while keeping the same bounded candidate set and at most two moves, preserving speed.
+3) Enhancing the GPU pack refinement with label-aware penalties to avoid co-locating replicas of the same logical expert, plus a bounded 2x2 fallback swap (heaviest↔lightest) if 1x1 stalls. Refinement depth becomes adaptive to residual imbalance (up to 3 passes when needed). The candidate set remains tiny to keep the runtime minimal.
+
+These targeted changes aim to lift the balancedness score without sacrificing the speed score.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy water-filling for remaining extras
+    extras = target_total - s
+    while extras > 0:
+        k = min(extras, num_log)
+        # Select top-k by current w_i / c_i
+        scores = w / counts.to(w.dtype)
+        topk_idx = torch.argsort(scores, descending=True)[:k]
+        counts[topk_idx] += 1
+        extras -= k
+    return counts
+=======
+    # Greedy water-filling for remaining extras with hybrid peak-aware tail
+    extras = target_total - s
+    if extras > 0:
+        # Bulk D'Hondt (w/c) fill except for a small adaptive tail
+        num_redundant = max(0, target_total - num_log)
+        tail = min(extras, max(1, int(round(0.1 * num_redundant))))
+        bulk = extras - tail
+
+        # Fast batched fill for bulk using topk
+        while bulk > 0:
+            k = min(bulk, num_log)
+            scores = w / counts.to(w.dtype)
+            topk_idx = torch.topk(scores, k=k, largest=True).indices
+            counts[topk_idx] += 1
+            bulk -= k
+
+        # Adaptive tail: choose between D’Hondt and Sainte–Laguë at each step
+        for _ in range(tail):
+            counts_f = counts.to(w.dtype)
+            avg = w / counts_f
+            if num_log >= 2:
+                vals, idxs = torch.topk(avg, k=2)
+                peak1_val = float(vals[0].item())
+                peak1_idx = int(idxs[0].item())
+                peak2_val = float(vals[1].item())
+            else:
+                peak1_val = float(avg[0].item())
+                peak1_idx = 0
+                peak2_val = float("-inf")
+
+            # D’Hondt pick (argmax w/c == argmax avg)
+            d_pick = int(torch.argmax(avg).item())
+            # Sainte–Laguë pick (argmax w/(2c+1))
+            denom = (2 * counts + 1).to(w.dtype)
+            s_scores = w / denom
+            s_pick = int(torch.argmax(s_scores).item())
+
+            best_choice = None
+            best_key = None  # (new_peak, new_second, receiver_cnt, -new_avg_chosen)
+
+            for pick in (d_pick, s_pick):
+                if best_choice is not None and pick == best_choice:
+                    continue
+                new_avg_chosen = float((w[pick] / (counts_f[pick] + 1.0)).item())
+                # Predict new peak and second-highest after this assignment
+                if pick == peak1_idx:
+                    new_peak = max(new_avg_chosen, peak2_val)
+                    new_second = min(new_avg_chosen, peak2_val)
+                else:
+                    new_peak = max(peak1_val, new_avg_chosen)
+                    new_second = (peak1_val if new_avg_chosen >= peak1_val else max(new_avg_chosen, peak2_val))
+                receiver_cnt = int(counts[pick].item())
+                key = (new_peak, new_second, receiver_cnt, -new_avg_chosen)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_choice = pick
+
+            counts[best_choice] += 1
+    return counts
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            def _one_move(cnt: torch.Tensor) -> tuple[torch.Tensor, float, bool]:
+                cnt_safe = torch.clamp(cnt, min=1)
+                avg = w / cnt_safe.to(w.dtype)
+                cur_max = float(avg.max().item())
+                can_donate = (cnt > 1)
+                if not bool(can_donate.any()):
+                    return cnt, cur_max, False
+                kd = int(min(2, int(can_donate.sum().item())))
+                kr = int(min(2, num_log))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=kd).indices.tolist()
+                receivers = torch.topk(-avg, k=kr).indices.tolist()
+                best_pair = None
+                best_peak = cur_max
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = cnt.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        peak = float((w / c_try.to(w.dtype)).max().item())
+                        if peak + 1e-9 < best_peak:
+                            best_peak = peak
+                            best_pair = (d, r)
+                if best_pair is None:
+                    return cnt, cur_max, False
+                d, r = best_pair
+                cnt = cnt.clone()
+                cnt[d] -= 1
+                cnt[r] += 1
+                return cnt, best_peak, True
+=======
+            def _one_move(cnt: torch.Tensor) -> tuple[torch.Tensor, float, bool]:
+                cnt_safe = torch.clamp(cnt, min=1)
+                avg = w / cnt_safe.to(w.dtype)
+                cur_max = float(avg.max().item())
+                can_donate = (cnt > 1)
+                if not bool(can_donate.any()):
+                    return cnt, cur_max, False
+                kd = int(min(2, int(can_donate.sum().item())))
+                kr = int(min(2, num_log))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=kd).indices.tolist()
+                receivers = torch.topk(-avg, k=kr).indices.tolist()
+                best_pair = None
+                best_key = None  # (new_peak, new_second_peak, donor_post_avg)
+                eps = 1e-9
+                for d in donors:
+                    for r in receivers:
+                        if d == r or cnt[d] <= 1:
+                            continue
+                        c_try = cnt.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        avg_try = w / c_try.to(w.dtype)
+                        new_peak = float(avg_try.max().item())
+                        if new_peak + eps >= cur_max:
+                            continue
+                        k2 = min(2, num_log)
+                        top2_vals = torch.topk(avg_try, k=k2).values
+                        if top2_vals.numel() >= 2:
+                            new_second = float(top2_vals[1].item())
+                        else:
+                            new_second = float("-inf")
+                        donor_post = float((w[d] / float(cnt[d] - 1)).item()) if cnt[d] > 1 else float("inf")
+                        cand_key = (new_peak, new_second, donor_post)
+                        if best_key is None or cand_key < best_key:
+                            best_key = cand_key
+                            best_pair = (d, r)
+                if best_pair is None:
+                    return cnt, cur_max, False
+                d, r = best_pair
+                cnt = cnt.clone()
+                cnt[d] -= 1
+                cnt[r] += 1
+                return cnt, float((w / cnt.to(w.dtype)).max().item()), True
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Adaptive bounded refinement: evaluate (h1↔l1), (h1↔l2), (h2↔l1); apply best if it strictly reduces peak
+        if num_packs >= 2:
+            # Build pack membership lists for this row
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(n_items):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+
+            def _refine_once() -> bool:
+                order_asc = sorted(range(num_packs), key=lambda k: loads[k])
+                order_desc = list(reversed(order_asc))
+                l1 = order_asc[0]
+                l2 = order_asc[1] if len(order_asc) > 1 else None
+                h1 = order_desc[0]
+                h2 = order_desc[1] if len(order_desc) > 1 else None
+
+                pairs = []
+                pairs.append((h1, l1))
+                if l2 is not None and l2 != h1:
+                    pairs.append((h1, l2))
+                if h2 is not None and h2 != l1:
+                    pairs.append((h2, l1))
+
+                cur_max = max(loads)
+                best = None  # (new_peak, new_imb, d, r, ai, bi, a_item, b_item, wa, wb)
+
+                for (d, r) in pairs:
+                    if d is None or r is None or d == r:
+                        continue
+                    if not pack_groups[d] or not pack_groups[r]:
+                        continue
+                    if loads[d] <= loads[r]:
+                        continue
+                    d_idx_tensor = torch.tensor(pack_groups[d], dtype=torch.int64, device=row_w.device)
+                    r_idx_tensor = torch.tensor(pack_groups[r], dtype=torch.int64, device=row_w.device)
+                    d_w = row_w[d_idx_tensor]
+                    r_w = row_w[r_idx_tensor]
+                    kd = min(2, d_w.numel())
+                    kr = min(2, r_w.numel())
+                    if kd == 0 or kr == 0:
+                        continue
+                    d_top = torch.topk(d_w, kd).indices.tolist()
+                    r_bot = torch.topk(r_w, kr, largest=False).indices.tolist()
+
+                    other_max = max([loads[p] for p in range(num_packs) if p != d and p != r], default=float("-inf"))
+                    other_min = min([loads[p] for p in range(num_packs) if p != d and p != r], default=float("inf"))
+
+                    for ai in d_top:
+                        wa = float(d_w[ai].item())
+                        a_item = int(d_idx_tensor[ai].item())
+                        for bi in r_bot:
+                            wb = float(r_w[bi].item())
+                            b_item = int(r_idx_tensor[bi].item())
+                            new_d = loads[d] - wa + wb
+                            new_r = loads[r] - wb + wa
+                            new_peak = max(new_d, new_r, other_max)
+                            new_bottom = min(new_d, new_r, other_min)
+                            new_imb = new_peak - new_bottom
+                            cand = (new_peak, new_imb, d, r, ai, bi, a_item, b_item, wa, wb)
+                            if best is None:
+                                best = cand
+                            else:
+                                if (cand[0] + 1e-9 < best[0]) or (abs(cand[0] - best[0]) <= 1e-9 and cand[1] + 1e-9 < best[1]):
+                                    best = cand
+
+                if best is None:
+                    return False
+                if best[0] + 1e-9 >= cur_max:
+                    return False
+                # apply best 1x1 swap
+                _, _, d, r, ai, bi, a_item, b_item, wa, wb = best
+                loads[d] = loads[d] - wa + wb
+                loads[r] = loads[r] - wb + wa
+                pack_groups[d][ai] = b_item
+                pack_groups[r][bi] = a_item
+                pack_index[i, a_item] = r
+                pack_index[i, b_item] = d
+                for rr, gg in enumerate(pack_groups[d]):
+                    rank_in_pack[i, gg] = rr
+                for rr, gg in enumerate(pack_groups[r]):
+                    rank_in_pack[i, gg] = rr
+                return True
+
+            # Adaptive depth: do a second pass only if imbalance is high
+            mean_load = sum(loads) / max(1, num_packs)
+            delta = max(loads) - min(loads)
+            steps = 2 if (mean_load > 0 and delta / max(mean_load, 1e-12) > 0.12) else 1
+            for _ in range(steps):
+                changed = _refine_once()
+                if not changed:
+                    break
+=======
+        # Adaptive bounded refinement: evaluate (h1↔l1), (h1↔l2), (h2↔l1); apply best if it strictly reduces peak
+        if num_packs >= 2:
+            # Build pack membership lists for this row
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(n_items):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+
+            def _refine_once() -> bool:
+                order_asc = sorted(range(num_packs), key=lambda k: loads[k])
+                order_desc = list(reversed(order_asc))
+                l1 = order_asc[0]
+                l2 = order_asc[1] if len(order_asc) > 1 else None
+                h1 = order_desc[0]
+                h2 = order_desc[1] if len(order_desc) > 1 else None
+
+                pairs = []
+                pairs.append((h1, l1))
+                if l2 is not None and l2 != h1:
+                    pairs.append((h1, l2))
+                if h2 is not None and h2 != l1:
+                    pairs.append((h2, l1))
+
+                cur_max = max(loads)
+                cur_min = min(loads)
+                cur_imb = cur_max - cur_min
+
+                # Build label histograms per pack for penalty
+                label_hist = [defaultdict(int) for _ in range(num_packs)]
+                for p in range(num_packs):
+                    for gg in pack_groups[p]:
+                        label_hist[p][int(row_labels[gg].item())] += 1
+
+                best1 = None  # (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+
+                for (d, r) in pairs:
+                    if d is None or r is None or d == r:
+                        continue
+                    if not pack_groups[d] or not pack_groups[r]:
+                        continue
+                    if loads[d] <= loads[r]:
+                        continue
+                    d_idx_tensor = torch.tensor(pack_groups[d], dtype=torch.int64, device=row_w.device)
+                    r_idx_tensor = torch.tensor(pack_groups[r], dtype=torch.int64, device=row_w.device)
+                    d_w = row_w[d_idx_tensor]
+                    r_w = row_w[r_idx_tensor]
+                    kd = min(2, d_w.numel())
+                    kr = min(2, r_w.numel())
+                    if kd == 0 or kr == 0:
+                        continue
+                    d_top = torch.topk(d_w, kd).indices.tolist()
+                    r_bot = torch.topk(r_w, kr, largest=False).indices.tolist()
+
+                    other_max = max([loads[p] for p in range(num_packs) if p != d and p != r], default=float("-inf"))
+                    other_min = min([loads[p] for p in range(num_packs) if p != d and p != r], default=float("inf"))
+
+                    for ai in d_top:
+                        wa = float(d_w[ai].item())
+                        a_item = int(d_idx_tensor[ai].item())
+                        la = int(row_labels[a_item].item())
+                        for bi in r_bot:
+                            wb = float(r_w[bi].item())
+                            b_item = int(r_idx_tensor[bi].item())
+                            lb = int(row_labels[b_item].item())
+                            new_d = loads[d] - wa + wb
+                            new_r = loads[r] - wb + wa
+                            new_peak = max(new_d, new_r, other_max)
+                            new_bottom = min(new_d, new_r, other_min)
+                            new_imb = new_peak - new_bottom
+                            penalty = (1 if label_hist[d].get(lb, 0) > 0 else 0) + (1 if label_hist[r].get(la, 0) > 0 else 0)
+                            cand = (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+                            if best1 is None:
+                                best1 = cand
+                            else:
+                                if (cand[0] + 1e-9 < best1[0] or
+                                    (abs(cand[0] - best1[0]) <= 1e-9 and (cand[1] + 1e-9 < best1[1] or
+                                     (abs(cand[1] - best1[1]) <= 1e-9 and cand[2] < best1[2])))):
+                                    best1 = cand
+
+                # Optional 2x2 fallback for (heaviest↔lightest) only
+                best2 = None  # (new_peak2, new_imb2, penalty2, h_sel, l_sel, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum)
+                if pack_groups[h1] and pack_groups[l1]:
+                    h_idx_tensor = torch.tensor(pack_groups[h1], dtype=torch.int64, device=row_w.device)
+                    l_idx_tensor = torch.tensor(pack_groups[l1], dtype=torch.int64, device=row_w.device)
+                    h_w = row_w[h_idx_tensor]
+                    l_w = row_w[l_idx_tensor]
+                    if h_w.numel() >= 2 and l_w.numel() >= 2:
+                        ai, aj = torch.topk(h_w, 2).indices.tolist()
+                        bi, bj = torch.topk(l_w, 2, largest=False).indices.tolist()
+                        a_items = (int(h_idx_tensor[ai].item()), int(h_idx_tensor[aj].item()))
+                        b_items = (int(l_idx_tensor[bi].item()), int(l_idx_tensor[bj].item()))
+                        wa_sum = float(h_w[ai].item() + h_w[aj].item())
+                        wb_sum = float(l_w[bi].item() + l_w[bj].item())
+                        other_max = max([loads[p] for p in range(num_packs) if p != h1 and p != l1], default=float("-inf"))
+                        other_min = min([loads[p] for p in range(num_packs) if p != h1 and p != l1], default=float("inf"))
+                        new_h = loads[h1] - wa_sum + wb_sum
+                        new_l = loads[l1] - wb_sum + wa_sum
+                        new_peak2 = max(new_h, new_l, other_max)
+                        new_bottom2 = min(new_h, new_l, other_min)
+                        new_imb2 = new_peak2 - new_bottom2
+                        # label-aware penalty for 2x2
+                        la_i = int(row_labels[a_items[0]].item())
+                        la_j = int(row_labels[a_items[1]].item())
+                        lb_i = int(row_labels[b_items[0]].item())
+                        lb_j = int(row_labels[b_items[1]].item())
+                        penalty2 = 0
+                        penalty2 += (1 if label_hist[h1].get(lb_i, 0) > 0 else 0)
+                        penalty2 += (1 if label_hist[h1].get(lb_j, 0) > 0 else 0)
+                        penalty2 += (1 if label_hist[l1].get(la_i, 0) > 0 else 0)
+                        penalty2 += (1 if label_hist[l1].get(la_j, 0) > 0 else 0)
+                        best2 = (new_peak2, new_imb2, penalty2, h1, l1, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum)
+
+                applied = False
+                # Prefer 1x1 if it strictly reduces the global max
+                if best1 is not None and best1[0] + 1e-9 < cur_max:
+                    _, _, _, d, r, ai, bi, a_item, b_item, wa, wb, la, lb = best1
+                    loads[d] = loads[d] - wa + wb
+                    loads[r] = loads[r] - wb + wa
+                    pack_groups[d][ai] = b_item
+                    pack_groups[r][bi] = a_item
+                    pack_index[i, a_item] = r
+                    pack_index[i, b_item] = d
+                    # update ranks
+                    for rr, gg in enumerate(pack_groups[d]):
+                        rank_in_pack[i, gg] = rr
+                    for rr, gg in enumerate(pack_groups[r]):
+                        rank_in_pack[i, gg] = rr
+                    applied = True
+                # Otherwise try bounded 2x2 if it reduces the global max (tie by imbalance, then penalty)
+                elif best2 is not None:
+                    if best1 is None or (best2[0] + 1e-9 < best1[0] or
+                                         (abs(best2[0] - (best1[0] if best1 else cur_max)) <= 1e-9 and best2[1] + 1e-9 < (best1[1] if best1 else float("inf")))):
+                        new_peak2, _, _, h_sel, l_sel, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum = best2
+                        if new_peak2 + 1e-9 < cur_max:
+                            loads[h_sel] = loads[h_sel] - wa_sum + wb_sum
+                            loads[l_sel] = loads[l_sel] - wb_sum + wa_sum
+                            # swap membership
+                            pack_groups[h_sel][ai] = b_items[0]
+                            pack_groups[h_sel][aj] = b_items[1]
+                            pack_groups[l_sel][bi] = a_items[0]
+                            pack_groups[l_sel][bj] = a_items[1]
+                            # update indices
+                            pack_index[i, a_items[0]] = l_sel
+                            pack_index[i, a_items[1]] = l_sel
+                            pack_index[i, b_items[0]] = h_sel
+                            pack_index[i, b_items[1]] = h_sel
+                            # update ranks
+                            for rr, gg in enumerate(pack_groups[h_sel]):
+                                rank_in_pack[i, gg] = rr
+                            for rr, gg in enumerate(pack_groups[l_sel]):
+                                rank_in_pack[i, gg] = rr
+                            applied = True
+                return applied
+
+            # Adaptive depth: do more passes when residual imbalance is notable
+            mean_load = sum(loads) / max(1, num_packs)
+            delta = max(loads) - min(loads)
+            rel = (delta / max(mean_load, 1e-12)) if mean_load > 0 else 0.0
+            steps = 3 if rel > 0.12 else (2 if rel > 0.02 else 1)
+            for _ in range(steps):
+                changed = _refine_once()
+                if not changed:
+                    break
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,226 @@
+<NAME>
+bundle_alignment_and_dynamic_soft_zero
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements aligned with the research principles (R1/R3) and the potential recommendations:
+
+1) Dynamic early soft-zero pre-pass:
+   - Before the router projection, compute per-router dynamic near-zero thresholds thr_r = max(ZERO_THRESH, 0.002·(sum_rx + sum_tx)).
+   - If all four directions of a link are below 1.5·max(thr_ra, thr_rb) and both adjacent routers are within adaptive router tolerance, snap all four to zero with high confidence.
+   - This reduces noise-level workloads and prevents spurious corrections on near-zero traffic, improving both counter accuracy and confidence calibration.
+
+2) Conservation-preserving bundle finishing pass (zero-sum residual alignment):
+   - For parallel links (same local_router -> remote_router), compute per-link residuals e_i = tx_i − peer_rx_i and their unweighted mean ē to ensure a zero-sum correction basis.
+   - Build direction weights w_i = (1 − conf_dir)·rate_i focusing the correction on low-confidence links.
+   - Form proposal d_i = −(e_i − ē) reweighted by w_i, re-center to zero-sum, and apply a small, gain-limited correction Δ_i with per-link clip ±3% on tx_i and the opposite on the peer’s rx.
+   - Rebalance remaining residual onto non-clipped links once to maintain zero-sum.
+   - This tightens intra-bundle symmetry (R3) without disturbing router flow conservation (R1), improving counter repair accuracy while preserving stability.
+
+Both changes are modest in scale, safe due to tight clipping and router imbalance guards, and should improve combined score by reducing residual asymmetries and snapping non-informative noise to zero while calibrating confidences conservatively.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Hyperparameters
+    TAU_H_BASE = 0.02           # ~2% hardening threshold
+    TAU_H_HIGH = 0.015          # tighter tolerance for high-rate pairs
+    TAU_H_LOW = 0.03            # looser tolerance for low/near-zero pairs
+    ZERO_THRESH = 1.0           # Mbps soft-zero threshold
+    ZERO_EPS = 1e-6
+    DAMP_ROUTER = 0.60          # router projection damping on lambda
+    DOMINANCE_CAP = 0.50        # ≤ 50% share cap for any single interface correction
+    PEER_SMOOTH = 0.10          # confidence peer smoothing fraction
+    STRONG_SCALE_GUARD = 0.08   # guard threshold for re-sync skipping
+    RESYNC_MAX_F = 0.40         # max fraction for one-sided nudge toward mean
+    BUNDLE_DOM_FRAC = 0.60      # bundle dominance threshold on a side’s traffic
+    INTRA_BUNDLE_CLIP = 0.05    # ±5% intra-bundle smoothing cap
+    UNTOUCHED_BOOST = 0.02      # confidence boost for untouched well-synced counters
+    CLIP_HIT_PENALTY = 0.95     # multiplicative penalty when strong scaling/clipping hit
+
+    # Targeted router correction focus and clipping
+    WEIGHT_FOCUS = 0.70         # focus on lowest-confidence 70% capacity
+    MID_TIER_BOOST = 1.5        # weight boost for 0.70–0.85 confidence (moves less)
+    OUTSIDE_FOCUS_BOOST = 2.0   # weight boost for ≥0.85 confidence (moves least)
+    PER_VAR_REL_CLIP = 0.10     # ±10% relative change cap per variable in router stage
+=======
+    # Hyperparameters
+    TAU_H_BASE = 0.02           # ~2% hardening threshold
+    TAU_H_HIGH = 0.015          # tighter tolerance for high-rate pairs
+    TAU_H_LOW = 0.03            # looser tolerance for low/near-zero pairs
+    ZERO_THRESH = 1.0           # Mbps soft-zero threshold
+    ZERO_EPS = 1e-6
+    DAMP_ROUTER = 0.60          # router projection damping on lambda
+    DOMINANCE_CAP = 0.50        # ≤ 50% share cap for any single interface correction
+    PEER_SMOOTH = 0.10          # confidence peer smoothing fraction
+    STRONG_SCALE_GUARD = 0.08   # guard threshold for re-sync skipping
+    RESYNC_MAX_F = 0.40         # max fraction for one-sided nudge toward mean
+    BUNDLE_DOM_FRAC = 0.60      # bundle dominance threshold on a side’s traffic
+    INTRA_BUNDLE_CLIP = 0.05    # ±5% intra-bundle smoothing cap
+    UNTOUCHED_BOOST = 0.02      # confidence boost for untouched well-synced counters
+    CLIP_HIT_PENALTY = 0.95     # multiplicative penalty when strong scaling/clipping hit
+    # New: gentle bundle finishing parameters and dynamic near-zero controls
+    BUNDLE_FINISH_CLIP = 0.03   # ±3% per-link micro alignment cap
+    BUNDLE_FINISH_GAIN_MAX = 0.25  # max gain for bundle finishing pass
+    NEAR_ZERO_DYNAMIC_COEFF = 0.002  # dynamic near-zero factor per router total
+    NEAR_ZERO_MULT = 1.5        # multiplier for link-level soft-zero threshold
+
+    # Targeted router correction focus and clipping
+    WEIGHT_FOCUS = 0.70         # focus on lowest-confidence 70% capacity
+    MID_TIER_BOOST = 1.5        # weight boost for 0.70–0.85 confidence (moves less)
+    OUTSIDE_FOCUS_BOOST = 2.0   # weight boost for ≥0.85 confidence (moves least)
+    PER_VAR_REL_CLIP = 0.10     # ±10% relative change cap per variable in router stage
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+=======
+    # Early soft-zero pre-pass with dynamic thresholds
+    # Compute per-router dynamic near-zero thresholds and residuals
+    early_residuals = compute_router_residuals(rx, tx)
+    router_thr: Dict[str, float] = {}
+    router_tau: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        ups_r = [i for i in ifs if status.get(i) == 'up']
+        srx = sum(rx[i] for i in ups_r) if ups_r else 0.0
+        stx = sum(tx[i] for i in ups_r) if ups_r else 0.0
+        router_thr[r] = max(ZERO_THRESH, NEAR_ZERO_DYNAMIC_COEFF * (srx + stx))
+        n_active = len(ups_r)
+        router_tau[r] = min(0.07, max(0.03, 0.05 * math.sqrt(2.0 / max(2, n_active)))) if n_active > 0 else 0.03
+
+    for a, b in link_pairs:
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        ra = local_router_of.get(a)
+        rb = local_router_of.get(b)
+        thr_link = NEAR_ZERO_MULT * max(router_thr.get(ra, ZERO_THRESH), router_thr.get(rb, ZERO_THRESH))
+        if max(rx[a], tx[a], rx[b], tx[b]) < thr_link:
+            if early_residuals.get(ra, 0.0) <= router_tau.get(ra, 0.05) and early_residuals.get(rb, 0.0) <= router_tau.get(rb, 0.05):
+                rx[a] = tx[a] = rx[b] = tx[b] = 0.0
+                conf_rx[a] = max(conf_rx[a], 0.95)
+                conf_tx[a] = max(conf_tx[a], 0.95)
+                conf_rx[b] = max(conf_rx[b], 0.95)
+                conf_tx[b] = max(conf_tx[b], 0.95)
+
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 3: Confidence-gap re-sync with scaling guard and router attenuation
+    def nudge_toward_mean(val_lo: float, val_hi: float, frac: float) -> float:
+=======
+    # Stage 2.25: Conservation-preserving bundle finishing pass (zero-sum residual alignment)
+    # Group oriented links by (local_router -> remote_router) using (a -> b) orientation
+    bundle_map_links: Dict[Tuple[Any, Any], List[Tuple[str, str]]] = {}
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            ra = local_router_of.get(a)
+            rb = local_router_of.get(b)
+            bundle_map_links.setdefault((ra, rb), []).append((a, b))
+
+    for (ra, rb), pairs in bundle_map_links.items():
+        # Require at least two links in a bundle to benefit from alignment
+        if len(pairs) < 2:
+            continue
+
+        # Build residuals and weights for links that are not near-zero
+        e_list: List[float] = []
+        w_list: List[float] = []
+        idx_list: List[int] = []  # indices in pairs for valid entries
+        rd_list: List[float] = []
+        tau_list: List[float] = []
+        caps: List[float] = []
+
+        for idx, (a, b) in enumerate(pairs):
+            v_tx = tx[a]
+            v_pr = rx[b]
+            if max(v_tx, v_pr) < ZERO_THRESH:
+                continue
+            e = v_tx - v_pr
+            # Directional confidence: average of the two directions involved in this residual
+            cdir = 0.5 * (clamp01(conf_tx.get(a, 0.7)) + clamp01(conf_rx.get(b, 0.7)))
+            w = (1.0 - cdir) * max(v_tx, ZERO_THRESH) + 1e-12
+            e_list.append(e)
+            w_list.append(w)
+            idx_list.append(idx)
+            rd = rel_diff(v_tx, v_pr)
+            rd_list.append(rd)
+            tau_list.append(adaptive_tau(v_tx, v_pr))
+            caps.append(BUNDLE_FINISH_CLIP * max(v_tx, ZERO_THRESH))
+
+        n = len(e_list)
+        if n < 2:
+            continue
+
+        # Zero-sum baseline using unweighted mean residual
+        e_mean = sum(e_list) / n
+        d0 = [-(e - e_mean) for e in e_list]
+
+        # Reweight toward low-confidence/high-rate links and re-center to zero-sum
+        avg_w = sum(w_list) / n
+        d = [d0_i * (w_i / max(avg_w, 1e-12)) for d0_i, w_i in zip(d0, w_list)]
+        mu = sum(d) / n
+        d = [di - mu for di in d]
+
+        # Gain based on mismatch beyond tolerance
+        mean_rd = sum(rd_list) / n
+        mean_tau = sum(tau_list) / n
+        gap_norm = max(0.0, (mean_rd - mean_tau) / max(mean_tau, 1e-9))
+        gamma = min(BUNDLE_FINISH_GAIN_MAX, 0.4 * gap_norm)
+        if gamma <= 0.0:
+            continue
+
+        # Proposed deltas with per-link clip and one-step zero-sum rebalance
+        deltas = []
+        for di, cap in zip(d, caps):
+            delta = max(-cap, min(cap, gamma * di))
+            deltas.append(delta)
+        sum_delta = sum(deltas)
+        if abs(sum_delta) > 1e-9:
+            # Rebalance onto non-clipped links using weights
+            free_idx = [k for k, (delta, cap) in enumerate(zip(deltas, caps)) if abs(delta) < cap - 1e-12]
+            sw = sum(w_list[k] for k in free_idx)
+            if sw > 0.0:
+                for k in free_idx:
+                    adj = sum_delta * (w_list[k] / sw)
+                    new_delta = deltas[k] - adj
+                    # Respect caps
+                    deltas[k] = max(-caps[k], min(caps[k], new_delta))
+
+        # Apply deltas on tx[a] and opposite on rx[b], update scale factors and confidence slightly
+        for local_idx, delta in enumerate(deltas):
+            a, b = pairs[idx_list[local_idx]]
+            if delta == 0.0:
+                continue
+            # TX adjustment on local interface a
+            prev_tx = tx[a]
+            new_tx = max(0.0, prev_tx + delta)
+            if prev_tx > ZERO_EPS:
+                scl_tx = new_tx / prev_tx
+                scaled_tx_factor[a] *= scl_tx
+            tx[a] = new_tx
+            # RX opposite adjustment on peer interface b
+            prev_rx = rx[b]
+            new_rx = max(0.0, prev_rx - delta)
+            if prev_rx > ZERO_EPS:
+                scl_rx = new_rx / prev_rx
+                scaled_rx_factor[b] *= scl_rx
+            rx[b] = new_rx
+            # Mild confidence penalty proportional to relative movement
+            if prev_tx > ZERO_EPS:
+                relc_tx = rel_diff(new_tx, prev_tx)
+                conf_tx[a] = clamp01(conf_tx.get(a, 0.7) * (1.0 - 0.2 * relc_tx))
+            if prev_rx > ZERO_EPS:
+                relc_rx = rel_diff(new_rx, prev_rx)
+                conf_rx[b] = clamp01(conf_rx.get(b, 0.7) * (1.0 - 0.2 * relc_rx))
+
+    # Stage 3: Confidence-gap re-sync with scaling guard and router attenuation
+    def nudge_toward_mean(val_lo: float, val_hi: float, frac: float) -> float:
+>>>>>>> REPLACE
+</DIFF>

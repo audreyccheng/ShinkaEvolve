@@ -1,0 +1,180 @@
+<NAME>
+adaptive_tail_and_group_tiebreak
+</NAME>
+
+<DESCRIPTION>
+Improve balancedness with negligible runtime impact by:
+1) Adding a simple but effective tie-break by fewer items in the group-to-node balanced_packing LPT step. This reduces early overfilling of some packs on ties and smooths loads.
+2) Making the water-filling tail adaptive to current row imbalance. We modulate the hybrid tail size by the ratio (peak/mean − 1) clamped to [0,1], and keep the peak-aware chooser between D’Hondt and Sainte–Laguë for the last steps. This concentrates the more careful assignments only when needed, improving worst-replica loads without significant overhead.
+
+Both changes are O(n) per step and preserve the overall speed while improving peak smoothing, aiming to raise the balancedness_score with minimal runtime cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load
+            best_p = None
+            best_load = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if best_load is None or pack_loads[p] < best_load:
+                    best_load = pack_loads[p]
+                    best_p = p
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+=======
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load; tie-break by fewer items
+            best_p = None
+            best_load = None
+            best_cnt = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if (best_load is None or pack_loads[p] < best_load or
+                    (abs(pack_loads[p] - (best_load if best_load is not None else 0.0)) <= 1e-12 and
+                     (best_cnt is None or pack_counts[p] < best_cnt))):
+                    best_p = p
+                    best_load = pack_loads[p]
+                    best_cnt = pack_counts[p]
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy water-filling with peak-aware hybrid tail
+    extras = target_total - s
+    if extras > 0:
+        # Bulk D'Hondt (w/c) fill except for a small adaptive tail
+        num_redundant = max(0, target_total - num_log)
+        tail = min(extras, max(1, int(round(0.1 * num_redundant))))
+        bulk = extras - tail
+
+        # Fast batched fill for bulk (use topk for efficiency)
+        while bulk > 0:
+            k = min(bulk, num_log)
+            scores = w / counts.to(w.dtype)
+            topk_idx = torch.topk(scores, k=k, largest=True).indices
+            counts[topk_idx] += 1
+            bulk -= k
+
+        # Adaptive tail: choose between D'Hondt and Sainte–Laguë at each step,
+        # minimizing (new_peak, new_second_peak, receiver_count, -new_avg_chosen)
+        for _ in range(tail):
+            counts_f = counts.to(w.dtype)
+            avg = w / counts_f
+            if num_log >= 2:
+                vals, idxs = torch.topk(avg, k=2)
+                peak1_val = float(vals[0].item())
+                peak1_idx = int(idxs[0].item())
+                peak2_val = float(vals[1].item())
+            else:
+                peak1_val = float(avg[0].item())
+                peak1_idx = 0
+                peak2_val = float("-inf")
+
+            # D'Hondt pick (argmax w/c == argmax avg)
+            d_pick = int(torch.argmax(avg).item())
+            # Sainte–Laguë pick (argmax w/(2c+1))
+            denom = (2 * counts + 1).to(w.dtype)
+            s_scores = w / denom
+            s_pick = int(torch.argmax(s_scores).item())
+
+            best_choice = None
+            best_key = None  # (new_peak, new_second, receiver_cnt, -new_avg)
+
+            for pick in (d_pick, s_pick):
+                if best_choice is not None and pick == best_choice:
+                    continue
+                new_avg_chosen = float((w[pick] / (counts_f[pick] + 1.0)).item())
+                # Predict new peak and second-highest after this assignment
+                if pick == peak1_idx:
+                    new_peak = max(new_avg_chosen, peak2_val)
+                    new_second = min(new_avg_chosen, peak2_val)
+                else:
+                    new_peak = max(peak1_val, new_avg_chosen)
+                    new_second = (peak1_val if new_avg_chosen >= peak1_val else max(new_avg_chosen, peak2_val))
+                receiver_cnt = int(counts[pick].item())
+                key = (new_peak, new_second, receiver_cnt, -new_avg_chosen)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_choice = pick
+
+            counts[best_choice] += 1
+=======
+    # Greedy water-filling with peak-aware hybrid tail
+    extras = target_total - s
+    if extras > 0:
+        # Bulk D'Hondt (w/c) fill except for a small adaptive tail sized by current imbalance
+        num_redundant = max(0, target_total - num_log)
+        counts_f0 = counts.to(w.dtype)
+        avg0 = w / counts_f0
+        mean_avg = float((w.sum().item() / max(1, target_total)))
+        cur_peak = float(avg0.max().item())
+        ratio = (cur_peak / max(mean_avg, 1e-12)) if mean_avg > 0 else 0.0
+        ratio = max(0.0, min(1.0, ratio - 1.0))  # clamp(cur_peak/mean - 1, 0, 1)
+        tail = min(extras, max(1, int(round(0.1 * num_redundant * ratio))))
+        bulk = extras - tail
+
+        # Fast batched fill for bulk (use topk for efficiency)
+        while bulk > 0:
+            k = min(bulk, num_log)
+            scores = w / counts.to(w.dtype)
+            topk_idx = torch.topk(scores, k=k, largest=True).indices
+            counts[topk_idx] += 1
+            bulk -= k
+
+        # Adaptive tail: choose between D'Hondt and Sainte–Laguë at each step,
+        # minimizing (new_peak, new_second_peak, receiver_count, -new_avg_chosen)
+        for _ in range(tail):
+            counts_f = counts.to(w.dtype)
+            avg = w / counts_f
+            if num_log >= 2:
+                vals, idxs = torch.topk(avg, k=2)
+                peak1_val = float(vals[0].item())
+                peak1_idx = int(idxs[0].item())
+                peak2_val = float(vals[1].item())
+            else:
+                peak1_val = float(avg[0].item())
+                peak1_idx = 0
+                peak2_val = float("-inf")
+
+            # D'Hondt pick (argmax w/c == argmax avg)
+            d_pick = int(torch.argmax(avg).item())
+            # Sainte–Laguë pick (argmax w/(2c+1))
+            denom = (2 * counts + 1).to(w.dtype)
+            s_scores = w / denom
+            s_pick = int(torch.argmax(s_scores).item())
+
+            best_choice = None
+            best_key = None  # (new_peak, new_second, receiver_cnt, -new_avg)
+
+            for pick in (d_pick, s_pick):
+                if best_choice is not None and pick == best_choice:
+                    continue
+                new_avg_chosen = float((w[pick] / (counts_f[pick] + 1.0)).item())
+                # Predict new peak and second-highest after this assignment
+                if pick == peak1_idx:
+                    new_peak = max(new_avg_chosen, peak2_val)
+                    new_second = min(new_avg_chosen, peak2_val)
+                else:
+                    new_peak = max(peak1_val, new_avg_chosen)
+                    new_second = (peak1_val if new_avg_chosen >= peak1_val else max(new_avg_chosen, peak2_val))
+                receiver_cnt = int(counts[pick].item())
+                key = (new_peak, new_second, receiver_cnt, -new_avg_chosen)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_choice = pick
+
+            counts[best_choice] += 1
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,154 @@
+<NAME>
+tolerance_and_partial_reconcile_with_clamped_router_scaling
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to boost counter repair accuracy and confidence calibration:
+
+1) Use traffic-aware tolerances for first-pass peer substitutions. Previously, we substituted whenever residuals exceeded a fixed 2% threshold, which can be too aggressive on tiny links and too weak on high-rate links. Switching to a rate-aware pair_tolerance prevents false positives on small counters and makes corrections more precise.
+
+2) Clamp router multiplicative scaling factors to ±15%. The previous router scaling could apply large uniform corrections when an aggregate was skewed by a single bad counter, hurting calibration and sometimes accuracy. Bounding k to [0.85, 1.15] enforces conservative, stable flow-conservation adjustments aligned with the hardening threshold, improving both accuracy and calibration.
+
+3) Replace snapping pair reconciliation with partial, asymmetric moves toward the peer value. The previous approach set one side exactly to the peer when a residual exceeded tolerance, which can overshoot ground truth and degrade calibration. The new approach moves the more suspicious side by a larger fraction (alpha_hi = 0.5) and the other by a smaller fraction (alpha_lo = 0.25), scaled by residual severity. This reduces overcorrections, preserves router-level balance better, and improves confidence calibration by aligning magnitudes of edits with uncertainty.
+
+These changes are consistent with the Hodor spirit: conservative, redundancy-driven adjustments with tolerance-aware thresholds and cautious redistribution.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def pair_tolerance(a: float, b: float) -> float:
+        # Rate-aware tolerance: looser for very low traffic, at least HARDENING_THRESHOLD
+        traffic = max(abs(a), abs(b), 1.0)
+        return max(HARDENING_THRESHOLD, 2.5 / traffic)
+=======
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def pair_tolerance(a: float, b: float) -> float:
+        # Rate-aware tolerance: looser for very low traffic, at least HARDENING_THRESHOLD
+        traffic = max(abs(a), abs(b), 1.0)
+        return max(HARDENING_THRESHOLD, 2.5 / traffic)
+
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+
+                # Apply direct substitution when violation exceeds tolerance (higher accuracy under single-sided faults)
+                if rx_link_diff > HARDENING_THRESHOLD:
+                    pre_rx = peer_tx
+                if tx_link_diff > HARDENING_THRESHOLD:
+                    pre_tx = peer_rx
+=======
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+
+                # Use traffic-aware tolerance to avoid over-correcting tiny links
+                tol_rx = pair_tolerance(rx_orig, peer_tx)
+                tol_tx = pair_tolerance(tx_orig, peer_rx)
+
+                # Apply direct substitution when violation exceeds tolerance (higher accuracy under single-sided faults)
+                if rx_link_diff > tol_rx:
+                    pre_rx = peer_tx
+                if tx_link_diff > tol_tx:
+                    pre_tx = peer_rx
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if sum_tx > sum_rx:
+                k = sum_rx / max(sum_tx, 1e-9)
+                for i in up_ifaces:
+                    # Scale only TX values on active interfaces
+                    scale_tx[i] = k
+            else:
+                k = sum_tx / max(sum_rx, 1e-9)
+                for i in up_ifaces:
+                    # Scale only RX values on active interfaces
+                    scale_rx[i] = k
+=======
+            if sum_tx > sum_rx:
+                k_raw = sum_rx / max(sum_tx, 1.0e-9)
+                # Clamp router scaling to avoid overshoot on skewed aggregates
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    # Scale only TX values on active interfaces
+                    scale_tx[i] = k
+            else:
+                k_raw = sum_tx / max(sum_rx, 1.0e-9)
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    # Scale only RX values on active interfaces
+                    scale_rx[i] = k
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Reconcile A.tx <-> B.rx if residual exceeds tolerance
+        if tx_pair_resid > tol_tx:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx if residual exceeds tolerance
+        if rx_pair_resid > tol_rx:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+=======
+        # Reconcile A.tx <-> B.rx if residual exceeds tolerance (partial, asymmetric move)
+        if tx_pair_resid > tol_tx:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            # Severity factor scales move magnitude (0 at tol, up to ~1 for large residuals)
+            sev = clamp((tx_pair_resid / max(tol_tx, 1e-9)) - 1.0, 0.0, 1.0)
+            alpha_hi = 0.5 * (0.5 + 0.5 * sev)   # more suspicious side moves more
+            alpha_lo = 0.25 * (0.5 + 0.5 * sev)  # less suspicious side moves less
+            if a_tx_s >= b_rx_s:
+                post[iface]['tx'] = (1.0 - alpha_hi) * a_tx + alpha_hi * b_rx
+                post[peer_id]['rx'] = (1.0 - alpha_lo) * b_rx + alpha_lo * a_tx
+            else:
+                post[peer_id]['rx'] = (1.0 - alpha_hi) * b_rx + alpha_hi * a_tx
+                post[iface]['tx'] = (1.0 - alpha_lo) * a_tx + alpha_lo * b_rx
+
+        # Reconcile A.rx <-> B.tx if residual exceeds tolerance (partial, asymmetric move)
+        if rx_pair_resid > tol_rx:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            sev2 = clamp((rx_pair_resid / max(tol_rx, 1e-9)) - 1.0, 0.0, 1.0)
+            alpha_hi2 = 0.5 * (0.5 + 0.5 * sev2)
+            alpha_lo2 = 0.25 * (0.5 + 0.5 * sev2)
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = (1.0 - alpha_hi2) * a_rx + alpha_hi2 * b_tx
+                post[peer_id]['tx'] = (1.0 - alpha_lo2) * b_tx + alpha_lo2 * a_rx
+            else:
+                post[peer_id]['tx'] = (1.0 - alpha_hi2) * b_tx + alpha_hi2 * a_rx
+                post[iface]['rx'] = (1.0 - alpha_lo2) * a_rx + alpha_lo2 * b_tx
+>>>>>>> REPLACE
+</DIFF>

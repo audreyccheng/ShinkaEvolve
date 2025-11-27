@@ -1,0 +1,194 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using Flow Consensus.
+Detects and corrects inconsistencies by treating network invariants as voters
+in a consensus system.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry using a Flow Consensus algorithm.
+    
+    The algorithm treats the "true" rate of a link as a hidden variable estimated by
+    multiple sensors:
+    1. Direct Local Measurement
+    2. Direct Remote Measurement (Link Symmetry R3)
+    3. Local Flow Hint (Flow Conservation R1 at local router)
+    4. Remote Flow Hint (Flow Conservation R1 at remote router)
+    
+    It selects the measured value that best minimizes the disagreement (distance) 
+    between all these estimates.
+    """
+    
+    # --- Phase 1: Topological Context & Flow Hints ---
+    # We first calculate "Hints": what should this interface's rate be to perfectly
+    # balance its router, assuming other interfaces on that router are correct?
+    
+    interface_hints = {} # {iface_id: {'rx': val, 'tx': val}}
+    
+    # Iterate over routers to calculate flow conservation context
+    for router_id, iface_ids in topology.items():
+        # Filter to interfaces that exist in the telemetry data
+        valid_ifaces = [i for i in iface_ids if i in telemetry]
+        
+        # Calculate sums of raw observed rates for the router
+        sum_rx = sum(telemetry[i].get('rx_rate', 0.0) for i in valid_ifaces)
+        sum_tx = sum(telemetry[i].get('tx_rate', 0.0) for i in valid_ifaces)
+        
+        for iface in valid_ifaces:
+            current_rx = telemetry[iface].get('rx_rate', 0.0)
+            current_tx = telemetry[iface].get('tx_rate', 0.0)
+            
+            # Calculate hints based on Flow Conservation (Sum In = Sum Out)
+            # Hint_RX: The RX rate needed to balance the router given all other flows
+            # hint_rx + (sum_rx - current_rx) = sum_tx  =>  hint_rx = sum_tx - sum_rx_others
+            rx_hint = sum_tx - (sum_rx - current_rx)
+            
+            # Hint_TX: The TX rate needed to balance the router
+            # hint_tx + (sum_tx - current_tx) = sum_rx  =>  hint_tx = sum_rx - sum_tx_others
+            tx_hint = sum_rx - (sum_tx - current_tx)
+            
+            # Store hints (clamped to 0 as rates cannot be negative)
+            interface_hints[iface] = {
+                'rx': max(0.0, rx_hint),
+                'tx': max(0.0, tx_hint)
+            }
+
+    result = {}
+
+    # --- Phase 2: Repair Execution ---
+    for iface_id, data in telemetry.items():
+        # Retrieve original values
+        orig_rx = data.get('rx_rate', 0.0)
+        orig_tx = data.get('tx_rate', 0.0)
+        orig_status = data.get('interface_status', 'unknown')
+        
+        # Initialize repaired values (default to original)
+        rep_rx = orig_rx
+        rep_tx = orig_tx
+        rep_status = orig_status
+        
+        # Initialize confidence (default to max)
+        conf_rx = 1.0
+        conf_tx = 1.0
+        conf_status = 1.0
+        
+        # Get Peer Information
+        peer_id = data.get('connected_to')
+        peer_data = telemetry.get(peer_id, {}) if (peer_id and peer_id in telemetry) else {}
+        has_peer = bool(peer_data)
+        
+        # --- A. Status Repair ---
+        # Logic: Traffic presence is a stronger signal than status flags.
+        # If status contradicts across link, trust the 'up' status if traffic exists.
+        
+        peer_status = peer_data.get('interface_status')
+        if has_peer and peer_status and orig_status != peer_status:
+            # Gather traffic evidence from both sides
+            traffic_evidence = [
+                orig_rx, orig_tx, 
+                peer_data.get('rx_rate', 0.0), peer_data.get('tx_rate', 0.0)
+            ]
+            max_traffic = max(traffic_evidence)
+            
+            # If significant traffic (> 1.0 Mbps) is detected, link must be UP
+            if max_traffic > 1.0:
+                rep_status = 'up'
+                conf_status = 0.95 # High confidence due to traffic evidence
+            else:
+                rep_status = 'down'
+                conf_status = 0.8 # Good guess, but less certain
+        
+        # --- B. Rate Repair ---
+        
+        if rep_status == 'down':
+            # Enforce physics: Down interfaces cannot have rate
+            rep_rx = 0.0
+            rep_tx = 0.0
+            # Confidence in rate is tied to confidence in status
+            # If we forced a change, we inherit the status confidence
+            if orig_rx > 1.0 or orig_tx > 1.0:
+                conf_rx = conf_status
+                conf_tx = conf_status
+        elif has_peer:
+            # Interface is UP. Apply Flow Consensus to repair rates.
+            
+            # --- Sub-task: Repair RX Rate ---
+            # Observable Candidates: [My RX, Peer TX]
+            # Voters: [My RX, Peer TX, My Flow Hint, Peer Flow Hint]
+            
+            obs_candidates = [orig_rx, peer_data.get('tx_rate', 0.0)]
+            votes = list(obs_candidates)
+            
+            # Add hints as voters if available
+            my_hint_rx = interface_hints.get(iface_id, {}).get('rx')
+            if my_hint_rx is not None: votes.append(my_hint_rx)
+            
+            peer_hint_tx = interface_hints.get(peer_id, {}).get('tx')
+            if peer_hint_tx is not None: votes.append(peer_hint_tx)
+            
+            # Find candidate that minimizes distance to all votes
+            best_rx = orig_rx
+            min_score = float('inf')
+            
+            for candidate in obs_candidates:
+                score = 0.0
+                for v in votes:
+                    # Normalized L1 distance (relative error)
+                    # Denominator prevents division by zero and handles small scales
+                    denom = max(candidate, v, 1.0)
+                    score += abs(candidate - v) / denom
+                
+                if score < min_score:
+                    min_score = score
+                    best_rx = candidate
+            
+            rep_rx = best_rx
+            # Calibration: Confidence decreases as disagreement (min_score) increases
+            avg_disagreement = min_score / len(votes) if votes else 0
+            conf_rx = max(0.0, 1.0 - avg_disagreement)
+            
+            # --- Sub-task: Repair TX Rate ---
+            # Observable Candidates: [My TX, Peer RX]
+            
+            obs_candidates_tx = [orig_tx, peer_data.get('rx_rate', 0.0)]
+            votes_tx = list(obs_candidates_tx)
+            
+            my_hint_tx = interface_hints.get(iface_id, {}).get('tx')
+            if my_hint_tx is not None: votes_tx.append(my_hint_tx)
+            
+            peer_hint_rx = interface_hints.get(peer_id, {}).get('rx')
+            if peer_hint_rx is not None: votes_tx.append(peer_hint_rx)
+            
+            best_tx = orig_tx
+            min_score_tx = float('inf')
+            
+            for candidate in obs_candidates_tx:
+                score = 0.0
+                for v in votes_tx:
+                    denom = max(candidate, v, 1.0)
+                    score += abs(candidate - v) / denom
+                
+                if score < min_score_tx:
+                    min_score_tx = score
+                    best_tx = candidate
+                    
+            rep_tx = best_tx
+            avg_disagreement_tx = min_score_tx / len(votes_tx) if votes_tx else 0
+            conf_tx = max(0.0, 1.0 - avg_disagreement_tx)
+
+        # Store result tuple: (original, repaired, confidence)
+        result[iface_id] = {
+            'rx_rate': (orig_rx, rep_rx, conf_rx),
+            'tx_rate': (orig_tx, rep_tx, conf_tx),
+            'interface_status': (orig_status, rep_status, conf_status),
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router')
+        }
+        
+    return result
+# EVOLVE-BLOCK-END

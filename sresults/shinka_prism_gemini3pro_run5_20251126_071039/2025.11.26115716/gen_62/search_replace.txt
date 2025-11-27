@@ -1,0 +1,464 @@
+<NAME>
+density_ils_and_directed_kick
+</NAME>
+
+<DESCRIPTION>
+Optimizes the Iterated Local Search (ILS) by:
+1.  **Density-Based Sorting**: Sorts models on the bottleneck GPU by "Density" (Pressure/Size) instead of just Pressure. This prioritizes moving small models that contribute disproportionately to the pressure, increasing the likelihood of finding valid moves to other GPUs.
+2.  **Directed Burst Kick**: Improves the perturbation mechanism to explicitly target the current bottleneck GPU for unloading, rather than randomly selecting high-load GPUs. This forces the algorithm to break out of local optima specifically related to the bottleneck.
+3.  **Refined Move Acceptance**: Resets patience fully on peak reduction and partially on variance reduction, allowing the algorithm to traverse plateaus (variance reduction) without getting stuck, but committing to peak reductions when found.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _variance_smoothing_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Variance Tie-Breaking and Burst Kicks (Moves & Swaps).
+    """
+    # State initialization
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    best_max_k = max(get_k(i) for i in range(gpu_num))
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 1000
+    patience = 20
+    no_improve = 0
+
+    # Pre-calculate initial sum of squares
+    current_ks = [get_k(i) for i in range(gpu_num)]
+
+    for _ in range(max_steps):
+        # 1. Status Check
+        max_k = -1.0
+        src = -1
+        sum_sq = 0.0
+
+        for i in range(gpu_num):
+            k = get_k(i)
+            current_ks[i] = k
+            if k > max_k:
+                max_k = k
+                src = i
+            sum_sq += k*k
+
+        # Update Global Best
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Burst Kick (Escape Local Optima)
+        if no_improve > patience:
+            moves_done = 0
+            # Perform a burst of perturbations
+            burst_size = random.randint(3, 6)
+            for _ in range(burst_size):
+                # Bias source towards high-load GPUs
+                candidates = [i for i in range(gpu_num) if current_ks[i] > max_k * 0.7]
+                if not candidates: candidates = list(range(gpu_num))
+                s_idx = random.choice(candidates)
+
+                if not placement[s_idx]: continue
+
+                d_idx = random.randint(0, gpu_num - 1)
+                if s_idx == d_idx: continue
+
+                # 50% Move, 50% Swap
+                if random.random() < 0.5:
+                    # Try Move
+                    m_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m = placement[s_idx][m_idx]
+
+                    if gpu_s[d_idx] + m.model_size <= GPU_MEM_SIZE:
+                        placement[d_idx].append(m)
+                        placement[s_idx].pop(m_idx)
+                        gpu_s[d_idx] += m.model_size; gpu_w[d_idx] += m.req_rate/m.slo
+                        gpu_s[s_idx] -= m.model_size; gpu_w[s_idx] -= m.req_rate/m.slo
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+                else:
+                    # Try Swap
+                    if not placement[d_idx]: continue
+                    m1_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m1 = placement[s_idx][m1_idx]
+                    m2_idx = random.randint(0, len(placement[d_idx]) - 1)
+                    m2 = placement[d_idx][m2_idx]
+
+                    ns_s = gpu_s[s_idx] - m1.model_size + m2.model_size
+                    ns_d = gpu_s[d_idx] - m2.model_size + m1.model_size
+
+                    if ns_s <= GPU_MEM_SIZE and ns_d <= GPU_MEM_SIZE:
+                        placement[s_idx][m1_idx] = m2
+                        placement[d_idx][m2_idx] = m1
+                        gpu_s[s_idx] = ns_s; gpu_w[s_idx] = gpu_w[s_idx] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+                        gpu_s[d_idx] = ns_d; gpu_w[d_idx] = gpu_w[d_idx] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+
+            if moves_done > 0:
+                # Reset patience partially
+                no_improve = max(0, patience - 8)
+            continue
+
+        # 3. Steepest Descent with Variance Tie-Breaking
+        # We only look for moves from 'src' (bottleneck) to others
+
+        best_move = None # (type, idx1, dst, idx2, ...)
+        best_imp_k = -1.0
+        best_imp_var = -1.0
+
+        models = placement[src]
+        # Sort models by contribution (Weight) to find good moves earlier (optimization)
+        sorted_models_idx = sorted(range(len(models)), key=lambda i: models[i].req_rate/models[i].slo, reverse=True)
+
+        # A. Try Moves
+        for i in sorted_models_idx:
+            m = models[i]
+            w, s = m.req_rate/m.slo, m.model_size
+
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + s > GPU_MEM_SIZE: continue
+
+                # Check metrics
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - s)
+                nk_src = (gpu_w[src] - w) / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + s)
+                nk_dst = (gpu_w[dst] + w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                new_peak = max(nk_src, nk_dst)
+
+                # Delta calculations
+                diff_k = max_k - new_peak
+
+                # Accept if Peak reduces significantly
+                if diff_k > 1e-6:
+                    if diff_k > best_imp_k:
+                        best_imp_k = diff_k
+                        best_move = ('move', i, dst, s, w)
+                        best_imp_var = 0 # Irrelevant if K improves
+
+                # Accept if Peak is same (approx) but Variance reduces
+                elif abs(diff_k) < 1e-6 and best_imp_k < 1e-6:
+                    old_sq = current_ks[src]**2 + current_ks[dst]**2
+                    new_sq = nk_src**2 + nk_dst**2
+                    diff_var = old_sq - new_sq
+
+                    if diff_var > 1e-5 and diff_var > best_imp_var:
+                        best_imp_var = diff_var
+                        best_move = ('move', i, dst, s, w)
+
+        # B. Try Swaps (Only if no significant move found to save time)
+        if best_imp_k < 1e-6:
+            for i1 in sorted_models_idx:
+                m1 = models[i1]
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+
+                for dst in range(gpu_num):
+                    if dst == src: continue
+                    # Optimization: Don't swap with another bottleneck
+                    if current_ks[dst] > max_k * 0.95: continue
+
+                    for i2, m2 in enumerate(placement[dst]):
+                        w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                        ns_src = gpu_s[src] - s1 + s2
+                        ns_dst = gpu_s[dst] - s2 + s1
+
+                        if ns_src > GPU_MEM_SIZE or ns_dst > GPU_MEM_SIZE: continue
+
+                        rem_src = GPU_MEM_SIZE - ns_src
+                        nk_src = (gpu_w[src] - w1 + w2) / rem_src if rem_src > 1e-7 else 1e9
+
+                        rem_dst = GPU_MEM_SIZE - ns_dst
+                        nk_dst = (gpu_w[dst] - w2 + w1) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                        new_peak = max(nk_src, nk_dst)
+                        diff_k = max_k - new_peak
+
+                        if diff_k > 1e-6:
+                            if diff_k > best_imp_k:
+                                best_imp_k = diff_k
+                                best_move = ('swap', i1, dst, i2, s1, w1, s2, w2)
+                                best_imp_var = 0
+                        elif abs(diff_k) < 1e-6 and best_imp_k < 1e-6:
+                            old_sq = current_ks[src]**2 + current_ks[dst]**2
+                            new_sq = nk_src**2 + nk_dst**2
+                            diff_var = old_sq - new_sq
+
+                            if diff_var > 1e-5 and diff_var > best_imp_var:
+                                best_imp_var = diff_var
+                                best_move = ('swap', i1, dst, i2, s1, w1, s2, w2)
+
+        # Execute Best Move
+        if best_move:
+            if best_move[0] == 'move':
+                _, i, dst, s, w = best_move
+                m = placement[src].pop(i)
+                placement[dst].append(m)
+                gpu_s[src] -= s; gpu_w[src] -= w
+                gpu_s[dst] += s; gpu_w[dst] += w
+            elif best_move[0] == 'swap':
+                _, i1, dst, i2, s1, w1, s2, w2 = best_move
+                m1 = placement[src][i1]
+                m2 = placement[dst][i2]
+                placement[src][i1] = m2
+                placement[dst][i2] = m1
+                gpu_s[src] = gpu_s[src] - s1 + s2
+                gpu_w[src] = gpu_w[src] - w1 + w2
+                gpu_s[dst] = gpu_s[dst] - s2 + s1
+                gpu_w[dst] = gpu_w[dst] - w2 + w1
+
+            # Reset patience slightly on successful variance reduction to allow climbing
+            if best_imp_k < 1e-6:
+                no_improve = max(0, patience - 5)
+            else:
+                no_improve = 0
+        else:
+            no_improve += 1
+
+    return best_sol
+=======
+def _variance_smoothing_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Variance Tie-Breaking and Burst Kicks (Moves & Swaps).
+    """
+    # State initialization
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    best_max_k = max(get_k(i) for i in range(gpu_num))
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 1000
+    patience = 20
+    no_improve = 0
+
+    # Pre-calculate initial sum of squares
+    current_ks = [get_k(i) for i in range(gpu_num)]
+
+    for _ in range(max_steps):
+        # 1. Status Check
+        max_k = -1.0
+        src = -1
+        sum_sq = 0.0
+
+        for i in range(gpu_num):
+            k = get_k(i)
+            current_ks[i] = k
+            if k > max_k:
+                max_k = k
+                src = i
+            sum_sq += k*k
+
+        # Update Global Best
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Burst Kick (Escape Local Optima)
+        if no_improve > patience:
+            moves_done = 0
+            # Perform a burst of perturbations focused on the bottleneck
+            burst_size = random.randint(3, 5)
+            # Force at least one move from the bottleneck 'src' if possible
+            kick_sources = [src]
+            # Add random other sources
+            for _ in range(burst_size - 1):
+                kick_sources.append(random.randint(0, gpu_num - 1))
+
+            for s_idx in kick_sources:
+                if not placement[s_idx]: continue
+
+                # Pick destination: preferably low load (below average)
+                avg_k = sum(current_ks)/gpu_num
+                d_candidates = [i for i in range(gpu_num) if i != s_idx and current_ks[i] < avg_k * 1.2]
+                if d_candidates:
+                    d_idx = random.choice(d_candidates)
+                else:
+                    d_idx = random.randint(0, gpu_num - 1)
+
+                if s_idx == d_idx: continue
+
+                # 50% Move, 50% Swap
+                if random.random() < 0.5:
+                    # Try Move
+                    m_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m = placement[s_idx][m_idx]
+
+                    if gpu_s[d_idx] + m.model_size <= GPU_MEM_SIZE:
+                        placement[d_idx].append(m)
+                        placement[s_idx].pop(m_idx)
+                        gpu_s[d_idx] += m.model_size; gpu_w[d_idx] += m.req_rate/m.slo
+                        gpu_s[s_idx] -= m.model_size; gpu_w[s_idx] -= m.req_rate/m.slo
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+                else:
+                    # Try Swap
+                    if not placement[d_idx]: continue
+                    m1_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m1 = placement[s_idx][m1_idx]
+                    m2_idx = random.randint(0, len(placement[d_idx]) - 1)
+                    m2 = placement[d_idx][m2_idx]
+
+                    ns_s = gpu_s[s_idx] - m1.model_size + m2.model_size
+                    ns_d = gpu_s[d_idx] - m2.model_size + m1.model_size
+
+                    if ns_s <= GPU_MEM_SIZE and ns_d <= GPU_MEM_SIZE:
+                        placement[s_idx][m1_idx] = m2
+                        placement[d_idx][m2_idx] = m1
+                        gpu_s[s_idx] = ns_s; gpu_w[s_idx] = gpu_w[s_idx] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+                        gpu_s[d_idx] = ns_d; gpu_w[d_idx] = gpu_w[d_idx] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+
+            if moves_done > 0:
+                # Reset patience partially
+                no_improve = max(0, patience - 8)
+            continue
+
+        # 3. Steepest Descent with Variance Tie-Breaking
+        best_move = None
+        best_imp_k = -1.0
+        best_imp_var = -1.0
+
+        models = placement[src]
+        # Sort models by Density (Pressure per GB) to prioritize efficient moves
+        # w = req_rate/slo, s = model_size
+        sorted_models_idx = sorted(
+            range(len(models)),
+            key=lambda i: (models[i].req_rate / models[i].slo) / (models[i].model_size + 1e-7),
+            reverse=True
+        )
+
+        # A. Try Moves
+        for i in sorted_models_idx:
+            m = models[i]
+            w, s = m.req_rate/m.slo, m.model_size
+
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + s > GPU_MEM_SIZE: continue
+
+                # Check metrics
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - s)
+                nk_src = (gpu_w[src] - w) / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + s)
+                nk_dst = (gpu_w[dst] + w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                new_peak = max(nk_src, nk_dst)
+                diff_k = max_k - new_peak
+
+                # Accept if Peak reduces significantly
+                if diff_k > 1e-6:
+                    if diff_k > best_imp_k:
+                        best_imp_k = diff_k
+                        best_move = ('move', i, dst, s, w)
+                        best_imp_var = 0
+
+                # Accept if Peak is same (approx) but Variance reduces
+                elif abs(diff_k) < 1e-6 and best_imp_k < 1e-6:
+                    old_sq = current_ks[src]**2 + current_ks[dst]**2
+                    new_sq = nk_src**2 + nk_dst**2
+                    diff_var = old_sq - new_sq
+
+                    if diff_var > 1e-5 and diff_var > best_imp_var:
+                        best_imp_var = diff_var
+                        best_move = ('move', i, dst, s, w)
+
+        # B. Try Swaps (Only if no significant move found to save time)
+        if best_imp_k < 1e-6:
+            for i1 in sorted_models_idx:
+                m1 = models[i1]
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+
+                for dst in range(gpu_num):
+                    if dst == src: continue
+                    # Optimization: Don't swap with another bottleneck
+                    if current_ks[dst] > max_k * 0.95: continue
+
+                    for i2, m2 in enumerate(placement[dst]):
+                        w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                        ns_src = gpu_s[src] - s1 + s2
+                        ns_dst = gpu_s[dst] - s2 + s1
+
+                        if ns_src > GPU_MEM_SIZE or ns_dst > GPU_MEM_SIZE: continue
+
+                        rem_src = GPU_MEM_SIZE - ns_src
+                        nk_src = (gpu_w[src] - w1 + w2) / rem_src if rem_src > 1e-7 else 1e9
+
+                        rem_dst = GPU_MEM_SIZE - ns_dst
+                        nk_dst = (gpu_w[dst] - w2 + w1) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                        new_peak = max(nk_src, nk_dst)
+                        diff_k = max_k - new_peak
+
+                        if diff_k > 1e-6:
+                            if diff_k > best_imp_k:
+                                best_imp_k = diff_k
+                                best_move = ('swap', i1, dst, i2, s1, w1, s2, w2)
+                                best_imp_var = 0
+                        elif abs(diff_k) < 1e-6 and best_imp_k < 1e-6:
+                            old_sq = current_ks[src]**2 + current_ks[dst]**2
+                            new_sq = nk_src**2 + nk_dst**2
+                            diff_var = old_sq - new_sq
+
+                            if diff_var > 1e-5 and diff_var > best_imp_var:
+                                best_imp_var = diff_var
+                                best_move = ('swap', i1, dst, i2, s1, w1, s2, w2)
+
+        # Execute Best Move
+        if best_move:
+            if best_move[0] == 'move':
+                _, i, dst, s, w = best_move
+                m = placement[src].pop(i)
+                placement[dst].append(m)
+                gpu_s[src] -= s; gpu_w[src] -= w
+                gpu_s[dst] += s; gpu_w[dst] += w
+            elif best_move[0] == 'swap':
+                _, i1, dst, i2, s1, w1, s2, w2 = best_move
+                m1 = placement[src][i1]
+                m2 = placement[dst][i2]
+                placement[src][i1] = m2
+                placement[dst][i2] = m1
+                gpu_s[src] = gpu_s[src] - s1 + s2
+                gpu_w[src] = gpu_w[src] - w1 + w2
+                gpu_s[dst] = gpu_s[dst] - s2 + s1
+                gpu_w[dst] = gpu_w[dst] - w2 + w1
+
+            # Reset patience
+            if best_imp_k > 1e-6:
+                no_improve = 0
+            else:
+                # Variance reduction only, slight reset
+                no_improve = max(0, patience - 5)
+        else:
+            no_improve += 1
+
+    return best_sol
+>>>>>>> REPLACE
+</DIFF>

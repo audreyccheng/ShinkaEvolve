@@ -1,0 +1,160 @@
+<NAME>
+ils_targeted_first_improvement
+</NAME>
+
+<DESCRIPTION>
+This edit implements three key improvements based on expert recommendations:
+1.  **Workload-Based Sorting in Packing**: In `_check_feasibility_robust`, a sorting heuristic based purely on workload (`w`) is added. This helps in scenarios where the constraint is dominated by pressure rather than size or density.
+2.  **Targeted Kick Strategy**: The `_variance_aware_ils` function's kick mechanism is updated to explicitly target the bottleneck GPU (`src`). Instead of random perturbations, it attempts to move or swap items specifically from the bottleneck GPU to other GPUs, aiming to relieve pressure directly when stuck in a local optimum.
+3.  **First-Improvement Descent with Sorting**: The local search strategy in `_variance_aware_ils` is switched from "Best-Improvement" (scanning all moves) to "First-Improvement" with prioritized candidates. Models on the bottleneck GPU are sorted by their workload contribution (`w`) descending. The algorithm then iterates through these high-impact models and executes the first valid move or swap that improves the objective function. This approach aligns with "Steepest Descent" principles by prioritizing high-impact moves while maintaining the speed of First-Improvement, allowing for more iterations and better convergence within the time limit.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Heuristics: (sort_key, reverse)
+    heuristics = [
+        (lambda x: x['v'], True),  # Virtual Size Desc
+        (lambda x: x['s'], True),  # Physical Size Desc
+        (lambda x: x['d'], True),  # Density Desc
+    ]
+=======
+    # Heuristics: (sort_key, reverse)
+    heuristics = [
+        (lambda x: x['v'], True),  # Virtual Size Desc
+        (lambda x: x['s'], True),  # Physical Size Desc
+        (lambda x: x['w'], True),  # Workload Desc
+        (lambda x: x['d'], True),  # Density Desc
+    ]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _variance_aware_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Best-Improvement and Variance Tie-Breaking.
+    """
+    # State tracking
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    current_ks = [get_k(i) for i in range(gpu_num)]
+
+    best_max_k = max(current_ks)
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 300
+    patience = 30
+    no_improve = 0
+
+    for step in range(max_steps):
+        # 1. Identify bottleneck
+        max_k = -1.0
+        src = -1
+        sum_sq = 0.0
+        for i in range(gpu_num):
+            k = current_ks[i]
+            if k > max_k:
+                max_k = k
+                src = i
+            sum_sq += k*k
+
+        # Check global best
+        if max_k < best_max_k - 1e-7:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Kick if stuck
+        if no_improve > patience:
+            # Burst Kick: 3 random moves
+            for _ in range(3):
+                s = random.randint(0, gpu_num - 1)
+                if not placement[s]: continue
+                d = random.randint(0, gpu_num - 1)
+                if s == d: continue
+
+                m_idx = random.randint(0, len(placement[s]) - 1)
+                m = placement[s][m_idx]
+                if gpu_s[d] + m.model_size <= GPU_MEM_SIZE:
+                    placement[d].append(m)
+                    placement[s].pop(m_idx)
+                    gpu_s[d] += m.model_size
+                    gpu_w[d] += m.req_rate/m.slo
+                    gpu_s[s] -= m.model_size
+                    gpu_w[s] -= m.req_rate/m.slo
+                    current_ks[d] = get_k(d)
+                    current_ks[s] = get_k(s)
+
+            no_improve = 0 # Reset patience
+            continue
+
+        # 3. Best-Improvement Descent
+        best_move = None
+        best_eval = (max_k, sum_sq)
+
+        models = placement[src]
+
+        # Try Moves
+        for i, m in enumerate(models):
+            w, s = m.req_rate/m.slo, m.model_size
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + s > GPU_MEM_SIZE: continue
+
+                # Predict
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - s)
+                nk_src = (gpu_w[src] - w) / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + s)
+                nk_dst = (gpu_w[dst] + w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                local_peak = max(nk_src, nk_dst)
+                if local_peak > max_k + 1e-7: continue
+
+                # New variance
+                delta_sq = (nk_src**2 + nk_dst**2) - (current_ks[src]**2 + current_ks[dst]**2)
+                new_sum_sq = sum_sq + delta_sq
+
+                # Acceptance
+                if local_peak < best_eval[0] - 1e-7:
+                    best_eval = (local_peak, new_sum_sq)
+                    best_move = ('move', i, dst, s, w)
+                elif abs(local_peak - best_eval[0]) < 1e-7:
+                    if new_sum_sq < best_eval[1] - 1e-5:
+                        best_eval = (local_peak, new_sum_sq)
+                        best_move = ('move', i, dst, s, w)
+
+        # Try Swaps
+        if True:
+            for i1, m1 in enumerate(models):
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+                for dst in range(gpu_num):
+                    if dst == src: continue
+                    # Optimization: Skip if dst is too unloaded (moving won't help global peak much if swapped with small?)
+                    # No, swapping might bring a large model back to src? No, we want to offload src.
+                    # We want to swap a large item from src with a small item from dst?
+                    # Let's just check all for correctness.
+
+                    for i2, m2 in enumerate(placement[dst]):
+                        w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                        ns_src = gpu_s[src] - s1 + s2
+                        ns_dst = gpu_s[dst] - s2 + s1
+                        if ns_src > GPU_MEM_SIZE or ns_dst > GPU_MEM_SIZE: continue
+
+                        rem_src = GPU_MEM_SIZE - ns_src
+                        nk_src = (gpu_w[src] - w1 + w2) / rem_src if rem_src > 1e-7 else 1e9
+
+                        rem_dst = GPU_MEM_SIZE - ns_dst
+                        nk_dst = (gpu_w[dst] - w2 + w1) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                        local_peak = max(nk_src, nk_dst)
+                        if local_peak > max_k + 1e-7: continue
+
+                        delta_sq = (nk_src**2 + nk_dst**2) - (current_ks[src]**2 + current_ks[dst]**2)
+                        new_sum_sq =

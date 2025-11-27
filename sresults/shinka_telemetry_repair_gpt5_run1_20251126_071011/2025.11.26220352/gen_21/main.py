@@ -1,0 +1,504 @@
+# EVOLVE-BLOCK-START
+"""
+Constrained projection based telemetry repair:
+- Build directed link variables from interfaces (merge redundant observations on pairs)
+- Resolve status via traffic evidence and enforce "down => zero"
+- Solve weighted least squares with equality constraints (flow conservation) to repair rates
+- Map repaired directed rates back to per-interface tx/rx
+- Calibrate confidence using change magnitude, pair disagreement, and router imbalance
+"""
+from typing import Dict, Any, Tuple, List
+from math import exp
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Tolerances and constants
+    HARDENING_THRESHOLD = 0.02
+    TRAFFIC_EVIDENCE_MIN = 0.5
+    EPS = 1e-9
+
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / denom
+
+    def rate_aware_tol(v: float) -> float:
+        # Smooth tolerance: >= 2%, relaxed at very low rates
+        return max(HARDENING_THRESHOLD, 5.0 / max(v, 1.0))
+
+    def logistic_conf(residual: float, tol: float, k: float = 3.0) -> float:
+        # Residual relative to tolerance => [0,1] confidence; residual=tol => ~0.5
+        tol = max(tol, 1e-9)
+        x = residual / tol
+        return clamp(1.0 / (1.0 + exp(k * (x - 1.0))))
+
+    # Build undirected pairs (links) and peer map
+    visited = set()
+    pairs: List[Tuple[str, str]] = []
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            if key not in visited:
+                visited.add(key)
+                pairs.append((key[0], key[1]))
+                peer_of[key[0]] = key[1]
+                peer_of[key[1]] = key[0]
+
+    # Resolve status per interface using pair agreement and traffic evidence
+    resolved_status: Dict[str, str] = {}
+    status_conf: Dict[str, float] = {}
+    for a_id, b_id in pairs:
+        a = telemetry[a_id]; b = telemetry[b_id]
+        a_stat = a.get('interface_status', 'unknown')
+        b_stat = b.get('interface_status', 'unknown')
+        a_rx, a_tx = float(a.get('rx_rate', 0.0)), float(a.get('tx_rate', 0.0))
+        b_rx, b_tx = float(b.get('rx_rate', 0.0)), float(b.get('tx_rate', 0.0))
+        max_traffic = max(a_rx, a_tx, b_rx, b_tx)
+        if a_stat == b_stat:
+            st = a_stat
+            sc = 0.95 if st in ('up', 'down') else 0.7
+        else:
+            if max_traffic > TRAFFIC_EVIDENCE_MIN:
+                st, sc = 'up', 0.85
+            else:
+                st, sc = 'down', 0.75
+        resolved_status[a_id] = st
+        resolved_status[b_id] = st
+        status_conf[a_id] = sc
+        status_conf[b_id] = sc
+
+    # For unpaired interfaces: keep stated status; use traffic evidence to adjust if unknown
+    for if_id, data in telemetry.items():
+        if if_id in resolved_status:
+            continue
+        st = data.get('interface_status', 'unknown')
+        rx0 = float(data.get('rx_rate', 0.0))
+        tx0 = float(data.get('tx_rate', 0.0))
+        if st not in ('up', 'down'):
+            if max(rx0, tx0) > TRAFFIC_EVIDENCE_MIN:
+                st = 'up'; sc = 0.8
+            else:
+                st = 'down'; sc = 0.7
+        else:
+            sc = 0.95
+        resolved_status[if_id] = st
+        status_conf[if_id] = sc
+
+    # Directed variable construction
+    # Each variable key maps to (src_router, dst_router), observation list, and fixed_zero flag
+    class Var:
+        __slots__ = ('src', 'dst', 'obs', 'fixed_zero')
+
+        def __init__(self, src: str, dst: str, fixed_zero: bool = False):
+            self.src = src
+            self.dst = dst
+            self.obs: List[Tuple[str, str, float, float]] = []  # (if_id, dir, value, weight)
+            self.fixed_zero = fixed_zero
+
+    # Mapping from (if_id, 'tx'/'rx') to variable key
+    ifdir_to_varkey: Dict[Tuple[str, str], str] = {}
+
+    # Helper to create or fetch variable
+    variables: Dict[str, Var] = {}
+
+    def add_obs(vkey: str, src: str, dst: str, if_id: str, idir: str, val: float, w: float, fixed_zero: bool):
+        if vkey not in variables:
+            variables[vkey] = Var(src, dst, fixed_zero)
+        else:
+            # If any contributor is fixed to zero => the variable should be fixed zero
+            variables[vkey].fixed_zero = variables[vkey].fixed_zero or fixed_zero
+        variables[vkey].obs.append((if_id, idir, val, w))
+        ifdir_to_varkey[(if_id, idir)] = vkey
+
+    # Observation weight from rate-aware tolerance
+    def obs_weight(val: float) -> float:
+        tol = rate_aware_tol(abs(val))
+        # Convert tolerance to pseudo-variance weight
+        return 1.0 / (tol * tol)
+
+    # Build variables for paired links
+    for a_id, b_id in pairs:
+        a = telemetry[a_id]; b = telemetry[b_id]
+        R_a = a.get('local_router'); R_b = b.get('local_router')
+        # Variable for R_a -> R_b uses a.tx and b.rx
+        fwd_key = f"pair:{a_id}|{b_id}:fwd"
+        rev_key = f"pair:{a_id}|{b_id}:rev"
+        st = resolved_status[a_id]  # same for both ends
+        fixed_zero = (st == 'down')
+        # Forward obs
+        a_tx = float(a.get('tx_rate', 0.0)); b_rx = float(b.get('rx_rate', 0.0))
+        add_obs(fwd_key, R_a, R_b, a_id, 'tx', a_tx, obs_weight(a_tx), fixed_zero)
+        add_obs(fwd_key, R_a, R_b, b_id, 'rx', b_rx, obs_weight(b_rx), fixed_zero)
+        # Reverse obs
+        a_rx = float(a.get('rx_rate', 0.0)); b_tx = float(b.get('tx_rate', 0.0))
+        add_obs(rev_key, R_b, R_a, b_id, 'tx', b_tx, obs_weight(b_tx), fixed_zero)
+        add_obs(rev_key, R_b, R_a, a_id, 'rx', a_rx, obs_weight(a_rx), fixed_zero)
+
+    # Build variables for unpaired interfaces: separate variables for their tx and rx
+    for if_id, data in telemetry.items():
+        if if_id in peer_of:
+            continue
+        st = resolved_status.get(if_id, data.get('interface_status', 'down'))
+        fixed_zero = (st == 'down')
+        R_loc = data.get('local_router')
+        R_rem = data.get('remote_router')  # may be None
+        tx = float(data.get('tx_rate', 0.0)); rx = float(data.get('rx_rate', 0.0))
+        # Outgoing (tx): R_loc -> R_rem
+        vtx = f"unpaired:{if_id}:tx"
+        add_obs(vtx, R_loc, R_rem, if_id, 'tx', tx, obs_weight(tx), fixed_zero)
+        # Incoming (rx): R_rem -> R_loc
+        vrx = f"unpaired:{if_id}:rx"
+        add_obs(vrx, R_rem, R_loc, if_id, 'rx', rx, obs_weight(rx), fixed_zero)
+
+    # Aggregate observations per variable to get y and W
+    varkeys: List[str] = list(variables.keys())
+    m = len(varkeys)
+    y_vec = [0.0] * m
+    W_diag = [1.0] * m
+    var_src_idx: List[int] = []  # router row index (to be filled later)
+    var_dst_idx: List[int] = []
+
+    # Routers participating
+    routers_set = set()
+    for k in varkeys:
+        v = variables[k]
+        if v.src is not None:
+            routers_set.add(v.src)
+        if v.dst is not None:
+            routers_set.add(v.dst)
+
+    routers_list = sorted([r for r in routers_set if r is not None])
+
+    # Build router index mapping, and later we will drop last row/col to avoid singularity
+    router_to_row = {r: idx for idx, r in enumerate(routers_list)}
+    R = len(routers_list)
+
+    # Precompute pre-repair (observation) router imbalance using y_obs means
+    # First compute y_e and W_e to use for both solve and pre-imbalance
+    for idx, k in enumerate(varkeys):
+        v = variables[k]
+        if v.fixed_zero:
+            y = 0.0
+            W = 1e6  # extremely large weight -> keep at zero if it appears; but we'll also skip in A
+        else:
+            sumw = 0.0
+            sumwy = 0.0
+            for (_, _, val, w) in v.obs:
+                sumw += w
+                sumwy += w * val
+            if sumw <= 0:
+                sumw = 1.0
+            y = sumwy / sumw
+            # Regularize weights mildly to avoid extremes
+            W = max(sumw, 1e-3)
+        y_vec[idx] = max(0.0, y)
+        W_diag[idx] = W
+        var_src_idx.append(router_to_row.get(v.src, -1))
+        var_dst_idx.append(router_to_row.get(v.dst, -1))
+
+    # Compute pre-repair per-router imbalance using y_vec (ignore vars with missing endpoints or fixed zero)
+    pre_sum_out = [0.0] * R
+    pre_sum_in = [0.0] * R
+    for j in range(m):
+        i_src = var_src_idx[j]; i_dst = var_dst_idx[j]
+        if i_src == -1 or i_dst == -1:
+            continue
+        val = y_vec[j]
+        pre_sum_out[i_src] += val
+        pre_sum_in[i_dst] += val
+    pre_imbalance = [0.0] * R
+    for i in range(R):
+        pre_imbalance[i] = rel_diff(pre_sum_out[i], pre_sum_in[i])
+
+    # Build M = A W^{-1} A^T (size R x R) and g = A y (size R)
+    # Skip variables that are fixed to zero (we'll still keep y=0 but no need to constrain)
+    # Also handle variables with missing endpoints: exclude from A
+    M = [[0.0 for _ in range(R)] for __ in range(R)]
+    g = [0.0 for _ in range(R)]
+    for j in range(m):
+        i_src = var_src_idx[j]; i_dst = var_dst_idx[j]
+        if i_src == -1 or i_dst == -1:
+            continue
+        v = variables[varkeys[j]]
+        if v.fixed_zero:
+            continue
+        y = y_vec[j]
+        Winv = 1.0 / max(W_diag[j], 1e-9)
+        # g contribution: A*y
+        g[i_src] += y
+        g[i_dst] -= y
+        # M contribution: W^{-1} * [[1,-1],[-1,1]]
+        M[i_src][i_src] += Winv
+        M[i_dst][i_dst] += Winv
+        M[i_src][i_dst] -= Winv
+        M[i_dst][i_src] -= Winv
+
+    # Reduce system by dropping last router (to remove redundancy) if any
+    def reduce_matrix(M_full: List[List[float]], b_full: List[float]) -> Tuple[List[List[float]], List[float]]:
+        if len(M_full) == 0:
+            return [], []
+        n = len(M_full)
+        if n == 1:
+            # Return 1x1 system as-is
+            return [[M_full[0][0]]], [b_full[0]]
+        # Drop the last row/col
+        n_red = n - 1
+        M_red = [[0.0 for _ in range(n_red)] for __ in range(n_red)]
+        b_red = [0.0 for _ in range(n_red)]
+        for i in range(n_red):
+            b_red[i] = b_full[i]
+            for j in range(n_red):
+                M_red[i][j] = M_full[i][j]
+        return M_red, b_red
+
+    M_red, g_red = reduce_matrix(M, g)
+
+    # Solve linear system M_red * lam = g_red via Gaussian elimination with partial pivoting
+    def solve_linear(A_mat: List[List[float]], b_vec: List[float]) -> List[float]:
+        n = len(A_mat)
+        if n == 0:
+            return []
+        # Build augmented matrix
+        aug = [row[:] + [b_vec[i]] for i, row in enumerate(A_mat)]
+        # Forward elimination
+        for col in range(n):
+            # Pivot
+            pivot_row = max(range(col, n), key=lambda r: abs(aug[r][col]))
+            if abs(aug[pivot_row][col]) < 1e-12:
+                continue
+            if pivot_row != col:
+                aug[col], aug[pivot_row] = aug[pivot_row], aug[col]
+            # Normalize pivot row
+            piv = aug[col][col]
+            for k in range(col, n + 1):
+                aug[col][k] /= piv
+            # Eliminate below
+            for r in range(col + 1, n):
+                factor = aug[r][col]
+                if abs(factor) < 1e-18:
+                    continue
+                for k in range(col, n + 1):
+                    aug[r][k] -= factor * aug[col][k]
+        # Back substitution
+        x = [0.0] * n
+        for i in range(n - 1, -1, -1):
+            s = aug[i][n]
+            for j in range(i + 1, n):
+                s -= aug[i][j] * x[j]
+            denom = aug[i][i]
+            if abs(denom) < 1e-12:
+                x[i] = 0.0
+            else:
+                x[i] = s / denom
+        return x
+
+    lam_red = solve_linear(M_red, g_red)
+
+    # Build full lambda vector with last element = 0 (dropped equation)
+    lam = [0.0] * R
+    for i in range(R - 1):
+        lam[i] = lam_red[i]
+    lam[R - 1 if R > 0 else 0] = 0.0
+
+    # Compute repaired variable values: x = y - W^{-1} A^T lam
+    x_vec = [0.0] * m
+    for j in range(m):
+        v = variables[varkeys[j]]
+        y = y_vec[j]
+        if v.fixed_zero:
+            x = 0.0
+        else:
+            i_src = var_src_idx[j]; i_dst = var_dst_idx[j]
+            if i_src == -1 or i_dst == -1:
+                # Cannot constrain without both endpoints; leave at observation
+                x = y
+            else:
+                Winv = 1.0 / max(W_diag[j], 1e-9)
+                al = lam[i_src] - lam[i_dst]
+                x = y - Winv * al
+        x_vec[j] = max(0.0, x)  # non-negativity
+
+    # Prepare interim storage per interface for output and confidence
+    interim: Dict[str, Dict[str, Any]] = {}
+    for if_id, data in telemetry.items():
+        interim[if_id] = {
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'rx': float(data.get('rx_rate', 0.0)),
+            'status': resolved_status.get(if_id, data.get('interface_status', 'unknown')),
+            'status_conf': status_conf.get(if_id, 0.8),
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            'tx_conf': 1.0,
+            'rx_conf': 1.0,
+            'orig_status': data.get('interface_status', 'unknown'),
+        }
+
+    # Map repaired variables back to per-interface tx/rx
+    for (if_id, idir), vkey in ifdir_to_varkey.items():
+        j = varkeys.index(vkey)
+        repaired_val = x_vec[j]
+        if idir == 'tx':
+            interim[if_id]['tx'] = repaired_val
+        else:
+            interim[if_id]['rx'] = repaired_val
+
+    # Enforce "down => zero" again to be safe and calibrate status confidence
+    for if_id, r in interim.items():
+        if r['status'] == 'down':
+            # Confidence high if originals near zero, else low
+            r['tx'] = 0.0
+            r['rx'] = 0.0
+            r['tx_conf'] = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            r['rx_conf'] = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            if max(r['orig_tx'], r['orig_rx']) > TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(min(r['status_conf'], 0.4))
+            continue
+
+    # Confidence calibration: change-based, pair-consistency, router-imbalance, status
+    # Compute post-repair router imbalance for information (usually near-zero)
+    post_sum_out = [0.0] * R
+    post_sum_in = [0.0] * R
+    for j in range(m):
+        i_src = var_src_idx[j]; i_dst = var_dst_idx[j]
+        if i_src == -1 or i_dst == -1:
+            continue
+        x = x_vec[j]
+        post_sum_out[i_src] += x
+        post_sum_in[i_dst] += x
+    post_imbalance = [0.0] * R
+    for i in range(R):
+        post_imbalance[i] = rel_diff(post_sum_out[i], post_sum_in[i])
+
+    # Precompute pair disagreement per variable (from raw observations before solve)
+    var_pair_residual: Dict[str, float] = {}
+    var_pair_tol: Dict[str, float] = {}
+    for k, v in variables.items():
+        if len(v.obs) >= 2:
+            # Collect two best observations by weight
+            sorted_obs = sorted(v.obs, key=lambda o: o[3], reverse=True)
+            o1 = sorted_obs[0]; o2 = sorted_obs[1]
+            y1 = o1[2]; y2 = o2[2]
+            resid = rel_diff(y1, y2)
+            traffic = max(abs(y1), abs(y2), 1.0)
+            tol = rate_aware_tol(traffic)
+            var_pair_residual[k] = resid
+            var_pair_tol[k] = tol
+        else:
+            var_pair_residual[k] = 0.4  # default moderate uncertainty
+            var_pair_tol[k] = 0.2
+
+    # Assign confidences per interface direction
+    for if_id, r in interim.items():
+        loc = r.get('local_router')
+        router_idx = router_to_row.get(loc, None)
+        router_comp = 0.7
+        if router_idx is not None:
+            # Use pre-repair imbalance; high imbalance lowers confidence
+            router_comp = logistic_conf(pre_imbalance[router_idx], rate_aware_tol(max(pre_sum_out[router_idx], pre_sum_in[router_idx], 1.0)))
+
+        # TX confidence
+        tx_orig = r['orig_tx']; tx_new = r['tx']
+        vkey_tx = ifdir_to_varkey.get((if_id, 'tx'))
+        pair_comp_tx = 0.6
+        if vkey_tx is not None:
+            pair_comp_tx = logistic_conf(var_pair_residual[vkey_tx], var_pair_tol[vkey_tx])
+        change_tx = rel_diff(tx_orig, tx_new)
+        tol_tx = rate_aware_tol(max(tx_new, tx_orig, 1.0))
+        change_comp_tx = logistic_conf(change_tx, tol_tx)
+        tx_conf = 0.5 * change_comp_tx + 0.3 * pair_comp_tx + 0.15 * router_comp + 0.05 * clamp(r['status_conf'])
+        # Penalize if clipped to zero with significant original
+        if tx_new <= EPS and tx_orig > TRAFFIC_EVIDENCE_MIN and r['status'] == 'up':
+            tx_conf *= 0.6
+        r['tx_conf'] = clamp(tx_conf)
+
+        # RX confidence
+        rx_orig = r['orig_rx']; rx_new = r['rx']
+        vkey_rx = ifdir_to_varkey.get((if_id, 'rx'))
+        pair_comp_rx = 0.6
+        if vkey_rx is not None:
+            pair_comp_rx = logistic_conf(var_pair_residual[vkey_rx], var_pair_tol[vkey_rx])
+        change_rx = rel_diff(rx_orig, rx_new)
+        tol_rx = rate_aware_tol(max(rx_new, rx_orig, 1.0))
+        change_comp_rx = logistic_conf(change_rx, tol_rx)
+        rx_conf = 0.5 * change_comp_rx + 0.3 * pair_comp_rx + 0.15 * router_comp + 0.05 * clamp(r['status_conf'])
+        if rx_new <= EPS and rx_orig > TRAFFIC_EVIDENCE_MIN and r['status'] == 'up':
+            rx_conf *= 0.6
+        r['rx_conf'] = clamp(rx_conf)
+
+        # If up but effectively idle, slightly reduce status confidence
+        if r['status'] == 'up' and r['tx'] <= TRAFFIC_EVIDENCE_MIN and r['rx'] <= TRAFFIC_EVIDENCE_MIN:
+            r['status_conf'] = clamp(r['status_conf'] * 0.9)
+
+    # Assemble final output
+    result: Dict[str, Dict[str, Tuple]] = {}
+    for if_id, r in interim.items():
+        out: Dict[str, Tuple] = {}
+        out['rx_rate'] = (r['orig_rx'], r['rx'], clamp(r['rx_conf']))
+        out['tx_rate'] = (r['orig_tx'], r['tx'], clamp(r['tx_conf']))
+        out['interface_status'] = (r['orig_status'], r['status'], clamp(r['status_conf']))
+        out['connected_to'] = r['connected_to']
+        out['local_router'] = r['local_router']
+        out['remote_router'] = r['remote_router']
+        result[if_id] = out
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

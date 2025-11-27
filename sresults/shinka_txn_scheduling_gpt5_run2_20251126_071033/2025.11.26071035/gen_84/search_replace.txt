@@ -1,0 +1,381 @@
+<NAME>
+bnb_and_block_repair_upgrade
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to drive down makespan:
+1) Stronger endgame branch-and-bound (BnB) with a transposition table, node expansion cap, suffix-based memoization, and lookahead-based ordering. This yields deeper, more effective enumerations for the last K transactions under a strict budget while pruning aggressively. I also add a configurable BNB_NODE_BUDGET and use blended immediate/second-step costs to order branches.
+2) Block-aware reinsertion during LNS repair. When the destroy phase removes contiguous segments, we try reinserting 1–2 best blocks as a unit using a new Engine.insert_block_best method (with LRU memo reuse), then finish with regret-guided single insertions. This captures large structural improvements missed by only single reinsertion.
+
+Additionally, I increase the LRU capacities for the best-two and block caches to cut recomputation across the richer neighborhoods.
+
+These changes are minimal, consistent with existing structures, and increase solution quality by better exploiting endgame exactness and powerful block moves while keeping runtime bounded.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            self.best_two_lru = LRU(20000)
+            self.best_block_lru = LRU(10000)
+=======
+            self.best_two_lru = LRU(40000)
+            self.best_block_lru = LRU(20000)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        def best_block_reinsertion(self, seq, i, k, focus_idx=None, exhaustive=False):
+            # Remove block seq[i:i+k] and find best position to insert it back
+            block = tuple(seq[i:i + k])
+            base = seq[:i] + seq[i + k:]
+            base_t = tuple(base)
+            positions, sig = self.positions_for_insertion(len(base), exhaustive=exhaustive, focus_idx=focus_idx if focus_idx is not None else i)
+            key = (base_t, block, sig)
+            cached = self.best_block_lru.get(key)
+            if cached is not None:
+                return cached[0], list(cached[1]), cached[2]  # (best_cost, new_seq, best_pos)
+
+            best_c = float('inf')
+            best_pos = None
+            best_seq = None
+            for p in positions:
+                cand = base[:]
+                cand[p:p] = block
+                c = self.eval_cost(cand)
+                if c < best_c:
+                    best_c = c
+                    best_pos = p
+                    best_seq = cand
+            if best_pos is None:
+                # no improvement
+                best_c = self.eval_cost(seq)
+                best_seq = list(seq)
+                best_pos = i
+            self.best_block_lru.put(key, (best_c, tuple(best_seq), best_pos))
+            return best_c, best_seq, best_pos
+=======
+        def best_block_reinsertion(self, seq, i, k, focus_idx=None, exhaustive=False):
+            # Remove block seq[i:i+k] and find best position to insert it back
+            block = tuple(seq[i:i + k])
+            base = seq[:i] + seq[i + k:]
+            base_t = tuple(base)
+            positions, sig = self.positions_for_insertion(len(base), exhaustive=exhaustive, focus_idx=focus_idx if focus_idx is not None else i)
+            key = (base_t, block, sig)
+            cached = self.best_block_lru.get(key)
+            if cached is not None:
+                return cached[0], list(cached[1]), cached[2]  # (best_cost, new_seq, best_pos)
+
+            best_c = float('inf')
+            best_pos = None
+            best_seq = None
+            for p in positions:
+                cand = base[:]
+                cand[p:p] = block
+                c = self.eval_cost(cand)
+                if c < best_c:
+                    best_c = c
+                    best_pos = p
+                    best_seq = cand
+            if best_pos is None:
+                # no improvement
+                best_c = self.eval_cost(seq)
+                best_seq = list(seq)
+                best_pos = i
+            self.best_block_lru.put(key, (best_c, tuple(best_seq), best_pos))
+            return best_c, best_seq, best_pos
+
+        def insert_block_best(self, base_seq, block, focus_idx=None, exhaustive=False):
+            """
+            Best insertion of a given block (tuple/list) into base_seq.
+            Reuses the same LRU as best_block_reinsertion via (base, block, pos_sig) key.
+            """
+            base = list(base_seq)
+            block_t = tuple(block)
+            base_t = tuple(base)
+            positions, sig = self.positions_for_insertion(len(base), exhaustive=exhaustive, focus_idx=focus_idx)
+            key = (base_t, block_t, sig)
+            cached = self.best_block_lru.get(key)
+            if cached is not None:
+                return cached[0], list(cached[1]), cached[2]
+
+            best_c = float('inf')
+            best_pos = 0
+            best_seq = None
+            for p in positions:
+                cand = base[:]
+                cand[p:p] = list(block_t)
+                c = self.eval_cost(cand)
+                if c < best_c:
+                    best_c = c
+                    best_pos = p
+                    best_seq = cand
+            if best_seq is None:
+                best_c = self.eval_cost(base)
+                best_seq = list(base)
+                best_pos = len(base)
+            self.best_block_lru.put(key, (best_c, tuple(best_seq), best_pos))
+            return best_c, best_seq, best_pos
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    BNB_K = 9  # enumerate last <= 9 txns exactly with pruning
+    BNB_TIME_BUDGET = 0.35  # seconds per BnB call (soft cap)
+=======
+    BNB_K = 9  # enumerate last <= 9 txns exactly with pruning
+    BNB_TIME_BUDGET = 0.35  # seconds per BnB call (soft cap)
+    BNB_NODE_BUDGET = 3500  # cap node expansions per BnB call
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def bnb_complete(prefix, remaining, best_bound):
+        start_time = time.time()
+        best_cost = best_bound[0]
+        best_seq = None
+
+        rem_list = list(remaining)
+        # Precompute immediate extension costs for ordering
+        order = []
+        for t in rem_list:
+            c = eng.eval_cost(prefix + [t])
+            order.append((c, t))
+        order.sort(key=lambda x: x[0])
+
+        memo = {}
+
+        def dfs(cur, rem):
+            nonlocal best_cost, best_seq
+            # prune by time
+            if time.time() - start_time > BNB_TIME_BUDGET:
+                return
+            if not rem:
+                c = eng.eval_cost(cur)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = list(cur)
+                return
+            key = (tuple(cur), tuple(sorted(rem)))
+            if key in memo and memo[key] >= best_cost:
+                return
+            # Lower bound is current prefix cost since cost is non-decreasing
+            c_pref = eng.eval_cost(cur)
+            if c_pref >= best_cost:
+                memo[key] = c_pref
+                return
+            # Order remaining by immediate extension cost to prune faster
+            local = []
+            for t in rem:
+                c1 = eng.eval_cost(cur + [t])
+                local.append((c1, t))
+            local.sort(key=lambda x: x[0])
+            for c1, t in local:
+                if c1 >= best_cost:
+                    continue
+                nxt = list(cur)
+                nxt.append(t)
+                rem_next = [x for x in rem if x != t]
+                dfs(nxt, rem_next)
+                if time.time() - start_time > BNB_TIME_BUDGET:
+                    break
+            memo[key] = min(memo.get(key, float('inf')), c_pref)
+
+        dfs(list(prefix), rem_list)
+        if best_seq is None:
+            # Fallback greedy completion if time pruned everything
+            cur = list(prefix)
+            rem = list(remaining)
+            while rem:
+                best_t, best_c = None, float('inf')
+                for t in rem:
+                    c = eng.eval_cost(cur + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                cur.append(best_t)
+                rem.remove(best_t)
+            return eng.eval_cost(cur), cur
+        return best_cost, best_seq
+=======
+    def bnb_complete(prefix, remaining, best_bound):
+        start_time = time.time()
+        time_budget = BNB_TIME_BUDGET
+        node_budget = BNB_NODE_BUDGET
+
+        best_cost = best_bound[0]
+        best_seq = None
+
+        rem_list = list(remaining)
+        # Precompute ordering by blended immediate + exact one-step lookahead
+        order = []
+        for t in rem_list:
+            c1 = eng.eval_cost(prefix + [t])
+            rest = [x for x in rem_list if x != t]
+            best_c2 = c1
+            for u in rest:
+                cu = eng.eval_cost(prefix + [t, u])
+                if cu < best_c2:
+                    best_c2 = cu
+            score = 0.7 * c1 + 0.3 * best_c2
+            order.append((score, c1, t))
+        order.sort(key=lambda x: x[0])
+
+        # Transposition table keyed by (frozenset(remaining), suffix-2 of cur)
+        tt = {}
+        expansions = 0
+
+        def suffix2_key(cur):
+            if len(cur) >= 2:
+                return (cur[-2], cur[-1])
+            elif len(cur) == 1:
+                return (None, cur[-1])
+            else:
+                return (None, None)
+
+        def dfs(cur, rem):
+            nonlocal best_cost, best_seq, expansions
+            if expansions >= node_budget or (time.time() - start_time) > time_budget:
+                return
+            expansions += 1
+            if not rem:
+                c = eng.eval_cost(cur)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = list(cur)
+                return
+            # Current prefix cost and transposition pruning
+            c_pref = eng.eval_cost(cur)
+            if c_pref >= best_cost:
+                return
+            key = (frozenset(rem), suffix2_key(cur))
+            prev = tt.get(key)
+            if prev is not None and c_pref >= prev - 1e-12:
+                return
+            tt[key] = c_pref if prev is None else min(prev, c_pref)
+
+            # Order remaining by immediate extension cost
+            local = []
+            for t in rem:
+                c1 = eng.eval_cost(cur + [t])
+                local.append((c1, t))
+            local.sort(key=lambda x: x[0])
+
+            for c1, t in local:
+                if c1 >= best_cost:
+                    continue
+                nxt = cur + [t]
+                rem_next = [x for x in rem if x != t]
+                dfs(nxt, rem_next)
+                if expansions >= node_budget or (time.time() - start_time) > time_budget:
+                    break
+
+        # Start DFS using the pre-ordered first step choices
+        for _, c1, t in order:
+            if c1 >= best_cost:
+                continue
+            dfs(prefix + [t], [x for x in rem_list if x != t])
+            if expansions >= node_budget or (time.time() - start_time) > time_budget:
+                break
+
+        if best_seq is None:
+            # Fallback greedy completion
+            cur = list(prefix)
+            rem = list(remaining)
+            while rem:
+                best_t, best_c = None, float('inf')
+                for t in rem:
+                    c = eng.eval_cost(cur + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                cur.append(best_t)
+                rem.remove(best_t)
+            return eng.eval_cost(cur), cur
+        return best_cost, best_seq
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            removed = [cur[i] for i in remove_idx]
+            base = [cur[i] for i in range(L) if i not in remove_idx]
+
+            # Regret-guided repair using best-two with consensus-focused ring
+            rebuilt = list(base)
+            pool = list(removed)
+            while pool:
+                # evaluate a small candidate subset or all if small
+                k_t = min(len(pool), 10)
+                cand_txns = pool if len(pool) <= k_t else random.sample(pool, k_t)
+                scored = []
+                for t in cand_txns:
+                    focus = min(max(0, cons.get(t, len(rebuilt))), len(rebuilt)) if cons else None
+                    c1, p1, c2 = eng.best_two_insertions(rebuilt, t, focus_idx=focus, exhaustive=(len(rebuilt) <= exhaustive_threshold or len(pool) <= 2 * beam_width))
+                    scored.append((c1, c2, t, p1))
+                scored.sort(key=lambda x: x[0])
+                top = scored[:min(3, len(scored))]
+                top.sort(key=lambda x: (-(x[1] - x[0]), x[0]))
+                c1, c2, t_pick, p_pick = top[0]
+                rebuilt.insert(p_pick, t_pick)
+                pool.remove(t_pick)
+=======
+            removed = [cur[i] for i in remove_idx]
+            base = [cur[i] for i in range(L) if i not in remove_idx]
+
+            # Block-aware first repair using contiguous removed segments, then regret-guided singles
+            rebuilt = list(base)
+
+            # Identify up to 3 contiguous removed blocks
+            segments = []
+            curr = []
+            for idx in remove_idx:
+                if not curr or idx == curr[-1] + 1:
+                    curr.append(idx)
+                else:
+                    if len(curr) >= 2:
+                        segments.append([cur[i] for i in curr])
+                    curr = [idx]
+            if curr and len(curr) >= 2:
+                segments.append([cur[i] for i in curr])
+            block_list = [tuple(seg) for seg in segments[:3]]
+
+            # Try reinserting up to 2 best blocks
+            inserted_blocks = 0
+            while block_list and inserted_blocks < 2:
+                best_b, best_seq_after, best_c_after = None, None, float('inf')
+                for b in block_list:
+                    c_b, seq_b, _ = eng.insert_block_best(rebuilt, b, exhaustive=(len(rebuilt) <= exhaustive_threshold))
+                    if c_b < best_c_after:
+                        best_c_after = c_b
+                        best_b = b
+                        best_seq_after = seq_b
+                if best_b is None:
+                    break
+                rebuilt = best_seq_after
+                # Remove items of inserted block from removed pool
+                for x in best_b:
+                    if x in removed:
+                        removed.remove(x)
+                block_list.remove(best_b)
+                inserted_blocks += 1
+
+            # Regret-guided single reinsertion for remaining
+            pool = list(removed)
+            while pool:
+                # evaluate a small candidate subset or all if small
+                k_t = min(len(pool), 10)
+                cand_txns = pool if len(pool) <= k_t else random.sample(pool, k_t)
+                scored = []
+                for t in cand_txns:
+                    focus = min(max(0, cons.get(t, len(rebuilt))), len(rebuilt)) if cons else None
+                    c1, p1, c2 = eng.best_two_insertions(rebuilt, t, focus_idx=focus, exhaustive=(len(rebuilt) <= exhaustive_threshold or len(pool) <= 2 * beam_width))
+                    scored.append((c1, c2, t, p1))
+                scored.sort(key=lambda x: x[0])
+                top = scored[:min(3, len(scored))]
+                top.sort(key=lambda x: (-(x[1] - x[0]), x[0]))
+                c1, c2, t_pick, p_pick = top[0]
+                rebuilt.insert(p_pick, t_pick)
+                pool.remove(t_pick)
+>>>>>>> REPLACE
+
+</DIFF>

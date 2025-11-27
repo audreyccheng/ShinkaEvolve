@@ -1,0 +1,185 @@
+<NAME>
+hybrid_tail_waterfill
+</NAME>
+
+<DESCRIPTION>
+Introduce a peak-driven hybrid tail allocator inside _waterfill_counts_row. After the binary-search baseline and a bulk D’Hondt-style (w/c) batched fill, we handle the last T = max(1, round(0.1 · num_redundant)) allocations one-by-one by choosing between the D’Hondt pick and the Sainte–Laguë pick at each step. We simulate the new peak average for both choices and commit the one that yields the lower peak (tie-breaking by lower second-highest average, then by lower chosen expert’s new average). This targets peak reduction where it matters while keeping the rest of the allocation fast. The change is localized and computationally light since the tail length T is small and extras are typically small.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _waterfill_counts_row(w: torch.Tensor, target_total: int) -> torch.Tensor:
+    """
+    Compute integer replica counts c_i >= 1 that approximately minimize max_i w_i / c_i
+    subject to sum c_i == target_total using water-filling + greedy fill.
+
+    Parameters:
+        w: [num_log], float tensor (on CPU)
+        target_total: int, total replicas to allocate
+
+    Returns:
+        counts: [num_log], int64
+    """
+    num_log = w.numel()
+    assert target_total >= num_log  # at least one per expert
+
+    if target_total == num_log:
+        return torch.ones(num_log, dtype=torch.int64, device=w.device)
+
+    maxw = float(w.max().item()) if num_log > 0 else 0.0
+    # Binary search T such that sum max(1, ceil(w_i / T)) <= target_total
+    lo = 0.0
+    hi = max(maxw, 1.0)
+    # Handle all-zero quickly
+    if maxw == 0.0:
+        counts = torch.ones(num_log, dtype=torch.int64, device=w.device)
+        extras = target_total - num_log
+        if extras > 0:
+            base_add = extras // num_log
+            rem = extras % num_log
+            if base_add > 0:
+                counts += base_add
+            if rem > 0:
+                counts[:rem] += 1
+        return counts
+
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        # counts_i = max(1, ceil(w_i / mid))
+        c = torch.ceil(w / mid).to(torch.int64)
+        c = torch.maximum(c, torch.ones_like(c))
+        s = int(c.sum().item())
+        if s <= target_total:
+            hi = mid
+        else:
+            lo = mid
+
+    # Base counts from hi guarantee <= target_total
+    counts = torch.ceil(w / hi).to(torch.int64)
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    s = int(counts.sum().item())
+
+    # Greedy water-filling for remaining extras
+    extras = target_total - s
+    while extras > 0:
+        k = min(extras, num_log)
+        # Select top-k by current w_i / c_i
+        scores = w / counts.to(w.dtype)
+        topk_idx = torch.argsort(scores, descending=True)[:k]
+        counts[topk_idx] += 1
+        extras -= k
+    return counts
+=======
+def _waterfill_counts_row(w: torch.Tensor, target_total: int) -> torch.Tensor:
+    """
+    Compute integer replica counts c_i >= 1 that approximately minimize max_i w_i / c_i
+    subject to sum c_i == target_total using water-filling + greedy fill.
+
+    Parameters:
+        w: [num_log], float tensor (on CPU)
+        target_total: int, total replicas to allocate
+
+    Returns:
+        counts: [num_log], int64
+    """
+    num_log = w.numel()
+    assert target_total >= num_log  # at least one per expert
+
+    if target_total == num_log:
+        return torch.ones(num_log, dtype=torch.int64, device=w.device)
+
+    maxw = float(w.max().item()) if num_log > 0 else 0.0
+    # Binary search T such that sum max(1, ceil(w_i / T)) <= target_total
+    lo = 0.0
+    hi = max(maxw, 1.0)
+    # Handle all-zero quickly
+    if maxw == 0.0:
+        counts = torch.ones(num_log, dtype=torch.int64, device=w.device)
+        extras = target_total - num_log
+        if extras > 0:
+            base_add = extras // num_log
+            rem = extras % num_log
+            if base_add > 0:
+                counts += base_add
+            if rem > 0:
+                counts[:rem] += 1
+        return counts
+
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        # counts_i = max(1, ceil(w_i / mid))
+        c = torch.ceil(w / mid).to(torch.int64)
+        c = torch.maximum(c, torch.ones_like(c))
+        s = int(c.sum().item())
+        if s <= target_total:
+            hi = mid
+        else:
+            lo = mid
+
+    # Base counts from hi guarantee <= target_total
+    counts = torch.ceil(w / hi).to(torch.int64)
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    s = int(counts.sum().item())
+
+    # Greedy water-filling with peak-aware hybrid tail
+    extras = target_total - s
+    if extras > 0:
+        # Bulk D'Hondt (w/c) fill except for a small adaptive tail
+        num_redundant = max(0, target_total - num_log)
+        tail = min(extras, max(1, int(round(0.1 * num_redundant))))
+        bulk = extras - tail
+
+        # Fast batched fill for bulk
+        while bulk > 0:
+            k = min(bulk, num_log)
+            scores = w / counts.to(w.dtype)
+            topk_idx = torch.argsort(scores, descending=True)[:k]
+            counts[topk_idx] += 1
+            bulk -= k
+
+        # Adaptive tail: choose between D'Hondt and Sainte–Laguë at each step
+        for _ in range(tail):
+            counts_f = counts.to(w.dtype)
+            avg = w / counts_f
+            if num_log >= 2:
+                vals, idxs = torch.topk(avg, k=2)
+                peak1_val = float(vals[0].item())
+                peak1_idx = int(idxs[0].item())
+                peak2_val = float(vals[1].item())
+            else:
+                peak1_val = float(avg[0].item())
+                peak1_idx = 0
+                peak2_val = float("-inf")
+
+            # D'Hondt pick (argmax w/c == argmax avg)
+            d_pick = int(torch.argmax(avg).item())
+            # Sainte–Laguë pick (argmax w/(2c+1))
+            denom = (2 * counts + 1).to(w.dtype)
+            s_scores = w / denom
+            s_pick = int(torch.argmax(s_scores).item())
+
+            best_choice = None
+            best_key = None  # (new_peak, new_second, -new_avg_chosen)
+
+            for pick in (d_pick, s_pick):
+                if best_choice is not None and pick == best_choice:
+                    continue
+                new_avg_chosen = float((w[pick] / (counts_f[pick] + 1.0)).item())
+                # Predict new peak and second-highest after this assignment
+                if pick == peak1_idx:
+                    new_peak = max(new_avg_chosen, peak2_val)
+                    new_second = min(new_avg_chosen, peak2_val)
+                else:
+                    new_peak = max(peak1_val, new_avg_chosen)
+                    new_second = (peak1_val if new_avg_chosen >= peak1_val else max(new_avg_chosen, peak2_val))
+                key = (new_peak, new_second, -new_avg_chosen)
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_choice = pick
+
+            counts[best_choice] += 1
+
+    return counts
+>>>>>>> REPLACE
+
+</DIFF>

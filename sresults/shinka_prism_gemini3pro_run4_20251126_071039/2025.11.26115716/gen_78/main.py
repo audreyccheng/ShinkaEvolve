@@ -1,0 +1,436 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+import math
+
+GPU_MEM_SIZE = 80.0  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Minimizes max KVPR using Adaptive Binary Search packing followed by Iterated Local Search.
+    
+    1. Adaptive Binary Search: Uses variable effort (trials) based on search convergence.
+    2. Failure Memory: Prioritizes items that failed packing in previous attempts.
+    3. Iterated Local Search: Perturbs the bottleneck GPU (Ruin & Recreate) to escape local optima.
+    """
+
+    # 0. Precompute model data
+    m_data = []
+    total_w = 0.0
+    total_s = 0.0
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        m_data.append({
+            'id': i, 'w': w, 's': s, 'obj': m,
+            'd': w / (s + 1e-9) # Density
+        })
+        total_w += w
+        total_s += s
+
+    # Helper: Evaluate Max KVPR for a list-of-lists solution
+    def get_max_kvpr(placement_indices):
+        max_p = 0.0
+        for indices in placement_indices:
+            w_sum = sum(m_data[i]['w'] for i in indices)
+            s_sum = sum(m_data[i]['s'] for i in indices)
+            rem = GPU_MEM_SIZE - s_sum
+            if rem <= 1e-9:
+                if w_sum > 0: return float('inf')
+                else: continue
+            p = w_sum / rem
+            if p > max_p: max_p = p
+        return max_p
+
+    # Global Tracking
+    best_sol_indices = None
+    best_max_p = float('inf')
+    global_fail_counts = [0] * len(m_data)
+
+    # ------------------------------------------------------------------
+    # 1. Binary Search with Adaptive Effort & Failure Memory
+    # ------------------------------------------------------------------
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    lb = total_w / rem_global if rem_global > 1e-6 else 0.0
+    ub = 5000.0 # Loose upper bound
+
+    def solve_packing(target_k, effort_level):
+        """
+        Attempts to pack items into gpu_num bins given target pressure K.
+        Returns (placement, success_bool).
+        """
+        # Strategies: (Base Key Lambda, Reverse Sort)
+        strategies = [
+            (lambda x: x['s'] + x['w'] / target_k, True), # Effective Size
+            (lambda x: x['s'], True),                     # Physical Size
+            (lambda x: x['w'], True),                     # Weight
+            (lambda x: x['d'], True)                      # Density
+        ]
+        
+        # Adaptive trials: More effort when narrowing down
+        trials = int(5 + 35 * effort_level)
+        
+        for t in range(trials):
+            # Rotate strategies and apply noise
+            strat_idx = t % len(strategies)
+            base_key, reverse = strategies[strat_idx]
+            
+            # Increasing noise for later trials
+            noise = 0.0
+            if t >= len(strategies):
+                noise = 0.01 + (t * 0.002)
+                
+            def sort_key(idx):
+                val = base_key(m_data[idx])
+                if noise > 0:
+                    val *= random.uniform(1.0 - noise, 1.0 + noise)
+                # Failure Memory: heavily boost priority of previously failed items
+                if global_fail_counts[idx] > 0:
+                     val += 1e6 * global_fail_counts[idx] 
+                return val
+
+            indices = sorted(range(len(m_data)), key=sort_key, reverse=reverse)
+            
+            # Packing: Best Fit Decreasing on Slack
+            # Constraint: w_new <= K * (C - s_new)
+            bins_w = [0.0] * gpu_num
+            bins_s = [0.0] * gpu_num
+            placement = [[] for _ in range(gpu_num)]
+            possible = True
+            first_fail = None
+            
+            for idx in indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+                
+                best_b = -1
+                min_slack = float('inf')
+                
+                for b in range(gpu_num):
+                    if bins_s[b] + s > GPU_MEM_SIZE: continue
+                    
+                    rem_new = GPU_MEM_SIZE - (bins_s[b] + s)
+                    max_w = target_k * rem_new
+                    curr_w = bins_w[b] + w
+                    
+                    if curr_w <= max_w + 1e-6:
+                        slack = max_w - curr_w
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_b = b
+                            
+                if best_b == -1:
+                    possible = False
+                    first_fail = idx
+                    break
+                
+                placement[best_b].append(idx)
+                bins_w[best_b] += w
+                bins_s[best_b] += s
+            
+            if possible:
+                return placement, True
+            
+            # Record failure
+            if first_fail is not None and t > trials // 2:
+                global_fail_counts[first_fail] += 1
+                
+        return None, False
+
+    # Binary Search Loop
+    for i in range(20):
+        mid = (lb + ub) / 2.0
+        
+        # Heuristic: Increase effort if range is small or late in search
+        gap = ub - lb
+        effort = 0.2
+        if gap < 20.0 or i > 12: effort = 1.0
+        elif gap < 100.0: effort = 0.6
+        
+        sol, success = solve_packing(mid, effort)
+        
+        if success:
+            # We found a valid packing for 'mid'.
+            # Record it and try for smaller K.
+            real_max = get_max_kvpr(sol)
+            if real_max < best_max_p:
+                best_max_p = real_max
+                best_sol_indices = sol
+            ub = mid
+        else:
+            lb = mid
+            
+    if best_sol_indices is None:
+        # Fallback if binary search failed completely (unlikely)
+        # Sort by density and greedy pack
+        sorted_indices = sorted(range(len(m_data)), key=lambda i: m_data[i]['d'], reverse=True)
+        fallback_sol = [[] for _ in range(gpu_num)]
+        bins_s = [0.0] * gpu_num
+        for idx in sorted_indices:
+            s = m_data[idx]['s']
+            best_b = -1
+            max_rem = -1.0
+            for b in range(gpu_num):
+                if bins_s[b] + s <= GPU_MEM_SIZE:
+                    if (GPU_MEM_SIZE - bins_s[b]) > max_rem:
+                        max_rem = GPU_MEM_SIZE - bins_s[b]
+                        best_b = b
+            if best_b != -1:
+                fallback_sol[best_b].append(idx)
+                bins_s[best_b] += s
+            else:
+                # Critical failure fallback
+                fallback_sol[random.randint(0, gpu_num-1)].append(idx) 
+        best_sol_indices = fallback_sol
+
+    # ------------------------------------------------------------------
+    # 2. Iterated Local Search (ILS)
+    # ------------------------------------------------------------------
+    curr_sol = [list(x) for x in best_sol_indices]
+    
+    # Precalculate stats for speed
+    bin_stats = []
+    for g in range(gpu_num):
+        w = sum(m_data[i]['w'] for i in curr_sol[g])
+        s = sum(m_data[i]['s'] for i in curr_sol[g])
+        rem = GPU_MEM_SIZE - s
+        p = w/rem if rem > 1e-9 else (float('inf') if w > 0 else 0.0)
+        bin_stats.append({'w': w, 's': s, 'p': p})
+
+    def run_hill_climbing(sol, stats, steps=50):
+        """Standard Steepest Descent on the bottleneck GPU"""
+        max_p = max(b['p'] for b in stats)
+        
+        for _ in range(steps):
+            # Identify bottleneck
+            src_g = -1
+            curr_max = -1.0
+            for g in range(gpu_num):
+                if stats[g]['p'] > curr_max:
+                    curr_max = stats[g]['p']
+                    src_g = g
+            
+            if curr_max < 1e-9: break
+            max_p = curr_max
+            
+            improved = False
+            src_items = sol[src_g]
+            
+            # 1. Try Moves
+            for idx_in_list, m_idx in enumerate(src_items):
+                item = m_data[m_idx]
+                
+                # Stats if removed from Src
+                src_rem_s = GPU_MEM_SIZE - (stats[src_g]['s'] - item['s'])
+                src_new_w = stats[src_g]['w'] - item['w']
+                src_new_p = src_new_w / src_rem_s if src_rem_s > 1e-9 else 0.0
+                
+                best_dst = -1
+                best_dst_p = float('inf')
+                
+                for dst in range(gpu_num):
+                    if dst == src_g: continue
+                    if stats[dst]['s'] + item['s'] > GPU_MEM_SIZE: continue
+                    
+                    dst_rem_s = GPU_MEM_SIZE - (stats[dst]['s'] + item['s'])
+                    if dst_rem_s <= 1e-9: continue
+                    
+                    dst_new_w = stats[dst]['w'] + item['w']
+                    dst_new_p = dst_new_w / dst_rem_s
+                    
+                    # Accept if global max is reduced
+                    if max(src_new_p, dst_new_p) < max_p - 1e-6:
+                        # Tie-break: minimize pressure on destination
+                        if dst_new_p < best_dst_p:
+                            best_dst_p = dst_new_p
+                            best_dst = dst
+                
+                if best_dst != -1:
+                    sol[src_g].pop(idx_in_list)
+                    sol[best_dst].append(m_idx)
+                    
+                    stats[src_g]['w'] -= item['w']; stats[src_g]['s'] -= item['s']
+                    rem = GPU_MEM_SIZE - stats[src_g]['s']
+                    stats[src_g]['p'] = stats[src_g]['w']/rem if rem > 1e-9 else 0.0
+                    
+                    stats[best_dst]['w'] += item['w']; stats[best_dst]['s'] += item['s']
+                    rem = GPU_MEM_SIZE - stats[best_dst]['s']
+                    stats[best_dst]['p'] = stats[best_dst]['w']/rem
+                    
+                    improved = True
+                    break
+            
+            if improved: continue
+            
+            # 2. Try Swaps
+            for s_idx, m_src_idx in enumerate(src_items):
+                m_src = m_data[m_src_idx]
+                
+                for dst in range(gpu_num):
+                    if dst == src_g: continue
+                    
+                    for d_idx, m_dst_idx in enumerate(sol[dst]):
+                        m_dst = m_data[m_dst_idx]
+                        
+                        s_s_new = stats[src_g]['s'] - m_src['s'] + m_dst['s']
+                        d_s_new = stats[dst]['s'] - m_dst['s'] + m_src['s']
+                        
+                        if s_s_new > GPU_MEM_SIZE or d_s_new > GPU_MEM_SIZE: continue
+                        
+                        s_rem = GPU_MEM_SIZE - s_s_new
+                        d_rem = GPU_MEM_SIZE - d_s_new
+                        if s_rem <= 1e-9 or d_rem <= 1e-9: continue
+                        
+                        s_p_new = (stats[src_g]['w'] - m_src['w'] + m_dst['w']) / s_rem
+                        d_p_new = (stats[dst]['w'] - m_dst['w'] + m_src['w']) / d_rem
+                        
+                        if max(s_p_new, d_p_new) < max_p - 1e-6:
+                            sol[src_g][s_idx] = m_dst_idx
+                            sol[dst][d_idx] = m_src_idx
+                            
+                            stats[src_g] = {'w': stats[src_g]['w'] - m_src['w'] + m_dst['w'], 
+                                            's': s_s_new, 'p': s_p_new}
+                            stats[dst] = {'w': stats[dst]['w'] - m_dst['w'] + m_src['w'],
+                                          's': d_s_new, 'p': d_p_new}
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+            
+            if not improved: break
+            
+        return sol, stats
+
+    # Initial Descent
+    curr_sol, bin_stats = run_hill_climbing(curr_sol, bin_stats, steps=80)
+    
+    # Best Solution Tracking
+    best_final_sol = [list(x) for x in curr_sol]
+    best_final_max = max(b['p'] for b in bin_stats)
+    
+    # Perturbation Loop
+    for _ in range(5):
+        # Find bottleneck
+        b_idx = max(range(gpu_num), key=lambda g: bin_stats[g]['p'])
+        if bin_stats[b_idx]['p'] < 1e-9: break
+        
+        # Ruin: Remove 1-2 random items from bottleneck
+        if not curr_sol[b_idx]: break
+        
+        backup_sol = [list(x) for x in curr_sol]
+        backup_stats = [dict(x) for x in bin_stats]
+        
+        num_eject = min(2, len(curr_sol[b_idx]))
+        ejected = []
+        for _ in range(num_eject):
+            idx = random.randrange(len(curr_sol[b_idx]))
+            ejected.append(curr_sol[b_idx].pop(idx))
+            
+        # Update bottleneck stats
+        w = sum(m_data[i]['w'] for i in curr_sol[b_idx])
+        s = sum(m_data[i]['s'] for i in curr_sol[b_idx])
+        rem = GPU_MEM_SIZE - s
+        p = w/rem if rem > 1e-9 else 0.0
+        bin_stats[b_idx] = {'w': w, 's': s, 'p': p}
+        
+        # Recreate: Insert into best available slots (Greedy Best Fit on Pressure)
+        success = True
+        for m_idx in ejected:
+            m = m_data[m_idx]
+            best_dst = -1
+            best_val = float('inf')
+            
+            for dst in range(gpu_num):
+                if dst == b_idx: continue
+                if bin_stats[dst]['s'] + m['s'] <= GPU_MEM_SIZE:
+                    rem = GPU_MEM_SIZE - (bin_stats[dst]['s'] + m['s'])
+                    if rem > 1e-9:
+                        # Metric: resulting pressure
+                        val = (bin_stats[dst]['w'] + m['w']) / rem
+                        if val < best_val:
+                            best_val = val
+                            best_dst = dst
+            
+            if best_dst != -1:
+                curr_sol[best_dst].append(m_idx)
+                # Update stats
+                d_w = bin_stats[best_dst]['w'] + m['w']
+                d_s = bin_stats[best_dst]['s'] + m['s']
+                d_p = d_w / (GPU_MEM_SIZE - d_s)
+                bin_stats[best_dst] = {'w': d_w, 's': d_s, 'p': d_p}
+            else:
+                success = False
+                break
+        
+        if success:
+            # Run Local Search
+            curr_sol, bin_stats = run_hill_climbing(curr_sol, bin_stats, steps=30)
+            curr_max = max(b['p'] for b in bin_stats)
+            
+            if curr_max < best_final_max:
+                best_final_max = curr_max
+                best_final_sol = [list(x) for x in curr_sol]
+            else:
+                # Revert
+                curr_sol = backup_sol
+                bin_stats = backup_stats
+        else:
+            curr_sol = backup_sol
+            bin_stats = backup_stats
+
+    # Final conversion
+    result = {}
+    for g, idxs in enumerate(best_final_sol):
+        result[g] = [m_data[i]['obj'] for i in idxs]
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

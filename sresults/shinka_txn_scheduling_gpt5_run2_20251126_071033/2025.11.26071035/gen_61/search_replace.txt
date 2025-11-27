@@ -1,0 +1,430 @@
+<NAME>
+elite_relink_and_deterministic_positions
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to reduce makespan:
+
+1) Deterministic position sampling with a bounded best-two cache to increase memoization hit rate:
+   - position_samples is changed to use a deterministic Random seeded by (seq_len, focus_idx, k), making insertion position sampling repeatable across calls. This dramatically increases cache reuse for evaluate_best_two_positions because pos_list becomes stable for the same parameters.
+   - Added a best_two_cache_cap (default 20,000) and a simple eviction strategy (clear when exceeding cap) to bound memory while retaining performance benefits.
+
+2) Elite pool with path relinking:
+   - Maintain a small elite pool of high-quality solutions from different seeds (diversified by suffix).
+   - Add bidirectional-like path relinking from the current best towards elite partners (moving items toward their desired positions), followed by a quick local refine to exploit promising intermediate solutions.
+   - Integrate elite updates into ILS and LNS improvements and perform additional relinking after these phases for extra gains.
+
+These changes better exploit the simulator’s cost feedback during construction and intensify the search across high-quality basins without excessive runtime overhead, improving makespan substantially over purely greedy/beam heuristics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Parameterization (tuned for quality/runtime balance)
+    elite_seeds = max(2, min(6, int(num_seqs)))           # number of elite singleton starts
+    random_seeds = max(1, min(3, int(num_seqs) // 4))     # random additional starts
+    # Candidate sampling sizes
+    k_txn_sample = min(16, max(8, 2 + int(1.5 * num_seqs)))   # txns to consider per insertion
+    k_pos_sample = min(10, max(6, 2 + int(1.2 * num_seqs)))   # insertion positions to sample
+    rem_all_threshold = 14                                     # when few remain, consider all txns
+    # Local insertion beam
+    base_beam_width = max(3, min(6, 2 + num_seqs // 2))       # keep multiple good partials
+    diversity_suffix_len = 2
+    # Lookahead sampling
+    k_look_txn = max(4, min(8, 2 + num_seqs // 2))            # number of txns to sample for 1-step lookahead
+    # Iterated local search parameters
+    perturbations = max(2, min(4, int(num_seqs) // 4))
+    random_swap_trials = 3
+    # LNS parameters
+    lns_iters = max(2, min(6, 2 + num_seqs // 3))
+    destroy_frac_range = (0.08, 0.18)
+    lns_regret_prob = 0.6
+
+    # Helper to generate insertion position samples; evaluate all when small
+=======
+    # Parameterization (tuned for quality/runtime balance)
+    elite_seeds = max(2, min(6, int(num_seqs)))           # number of elite singleton starts
+    random_seeds = max(1, min(3, int(num_seqs) // 4))     # random additional starts
+    # Candidate sampling sizes
+    k_txn_sample = min(16, max(8, 2 + int(1.5 * num_seqs)))   # txns to consider per insertion
+    k_pos_sample = min(10, max(6, 2 + int(1.2 * num_seqs)))   # insertion positions to sample
+    rem_all_threshold = 14                                     # when few remain, consider all txns
+    # Local insertion beam
+    base_beam_width = max(3, min(6, 2 + num_seqs // 2))       # keep multiple good partials
+    diversity_suffix_len = 2
+    # Lookahead sampling
+    k_look_txn = max(4, min(8, 2 + num_seqs // 2))            # number of txns to sample for 1-step lookahead
+    # Iterated local search parameters
+    perturbations = max(2, min(4, int(num_seqs) // 4))
+    random_swap_trials = 3
+    # LNS parameters
+    lns_iters = max(2, min(6, 2 + num_seqs // 3))
+    destroy_frac_range = (0.08, 0.18)
+    lns_regret_prob = 0.6
+    # Elite and cache controls
+    elite_size = max(3, min(6, 2 + num_seqs // 3))
+    best_two_cache_cap = 20000
+
+    # Helper to generate insertion position samples; evaluate all when small
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def position_samples(seq_len, focus_idx=None, k_positions=None):
+        if seq_len <= 1:
+            return [0, seq_len]
+        # For short sequences, check all positions for accuracy
+        if seq_len <= 12:
+            return list(range(seq_len + 1))
+        k = k_positions if k_positions is not None else k_pos_sample
+        pos_set = {0, seq_len, seq_len // 2}
+        if focus_idx is not None:
+            for d in (-3, -2, -1, 0, 1, 2, 3):
+                p = focus_idx + d
+                if 0 <= p <= seq_len:
+                    pos_set.add(p)
+        for _ in range(min(k, seq_len + 1)):
+            pos_set.add(random.randint(0, seq_len))
+        return sorted(pos_set)
+=======
+    def position_samples(seq_len, focus_idx=None, k_positions=None):
+        if seq_len <= 1:
+            return [0, seq_len]
+        # For short sequences, check all positions for accuracy
+        if seq_len <= 12:
+            return list(range(seq_len + 1))
+        k = k_positions if k_positions is not None else k_pos_sample
+        pos_set = {0, seq_len, seq_len // 2}
+        if focus_idx is not None:
+            for d in (-3, -2, -1, 0, 1, 2, 3):
+                p = focus_idx + d
+                if 0 <= p <= seq_len:
+                    pos_set.add(p)
+        # Deterministic sampling to improve cache reuse
+        seed_tuple = (seq_len, focus_idx if focus_idx is not None else -1, k)
+        rng = random.Random(hash(seed_tuple) & 0xffffffff)
+        for _ in range(min(k, seq_len + 1)):
+            pos_set.add(rng.randint(0, seq_len))
+        return sorted(pos_set)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def evaluate_best_two_positions(base_seq, t, pos_list):
+        key = (tuple(base_seq), t, tuple(pos_list))
+        if key in best_two_cache:
+            return best_two_cache[key]
+        best = (float('inf'), None)
+        second = float('inf')
+        for p in pos_list:
+            cand = base_seq[:p] + [t] + base_seq[p:]
+            c = seq_cost(cand)
+            if c < best[0]:
+                second = best[0]
+                best = (c, p)
+            elif c < second:
+                second = c
+        res = (best[0], best[1], second)
+        best_two_cache[key] = res
+        return res
+=======
+    def evaluate_best_two_positions(base_seq, t, pos_list):
+        key = (tuple(base_seq), t, tuple(pos_list))
+        if key in best_two_cache:
+            return best_two_cache[key]
+        best = (float('inf'), None)
+        second = float('inf')
+        for p in pos_list:
+            cand = base_seq[:p] + [t] + base_seq[p:]
+            c = seq_cost(cand)
+            if c < best[0]:
+                second = best[0]
+                best = (c, p)
+            elif c < second:
+                second = c
+        res = (best[0], best[1], second)
+        best_two_cache[key] = res
+        if len(best_two_cache) > best_two_cache_cap:
+            best_two_cache.clear()
+        return res
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # LNS destroy-and-repair: remove a subset and rebuild via regret-guided insertion
+    def lns_attempt(seq):
+        cur = seq[:]
+        frac = random.uniform(*destroy_frac_range)
+        m = max(4, min(n // 2, int(frac * n)))
+        # Choose removal indices: random subset or contiguous block
+        if random.random() < 0.5:
+            remove_idxs = sorted(random.sample(range(n), m))
+        else:
+            start = random.randint(0, n - m)
+            remove_idxs = list(range(start, start + m))
+        remove_set = set(remove_idxs)
+        removed = [cur[i] for i in remove_idxs]
+        remaining = [cur[i] for i in range(n) if i not in remove_set]
+
+        seq_rep = remaining[:]
+        rem_set = removed[:]
+        while rem_set:
+            if len(rem_set) > k_txn_sample:
+                cand_txns = random.sample(rem_set, k_txn_sample)
+            else:
+                cand_txns = rem_set[:]
+            best_overall = (float('inf'), None, None)  # cost, txn, pos
+            best_by_regret = (float('-inf'), None, None)  # regret, txn, pos
+
+            pos_list = position_samples(len(seq_rep))
+            for t in cand_txns:
+                best_c, best_p, second_c = evaluate_best_two_positions(seq_rep, t, pos_list)
+                regret = (second_c - best_c) if second_c < float('inf') else 0.0
+                if best_c < best_overall[0]:
+                    best_overall = (best_c, t, best_p)
+                if regret > best_by_regret[0]:
+                    best_by_regret = (regret, t, best_p)
+
+            pick_regret = (random.random() < lns_regret_prob)
+            chosen = best_by_regret if pick_regret and best_by_regret[1] is not None else best_overall
+            t = chosen[1]
+            p = chosen[2] if chosen[2] is not None else len(seq_rep)
+            if t is None:
+                t = random.choice(rem_set)
+                p = len(seq_rep)
+            seq_rep = seq_rep[:p] + [t] + seq_rep[p:]
+            rem_set.remove(t)
+
+        c_rep, s_rep = local_refine(seq_rep)
+        return c_rep, s_rep
+=======
+    # LNS destroy-and-repair: remove a subset and rebuild via regret-guided insertion
+    def lns_attempt(seq):
+        cur = seq[:]
+        frac = random.uniform(*destroy_frac_range)
+        m = max(4, min(n // 2, int(frac * n)))
+        # Choose removal indices: random subset or contiguous block
+        if random.random() < 0.5:
+            remove_idxs = sorted(random.sample(range(n), m))
+        else:
+            start = random.randint(0, n - m)
+            remove_idxs = list(range(start, start + m))
+        remove_set = set(remove_idxs)
+        removed = [cur[i] for i in remove_idxs]
+        remaining = [cur[i] for i in range(n) if i not in remove_set]
+
+        seq_rep = remaining[:]
+        rem_set = removed[:]
+        while rem_set:
+            if len(rem_set) > k_txn_sample:
+                cand_txns = random.sample(rem_set, k_txn_sample)
+            else:
+                cand_txns = rem_set[:]
+            best_overall = (float('inf'), None, None)  # cost, txn, pos
+            best_by_regret = (float('-inf'), None, None)  # regret, txn, pos
+
+            pos_list = position_samples(len(seq_rep))
+            for t in cand_txns:
+                best_c, best_p, second_c = evaluate_best_two_positions(seq_rep, t, pos_list)
+                regret = (second_c - best_c) if second_c < float('inf') else 0.0
+                if best_c < best_overall[0]:
+                    best_overall = (best_c, t, best_p)
+                if regret > best_by_regret[0]:
+                    best_by_regret = (regret, t, best_p)
+
+            pick_regret = (random.random() < lns_regret_prob)
+            chosen = best_by_regret if pick_regret and best_by_regret[1] is not None else best_overall
+            t = chosen[1]
+            p = chosen[2] if chosen[2] is not None else len(seq_rep)
+            if t is None:
+                t = random.choice(rem_set)
+                p = len(seq_rep)
+            seq_rep = seq_rep[:p] + [t] + seq_rep[p:]
+            rem_set.remove(t)
+
+        c_rep, s_rep = local_refine(seq_rep)
+        return c_rep, s_rep
+
+    # Path Relinking: move current solution towards target elite by aligning positions
+    def path_relink(source_seq, target_seq, max_moves=12):
+        pos_in_target = {t: i for i, t in enumerate(target_seq)}
+        s = source_seq[:]
+        best_c = seq_cost(s)
+        best_s = s[:]
+        moves = 0
+        # Choose items with largest position displacement
+        displacement = [(abs(i - pos_in_target[s[i]]), i) for i in range(n)]
+        displacement.sort(reverse=True)
+        for _, idx in displacement:
+            if moves >= max_moves:
+                break
+            item = s[idx]
+            desired = pos_in_target[item]
+            if desired == idx:
+                continue
+            base = s[:idx] + s[idx + 1:]
+            # Insert at desired (bounded within current length)
+            desired = max(0, min(desired, len(base)))
+            cand = base[:desired] + [item] + base[desired:]
+            c = seq_cost(cand)
+            if c < best_c:
+                best_c = c
+                best_s = cand[:]
+                s = cand
+                moves += 1
+        return best_c, best_s
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build schedules from seeds and keep the best
+    best_overall_cost = float('inf')
+    best_overall_seq = None
+
+    for seed in seed_txns:
+        seq0 = build_from_seed(seed)
+        # Local refinement
+        c1, s1 = local_refine(seq0)
+        if c1 < best_overall_cost:
+            best_overall_cost = c1
+            best_overall_seq = s1
+=======
+    # Build schedules from seeds, maintain elite pool, and keep the best
+    elite = []
+    def add_elite(c, s):
+        nonlocal elite
+        elite.append((c, s))
+        elite.sort(key=lambda x: x[0])
+        # keep unique by suffix-2 for diversity
+        uniq = []
+        seen_sig = set()
+        for c1, s1 in elite:
+            sig = tuple(s1[-2:]) if len(s1) >= 2 else tuple(s1)
+            if sig in seen_sig:
+                continue
+            seen_sig.add(sig)
+            uniq.append((c1, s1))
+            if len(uniq) >= elite_size:
+                break
+        elite = uniq
+
+    best_overall_cost = float('inf')
+    best_overall_seq = None
+
+    for seed in seed_txns:
+        seq0 = build_from_seed(seed)
+        # Local refinement
+        c1, s1 = local_refine(seq0)
+        add_elite(c1, s1)
+        if c1 < best_overall_cost:
+            best_overall_cost = c1
+            best_overall_seq = s1
+
+    # Path relinking among elites for additional improvement
+    if len(elite) >= 2:
+        base_cost, base_seq = best_overall_cost, best_overall_seq
+        partners = elite[1:min(len(elite), elite_size)]
+        for c_t, s_t in partners:
+            pr_c, pr_s = path_relink(base_seq, s_t, max_moves=max(8, min(12, n // 8)))
+            if pr_c < best_overall_cost:
+                lc, ls = local_refine(pr_s)
+                if lc < best_overall_cost:
+                    best_overall_cost, best_overall_seq = lc, ls
+                    add_elite(lc, ls)
+                else:
+                    best_overall_cost, best_overall_seq = pr_c, pr_s
+                    add_elite(pr_c, pr_s)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(perturbations):
+        pert = best_overall_seq[:]
+        # Apply a random segment reversal to escape local minima
+        if n > 3:
+            i = random.randint(0, n - 2)
+            j = random.randint(i + 1, n - 1)
+            pert = pert[:i] + pert[i:j + 1][::-1] + pert[j + 1:]
+        # Plus a few random swaps
+        for _trial in range(random_swap_trials):
+            i = random.randint(0, n - 1)
+            j = random.randint(0, n - 1)
+            if i != j:
+                pert[i], pert[j] = pert[j], pert[i]
+        c2, s2 = local_refine(pert)
+        if c2 < best_overall_cost:
+            best_overall_cost = c2
+            best_overall_seq = s2
+=======
+    for _ in range(perturbations):
+        pert = best_overall_seq[:]
+        # Apply a random segment reversal to escape local minima
+        if n > 3:
+            i = random.randint(0, n - 2)
+            j = random.randint(i + 1, n - 1)
+            pert = pert[:i] + pert[i:j + 1][::-1] + pert[j + 1:]
+        # Plus a few random swaps
+        for _trial in range(random_swap_trials):
+            i = random.randint(0, n - 1)
+            j = random.randint(0, n - 1)
+            if i != j:
+                pert[i], pert[j] = pert[j], pert[i]
+        c2, s2 = local_refine(pert)
+        if c2 < best_overall_cost:
+            best_overall_cost = c2
+            best_overall_seq = s2
+            add_elite(c2, s2)
+
+    # After ILS, try path relinking again with elite partners
+    if 'elite' in locals() and len(elite) >= 2:
+        base_seq = best_overall_seq
+        partners = elite[1:min(len(elite), elite_size)]
+        for c_t, s_t in partners:
+            pr_c, pr_s = path_relink(base_seq, s_t, max_moves=max(8, min(12, n // 8)))
+            if pr_c < best_overall_cost:
+                lc, ls = local_refine(pr_s)
+                if lc < best_overall_cost:
+                    best_overall_cost, best_overall_seq = lc, ls
+                    add_elite(lc, ls)
+                else:
+                    best_overall_cost, best_overall_seq = pr_c, pr_s
+                    add_elite(pr_c, pr_s)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(lns_iters):
+        c3, s3 = lns_attempt(best_overall_seq)
+        if c3 < best_overall_cost:
+            best_overall_cost = c3
+            best_overall_seq = s3
+=======
+    for _ in range(lns_iters):
+        c3, s3 = lns_attempt(best_overall_seq)
+        if c3 < best_overall_cost:
+            best_overall_cost = c3
+            best_overall_seq = s3
+            if 'elite' in locals():
+                add_elite(c3, s3)
+
+    # Final path relinking attempt among elites
+    if 'elite' in locals() and len(elite) >= 2:
+        base_seq = best_overall_seq
+        partners = elite[1:min(len(elite), elite_size)]
+        for c_t, s_t in partners:
+            pr_c, pr_s = path_relink(base_seq, s_t, max_moves=max(8, min(12, n // 8)))
+            if pr_c < best_overall_cost:
+                lc, ls = local_refine(pr_s)
+                if lc < best_overall_cost:
+                    best_overall_cost, best_overall_seq = lc, ls
+                    add_elite(lc, ls)
+                else:
+                    best_overall_cost, best_overall_seq = pr_c, pr_s
+                    add_elite(pr_c, pr_s)
+>>>>>>> REPLACE
+</DIFF>

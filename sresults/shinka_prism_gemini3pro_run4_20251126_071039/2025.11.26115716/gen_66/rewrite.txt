@@ -1,0 +1,272 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+import math
+
+GPU_MEM_SIZE = 80.0
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Algorithm:
+    1. Binary Search for optimal K (Max KVPR).
+    2. Feasibility Check:
+       - Greedy Best-Fit with multiple sort keys:
+         - Linearized Cost: w + K*s
+         - Physical Size: s
+         - Asymptotic Pressure: w / (C - s)
+       - Beam Search (Width=5) on Linearized Cost if Greedy fails.
+    3. Local Search (Hill Climbing):
+       - Refines valid placements by moving/swapping items from the bottleneck GPU.
+    """
+
+    # Preprocess models
+    items = []
+    for m in models:
+        items.append({
+            'model': m,
+            'w': m.req_rate / m.slo,
+            's': m.model_size
+        })
+
+    def calc_kvpr(w, s):
+        """Calculate KVPR safely."""
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-9:
+            return float('inf') if w > 1e-9 else 0.0
+        return w / rem
+
+    def get_max_kvpr(placement_list):
+        """Calculate max KVPR for a list of lists placement."""
+        mx = 0.0
+        for p in placement_list:
+            w = sum(x['w'] for x in p)
+            s = sum(x['s'] for x in p)
+            mx = max(mx, calc_kvpr(w, s))
+        return mx
+
+    def try_pack_greedy(k_target, ordered_items):
+        """Greedy Best-Fit Decreasing Packing."""
+        limit = k_target * GPU_MEM_SIZE
+        bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+        
+        for item in ordered_items:
+            w, s = item['w'], item['s']
+            cost = w + k_target * s
+            
+            best_idx = -1
+            best_fill = -1.0
+            
+            for i in range(gpu_num):
+                b = bins[i]
+                if b['s'] + s > GPU_MEM_SIZE: continue
+                
+                # Linearized Constraint: current_load + cost <= limit
+                curr_lin = b['w'] + k_target * b['s']
+                if curr_lin + cost > limit + 1e-7: continue
+                
+                # Best Fit: Pick bin with highest load that fits item
+                if curr_lin > best_fill:
+                    best_fill = curr_lin
+                    best_idx = i
+            
+            if best_idx != -1:
+                bins[best_idx]['w'] += w
+                bins[best_idx]['s'] += s
+                bins[best_idx]['items'].append(item)
+            else:
+                return None
+        return [b['items'] for b in bins]
+
+    def try_pack_beam(k_target, width=5):
+        """Beam Search Packing."""
+        limit = k_target * GPU_MEM_SIZE
+        
+        # Filter and sort items by Linearized Cost
+        valid_items = []
+        for x in items:
+            cost = x['w'] + k_target * x['s']
+            # Implicit physical check via limit, but safe to filter massive items
+            if cost > limit + 1e-5: return None
+            valid_items.append((cost, x))
+        
+        valid_items.sort(key=lambda x: x[0], reverse=True)
+        
+        # State: (heuristic_score, loads_tuple, placement_tuple)
+        # We use tuples for immutability and hashing/checking
+        start_loads = tuple([0.0] * gpu_num)
+        start_pl = tuple([() for _ in range(gpu_num)])
+        
+        beam = [(0.0, start_loads, start_pl)]
+        
+        for cost, item in valid_items:
+            candidates = []
+            
+            for score, loads, pl in beam:
+                tried_loads = set()
+                
+                for i in range(gpu_num):
+                    if loads[i] in tried_loads: continue
+                    
+                    if loads[i] + cost <= limit + 1e-7:
+                        tried_loads.add(loads[i])
+                        
+                        # New State
+                        new_loads_list = list(loads)
+                        new_loads_list[i] += cost
+                        new_loads = tuple(new_loads_list)
+                        
+                        # Heuristic: Sum of squares (Best Fit equivalent)
+                        new_score = sum(l*l for l in new_loads)
+                        
+                        new_pl_list = list(pl)
+                        new_pl_list[i] = pl[i] + (item,)
+                        new_pl = tuple(new_pl_list)
+                        
+                        candidates.append((new_score, new_loads, new_pl))
+            
+            if not candidates: return None
+            
+            # Keep top 'width' candidates
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = candidates[:width]
+            
+        return [list(p) for p in beam[0][2]]
+
+    def check_placement(k_target):
+        # 1. Deterministic Greedy Heuristics
+        strategies = [
+            lambda x: x['w'] + k_target * x['s'],            # Linearized Cost
+            lambda x: x['s'],                                # Size
+            lambda x: x['w'] / (GPU_MEM_SIZE - x['s'] + 1e-5)# Asymptotic Pressure
+        ]
+        
+        for key in strategies:
+            res = try_pack_greedy(k_target, sorted(items, key=key, reverse=True))
+            if res: return res
+            
+        # 2. Beam Search Fallback
+        return try_pack_beam(k_target, width=5)
+
+    def local_optimize(placement_list):
+        """Steepest Descent Hill Climbing."""
+        # Mutable state
+        state = []
+        for p in placement_list:
+            w = sum(x['w'] for x in p)
+            s = sum(x['s'] for x in p)
+            state.append({'w': w, 's': s, 'items': list(p)})
+            
+        # Limit iterations for speed
+        for _ in range(50):
+            # Identify Bottleneck
+            max_k = -1.0
+            src_idx = -1
+            gpu_k = []
+            
+            for i, st in enumerate(state):
+                k = calc_kvpr(st['w'], st['s'])
+                gpu_k.append(k)
+                if k > max_k:
+                    max_k = k
+                    src_idx = i
+            
+            if max_k <= 1e-9: break
+            
+            src = state[src_idx]
+            improved = False
+            
+            # Operator 1: Move (Src -> Dst)
+            for i, item in enumerate(src['items']):
+                # Projected Src
+                ns_w = src['w'] - item['w']
+                ns_s = src['s'] - item['s']
+                ns_k = calc_kvpr(ns_w, ns_s)
+                
+                # Pruning
+                if ns_k >= max_k - 1e-9: continue
+                
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = state[dst_idx]
+                    
+                    if dst['s'] + item['s'] > GPU_MEM_SIZE: continue
+                    
+                    nd_k = calc_kvpr(dst['w'] + item['w'], dst['s'] + item['s'])
+                    
+                    if nd_k < max_k - 1e-9:
+                        # Apply Move
+                        src['items'].pop(i)
+                        src['w'], src['s'] = ns_w, ns_s
+                        dst['items'].append(item)
+                        dst['w'] += item['w']
+                        dst['s'] += item['s']
+                        improved = True
+                        break
+                if improved: break
+            
+            if improved: continue
+            
+            # Operator 2: Swap (Src <-> Dst)
+            for i, m1 in enumerate(src['items']):
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = state[dst_idx]
+                    if gpu_k[dst_idx] > max_k * 0.95: continue
+                    
+                    for j, m2 in enumerate(dst['items']):
+                        ns_s = src['s'] - m1['s'] + m2['s']
+                        nd_s = dst['s'] - m2['s'] + m1['s']
+                        if ns_s > GPU_MEM_SIZE or nd_s > GPU_MEM_SIZE: continue
+                        
+                        ns_w = src['w'] - m1['w'] + m2['w']
+                        nd_w = dst['w'] - m2['w'] + m1['w']
+                        
+                        ns_k = calc_kvpr(ns_w, ns_s)
+                        nd_k = calc_kvpr(nd_w, nd_s)
+                        
+                        if max(ns_k, nd_k) < max_k - 1e-9:
+                            # Apply Swap
+                            src['items'][i] = m2
+                            dst['items'][j] = m1
+                            src['w'], src['s'] = ns_w, ns_s
+                            dst['w'], dst['s'] = nd_w, nd_s
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+            
+            if not improved: break
+            
+        return [p['items'] for p in state]
+
+    # Main Binary Search Loop
+    high = 1e9
+    best_pl = check_placement(high)
+    
+    if best_pl is None:
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+    
+    best_pl = local_optimize(best_pl)
+    high = get_max_kvpr(best_pl)
+    low = 0.0
+    
+    for _ in range(20):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+        
+        res = check_placement(mid)
+        if res:
+            res = local_optimize(res)
+            mx = get_max_kvpr(res)
+            if mx < get_max_kvpr(best_pl):
+                best_pl = res
+            high = min(mid, mx)
+        else:
+            low = mid
+            
+    # Format Output
+    return {i: [x['model'] for x in p] for i, p in enumerate(best_pl)}
+# EVOLVE-BLOCK-END

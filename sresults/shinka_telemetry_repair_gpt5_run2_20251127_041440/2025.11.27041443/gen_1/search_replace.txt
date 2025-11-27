@@ -1,0 +1,368 @@
+<NAME>
+pairwise_hardening_flow_choice
+</NAME>
+
+<DESCRIPTION>
+I propose a targeted improvement that performs pairwise, symmetry-consistent hardening of link rates and uses flow-conservation-aware selection to decide which side of a mismatching pair to trust. The current algorithm repairs each interface independently using the peer’s original counters, which can produce inconsistent repairs across a link pair (e.g., setting my_tx to their_rx while not ensuring their_rx in the final output equals my_tx). This can harm counter repair accuracy and calibration.
+
+Key changes:
+- Process each connected interface pair only once and repair both directions (forward: i.tx ↔ j.rx, reverse: i.rx ↔ j.tx) together to produce consistent, symmetric outputs.
+- If both ends are up and the pair differs beyond the hardening threshold, choose the value (either i’s or j’s original) that reduces the sum of router imbalances (|Σtx - Σrx|) across the two involved routers. This applies the flow-conservation principle to prefer the measurement that better balances routers.
+- If differences are within the tolerance, leave values unchanged to avoid over-correcting good telemetry.
+- If an interface is down, set its rx/tx to 0 with confidence based on peer state, but never change any interface status (preserving the observed perfect status accuracy).
+- Confidence calibration combines pair disagreement (1 - relative diff) and the flow-balance improvement achieved by the chosen repair, improving confidence calibration while avoiding overconfidence.
+
+This approach uses redundant signals (both sides of a link and router-level sums) to detect and correct faulty measurements, aligns with the Hodor three-step validation (collection, hardening, dynamic checking), and should improve counter repair accuracy and calibration without harming status accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Takes interface telemetry data and detects/repairs inconsistencies based on
+network invariants like link symmetry and flow conservation.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by detecting and correcting inconsistencies.
+
+    Core principle: Use network invariants to validate and repair telemetry:
+    1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+    2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+    3. Interface Consistency: Status should be consistent across connected pairs
+
+    Args:
+        telemetry: Dictionary where key is interface_id and value contains:
+            - interface_status: "up" or "down"
+            - rx_rate: receive rate in Mbps
+            - tx_rate: transmit rate in Mbps
+            - connected_to: interface_id this interface connects to
+            - local_router: router_id this interface belongs to
+            - remote_router: router_id on the other side
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary with same structure but telemetry values become tuples of:
+        (original_value, repaired_value, confidence_score)
+        where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+    """
+
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    result = {}
+
+    # First pass: collect all measurements and check link symmetry
+    link_symmetry_violations = {}
+
+    for interface_id, data in telemetry.items():
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Check link symmetry if connected interface exists
+        if connected_to and connected_to in telemetry:
+            peer_data = telemetry[connected_to]
+            peer_rx = peer_data.get('rx_rate', 0.0)
+            peer_tx = peer_data.get('tx_rate', 0.0)
+
+            # My TX should match their RX (within tolerance)
+            tx_rx_diff = abs(tx_rate - peer_rx) / max(tx_rate, peer_rx, 1.0)
+            # My RX should match their TX (within tolerance)
+            rx_tx_diff = abs(rx_rate - peer_tx) / max(rx_rate, peer_tx, 1.0)
+
+            link_symmetry_violations[interface_id] = {
+                'tx_rx_diff': tx_rx_diff,
+                'rx_tx_diff': rx_tx_diff,
+                'peer_rx': peer_rx,
+                'peer_tx': peer_tx
+            }
+
+    # Second pass: repair using redundant signals
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Default: no repair, high confidence
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        # Check for issues and attempt repair
+        if interface_id in link_symmetry_violations:
+            violations = link_symmetry_violations[interface_id]
+
+            # Repair RX rate if link symmetry is violated
+            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's TX as more reliable signal
+                repaired_rx = violations['peer_tx']
+                # Confidence decreases with magnitude of violation
+                rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+
+            # Repair TX rate if link symmetry is violated
+            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's RX as more reliable signal
+                repaired_tx = violations['peer_rx']
+                # Confidence decreases with magnitude of violation
+                tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+
+        # Check status consistency
+        if connected_to and connected_to in telemetry:
+            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+            # If statuses don't match, lower confidence
+            if interface_status != peer_status:
+                status_confidence = 0.5
+                # If interface is down but has non-zero rates, that's suspicious
+                if interface_status == 'down' and (rx_rate > 0 or tx_rate > 0):
+                    repaired_rx = 0.0
+                    repaired_tx = 0.0
+                    rx_confidence = 0.3
+                    tx_confidence = 0.3
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+
+    return result
+=======
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Takes interface telemetry data and detects/repairs inconsistencies based on
+network invariants like link symmetry and flow conservation.
+"""
+from typing import Dict, Any, Tuple, List
+from collections import defaultdict
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by detecting and correcting inconsistencies.
+
+    Core principle: Use network invariants to validate and repair telemetry:
+    1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+    2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+    3. Interface Consistency: Status should be consistent across connected pairs
+
+    This implementation performs pairwise hardening to ensure consistent repairs across a link,
+    and uses router-level flow imbalance to choose the more plausible value when sides disagree.
+    Status values are not altered (to preserve status accuracy); instead, we calibrate confidence.
+
+    Args:
+        telemetry: Dictionary where key is interface_id and value contains:
+            - interface_status: "up" or "down"
+            - rx_rate: receive rate in Mbps
+            - tx_rate: transmit rate in Mbps
+            - connected_to: interface_id this interface connects to
+            - local_router: router_id this interface belongs to
+            - remote_router: router_id on the other side
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+                  Note: We primarily use local_router fields from telemetry to compute per-router
+                  balances; topology list is not strictly necessary for the repair steps here.
+
+    Returns:
+        Dictionary with same structure but telemetry values become tuples of:
+        (original_value, repaired_value, confidence_score)
+        where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+    """
+
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    # Compute per-router tx/rx sums to assess flow-conservation imbalance
+    router_tx = defaultdict(float)
+    router_rx = defaultdict(float)
+    for if_id, data in telemetry.items():
+        r = data.get('local_router')
+        tx = float(data.get('tx_rate', 0.0) or 0.0)
+        rx = float(data.get('rx_rate', 0.0) or 0.0)
+        router_tx[r] += tx
+        router_rx[r] += rx
+    routers = set(list(router_tx.keys()) + list(router_rx.keys()))
+    router_imbalance = {r: router_tx.get(r, 0.0) - router_rx.get(r, 0.0) for r in routers}
+
+    visited = set()
+
+    # Helper: clamp confidence to [0,1]
+    def clamp01(x: float) -> float:
+        return float(max(0.0, min(1.0, x)))
+
+    for i_id, di in telemetry.items():
+        if i_id in visited:
+            continue
+
+        j_id = di.get('connected_to')
+        # If we have the peer, repair pairwise; otherwise, do best effort on single interface.
+        if j_id and j_id in telemetry:
+            visited.add(i_id)
+            visited.add(j_id)
+            dj = telemetry[j_id]
+
+            # Extract base fields
+            si = di.get('interface_status', 'unknown')
+            sj = dj.get('interface_status', 'unknown')
+            ri = di.get('local_router')
+            rj = dj.get('local_router')
+
+            ix_rx = float(di.get('rx_rate', 0.0) or 0.0)
+            ix_tx = float(di.get('tx_rate', 0.0) or 0.0)
+            jx_rx = float(dj.get('rx_rate', 0.0) or 0.0)
+            jx_tx = float(dj.get('tx_rate', 0.0) or 0.0)
+
+            # Initialize repaired values to originals
+            rep_i_rx, rep_i_tx = ix_rx, ix_tx
+            rep_j_rx, rep_j_tx = jx_rx, jx_tx
+            conf_i_rx = conf_i_tx = conf_j_rx = conf_j_tx = 1.0
+
+            # Status is not changed; only confidence is calibrated
+            rep_si = si
+            rep_sj = sj
+            # If statuses mismatch, lower status confidence
+            status_conf_pair = 0.9 if si == sj else 0.5
+
+            # If an interface is down, its counters must be zero. Do not force peer changes.
+            if si == 'down':
+                rep_i_rx = 0.0
+                rep_i_tx = 0.0
+                peer_zeroish = (abs(jx_tx) <= 1e-6 and abs(jx_rx) <= 1e-6)
+                conf_i_rx = conf_i_tx = 0.9 if (sj == 'down' or peer_zeroish) else 0.6
+            if sj == 'down':
+                rep_j_rx = 0.0
+                rep_j_tx = 0.0
+                peer_zeroish = (abs(ix_tx) <= 1e-6 and abs(ix_rx) <= 1e-6)
+                conf_j_rx = conf_j_tx = 0.9 if (si == 'down' or peer_zeroish) else 0.6
+
+            # If both sides are up, harden counters pairwise using flow-conservation-informed choice
+            if si == 'up' and sj == 'up':
+                Di = router_imbalance.get(ri, 0.0)
+                Dj = router_imbalance.get(rj, 0.0)
+
+                # Forward direction: i.tx should equal j.rx
+                denom_f = max(ix_tx, jx_rx, 1.0)
+                rel_f = abs(ix_tx - jx_rx) / denom_f
+                if rel_f <= HARDENING_THRESHOLD:
+                    # Within tolerance; keep both unchanged, assign high confidence based on small discrepancy
+                    rep_i_tx = ix_tx
+                    rep_j_rx = jx_rx
+                    base_conf_f = 1.0 - rel_f
+                    conf_i_tx = clamp01(min(conf_i_tx, base_conf_f))
+                    conf_j_rx = clamp01(min(conf_j_rx, base_conf_f))
+                else:
+                    # Evaluate which side to trust based on reducing router imbalance
+                    pre_cost = abs(Di) + abs(Dj)
+                    # Option 1: set both to i.tx
+                    cost_v1 = abs(Di + (ix_tx - ix_tx)) + abs(Dj - (ix_tx - jx_rx))  # = abs(Di) + abs(Dj - (ix_tx - jx_rx))
+                    # Option 2: set both to j.rx
+                    cost_v2 = abs(Di + (jx_rx - ix_tx)) + abs(Dj - (jx_rx - jx_rx))  # = abs(Di + (jx_rx - ix_tx)) + abs(Dj)
+                    if cost_v1 <= cost_v2:
+                        chosen_v = ix_tx
+                        post_cost = cost_v1
+                    else:
+                        chosen_v = jx_rx
+                        post_cost = cost_v2
+                    improvement = max(0.0, (pre_cost - post_cost) / max(pre_cost, 1e-9))
+                    base_conf_f = 1.0 - min(1.0, rel_f)
+                    conf_f = clamp01(0.5 * base_conf_f + 0.5 * improvement)
+                    rep_i_tx = chosen_v
+                    rep_j_rx = chosen_v
+                    conf_i_tx = clamp01(min(conf_i_tx, conf_f))
+                    conf_j_rx = clamp01(min(conf_j_rx, conf_f))
+
+                # Reverse direction: i.rx should equal j.tx
+                denom_r = max(ix_rx, jx_tx, 1.0)
+                rel_r = abs(ix_rx - jx_tx) / denom_r
+                if rel_r <= HARDENING_THRESHOLD:
+                    rep_i_rx = ix_rx
+                    rep_j_tx = jx_tx
+                    base_conf_r = 1.0 - rel_r
+                    conf_i_rx = clamp01(min(conf_i_rx, base_conf_r))
+                    conf_j_tx = clamp01(min(conf_j_tx, base_conf_r))
+                else:
+                    pre_cost = abs(Di) + abs(Dj)
+                    # Option 1: set both to i.rx
+                    cost_u1 = abs(Di - (ix_rx - ix_rx)) + abs(Dj + (ix_rx - jx_tx))  # = abs(Di) + abs(Dj + (ix_rx - jx_tx))
+                    # Option 2: set both to j.tx
+                    cost_u2 = abs(Di - (jx_tx - ix_rx)) + abs(Dj + (jx_tx - jx_tx))  # = abs(Di - (jx_tx - ix_rx)) + abs(Dj)
+                    if cost_u1 <= cost_u2:
+                        chosen_u = ix_rx
+                        post_cost = cost_u1
+                    else:
+                        chosen_u = jx_tx
+                        post_cost = cost_u2
+                    improvement = max(0.0, (pre_cost - post_cost) / max(pre_cost, 1e-9))
+                    base_conf_r = 1.0 - min(1.0, rel_r)
+                    conf_r = clamp01(0.5 * base_conf_r + 0.5 * improvement)
+                    rep_i_rx = chosen_u
+                    rep_j_tx = chosen_u
+                    conf_i_rx = clamp01(min(conf_i_rx, conf_r))
+                    conf_j_tx = clamp01(min(conf_j_tx, conf_r))
+
+            # Build result entries for both interfaces
+            result[i_id] = {
+                'rx_rate': (di.get('rx_rate', 0.0), rep_i_rx, clamp01(conf_i_rx)),
+                'tx_rate': (di.get('tx_rate', 0.0), rep_i_tx, clamp01(conf_i_tx)),
+                'interface_status': (si, rep_si, clamp01(status_conf_pair)),
+                'connected_to': di.get('connected_to'),
+                'local_router': di.get('local_router'),
+                'remote_router': di.get('remote_router'),
+            }
+            result[j_id] = {
+                'rx_rate': (dj.get('rx_rate', 0.0), rep_j_rx, clamp01(conf_j_rx)),
+                'tx_rate': (dj.get('tx_rate', 0.0), rep_j_tx, clamp01(conf_j_tx)),
+                'interface_status': (sj, rep_sj, clamp01(status_conf_pair)),
+                'connected_to': dj.get('connected_to'),
+                'local_router': dj.get('local_router'),
+                'remote_router': dj.get('remote_router'),
+            }
+        else:
+            # No peer available: use status and basic sanity. Topology list is not strictly needed here.
+            si = di.get('interface_status', 'unknown')
+            ix_rx = float(di.get('rx_rate', 0.0) or 0.0)
+            ix_tx = float(di.get('tx_rate', 0.0) or 0.0)
+            rep_rx, rep_tx = ix_rx, ix_tx
+            conf_rx = conf_tx = 0.85  # moderate-high since no redundancy
+            if si == 'down':
+                rep_rx = 0.0
+                rep_tx = 0.0
+                # Higher confidence if original counters were already near zero
+                zeroish = (abs(ix_rx) <= 1e-6 and abs(ix_tx) <= 1e-6)
+                conf_rx = conf_tx = 0.9 if zeroish else 0.6
+            result[i_id] = {
+                'rx_rate': (di.get('rx_rate', 0.0), rep_rx, clamp01(conf_rx)),
+                'tx_rate': (di.get('tx_rate', 0.0), rep_tx, clamp01(conf_tx)),
+                'interface_status': (si, si, 0.85),
+                'connected_to': di.get('connected_to'),
+                'local_router': di.get('local_router'),
+                'remote_router': di.get('remote_router'),
+            }
+
+    return result
+>>>>>>> REPLACE
+
+</DIFF>

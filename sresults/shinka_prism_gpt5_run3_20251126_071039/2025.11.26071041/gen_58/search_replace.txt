@@ -1,0 +1,511 @@
+<NAME>
+adaptive_retune_T_and_expand_combos
+</NAME>
+
+<DESCRIPTION>
+I replace the entire parametric_pack_candidates function to add an adaptive in-placement T retuning strategy and expand the candidate generation combinations. The new try_pack_retune performs a two-stage packing: it places about 40% of items using the initial near-optimal T, then retunes T down to the current realized maximum KVPR (bounded by lower bounds) and continues packing with updated transformed weights and capacities. This helps correct discretization effects and better equalize KVPR across GPUs. I also expand the candidate combinations to include ordering 2 with "minmax" and "hybrid" policies, and add two extra candidates using the retuning variant (hybrid and minmax) at the final T. These changes directly target minimizing the maximum KVPR while keeping the code simple and efficient, with small runtime overhead.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Parametric T-based transformed packing to directly minimize max KVPR
+    def parametric_pack_candidates():
+        # Lower bounds on T
+        indiv_lb = max(safe_div(n, max(GPU_MEM_SIZE - ms, 1e-9)) for _, ms, n in items)
+        global_lb = safe_div(total_n, max(total_capacity - total_mem, 1e-9))
+
+        # Pair bound for heavy pairs that cannot co-reside
+        pair_lb = 0.0
+        if gpu_num >= 2 and len(items) >= 2:
+            L = min(len(items), 120)
+            heavy = sorted(items, key=lambda it: it[1], reverse=True)[:L]
+            for i in range(len(heavy)):
+                _, mi, ni = heavy[i]
+                for j in range(i + 1, len(heavy)):
+                    _, mj, nj = heavy[j]
+                    if mi + mj > GPU_MEM_SIZE + 1e-12:
+                        denom = 2.0 * GPU_MEM_SIZE - (mi + mj)
+                        pair_lb = max(pair_lb, safe_div(ni + nj, max(denom, 1e-9)))
+
+        # Lightweight triplet bound to tighten T
+        triplet_lb = 0.0
+        if gpu_num >= 3 and len(items) >= 3:
+            Ltr = min(len(items), 60)
+            top_by_mem = sorted(items, key=lambda it: it[1], reverse=True)[:Ltr]
+            for i in range(Ltr):
+                mi, ni = top_by_mem[i][1], top_by_mem[i][2]
+                for j in range(i + 1, min(Ltr, i + 1 + 8)):
+                    mj, nj = top_by_mem[j][1], top_by_mem[j][2]
+                    for k in range(j + 1, min(Ltr, j + 1 + 8)):
+                        mk, nk = top_by_mem[k][1], top_by_mem[k][2]
+                        total_m = mi + mj + mk
+                        if total_m > 2.0 * GPU_MEM_SIZE + 1e-12:
+                            denom = 3.0 * GPU_MEM_SIZE - total_m
+                            triplet_lb = max(triplet_lb, safe_div(ni + nj + nk, max(denom, 1e-9)))
+
+        # k-prefix bound (small k)
+        kprefix_lb = 0.0
+        if items:
+            by_m = sorted(items, key=lambda it: it[1], reverse=True)
+            max_k = min(gpu_num, 6)
+            for k in range(1, max_k + 1):
+                s_m = 0.0
+                s_n = 0.0
+                for (_, ms, n) in by_m:
+                    s_m += ms
+                    s_n += n
+                    if s_m > (k - 1) * GPU_MEM_SIZE + 1e-12:
+                        break
+                denom = k * GPU_MEM_SIZE - s_m
+                kprefix_lb = max(kprefix_lb, safe_div(s_n, max(denom, 1e-9)))
+
+        low_T = max(0.0, indiv_lb, global_lb, pair_lb, triplet_lb, kprefix_lb)
+
+        # Try to pack at a given T with different orderings and a choice policy
+        # ordering:
+        #   0 -> by transformed weight w(T) = n + T*m
+        #   1 -> by intrinsic KVPR n / (80 - m)
+        #   2 -> by pressure per GB n / m
+        # policy:
+        #   "resid"  -> best-fit on transformed residual
+        #   "minmax" -> place to minimize new global max KVPR (actual KVPR metric)
+        def try_pack(T, ordering=0, policy="resid", return_placement=False):
+            cap = GPU_MEM_SIZE * T
+            eps = 1e-12
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            elif ordering == 1:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+            else:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(it[1], 1e-9)), it[2]), reverse=True)
+
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            for mdl, ms, n in ordered:
+                w = n + T * ms
+                best_choice = None
+
+                # Precompute current actual KVPRs for "minmax"/"hybrid" policy
+                cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)] if policy != "resid" else None
+                # Average memory fraction across GPUs after placing this item (independent of target GPU)
+                total_m_after = sum(m_sum) + ms
+                avg_mem_frac = total_m_after / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+                Tnorm = max(T, 1e-12)
+                alpha = 0.15
+                beta = 0.05
+
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap - (used_cap[g] + w)
+                    if resid < -eps:
+                        continue
+
+                    if policy == "resid":
+                        key = (resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    elif policy == "minmax":
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        # New global max if placed on g
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        # prefer smaller new_max, then smaller local, then residual, then more remaining mem, then id
+                        key = (new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    else:
+                        # Hybrid: combine projected global KVPR, local KVPR, and memory imbalance
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                        mem_imb = abs(mem_frac_after - avg_mem_frac)
+                        K_after_norm = max(0.0, new_max) / Tnorm
+                        kv_new_norm = new_local / Tnorm
+                        J = K_after_norm + alpha * kv_new_norm + beta * mem_imb
+                        key = (J, new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+
+                    if best_choice is None or key < best_choice[0]:
+                        best_choice = (key, g)
+
+                if best_choice is None:
+                    return (False, None) if return_placement else False
+
+                best_g = best_choice[1]
+                plc[best_g].append(mdl)
+                m_sum[best_g] += ms
+                n_sum[best_g] += n
+                used_cap[best_g] += w
+
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+
+        # For feasibility checks during search (keep minimal to stay fast)
+        def try_any(T, need_plc=False):
+            if need_plc:
+                feas = []
+                ok0, p0 = try_pack(T, 0, "resid", True)
+                ok1, p1 = try_pack(T, 1, "resid", True)
+                if ok0: feas.append(p0)
+                if ok1: feas.append(p1)
+                return (len(feas) > 0), feas
+            else:
+                return try_pack(T, 0, "resid", False) or try_pack(T, 1, "resid", False)
+
+        # Exponential search for an initial feasible T
+        T = max(low_T, 1e-9)
+        found = False
+        for _ in range(50):
+            if try_any(T, need_plc=False):
+                found = True
+                break
+            T *= 2.0
+        if not found:
+            return []
+
+        # Binary search to tighten T
+        low, high = low_T, T
+        for _ in range(40):
+            mid = (low + high) / 2.0
+            if try_any(mid, need_plc=False):
+                high = mid
+            else:
+                low = mid
+
+        # Build placements at near-optimal T across multiple orderings and a tiny T-neighborhood
+        all_plcs = []
+        Ts = [high, high * 0.995, high * 1.005, high * 0.99, high * 1.01]
+        combos = [
+            (0, "resid"), (1, "resid"), (2, "resid"),
+            (0, "minmax"), (1, "minmax"),
+            (0, "hybrid"), (1, "hybrid")
+        ]
+        for Tv in Ts:
+            for ov, pol in combos:
+                ok, plc = try_pack(Tv, ov, pol, True)
+                if ok:
+                    all_plcs.append(plc)
+
+        return all_plcs
+=======
+    # Parametric T-based transformed packing to directly minimize max KVPR
+    def parametric_pack_candidates():
+        # Lower bounds on T
+        indiv_lb = max(safe_div(n, max(GPU_MEM_SIZE - ms, 1e-9)) for _, ms, n in items)
+        global_lb = safe_div(total_n, max(total_capacity - total_mem, 1e-9))
+
+        # Pair bound for heavy pairs that cannot co-reside
+        pair_lb = 0.0
+        if gpu_num >= 2 and len(items) >= 2:
+            L = min(len(items), 120)
+            heavy = sorted(items, key=lambda it: it[1], reverse=True)[:L]
+            for i in range(len(heavy)):
+                _, mi, ni = heavy[i]
+                for j in range(i + 1, len(heavy)):
+                    _, mj, nj = heavy[j]
+                    if mi + mj > GPU_MEM_SIZE + 1e-12:
+                        denom = 2.0 * GPU_MEM_SIZE - (mi + mj)
+                        pair_lb = max(pair_lb, safe_div(ni + nj, max(denom, 1e-9)))
+
+        # Lightweight triplet bound to tighten T
+        triplet_lb = 0.0
+        if gpu_num >= 3 and len(items) >= 3:
+            Ltr = min(len(items), 60)
+            top_by_mem = sorted(items, key=lambda it: it[1], reverse=True)[:Ltr]
+            for i in range(Ltr):
+                mi, ni = top_by_mem[i][1], top_by_mem[i][2]
+                for j in range(i + 1, min(Ltr, i + 1 + 8)):
+                    mj, nj = top_by_mem[j][1], top_by_mem[j][2]
+                    for k in range(j + 1, min(Ltr, j + 1 + 8)):
+                        mk, nk = top_by_mem[k][1], top_by_mem[k][2]
+                        total_m = mi + mj + mk
+                        if total_m > 2.0 * GPU_MEM_SIZE + 1e-12:
+                            denom = 3.0 * GPU_MEM_SIZE - total_m
+                            triplet_lb = max(triplet_lb, safe_div(ni + nj + nk, max(denom, 1e-9)))
+
+        # k-prefix bound (small k)
+        kprefix_lb = 0.0
+        if items:
+            by_m = sorted(items, key=lambda it: it[1], reverse=True)
+            max_k = min(gpu_num, 6)
+            for k in range(1, max_k + 1):
+                s_m = 0.0
+                s_n = 0.0
+                for (_, ms, n) in by_m:
+                    s_m += ms
+                    s_n += n
+                    if s_m > (k - 1) * GPU_MEM_SIZE + 1e-12:
+                        break
+                denom = k * GPU_MEM_SIZE - s_m
+                kprefix_lb = max(kprefix_lb, safe_div(s_n, max(denom, 1e-9)))
+
+        low_T = max(0.0, indiv_lb, global_lb, pair_lb, triplet_lb, kprefix_lb)
+
+        # Try to pack at a given T with different orderings and a choice policy
+        # ordering:
+        #   0 -> by transformed weight w(T) = n + T*m
+        #   1 -> by intrinsic KVPR n / (80 - m)
+        #   2 -> by pressure per GB n / m
+        # policy:
+        #   "resid"  -> best-fit on transformed residual
+        #   "minmax" -> place to minimize new global max KVPR (actual KVPR metric)
+        def try_pack(T, ordering=0, policy="resid", return_placement=False):
+            cap = GPU_MEM_SIZE * T
+            eps = 1e-12
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            elif ordering == 1:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+            else:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(it[1], 1e-9)), it[2]), reverse=True)
+
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            for mdl, ms, n in ordered:
+                w = n + T * ms
+                best_choice = None
+
+                # Precompute current actual KVPRs for "minmax"/"hybrid" policy
+                cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)] if policy != "resid" else None
+                # Average memory fraction across GPUs after placing this item (independent of target GPU)
+                total_m_after = sum(m_sum) + ms
+                avg_mem_frac = total_m_after / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+                Tnorm = max(T, 1e-12)
+                alpha = 0.15
+                beta = 0.05
+
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap - (used_cap[g] + w)
+                    if resid < -eps:
+                        continue
+
+                    if policy == "resid":
+                        key = (resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    elif policy == "minmax":
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        # New global max if placed on g
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        # prefer smaller new_max, then smaller local, then residual, then more remaining mem, then id
+                        key = (new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    else:
+                        # Hybrid: combine projected global KVPR, local KVPR, and memory imbalance
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                        mem_imb = abs(mem_frac_after - avg_mem_frac)
+                        K_after_norm = max(0.0, new_max) / Tnorm
+                        kv_new_norm = new_local / Tnorm
+                        J = K_after_norm + alpha * kv_new_norm + beta * mem_imb
+                        key = (J, new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+
+                    if best_choice is None or key < best_choice[0]:
+                        best_choice = (key, g)
+
+                if best_choice is None:
+                    return (False, None) if return_placement else False
+
+                best_g = best_choice[1]
+                plc[best_g].append(mdl)
+                m_sum[best_g] += ms
+                n_sum[best_g] += n
+                used_cap[best_g] += w
+
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+
+        # Retune-based two-phase packing:
+        # Place ~40% items at T, then set T' = max(low_T, current_max_kvpr) and continue with updated weights/capacities.
+        def try_pack_retune(T, ordering=0, policy="hybrid", return_placement=False):
+            eps = 1e-12
+            cap = GPU_MEM_SIZE * T
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            elif ordering == 1:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+            else:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(it[1], 1e-9)), it[2]), reverse=True)
+
+            remaining = list(ordered)
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            placed = 0
+            thresh1 = max(1, int(0.4 * len(remaining)))
+            retuned_once = False
+            second_thresh = max(thresh1 + 1, int(0.75 * len(remaining)))
+            retuned_twice = False
+
+            def place_one(item, Tcur, cap_cur):
+                nonlocal plc, m_sum, n_sum, used_cap
+                mdl, ms, n = item
+                w = n + Tcur * ms
+                best_choice = None
+                # KVPRs for policies needing it
+                cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)] if policy != "resid" else None
+                total_m_after = sum(m_sum) + ms
+                avg_mem_frac = total_m_after / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+                Tnorm = max(Tcur, 1e-12)
+                alpha = 0.15
+                beta = 0.05
+
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap_cur - (used_cap[g] + w)
+                    if resid < -eps:
+                        continue
+
+                    if policy == "resid":
+                        key = (resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    elif policy == "minmax":
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        key = (new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    else:
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                        mem_imb = abs(mem_frac_after - avg_mem_frac)
+                        J = (new_max / Tnorm) + 0.15 * (new_local / Tnorm) + 0.05 * mem_imb
+                        key = (J, new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+
+                    if best_choice is None or key < best_choice[0]:
+                        best_choice = (key, g)
+
+                if best_choice is None:
+                    return False
+                g_best = best_choice[1]
+                plc[g_best].append(mdl)
+                m_sum[g_best] += ms
+                n_sum[g_best] += n
+                used_cap[g_best] += w
+                return True
+
+            Tcur = max(T, 1e-12)
+            cap_cur = GPU_MEM_SIZE * Tcur
+
+            i = 0
+            while i < len(remaining):
+                item = remaining[i]
+                ok = place_one(item, Tcur, cap_cur)
+                if not ok:
+                    return (False, None) if return_placement else False
+                placed += 1
+                remaining.pop(i)  # placed current
+                # Retune at ~40% placed
+                if (not retuned_once) and placed >= thresh1:
+                    # Compute current max KVPR and retune T
+                    cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)]
+                    Tret = max(low_T, max(cur_kvprs))
+                    # Update T and capacities; used_cap must be recomputed
+                    Tcur = Tret
+                    cap_cur = GPU_MEM_SIZE * Tcur
+                    used_cap = [n_sum[g] + Tcur * m_sum[g] for g in range(gpu_num)]
+                    # Re-sort remaining by new Tcur
+                    if ordering == 0:
+                        remaining.sort(key=lambda it: (it[2] + Tcur * it[1], it[2], it[1]), reverse=True)
+                    elif ordering == 1:
+                        remaining.sort(key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+                    else:
+                        remaining.sort(key=lambda it: (safe_div(it[2], max(it[1], 1e-9)), it[2]), reverse=True)
+                    retuned_once = True
+                    i = 0
+                    continue
+                # Optional second lighter retune near 75%
+                if (retuned_once and not retuned_twice and placed >= second_thresh):
+                    cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)]
+                    Tret = max(low_T, max(Tcur, max(cur_kvprs)))
+                    if Tret != Tcur:
+                        Tcur = Tret
+                        cap_cur = GPU_MEM_SIZE * Tcur
+                        used_cap = [n_sum[g] + Tcur * m_sum[g] for g in range(gpu_num)]
+                    retuned_twice = True
+                    # do not reorder to keep overhead minimal
+                # keep placing sequentially
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+
+        # For feasibility checks during search (keep minimal to stay fast)
+        def try_any(T, need_plc=False):
+            if need_plc:
+                feas = []
+                ok0, p0 = try_pack(T, 0, "resid", True)
+                ok1, p1 = try_pack(T, 1, "resid", True)
+                if ok0: feas.append(p0)
+                if ok1: feas.append(p1)
+                return (len(feas) > 0), feas
+            else:
+                return try_pack(T, 0, "resid", False) or try_pack(T, 1, "resid", False)
+
+        # Exponential search for an initial feasible T
+        T = max(low_T, 1e-9)
+        found = False
+        for _ in range(50):
+            if try_any(T, need_plc=False):
+                found = True
+                break
+            T *= 2.0
+        if not found:
+            return []
+
+        # Binary search to tighten T
+        low, high = low_T, T
+        for _ in range(40):
+            mid = (low + high) / 2.0
+            if try_any(mid, need_plc=False):
+                high = mid
+            else:
+                low = mid
+
+        # Build placements at near-optimal T across multiple orderings and a tiny T-neighborhood
+        all_plcs = []
+        Ts = [high, high * 0.995, high * 1.005, high * 0.99, high * 1.01]
+        combos = [
+            (0, "resid"), (1, "resid"), (2, "resid"),
+            (0, "minmax"), (1, "minmax"), (2, "minmax"),
+            (0, "hybrid"), (1, "hybrid"), (2, "hybrid")
+        ]
+        for Tv in Ts:
+            for ov, pol in combos:
+                ok, plc = try_pack(Tv, ov, pol, True)
+                if ok:
+                    all_plcs.append(plc)
+
+        # Extra retune-based candidates at final high T
+        ok_hr, plc_hr = try_pack_retune(high, 0, "hybrid", True)
+        if ok_hr:
+            all_plcs.append(plc_hr)
+        ok_mr, plc_mr = try_pack_retune(high, 0, "minmax", True)
+        if ok_mr:
+            all_plcs.append(plc_mr)
+
+        return all_plcs
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,202 @@
+<NAME>
+multi_variant_tpacker_and_refine
+</NAME>
+
+<DESCRIPTION>
+I improved the T-based assignment phase by trying multiple item orderings and per-GPU selection rules instead of a single Best-Fit-Decreasing by transformed weight. This increases the chance of finding feasibility at lower T and produces lower measured KVPR. Specifically, bfd_assign_for_T now evaluates combinations of orderings (weight, intrinsic pressure, size, density) and selection rules (‘tight’ on KV slack and ‘min_kvpr’ on local KVPR) and returns the best feasible placement. Additionally, after the binary search finishes, I added a final local refinement pass (reusing the existing improve function) on the best T-based placement and compare it against the previous heuristic placement, returning the best. This change targets minimizing maximum KVPR while keeping the code simple and efficient.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def bfd_assign_for_T(T):
+        # Best-Fit-Decreasing by transformed weights for target T
+        eps = 1e-12
+        capacity = T * GPU_MEM_SIZE
+        if capacity < -eps:
+            return None
+
+        # Items: weight w = dR + T * size; capacity per bin = T * S
+        items = []
+        for m in models:
+            dR = m.req_rate / m.slo
+            w = dR + T * m.model_size
+            if w < 0:
+                w = 0.0
+            items.append((w, dR, m.model_size, m))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        used_w = [0.0 for _ in range(gpu_num)]
+        bins_R = [0.0 for _ in range(gpu_num)]
+        bins_used_mem = [0.0 for _ in range(gpu_num)]
+        assign = {i: [] for i in range(gpu_num)}
+
+        for w, dR, sz, m in items:
+            best_bin = None
+            best_after = float('inf')
+            for gid in range(gpu_num):
+                nw = used_w[gid] + w
+                if nw <= capacity + 1e-9:
+                    if nw < best_after:
+                        best_after = nw
+                        best_bin = gid
+            if best_bin is None:
+                return None
+            used_w[best_bin] += w
+            bins_R[best_bin] += dR
+            bins_used_mem[best_bin] += sz
+            assign[best_bin].append(m)
+
+        # Validate both memory and KVPR constraints at target T
+        for gid in range(gpu_num):
+            if bins_used_mem[gid] - GPU_MEM_SIZE > 1e-6:
+                return None
+            rem = GPU_MEM_SIZE - bins_used_mem[gid]
+            if rem <= 0:
+                return None
+            if (bins_R[gid] / rem) - T > 1e-6:
+                return None
+        return assign
+=======
+    def bfd_assign_for_T(T):
+        # Multi-variant greedy assign under transformed capacity for target T
+        eps = 1e-12
+        S = GPU_MEM_SIZE
+        cap = T * S
+        if cap < -eps:
+            return None
+
+        # Build enriched list once
+        enriched = []
+        for m in models:
+            dR = m.req_rate / m.slo
+            w = dR + T * m.model_size
+            if w < 0:
+                w = 0.0
+            enriched.append([w, dR, float(m.model_size), m])
+
+        def order_list(arr, mode):
+            a = list(arr)
+            if mode == 'w_desc':
+                a.sort(key=lambda x: x[0], reverse=True)
+            elif mode == 'intrinsic_desc':
+                a.sort(key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+            elif mode == 'size_desc':
+                a.sort(key=lambda x: x[2], reverse=True)
+            elif mode == 'density_desc':
+                a.sort(key=lambda x: (x[1] / max(x[2], 1e-9)), reverse=True)
+            else:
+                a.sort(key=lambda x: x[0], reverse=True)
+            return a
+
+        def assign_with_rule(arr, rule):
+            used_w = [0.0 for _ in range(gpu_num)]
+            used_mem = [0.0 for _ in range(gpu_num)]
+            sum_R = [0.0 for _ in range(gpu_num)]
+            K = [cap for _ in range(gpu_num)]
+            assign = {i: [] for i in range(gpu_num)}
+            for w, dR, sz, m in arr:
+                candidates = []
+                for gid in range(gpu_num):
+                    if used_mem[gid] + sz <= S + 1e-9 and K[gid] >= w - 1e-9:
+                        if rule == 'min_kvpr':
+                            rem = S - (used_mem[gid] + sz)
+                            if rem <= 0:
+                                continue
+                            kv_new = (sum_R[gid] + dR) / rem
+                            candidates.append((gid, kv_new, K[gid] - w, rem))
+                        else:
+                            # 'tight' on K_after with tie-breaks
+                            rem_after = S - (used_mem[gid] + sz)
+                            kv_new = (sum_R[gid] + dR) / rem_after if rem_after > 0 else float('inf')
+                            candidates.append((gid, None, K[gid] - w, rem_after, kv_new))
+                if not candidates:
+                    return None
+                if rule == 'min_kvpr':
+                    # minimize new local KVPR, tie-break by tighter K and more remaining mem
+                    candidates.sort(key=lambda t: (t[1], t[2], -t[3]))
+                    gid = candidates[0][0]
+                else:
+                    # minimize K_after (tight), tie-break by more remaining mem then lower new kvpr
+                    candidates.sort(key=lambda t: (t[2], -t[3], t[4]))
+                    gid = candidates[0][0]
+                assign[gid].append(m)
+                used_w[gid] += w
+                used_mem[gid] += sz
+                sum_R[gid] += dR
+                K[gid] -= w
+            # Validate both memory and KVPR constraints at target T
+            for gid in range(gpu_num):
+                if used_mem[gid] - S > 1e-6:
+                    return None
+                rem = S - used_mem[gid]
+                if rem <= 0:
+                    return None
+                if (sum_R[gid] / rem) - T > 1e-6:
+                    return None
+            return assign
+
+        best = None
+        best_val = float('inf')
+        for order in ('w_desc', 'intrinsic_desc', 'density_desc', 'size_desc'):
+            arr = order_list(enriched, order)
+            for rule in ('tight', 'min_kvpr'):
+                cand = assign_with_rule(arr, rule)
+                if cand is None:
+                    continue
+                # Evaluate measured max KVPR (can be <= T)
+                max_v = 0.0
+                for gid in range(gpu_num):
+                    bucket = cand.get(gid, [])
+                    R = sum((m.req_rate / m.slo) for m in bucket)
+                    used = sum(m.model_size for m in bucket)
+                    rem = S - used
+                    v = float('inf') if rem <= 0 else (R / rem)
+                    if v > max_v:
+                        max_v = v
+                if max_v < best_val:
+                    best_val = max_v
+                    best = cand
+        return best
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Compare and adopt if improved
+    final_T = max_kvpr_of(best_bsearch_placement)
+    if final_T + 1e-12 < best_max_kvpr:
+        return best_bsearch_placement
+
+    return best_placement
+=======
+    # Compare and adopt if improved; also try a final local refinement on the T-based result
+    final_choice = best_placement
+    final_best = best_max_kvpr
+
+    if best_bsearch_placement is not None:
+        # Optional local refinement using existing improve()
+        rem_mem = [S for _ in range(gpu_num)]
+        sum_r = [0.0 for _ in range(gpu_num)]
+        for gid in range(gpu_num):
+            for m in best_bsearch_placement.get(gid, []):
+                rem_mem[gid] -= m.model_size
+                sum_r[gid] += (m.req_rate / m.slo)
+        refined_place, refined_mem, refined_sum = improve(
+            {i: list(best_bsearch_placement.get(i, [])) for i in range(gpu_num)},
+            rem_mem[:],
+            sum_r[:]
+        )
+        bsearch_val = max_kvpr_of(best_bsearch_placement)
+        refined_val = max_kvpr_of(refined_place)
+        # Choose the best among refined T-based, raw T-based, and heuristic best_placement
+        if refined_val + 1e-12 < final_best:
+            final_choice = refined_place
+            final_best = refined_val
+        elif bsearch_val + 1e-12 < final_best:
+            final_choice = best_bsearch_placement
+            final_best = bsearch_val
+
+    return final_choice
+>>>>>>> REPLACE
+
+</DIFF>

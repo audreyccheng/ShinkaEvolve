@@ -1,0 +1,630 @@
+# EVOLVE-BLOCK-START
+"""
+Prescaled asymmetric consensus with residual-aware calibration and guarded
+router micro-fixes for network telemetry repair.
+
+Principles:
+- Link Symmetry (R3): my_tx ≈ their_rx and my_rx ≈ their_tx
+- Flow Conservation (R1): Σ incoming = Σ outgoing per router
+- Interface Consistency: paired statuses aligned; down links carry no traffic
+
+Enhancements over prior generation:
+- Gentle multiplicative pair-bias prescaling before averaging (clamped 0.90–1.10).
+- Asymmetric partial averaging (louder side moves more) with low-rate ramp (exp=1.2).
+- Residual-tilted consensus target to reduce local router imbalance.
+- Severity-adaptive, direction-aware router penalties using per-interface traffic share.
+- Ultra-agreement confidence floor at 0.995 when both directions strongly agree and routers are balanced.
+- Smarter router micro-adjustments with two-option evaluation and a capped proportional fallback.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Thresholds and constants
+    TH_REL_DEFAULT = 0.02   # 2% relative tolerance (τh)
+    TH_REL_LOW = 0.05       # 5% when flows are small (<10 Mbps)
+    TH_ABS_GUARD = 0.5      # require >0.5 Mbps absolute diff to trigger averaging
+    ABS_GUARD_LOW = 0.3     # 0.3 Mbps absolute guard for low-rate links
+    LOW_RATE_CUTOFF = 10.0  # Mbps threshold for low-rate behavior
+    ULTRA_AGREE = 0.003     # 0.3% ultra-agreement threshold
+    ULTRA_RESID_OK = 0.02   # 2% router residual threshold for ultra-agreement confidence floor
+    EPS = 1e-6
+
+    # Prescaling parameters (gentle multiplicative harmonization)
+    PRESCALE_MIN_RATE = 1.0  # skip prescaling below this to avoid amplifying noise
+    PRESCALE_CLAMP_LO = 0.90
+    PRESCALE_CLAMP_HI = 1.10
+
+    # Router micro-adjustment guards
+    RESID_MIN = 0.03        # minimum router residual fraction to trigger micro-adjustments
+    IMPROVE_REQ = 0.08      # require ≥8% residual improvement to commit first step
+    SECOND_STEP_REQ = 0.20  # allow second mini-step if improvement ≥20%
+    SECOND_STEP_MAX = 0.01  # second step cap (≤1% of router scale)
+    PROP_FALLBACK_MAX = 0.01  # proportional fallback cap (≤1% of router scale)
+
+    def to_float(x: Any) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (to_float(d.get('rx_rate', 0.0)) > EPS) or (to_float(d.get('tx_rate', 0.0)) > EPS)
+
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(a, b, 1.0)
+
+    def change_ratio(orig: float, rep: float) -> float:
+        denom = max(abs(orig), abs(rep), 1.0)
+        return abs(rep - orig) / denom
+
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def sgn(x: float) -> int:
+        return 1 if x > 0 else (-1 if x < 0 else 0)
+
+    # Build unique undirected link pairs
+    pairs: Dict[Tuple[str, str], Tuple[str, str]] = {}
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+
+    # Compute signed router residuals from original telemetry (down links contribute zero)
+    resid_signed: Dict[str, float] = {}
+    for router, if_list in topology.items():
+        s_tx = 0.0
+        s_rx = 0.0
+        for iid in if_list:
+            d = telemetry.get(iid)
+            if not d:
+                continue
+            status = d.get('interface_status', 'unknown')
+            tx = to_float(d.get('tx_rate', 0.0))
+            rx = to_float(d.get('rx_rate', 0.0))
+            if status == 'down':
+                tx = 0.0
+                rx = 0.0
+            s_tx += tx
+            s_rx += rx
+        scale = max(s_tx, s_rx, 1.0)
+        resid_signed[router] = (s_tx - s_rx) / scale if scale > 0 else 0.0
+
+    # First pass: pairwise consensus hardening and status harmonization
+    per_if: Dict[str, Dict[str, Any]] = {}
+
+    for _, (a_id, b_id) in pairs.items():
+        a = telemetry[a_id]
+        b = telemetry[b_id]
+
+        a_stat = a.get('interface_status', 'unknown')
+        b_stat = b.get('interface_status', 'unknown')
+
+        a_rx, a_tx = to_float(a.get('rx_rate', 0.0)), to_float(a.get('tx_rate', 0.0))
+        b_rx, b_tx = to_float(b.get('rx_rate', 0.0)), to_float(b.get('tx_rate', 0.0))
+
+        a_has = has_traffic(a)
+        b_has = has_traffic(b)
+
+        # Decide pair status using interface consistency + traffic evidence
+        if a_stat == 'down' and b_stat == 'down':
+            pair_status = 'down'
+        elif a_stat == 'up' and b_stat == 'up':
+            pair_status = 'up'
+        else:
+            pair_status = 'up' if (a_has or b_has) else 'down'
+
+        # Initialize repaired values with originals
+        rep_a_tx, rep_b_rx = a_tx, b_rx
+        rep_b_tx, rep_a_rx = b_tx, a_rx
+        rx_conf_a = tx_conf_a = rx_conf_b = tx_conf_b = 1.0
+
+        if pair_status == 'down':
+            # Enforce no traffic on a down link
+            rep_a_tx = rep_b_rx = rep_b_tx = rep_a_rx = 0.0
+            base_conf = 0.95 if not (a_has or b_has) else 0.7
+            rx_conf_a = tx_conf_a = rx_conf_b = tx_conf_b = base_conf
+        else:
+            # Direction A->B (A.tx vs B.rx)
+            max_ab = max(a_tx, b_rx)
+            thr_rel_ab = TH_REL_LOW if max_ab < LOW_RATE_CUTOFF else TH_REL_DEFAULT
+            guard_ab = ABS_GUARD_LOW if max_ab < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            d_ab = rel_diff(a_tx, b_rx)
+            abs_ab = abs(a_tx - b_rx)
+            partial_upper = (1.6 * thr_rel_ab) if max_ab < LOW_RATE_CUTOFF else (2.0 * thr_rel_ab)
+
+            if (d_ab > thr_rel_ab) and (abs_ab > guard_ab):
+                # Gentle multiplicative prescaling (skip for very low rates)
+                use_prescale = max_ab >= PRESCALE_MIN_RATE
+                if use_prescale and a_tx > 0.0 and b_rx > 0.0:
+                    s = clamp((b_rx / a_tx) ** 0.5, PRESCALE_CLAMP_LO, PRESCALE_CLAMP_HI)
+                    a_tx_p = a_tx * s
+                    b_rx_p = b_rx / s
+                else:
+                    s = 1.0
+                    a_tx_p = a_tx
+                    b_rx_p = b_rx
+
+                # Residual-tilted weighted consensus target in prescaled space
+                v_p = 0.5 * (a_tx_p + b_rx_p)
+                resid_a = resid_signed.get(a.get('local_router'), 0.0)
+                if max(a_tx_p, b_rx_p) >= 1.0 and (a_tx_p - b_rx_p) != 0.0 and resid_a != 0.0 and (sgn(a_tx_p - b_rx_p) == sgn(resid_a)):
+                    gamma = min(0.08, 0.1 * abs(resid_a))
+                    w_a = clamp(0.5 - gamma, 0.2, 0.8)
+                    w_b = 1.0 - w_a
+                    v_p = w_a * a_tx_p + w_b * b_rx_p
+
+                # Map consensus target back to original space for each side
+                t_a_tx = v_p / s
+                t_b_rx = v_p * s
+
+                # Partial/asymmetric averaging toward targets
+                if d_ab <= partial_upper:
+                    k_base = (d_ab - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                    k_base = min(1.0, max(0.0, k_base))
+                    if max_ab < LOW_RATE_CUTOFF:
+                        k_base = k_base ** 1.2
+                    loud = a_tx if a_tx >= b_rx else b_rx
+                    quiet = b_rx if a_tx >= b_rx else a_tx
+                    r = (loud - quiet) / max(1.0, loud)
+                    k_loud = clamp(k_base * (1.0 + 0.5 * r), 0.0, 1.0)
+                    k_quiet = clamp(k_base * (1.0 - 0.5 * r), 0.0, 1.0)
+                    if a_tx >= b_rx:
+                        rep_a_tx = a_tx * (1.0 - k_loud) + t_a_tx * k_loud
+                        rep_b_rx = b_rx * (1.0 - k_quiet) + t_b_rx * k_quiet
+                    else:
+                        rep_a_tx = a_tx * (1.0 - k_quiet) + t_a_tx * k_quiet
+                        rep_b_rx = b_rx * (1.0 - k_loud) + t_b_rx * k_loud
+                else:
+                    rep_a_tx = t_a_tx
+                    rep_b_rx = t_b_rx
+
+                conf_base = max(0.0, 1.0 - d_ab)
+                # Penalize by applied change magnitude for calibration
+                change_a = change_ratio(a_tx, rep_a_tx)
+                change_b = change_ratio(b_rx, rep_b_rx)
+                tx_conf_a = min(conf_base, 1.0 - 0.8 * change_a)
+                rx_conf_b = min(conf_base, 1.0 - 0.8 * change_b)
+            else:
+                # Within tolerance: keep values and set strong confidence floors
+                if max_ab >= LOW_RATE_CUTOFF and d_ab <= 0.005:
+                    conf_floor = 0.99
+                else:
+                    conf_floor = 0.98 if max_ab >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_a = max(tx_conf_a, conf_floor)
+                rx_conf_b = max(rx_conf_b, conf_floor)
+
+            # Direction B->A (B.tx vs A.rx)
+            max_ba = max(b_tx, a_rx)
+            thr_rel_ba = TH_REL_LOW if max_ba < LOW_RATE_CUTOFF else TH_REL_DEFAULT
+            guard_ba = ABS_GUARD_LOW if max_ba < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            d_ba = rel_diff(b_tx, a_rx)
+            abs_ba = abs(b_tx - a_rx)
+            partial_upper_ba = (1.6 * thr_rel_ba) if max_ba < LOW_RATE_CUTOFF else (2.0 * thr_rel_ba)
+
+            if (d_ba > thr_rel_ba) and (abs_ba > guard_ba):
+                # Gentle multiplicative prescaling (skip for very low rates)
+                use_prescale2 = max_ba >= PRESCALE_MIN_RATE
+                if use_prescale2 and b_tx > 0.0 and a_rx > 0.0:
+                    s2 = clamp((a_rx / b_tx) ** 0.5, PRESCALE_CLAMP_LO, PRESCALE_CLAMP_HI)
+                    b_tx_p = b_tx * s2
+                    a_rx_p = a_rx / s2
+                else:
+                    s2 = 1.0
+                    b_tx_p = b_tx
+                    a_rx_p = a_rx
+
+                # Residual-tilted weighted consensus in prescaled space
+                v2_p = 0.5 * (b_tx_p + a_rx_p)
+                resid_b = resid_signed.get(b.get('local_router'), 0.0)
+                if max(b_tx_p, a_rx_p) >= 1.0 and (b_tx_p - a_rx_p) != 0.0 and resid_b != 0.0 and (sgn(b_tx_p - a_rx_p) == sgn(resid_b)):
+                    gamma2 = min(0.08, 0.1 * abs(resid_b))
+                    w_b2 = clamp(0.5 - gamma2, 0.2, 0.8)
+                    w_a2 = 1.0 - w_b2
+                    v2_p = w_b2 * b_tx_p + w_a2 * a_rx_p
+
+                # Map back to original space
+                t_b_tx = v2_p / s2
+                t_a_rx = v2_p * s2
+
+                if d_ba <= partial_upper_ba:
+                    k_base2 = (d_ba - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                    k_base2 = min(1.0, max(0.0, k_base2))
+                    if max_ba < LOW_RATE_CUTOFF:
+                        k_base2 = k_base2 ** 1.2
+                    loud2 = b_tx if b_tx >= a_rx else a_rx
+                    quiet2 = a_rx if b_tx >= a_rx else b_tx
+                    r2 = (loud2 - quiet2) / max(1.0, loud2)
+                    k_loud2 = clamp(k_base2 * (1.0 + 0.5 * r2), 0.0, 1.0)
+                    k_quiet2 = clamp(k_base2 * (1.0 - 0.5 * r2), 0.0, 1.0)
+                    if b_tx >= a_rx:
+                        rep_b_tx = b_tx * (1.0 - k_loud2) + t_b_tx * k_loud2
+                        rep_a_rx = a_rx * (1.0 - k_quiet2) + t_a_rx * k_quiet2
+                    else:
+                        rep_b_tx = b_tx * (1.0 - k_quiet2) + t_b_tx * k_quiet2
+                        rep_a_rx = a_rx * (1.0 - k_loud2) + t_a_rx * k_loud2
+                else:
+                    rep_b_tx = t_b_tx
+                    rep_a_rx = t_a_rx
+
+                conf_base2 = max(0.0, 1.0 - d_ba)
+                change_b2 = change_ratio(b_tx, rep_b_tx)
+                change_a2 = change_ratio(a_rx, rep_a_rx)
+                tx_conf_b = min(conf_base2, 1.0 - 0.8 * change_b2)
+                rx_conf_a = min(conf_base2, 1.0 - 0.8 * change_a2)
+            else:
+                if max_ba >= LOW_RATE_CUTOFF and d_ba <= 0.005:
+                    conf_floor2 = 0.99
+                else:
+                    conf_floor2 = 0.98 if max_ba >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_b = max(tx_conf_b, conf_floor2)
+                rx_conf_a = max(rx_conf_a, conf_floor2)
+
+        # Status confidence based on agreement and evidence
+        if pair_status == 'down':
+            status_conf = 0.98 if (a_stat == 'down' and b_stat == 'down' and not (a_has or b_has)) else 0.7
+        else:
+            status_conf = 0.95 if (a_stat == 'up' and b_stat == 'up') else 0.8
+
+        # Low-rate conservative damping when only one side has traffic and we marked up
+        if pair_status == 'up' and (a_has != b_has):
+            # Relax penalty at small flows
+            if max(max(a_tx, b_rx), max(b_tx, a_rx)) < LOW_RATE_CUTOFF and max(a_tx, a_rx, b_tx, b_rx) <= 2.0:
+                damp = 0.92
+            else:
+                damp = 0.88
+            if not a_has:
+                rx_conf_a *= damp
+                tx_conf_a *= damp
+            if not b_has:
+                rx_conf_b *= damp
+                tx_conf_b *= damp
+
+        per_if[a_id] = {
+            'repaired_rx': rep_a_rx,
+            'repaired_tx': rep_a_tx,
+            'rx_conf': float(rx_conf_a),
+            'tx_conf': float(tx_conf_a),
+            'repaired_status': pair_status,
+            'status_conf': status_conf
+        }
+        per_if[b_id] = {
+            'repaired_rx': rep_b_rx,
+            'repaired_tx': rep_b_tx,
+            'rx_conf': float(rx_conf_b),
+            'tx_conf': float(tx_conf_b),
+            'repaired_status': pair_status,
+            'status_conf': status_conf
+        }
+
+    # Handle dangling interfaces (no valid peer in telemetry)
+    for if_id, data in telemetry.items():
+        if if_id in per_if:
+            continue
+        status = data.get('interface_status', 'unknown')
+        rx = to_float(data.get('rx_rate', 0.0))
+        tx = to_float(data.get('tx_rate', 0.0))
+        if status == 'down':
+            per_if[if_id] = {
+                'repaired_rx': 0.0,
+                'repaired_tx': 0.0,
+                'rx_conf': 0.9,
+                'tx_conf': 0.9,
+                'repaired_status': 'down',
+                'status_conf': 0.95
+            }
+        else:
+            per_if[if_id] = {
+                'repaired_rx': rx,
+                'repaired_tx': tx,
+                'rx_conf': 0.6,
+                'tx_conf': 0.6,
+                'repaired_status': status if status in ('up', 'down') else 'up',
+                'status_conf': 0.6
+            }
+
+    # Router-level micro-adjustments for flow conservation (R1) using dangling, up interfaces
+    paired_ids = set()
+    for _, (aid, bid) in pairs.items():
+        paired_ids.add(aid)
+        paired_ids.add(bid)
+
+    for router, if_list in topology.items():
+        present = [iid for iid in if_list if iid in per_if]
+        if not present:
+            continue
+
+        # Compute current sums
+        sum_tx = sum(to_float(per_if[iid]['repaired_tx']) for iid in present)
+        sum_rx = sum(to_float(per_if[iid]['repaired_rx']) for iid in present)
+        delta = sum_tx - sum_rx  # want to drive toward zero
+        scale = max(sum_tx, sum_rx, 1.0)
+        resid = abs(delta) / scale
+
+        # Trigger only on sufficiently large residuals
+        if resid < RESID_MIN or abs(delta) <= EPS:
+            continue
+
+        # Candidates: dangling, up, sufficient magnitude, and aligned with imbalance
+        candidates: List[Tuple[str, float, float, float]] = []
+        dangling_all: List[str] = []
+        for iid in present:
+            if per_if[iid].get('repaired_status', 'up') == 'down':
+                continue
+            if iid not in paired_ids:
+                dangling_all.append(iid)
+                cur_tx = to_float(per_if[iid]['repaired_tx'])
+                cur_rx = to_float(per_if[iid]['repaired_rx'])
+                if max(cur_tx, cur_rx) < LOW_RATE_CUTOFF:
+                    continue
+                contrib = cur_tx - cur_rx
+                if (delta > 0 and contrib > 0) or (delta < 0 and contrib < 0):
+                    candidates.append((iid, contrib, cur_tx, cur_rx))
+
+        # Dominant candidate path
+        committed = False
+        if candidates:
+            total_same_dir = sum(abs(c[1]) for c in candidates) or EPS
+            dom_iid, dom_contrib, cur_tx, cur_rx = max(candidates, key=lambda t: abs(t[1]))
+            if abs(dom_contrib) / total_same_dir >= 0.6:
+                # Evaluate both nudge options and pick best improvement (guarded)
+                alpha = min(0.02, 0.5 * resid)
+                step = alpha * scale
+
+                def simulate(adj_tx: bool) -> Tuple[float, float, float]:
+                    n_tx, n_rx = cur_tx, cur_rx
+                    if adj_tx:
+                        n_tx = max(0.0, cur_tx - min(step, cur_tx))
+                    else:
+                        n_rx = max(0.0, cur_rx - min(step, cur_rx))
+                    # internal skew guard (≤3%)
+                    new_int = abs(n_tx - n_rx) / max(1.0, max(n_tx, n_rx, 1.0))
+                    s_tx_new = sum_tx - cur_tx + n_tx
+                    s_rx_new = sum_rx - cur_rx + n_rx
+                    resid_new = abs(s_tx_new - s_rx_new) / max(s_tx_new, s_rx_new, 1.0)
+                    return resid_new, new_int, (n_tx if adj_tx else n_rx)
+
+                # For delta>0 prefer reducing TX; for delta<0 prefer reducing RX, but pick best
+                cand1 = simulate(adj_tx=True)   # reduce TX
+                cand2 = simulate(adj_tx=False)  # reduce RX
+                pick_adj_tx = True
+                best_resid, best_int, best_val = cand1
+                if cand2[0] < best_resid - 1e-12:
+                    pick_adj_tx = False
+                    best_resid, best_int, best_val = cand2
+
+                if best_int <= 0.03 + 1e-9 and best_resid <= (1.0 - IMPROVE_REQ) * resid:
+                    # Commit
+                    if pick_adj_tx:
+                        per_if[dom_iid]['repaired_tx'] = best_val
+                    else:
+                        per_if[dom_iid]['repaired_rx'] = best_val
+
+                    # Optional second mini-step if strong improvement and residual still meaningful
+                    if best_resid <= (1.0 - SECOND_STEP_REQ) * resid and best_resid >= 0.04:
+                        alpha2 = min(SECOND_STEP_MAX, 0.5 * best_resid)
+                        step2 = alpha2 * scale
+                        cur_tx2 = to_float(per_if[dom_iid]['repaired_tx'])
+                        cur_rx2 = to_float(per_if[dom_iid]['repaired_rx'])
+                        def simulate2(adj_tx2: bool) -> Tuple[float, float, float]:
+                            n_tx2, n_rx2 = cur_tx2, cur_rx2
+                            if adj_tx2:
+                                n_tx2 = max(0.0, cur_tx2 - min(step2, cur_tx2))
+                            else:
+                                n_rx2 = max(0.0, cur_rx2 - min(step2, cur_rx2))
+                            new_int2 = abs(n_tx2 - n_rx2) / max(1.0, max(n_tx2, n_rx2, 1.0))
+                            s_tx_new2 = (sum_tx - cur_tx) + n_tx2
+                            s_rx_new2 = (sum_rx - cur_rx) + n_rx2
+                            resid_new2 = abs(s_tx_new2 - s_rx_new2) / max(s_tx_new2, s_rx_new2, 1.0)
+                            return resid_new2, new_int2, (n_tx2 if adj_tx2 else n_rx2)
+
+                        c1 = simulate2(adj_tx2=True)
+                        c2 = simulate2(adj_tx2=False)
+                        pick2 = True
+                        best_r2, best_i2, best_v2 = c1
+                        if c2[0] < best_r2 - 1e-12:
+                            pick2 = False
+                            best_r2, best_i2, best_v2 = c2
+                        if best_i2 <= 0.03 + 1e-9 and best_r2 < best_resid:
+                            if pick2:
+                                per_if[dom_iid]['repaired_tx'] = best_v2
+                            else:
+                                per_if[dom_iid]['repaired_rx'] = best_v2
+                            best_resid = best_r2
+
+                    # Confidence penalty proportional to applied change on that interface
+                    tx_orig = to_float(telemetry.get(dom_iid, {}).get('tx_rate', 0.0))
+                    rx_orig = to_float(telemetry.get(dom_iid, {}).get('rx_rate', 0.0))
+                    tx_change = change_ratio(tx_orig, to_float(per_if[dom_iid]['repaired_tx']))
+                    rx_change = change_ratio(rx_orig, to_float(per_if[dom_iid]['repaired_rx']))
+                    per_if[dom_iid]['tx_conf'] = max(0.0, min(float(per_if[dom_iid].get('tx_conf', 0.6)), 1.0 - 0.8 * tx_change))
+                    per_if[dom_iid]['rx_conf'] = max(0.0, min(float(per_if[dom_iid].get('rx_conf', 0.6)), 1.0 - 0.8 * rx_change))
+                    committed = True
+
+        # Proportional fallback if no dominant commit was possible
+        if not committed and dangling_all:
+            # small capped proportional adjustment toward balancing
+            alpha_prop = min(PROP_FALLBACK_MAX, 0.3 * resid)
+            step_prop = alpha_prop * scale
+            if step_prop > 0.0:
+                if delta > 0.0:
+                    # Too much TX globally; slightly increase RX across dangling interfaces
+                    weights = []
+                    sum_w = 0.0
+                    for iid in dangling_all:
+                        w = to_float(per_if[iid]['repaired_tx']) + to_float(per_if[iid]['repaired_rx']) + EPS
+                        weights.append((iid, w))
+                        sum_w += w
+                    for iid, w in weights:
+                        inc = step_prop * (w / max(sum_w, EPS))
+                        per_if[iid]['repaired_rx'] = to_float(per_if[iid]['repaired_rx']) + inc
+                        rx_orig = to_float(telemetry.get(iid, {}).get('rx_rate', 0.0))
+                        cr = change_ratio(rx_orig, to_float(per_if[iid]['repaired_rx']))
+                        per_if[iid]['rx_conf'] = max(0.0, min(float(per_if[iid].get('rx_conf', 0.6)), 1.0 - 0.6 * cr))
+                else:
+                    # Too much RX globally; slightly increase TX across dangling interfaces
+                    weights = []
+                    sum_w = 0.0
+                    for iid in dangling_all:
+                        w = to_float(per_if[iid]['repaired_tx']) + to_float(per_if[iid]['repaired_rx']) + EPS
+                        weights.append((iid, w))
+                        sum_w += w
+                    for iid, w in weights:
+                        inc = step_prop * (w / max(sum_w, EPS))
+                        per_if[iid]['repaired_tx'] = to_float(per_if[iid]['repaired_tx']) + inc
+                        tx_orig = to_float(telemetry.get(iid, {}).get('tx_rate', 0.0))
+                        cr = change_ratio(tx_orig, to_float(per_if[iid]['repaired_tx']))
+                        per_if[iid]['tx_conf'] = max(0.0, min(float(per_if[iid].get('tx_conf', 0.6)), 1.0 - 0.6 * cr))
+
+    # Compute router-level residuals and totals after repairs for confidence penalties and shares
+    router_residual: Dict[str, float] = {}
+    router_totals: Dict[str, Dict[str, float]] = {}
+    for router, if_list in topology.items():
+        s_tx = 0.0
+        s_rx = 0.0
+        for iid in if_list:
+            if iid in per_if:
+                s_tx += to_float(per_if[iid]['repaired_tx'])
+                s_rx += to_float(per_if[iid]['repaired_rx'])
+        router_residual[router] = abs(s_tx - s_rx) / max(s_tx, s_rx, 1.0)
+        router_totals[router] = {'tx': s_tx, 'rx': s_rx}
+
+    # Ultra-agreement confidence floor when both directions tightly agree and routers balanced
+    for _, (a_id, b_id) in pairs.items():
+        if a_id not in per_if or b_id not in per_if:
+            continue
+        a_rep = per_if[a_id]
+        b_rep = per_if[b_id]
+        a_tx_r, a_rx_r = to_float(a_rep['repaired_tx']), to_float(a_rep['repaired_rx'])
+        b_tx_r, b_rx_r = to_float(b_rep['repaired_tx']), to_float(b_rep['repaired_rx'])
+        d1 = rel_diff(a_tx_r, b_rx_r)
+        d2 = rel_diff(b_tx_r, a_rx_r)
+        r1 = router_residual.get(telemetry[a_id].get('local_router'), 0.0)
+        r2 = router_residual.get(telemetry[b_id].get('local_router'), 0.0)
+        if (d1 <= ULTRA_AGREE) and (d2 <= ULTRA_AGREE) and (max(r1, r2) <= ULTRA_RESID_OK):
+            a_rep['tx_conf'] = max(to_float(a_rep['tx_conf']), 0.995)
+            a_rep['rx_conf'] = max(to_float(a_rep['rx_conf']), 0.995)
+            b_rep['tx_conf'] = max(to_float(b_rep['tx_conf']), 0.995)
+            b_rep['rx_conf'] = max(to_float(b_rep['rx_conf']), 0.995)
+
+    # Final assembly with severity-adaptive direction-aware confidence penalties using shares
+    result: Dict[str, Dict[str, Tuple]] = {}
+    for if_id, data in telemetry.items():
+        rep = per_if.get(if_id, {})
+        repaired_rx = to_float(rep.get('repaired_rx', data.get('rx_rate', 0.0)))
+        repaired_tx = to_float(rep.get('repaired_tx', data.get('tx_rate', 0.0)))
+        repaired_status = rep.get('repaired_status', data.get('interface_status', 'unknown'))
+
+        rx_conf = float(rep.get('rx_conf', 0.6))
+        tx_conf = float(rep.get('tx_conf', 0.6))
+        status_conf = float(rep.get('status_conf', 0.6))
+
+        local_router = data.get('local_router')
+        remote_router = data.get('remote_router')
+        resid_local = router_residual.get(local_router, 0.0)
+        resid_remote = router_residual.get(remote_router, 0.0)
+        max_resid = max(resid_local, resid_remote)
+
+        # Residual severity-adaptive amplitude
+        if max_resid < 0.03:
+            amp = 0.1
+        elif max_resid < 0.12:
+            amp = 0.2
+        else:
+            amp = 0.3
+
+        # Interface traffic shares used to tilt penalties
+        local_tot = router_totals.get(local_router, {'tx': 0.0, 'rx': 0.0})
+        remote_tot = router_totals.get(remote_router, {'tx': 0.0, 'rx': 0.0})
+        tx_share = repaired_tx / max(1.0, to_float(local_tot.get('tx', 0.0)))
+        rx_share = repaired_rx / max(1.0, to_float(remote_tot.get('rx', 0.0)))
+        tx_share = clamp(tx_share, 0.0, 1.0)
+        rx_share = clamp(rx_share, 0.0, 1.0)
+
+        # Direction-aware penalties tilted by shares and severity
+        penalty_tx = 1.0 - ((0.6 + amp * tx_share) * resid_local + (0.4 - amp * tx_share) * resid_remote)
+        penalty_rx = 1.0 - ((0.6 + amp * rx_share) * resid_remote + (0.4 - amp * rx_share) * resid_local)
+        penalty_tx = clamp(penalty_tx, 0.0, 1.0)
+        penalty_rx = clamp(penalty_rx, 0.0, 1.0)
+        avg_penalty = 0.5 * (penalty_tx + penalty_rx)
+        min_penalty = min(penalty_tx, penalty_rx)
+
+        tx_conf = clamp(tx_conf * penalty_tx, 0.0, 1.0)
+        rx_conf = clamp(rx_conf * penalty_rx, 0.0, 1.0)
+        # Status confidence mild scaling by penalty
+        status_conf = clamp(status_conf * (0.85 + 0.15 * min_penalty), 0.0, 1.0)
+
+        # Assemble output tuples
+        rx_orig = to_float(data.get('rx_rate', 0.0))
+        tx_orig = to_float(data.get('tx_rate', 0.0))
+        status_orig = data.get('interface_status', 'unknown')
+
+        out: Dict[str, Any] = {}
+        out['rx_rate'] = (rx_orig, repaired_rx, rx_conf)
+        out['tx_rate'] = (tx_orig, repaired_tx, tx_conf)
+        out['interface_status'] = (status_orig, repaired_status, status_conf)
+
+        # Copy metadata unchanged
+        out['connected_to'] = data.get('connected_to')
+        out['local_router'] = local_router
+        out['remote_router'] = remote_router
+
+        result[if_id] = out
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

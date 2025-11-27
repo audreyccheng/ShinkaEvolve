@@ -1,0 +1,318 @@
+# EVOLVE-BLOCK-START
+"""
+Bayesian Flow Consensus Repair
+Implements a probabilistic hypothesis selection algorithm.
+Treats telemetry repair as finding the value that maximizes the joint likelihood 
+of Link Symmetry, Flow Conservation, and Observation constraints.
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    # --- Config ---
+    REL_TOL = 0.02
+    ABS_TOL = 0.5
+    ITERATIONS = 4
+    
+    # --- Helper: Likelihood ---
+    def gaussian_score(x: float, mu: float, sigma: float, min_prob: float = 0.0) -> float:
+        """Unnormalized Gaussian likelihood with optional floor."""
+        if mu is None: return 1.0 # Uniform/Neutral if source missing
+        diff = abs(x - mu)
+        if diff < ABS_TOL: diff = 0.0
+        p = math.exp(-0.5 * (diff / sigma) ** 2)
+        return max(p, min_prob)
+
+    def get_sigma(val: float) -> float:
+        """Error model: Linear scaling with floor."""
+        return max(abs(val) * REL_TOL, ABS_TOL)
+
+    # --- Phase 1: Initialization & Status ---
+    estimates = {} # if_id -> {'rx': val, 'tx': val, 'status': str}
+    
+    for if_id, data in telemetry.items():
+        s_rx = float(data.get('rx_rate', 0.0))
+        s_tx = float(data.get('tx_rate', 0.0))
+        s_status = data.get('interface_status', 'unknown')
+        
+        peer_id = data.get('connected_to')
+        has_peer = (peer_id and peer_id in telemetry)
+        
+        p_rx, p_tx, p_status = 0.0, 0.0, 'unknown'
+        if has_peer:
+            p_data = telemetry[peer_id]
+            p_rx = float(p_data.get('rx_rate', 0.0))
+            p_tx = float(p_data.get('tx_rate', 0.0))
+            p_status = p_data.get('interface_status', 'unknown')
+
+        # Status Repair (Standard Heuristic)
+        traffic_detected = (s_rx > ABS_TOL or s_tx > ABS_TOL or 
+                            p_rx > ABS_TOL or p_tx > ABS_TOL)
+        
+        final_status = s_status
+        status_conf = 1.0
+        
+        if s_status == 'down' and traffic_detected:
+            final_status = 'up'
+            status_conf = 0.95
+        elif s_status == 'up' and not traffic_detected and p_status == 'down':
+            final_status = 'down'
+            status_conf = 0.90
+            
+        # Initial Estimates
+        if final_status == 'down':
+            est_rx, est_tx = 0.0, 0.0
+        else:
+            # Seed with Peer if available (generally more reliable), else Self
+            est_rx = p_tx if has_peer else s_rx
+            est_tx = p_rx if has_peer else s_tx
+            
+        estimates[if_id] = {
+            'rx': est_rx, 'tx': est_tx,
+            'status': final_status, 'status_conf': status_conf,
+            'has_peer': has_peer,
+            's_rx': s_rx, 's_tx': s_tx,
+            'p_tx': p_tx if has_peer else None, # My RX source
+            'p_rx': p_rx if has_peer else None, # My TX dest
+            'orig_status': s_status
+        }
+
+    # --- Phase 2: Iterative Bayesian Update ---
+    
+    for _ in range(ITERATIONS):
+        # 1. Compute Router Context (Flow Totals)
+        router_totals = {}
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in estimates]
+            sum_in = sum(estimates[i]['rx'] for i in valid_ifs)
+            sum_out = sum(estimates[i]['tx'] for i in valid_ifs)
+            
+            # Compute Reliability based on current imbalance
+            imbalance = abs(sum_in - sum_out)
+            scale = max(sum_in, sum_out, 1.0)
+            # Gaussian falloff for reliability.
+            # If imbalance is 5% of scale, reliability drops significantly
+            reliability = math.exp(-0.5 * (imbalance / (scale * 0.05)) ** 2)
+            
+            router_totals[r_id] = {
+                'in': sum_in, 'out': sum_out, 
+                'reliability': reliability
+            }
+
+        # 2. Update Estimates
+        for if_id, est in estimates.items():
+            if est['status'] == 'down':
+                continue # Values stay 0.0
+
+            r_id = telemetry[if_id].get('local_router')
+            
+            # --- Solve RX ---
+            cands = [est['s_rx']]
+            if est['p_tx'] is not None: cands.append(est['p_tx'])
+            cands.append(0.0) # Null hypothesis
+            
+            target_flow_rx = est['rx'] 
+            flow_sigma = 1.0
+            
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                other_in = rt['in'] - est['rx']
+                target_flow_rx = max(0.0, rt['out'] - other_in)
+                cands.append(target_flow_rx)
+                
+                # Dynamic Sigma for Flow
+                base_sigma = get_sigma(target_flow_rx)
+                # If reliability is low, sigma expands
+                flow_sigma = base_sigma * (1.0 + 10.0 * (1.0 - rt['reliability']))
+            
+            unique_cands = sorted(list(set(cands)))
+            
+            best_val_rx = 0.0
+            total_prob = 0.0
+            weighted_sum = 0.0
+            max_score = -1.0
+            
+            for val in unique_cands:
+                # 1. Symmetry (Peer TX -> My RX)
+                l_sym = gaussian_score(val, est['p_tx'], get_sigma(val))
+                
+                # 2. Self (Weak confirmation, min_prob=0.1 allows Self to be ignored if it's garbage)
+                l_self = gaussian_score(val, est['s_rx'], get_sigma(val) * 2.0, min_prob=0.1)
+                
+                # 3. Flow
+                l_flow = gaussian_score(val, target_flow_rx, flow_sigma)
+                
+                # Combined Score
+                score = l_sym * l_self * l_flow
+                
+                if score > max_score:
+                    max_score = score
+                    best_val_rx = val
+                
+                weighted_sum += val * score
+                total_prob += score
+                
+            # Soft update
+            final_rx = weighted_sum / total_prob if total_prob > 0 else best_val_rx
+            
+            # Confidence Estimation
+            # Base confidence is the max agreement score
+            evidence_factor = 1.0
+            if est['p_tx'] is None: evidence_factor *= 0.85 
+            if r_id not in router_totals: evidence_factor *= 0.9 
+            
+            # Recalculate "Trust Score" based on agreement of RELIABLE sources
+            trust_score = 0.5
+            d_peer = gaussian_score(final_rx, est['p_tx'], get_sigma(final_rx))
+            d_flow = gaussian_score(final_rx, target_flow_rx, flow_sigma)
+            
+            if est['has_peer']:
+                if r_id in router_totals:
+                    # Have Peer + Flow
+                    # If Peer + Flow agree, Conf is high regardless of Self
+                    agreement = d_peer * d_flow
+                    trust_score = 0.6 + 0.4 * agreement
+                else:
+                    # Peer only
+                    trust_score = 0.6 + 0.4 * d_peer
+            elif r_id in router_totals:
+                # Flow only (External)
+                # Trust flow if flow is reliable
+                trust_score = 0.6 + 0.3 * d_flow
+            else:
+                # Self only
+                trust_score = 0.5
+
+            conf_rx = trust_score * evidence_factor
+            
+            # Update State with Momentum
+            est['rx'] = 0.5 * est['rx'] + 0.5 * final_rx
+            est['conf_rx'] = conf_rx 
+            
+            # --- Solve TX --- 
+            cands = [est['s_tx'], 0.0]
+            if est['p_rx'] is not None: cands.append(est['p_rx'])
+            
+            target_flow_tx = est['tx']
+            flow_sigma_tx = 1.0
+            
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                other_out = rt['out'] - est['tx']
+                target_flow_tx = max(0.0, rt['in'] - other_out)
+                cands.append(target_flow_tx)
+                base_sigma = get_sigma(target_flow_tx)
+                flow_sigma_tx = base_sigma * (1.0 + 10.0 * (1.0 - rt['reliability']))
+                
+            unique_cands = sorted(list(set(cands)))
+            
+            best_val_tx = 0.0
+            total_prob = 0.0
+            weighted_sum = 0.0
+            
+            for val in unique_cands:
+                l_sym = gaussian_score(val, est['p_rx'], get_sigma(val))
+                l_self = gaussian_score(val, est['s_tx'], get_sigma(val) * 2.0, min_prob=0.1)
+                l_flow = gaussian_score(val, target_flow_tx, flow_sigma_tx)
+                
+                score = l_sym * l_self * l_flow
+                weighted_sum += val * score
+                total_prob += score
+                
+            final_tx = weighted_sum / total_prob if total_prob > 0 else 0.0 # fallback
+            
+            # Confidence
+            d_peer = gaussian_score(final_tx, est['p_rx'], get_sigma(final_tx))
+            d_flow = gaussian_score(final_tx, target_flow_tx, flow_sigma_tx)
+            
+            trust_score = 0.5
+            if est['has_peer']:
+                if r_id in router_totals:
+                    trust_score = 0.6 + 0.4 * (d_peer * d_flow)
+                else:
+                    trust_score = 0.6 + 0.4 * d_peer
+            elif r_id in router_totals:
+                trust_score = 0.6 + 0.3 * d_flow
+            
+            evidence_factor = 1.0
+            if est['p_rx'] is None: evidence_factor *= 0.85
+            if r_id not in router_totals: evidence_factor *= 0.9
+
+            conf_tx = trust_score * evidence_factor
+            
+            est['tx'] = 0.5 * est['tx'] + 0.5 * final_tx
+            est['conf_tx'] = conf_tx
+
+    # --- Phase 3: Construction ---
+    results = {}
+    for if_id, est in estimates.items():
+        orig = telemetry[if_id]
+        res = orig.copy()
+        
+        c_rx = est.get('conf_rx', 1.0)
+        c_tx = est.get('conf_tx', 1.0)
+        
+        if est['status'] == 'down':
+            c_rx = 0.95 if est['s_rx'] > ABS_TOL else 1.0
+            c_tx = 0.95 if est['s_tx'] > ABS_TOL else 1.0
+            
+        res['rx_rate'] = (est['s_rx'], est['rx'], max(0.5, min(1.0, c_rx)))
+        res['tx_rate'] = (est['s_tx'], est['tx'], max(0.5, min(1.0, c_tx)))
+        res['interface_status'] = (est['orig_status'], est['status'], est['status_conf'])
+        
+        results[if_id] = res
+        
+    return results
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

@@ -1,0 +1,276 @@
+<NAME>
+discrete_conf_dual_hints
+</NAME>
+
+<DESCRIPTION>
+1.  **Dual-Sided Flow Hints**: Upgraded the `resolve` logic in the iterative phase to calculate flow hints from *both* the local and remote routers. If both are "fully monitored" and provide consistent hints, this creates a "Bridge of Truth" that can repair the link even if both sensors are dead or disagree. If only one is available, it allows the "island of truth" to extend to its neighbors more effectively than implicit propagation.
+2.  **Discrete Confidence Buckets**: Replaced the linear confidence slope with discrete buckets (step function). Prior experiments showed this yields significantly better calibration scores by grouping error ranges into semantic confidence levels (e.g., <2% error -> 100% confidence, <5% -> 95%, etc.).
+3.  **Enhanced Double-Dead Check**: Lowered the threshold for overriding "Double Dead" links (both sensors ~0) from 5.0 Mbps to 1.0 Mbps (`TRAFFIC_THRESHOLD`) to catch smaller valid flows, but only if the effective flow hint strongly suggests traffic.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    ITERATIONS = 5               # Propagation passes
+    CONFIDENCE_SLOPE = 5.0       # Linear decay slope for confidence
+
+    # --- Phase 1: Assessment & Initialization ---
+=======
+    ITERATIONS = 5               # Propagation passes
+
+    # --- Phase 1: Assessment & Initialization ---
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        for iface_id, curr in state.items():
+            if curr['status'] == 'down':
+                next_rates[iface_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = curr['peer_id']
+            has_peer = peer_id and peer_id in state
+            r_id = curr.get('local_router')
+
+            # Rate Resolution Logic
+            def resolve(local_val, peer_val, is_rx):
+                # 1. Get Flow Hint if available
+                val_hint = None
+                if r_id in router_balances:
+                    rb = router_balances[r_id]
+                    if is_rx:
+                        # RX needed to match Total TX
+                        others_rx = rb['rx'] - local_val
+                        val_hint = max(0.0, rb['tx'] - others_rx)
+                    else:
+                        # TX needed to match Total RX
+                        others_tx = rb['tx'] - local_val
+                        val_hint = max(0.0, rb['rx'] - others_tx)
+
+                # 2. Check Symmetry
+                denom = max(local_val, peer_val, 1.0)
+                diff = abs(local_val - peer_val) / denom
+
+                if diff <= HARDENING_THRESHOLD:
+                    # Symmetry holds: Average
+                    return (local_val + peer_val) / 2.0
+
+                # 3. Symmetry Broken
+
+                if val_hint is not None:
+                    # Case A: Have Hint (Flow Conservation)
+
+                    # Double Dead Check: If sensors say 0 but flow says X
+                    if local_val < TRAFFIC_THRESHOLD and peer_val < TRAFFIC_THRESHOLD:
+                        if val_hint > 5.0: # Significant missing flow
+                             return val_hint
+                        return 0.0
+
+                    # Pick value closer to hint
+                    denom_l = max(local_val, val_hint, 1.0)
+                    err_l = abs(local_val - val_hint) / denom_l
+
+                    denom_p = max(peer_val, val_hint, 1.0)
+                    err_p = abs(peer_val - val_hint) / denom_p
+
+                    if err_l < err_p:
+                        return local_val
+                    else:
+                        return peer_val
+
+                else:
+                    # Case B: No Hint (Partial/Unmonitored Router)
+                    # Heuristic: Trust positive signal (assuming counters stick to 0 on fail)
+                    if local_val < TRAFFIC_THRESHOLD and peer_val > TRAFFIC_THRESHOLD:
+                        return peer_val
+                    elif peer_val < TRAFFIC_THRESHOLD and local_val > TRAFFIC_THRESHOLD:
+                        return local_val
+
+                    # If both significant but different, average them to minimize max error
+                    return (local_val + peer_val) / 2.0
+
+            # Resolve RX (vs Peer TX)
+            peer_tx = state[peer_id]['tx'] if has_peer else curr['rx']
+            next_rx = resolve(curr['rx'], peer_tx, is_rx=True)
+
+            # Resolve TX (vs Peer RX)
+            peer_rx = state[peer_id]['rx'] if has_peer else curr['tx']
+            next_tx = resolve(curr['tx'], peer_rx, is_rx=False)
+
+            next_rates[iface_id] = {'rx': next_rx, 'tx': next_tx}
+=======
+        for iface_id, curr in state.items():
+            if curr['status'] == 'down':
+                next_rates[iface_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = curr['peer_id']
+            has_peer = peer_id and peer_id in state
+            r_id = curr.get('local_router')
+
+            # Rate Resolution Logic
+            def resolve(local_val, peer_val, is_rx, remote_router_id):
+                # 1. Get Local Hint
+                hint_local = None
+                if r_id in router_balances:
+                    rb = router_balances[r_id]
+                    if is_rx:
+                        hint_local = max(0.0, rb['tx'] - (rb['rx'] - local_val))
+                    else:
+                        hint_local = max(0.0, rb['rx'] - (rb['tx'] - local_val))
+
+                # 2. Get Remote Hint (Dual-Sided Validation)
+                hint_remote = None
+                if remote_router_id in router_balances:
+                    rb_p = router_balances[remote_router_id]
+                    if is_rx:
+                        # Peer is TX. Hint for Peer TX = Remote RX Sum - (Remote TX Sum - Peer TX)
+                        hint_remote = max(0.0, rb_p['rx'] - (rb_p['tx'] - peer_val))
+                    else:
+                        # Peer is RX. Hint for Peer RX = Remote TX Sum - (Remote RX Sum - Peer RX)
+                        hint_remote = max(0.0, rb_p['tx'] - (rb_p['rx'] - peer_val))
+
+                # 3. Determine Effective Hint
+                effective_hint = None
+                if hint_local is not None and hint_remote is not None:
+                    # Check agreement between hints
+                    diff_hints = abs(hint_local - hint_remote) / max(hint_local, hint_remote, 1.0)
+                    if diff_hints <= 0.05:
+                        effective_hint = (hint_local + hint_remote) / 2.0
+                    else:
+                        # Disagreement: prefer local hint as we are repairing the local value
+                        effective_hint = hint_local
+                elif hint_local is not None:
+                    effective_hint = hint_local
+                elif hint_remote is not None:
+                    effective_hint = hint_remote
+
+                # 4. Check Symmetry
+                denom = max(local_val, peer_val, 1.0)
+                diff = abs(local_val - peer_val) / denom
+
+                if diff <= HARDENING_THRESHOLD:
+                    # Symmetry holds: Average
+                    return (local_val + peer_val) / 2.0
+
+                # 5. Symmetry Broken
+
+                if effective_hint is not None:
+                    # Case A: Have Hint (Flow Conservation)
+
+                    # Double Dead Check: If sensors say 0 but flow says X
+                    if local_val < TRAFFIC_THRESHOLD and peer_val < TRAFFIC_THRESHOLD:
+                        if effective_hint > TRAFFIC_THRESHOLD: # Significant missing flow
+                             return effective_hint
+                        return 0.0
+
+                    # Pick value closer to hint
+                    denom_l = max(local_val, effective_hint, 1.0)
+                    err_l = abs(local_val - effective_hint) / denom_l
+
+                    denom_p = max(peer_val, effective_hint, 1.0)
+                    err_p = abs(peer_val - effective_hint) / denom_p
+
+                    if err_l < err_p:
+                        return local_val
+                    else:
+                        return peer_val
+
+                else:
+                    # Case B: No Hint (Partial/Unmonitored Router)
+                    # Heuristic: Trust positive signal (assuming counters stick to 0 on fail)
+                    if local_val < TRAFFIC_THRESHOLD and peer_val > TRAFFIC_THRESHOLD:
+                        return peer_val
+                    elif peer_val < TRAFFIC_THRESHOLD and local_val > TRAFFIC_THRESHOLD:
+                        return local_val
+
+                    # If both significant but different, average them to minimize max error
+                    return (local_val + peer_val) / 2.0
+
+            # Resolve RX (vs Peer TX)
+            peer_tx = state[peer_id]['tx'] if has_peer else curr['rx']
+            remote_r = telemetry[iface_id].get('remote_router')
+            next_rx = resolve(curr['rx'], peer_tx, is_rx=True, remote_router_id=remote_r)
+
+            # Resolve TX (vs Peer RX)
+            peer_rx = state[peer_id]['rx'] if has_peer else curr['tx']
+            next_tx = resolve(curr['tx'], peer_rx, is_rx=False, remote_router_id=remote_r)
+
+            next_rates[iface_id] = {'rx': next_rx, 'tx': next_tx}
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        def calibrate(val, peer_val, hint_val, status_conf, is_down):
+            if is_down:
+                return status_conf
+
+            # Evidence Errors
+            err_sym = 0.0
+            if has_peer:
+                denom = max(val, peer_val, 1.0)
+                err_sym = abs(val - peer_val) / denom
+
+            err_flow = None
+            if hint_val is not None:
+                denom = max(val, hint_val, 1.0)
+                err_flow = abs(val - hint_val) / denom
+
+            # Select Best Evidence
+            if err_flow is not None:
+                best_err = min(err_sym, err_flow)
+            else:
+                best_err = err_sym
+
+            # Linear Decay Calibration
+            # 1.0 at 0 error, decaying to 0.0 at 20% error (slope=5.0)
+            base_conf = max(0.0, 1.0 - (best_err * CONFIDENCE_SLOPE))
+
+            # Minor penalty if supporting evidence is weak/contradictory
+            if err_flow is not None and err_sym > 0.1 and err_flow < 0.05:
+                # Flow saved us, but link is asymmetric (broken sensor)
+                base_conf = min(base_conf, 0.95)
+
+            return base_conf
+=======
+        def calibrate(val, peer_val, hint_val, status_conf, is_down):
+            if is_down:
+                return status_conf
+
+            # Evidence Errors
+            err_sym = 0.0
+            if has_peer:
+                denom = max(val, peer_val, 1.0)
+                err_sym = abs(val - peer_val) / denom
+
+            err_flow = None
+            if hint_val is not None:
+                denom = max(val, hint_val, 1.0)
+                err_flow = abs(val - hint_val) / denom
+
+            # Select Best Evidence
+            if err_flow is not None:
+                best_err = min(err_sym, err_flow)
+            else:
+                best_err = err_sym
+
+            # Discrete Confidence Buckets
+            # Maps error ranges to calibrated confidence probabilities
+            if best_err <= HARDENING_THRESHOLD:
+                conf = 1.0
+            elif best_err <= 0.05:
+                conf = 0.95
+            elif best_err <= 0.10:
+                conf = 0.85
+            elif best_err <= 0.20:
+                conf = 0.70
+            elif best_err <= 0.50:
+                conf = 0.40
+            else:
+                conf = 0.10
+
+            # Contradiction Penalty
+            # If flow and symmetry strongly disagree, confidence drops
+            if err_flow is not None:
+                conflict = abs(err_sym - err_flow)
+                if conflict > 0.2:
+                    conf = max(0.1, conf - 0.2)
+
+            return conf * status_conf
+>>>>>>> REPLACE
+</DIFF>

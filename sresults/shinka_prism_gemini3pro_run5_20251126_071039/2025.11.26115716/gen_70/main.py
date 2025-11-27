@@ -1,0 +1,382 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+
+GPU_MEM_SIZE = 80.0  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    Algorithm:
+    1. Binary Search for optimal pressure limit K using Multi-Strategy Best-Fit Decreasing.
+    2. Guided Iterated Local Search (ILS) with heuristic move ordering and targeted perturbation.
+    """
+    
+    # --- 1. Preprocessing ---
+    m_data = []
+    total_w = 0.0
+    total_s = 0.0
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        m_data.append({
+            'w': w, 's': s, 'obj': m,
+            'd': w/s if s > 1e-6 else 0
+        })
+        total_w += w
+        total_s += s
+
+    # --- 2. Binary Search for Initial Feasible Solution ---
+    
+    # Lower bound: Ideal perfect distribution
+    rem_global = GPU_MEM_SIZE * gpu_num - total_s
+    lb = total_w / rem_global if rem_global > 1e-6 else 0.0
+    ub = 1000.0
+    
+    best_bs_res = None
+    
+    def check_feasible(k):
+        # We transform the inequality L/(C-U) <= K into L + K*U <= K*C.
+        # This is a Bin Packing problem with item size v(k) = w + k*s and bin capacity k*C.
+        # We use Best-Fit Decreasing (BFD) with multiple sort strategies.
+        
+        strategies = [
+            lambda x: x['w'] + k * x['s'], # Effective Size
+            lambda x: x['s'],              # Physical Size
+            lambda x: x['d']               # Density
+        ]
+        
+        for key_fn in strategies:
+            sorted_items = sorted(m_data, key=key_fn, reverse=True)
+            bins = [[] for _ in range(gpu_num)]
+            b_l = [0.0] * gpu_num
+            b_u = [0.0] * gpu_num
+            possible = True
+            
+            for item in sorted_items:
+                w, s = item['w'], item['s']
+                eff_size = w + k * s
+                
+                best_g = -1
+                min_slack = float('inf')
+                
+                for g in range(gpu_num):
+                    if b_u[g] + s > GPU_MEM_SIZE - 1e-6: continue
+                    
+                    # Constraint check: L + w <= K(C - (U + s))
+                    # Transformed: (L+w) + K(U+s) <= K*C
+                    current_eff = b_l[g] + k * b_u[g]
+                    new_total = current_eff + eff_size
+                    limit = k * GPU_MEM_SIZE
+                    
+                    if new_total <= limit + 1e-7:
+                        # Best Fit: Choose bin with minimum remaining capacity (slack)
+                        slack = limit - new_total
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_g = g
+                            
+                if best_g != -1:
+                    bins[best_g].append(item['obj'])
+                    b_l[best_g] += w
+                    b_u[best_g] += s
+                else:
+                    possible = False
+                    break
+            
+            if possible:
+                return bins
+        return None
+
+    # Binary Search
+    for _ in range(20):
+        if ub - lb < 1e-4: break
+        mid = (lb + ub) / 2.0
+        res = check_feasible(mid)
+        if res:
+            best_bs_res = res
+            ub = mid
+        else:
+            lb = mid
+            
+    # Heuristic Fallback if BS fails (rare)
+    if best_bs_res is None:
+        bins = [[] for _ in range(gpu_num)]
+        b_l, b_u = [0.0]*gpu_num, [0.0]*gpu_num
+        # Greedy by density
+        for item in sorted(m_data, key=lambda x: x['d'], reverse=True):
+            best_g = -1
+            best_p = float('inf')
+            for g in range(gpu_num):
+                rem = GPU_MEM_SIZE - b_u[g] - item['s']
+                if rem > 1e-6:
+                    p = (b_l[g] + item['w']) / rem
+                    if p < best_p:
+                        best_p = p
+                        best_g = g
+            if best_g == -1: raise ValueError("Infeasible")
+            bins[best_g].append(item['obj'])
+            b_l[best_g] += item['w']
+            b_u[best_g] += item['s']
+        best_bs_res = bins
+
+    # --- 3. Guided Iterated Local Search ---
+    
+    current_placement = {i: list(b) for i, b in enumerate(best_bs_res)}
+    
+    # Maintain state arrays for speed
+    p_l = [0.0] * gpu_num
+    p_u = [0.0] * gpu_num
+    for g in range(gpu_num):
+        for m in current_placement[g]:
+            p_l[g] += m.req_rate / m.slo
+            p_u[g] += m.model_size
+            
+    def calc_pressure(l, u):
+        rem = GPU_MEM_SIZE - u
+        if rem <= 1e-6: return float('inf') if l > 1e-6 else 0.0
+        return l / rem
+        
+    pressures = [calc_pressure(p_l[g], p_u[g]) for g in range(gpu_num)]
+    best_max = max(pressures)
+    best_placement = {k: list(v) for k, v in current_placement.items()}
+    
+    max_iters = 500
+    
+    for it in range(max_iters):
+        curr_max = max(pressures)
+        
+        # Update Global Best
+        if curr_max < best_max - 1e-8:
+            best_max = curr_max
+            best_placement = {k: list(v) for k, v in current_placement.items()}
+            
+        # Identify Bottleneck
+        bottleneck = -1
+        max_p_val = -1.0
+        for g in range(gpu_num):
+            if pressures[g] > max_p_val:
+                max_p_val = pressures[g]
+                bottleneck = g
+                
+        if max_p_val < 1e-6: break
+        
+        # --- Heuristic Guided Descent ---
+        
+        # 1. Sort Bottleneck Items by "Impact Score"
+        # Removing an item reduces pressure by approx (P*s + w)/(R+s).
+        # We approximate score = P * s + w. Higher is better to remove.
+        bn_items = []
+        for i, m in enumerate(current_placement[bottleneck]):
+            w, s = m.req_rate/m.slo, m.model_size
+            score = max_p_val * s + w
+            bn_items.append((i, m, w, s, score))
+        bn_items.sort(key=lambda x: x[4], reverse=True)
+        
+        # 2. Sort Partners by "Water Filling" (Lowest Pressure First)
+        partners = []
+        for g in range(gpu_num):
+            if g != bottleneck:
+                partners.append((g, pressures[g]))
+        partners.sort(key=lambda x: x[1])
+        
+        found_move = False
+        
+        # Try Moves: Bottleneck -> Emptiest Partners
+        for i, m, w, s, _ in bn_items:
+            for partner, p_val in partners:
+                if p_u[partner] + s > GPU_MEM_SIZE - 1e-6: continue
+                
+                n_bn_l = p_l[bottleneck] - w
+                n_bn_u = p_u[bottleneck] - s
+                n_pt_l = p_l[partner] + w
+                n_pt_u = p_u[partner] + s
+                
+                p_bn = calc_pressure(n_bn_l, n_bn_u)
+                p_pt = calc_pressure(n_pt_l, n_pt_u)
+                
+                new_local_max = max(p_bn, p_pt)
+                
+                # Accept if improves local max below global max
+                # Or if neutral but improves variance (sum of squares)
+                if new_local_max < curr_max - 1e-9:
+                    pass # Good
+                elif new_local_max < curr_max + 1e-9:
+                    if (p_bn**2 + p_pt**2) < (max_p_val**2 + p_val**2) - 1e-9:
+                        pass # Good
+                    else:
+                        continue
+                else:
+                    continue
+                    
+                # Apply Move
+                current_placement[bottleneck].pop(i)
+                current_placement[partner].append(m)
+                p_l[bottleneck], p_u[bottleneck] = n_bn_l, n_bn_u
+                p_l[partner], p_u[partner] = n_pt_l, n_pt_u
+                pressures[bottleneck], pressures[partner] = p_bn, p_pt
+                found_move = True
+                break
+            if found_move: break
+            
+        if found_move: continue
+        
+        # Try Swaps (Only checking top 3 emptiest partners for speed)
+        for partner, p_val in partners[:3]:
+            pt_items = current_placement[partner]
+            for i, m1, w1, s1, _ in bn_items:
+                for j, m2 in enumerate(pt_items):
+                    w2, s2 = m2.req_rate/m2.slo, m2.model_size
+                    
+                    if p_u[bottleneck] - s1 + s2 > GPU_MEM_SIZE - 1e-6: continue
+                    if p_u[partner] - s2 + s1 > GPU_MEM_SIZE - 1e-6: continue
+                    
+                    n_bn_l = p_l[bottleneck] - w1 + w2
+                    n_pt_l = p_l[partner] - w2 + w1
+                    
+                    p_bn = calc_pressure(n_bn_l, p_u[bottleneck] - s1 + s2)
+                    p_pt = calc_pressure(n_pt_l, p_u[partner] - s2 + s1)
+                    
+                    new_local_max = max(p_bn, p_pt)
+                    
+                    if new_local_max < curr_max - 1e-9:
+                        pass
+                    elif new_local_max < curr_max + 1e-9:
+                        if (p_bn**2 + p_pt**2) < (max_p_val**2 + p_val**2) - 1e-9:
+                            pass
+                        else:
+                            continue
+                    else:
+                        continue
+                        
+                    current_placement[bottleneck][i] = m2
+                    current_placement[partner][j] = m1
+                    p_l[bottleneck] = n_bn_l
+                    p_u[bottleneck] += (s2 - s1)
+                    p_l[partner] = n_pt_l
+                    p_u[partner] += (s1 - s2)
+                    pressures[bottleneck] = p_bn
+                    pressures[partner] = p_pt
+                    found_move = True
+                    break
+                if found_move: break
+            if found_move: break
+            
+        if found_move: continue
+        
+        # --- Targeted Perturbation (Guided Ruin & Recreate) ---
+        # Ruin Bottleneck + K Emptiest Partners
+        k_victims = min(3, gpu_num - 1)
+        victims = [bottleneck] + [p[0] for p in partners[:k_victims]]
+        
+        repack = []
+        for v in victims:
+            repack.extend(current_placement[v])
+            current_placement[v] = []
+            p_l[v] = 0.0
+            p_u[v] = 0.0
+            
+        # Sort with noise to explore space
+        random.shuffle(repack)
+        repack.sort(key=lambda x: ((x.req_rate/x.slo)/(x.model_size+1e-6)) * random.uniform(0.8, 1.2), reverse=True)
+        
+        feasible_repack = True
+        for item in repack:
+            w, s = item.req_rate/item.slo, item.model_size
+            best_v = -1
+            min_local_p = float('inf')
+            
+            # Greedy fit
+            for v in victims:
+                rem = GPU_MEM_SIZE - p_u[v] - s
+                if rem > 1e-6:
+                    p = (p_l[v] + w) / rem
+                    if p < min_local_p:
+                        min_local_p = p
+                        best_v = v
+            
+            # Fallback
+            if best_v == -1:
+                for v in victims:
+                    if p_u[v] + s <= GPU_MEM_SIZE - 1e-6:
+                        best_v = v
+                        break
+                        
+            if best_v != -1:
+                current_placement[best_v].append(item)
+                p_l[best_v] += w
+                p_u[best_v] += s
+            else:
+                feasible_repack = False
+                break
+                
+        if feasible_repack:
+            for v in victims:
+                pressures[v] = calc_pressure(p_l[v], p_u[v])
+        else:
+            # Revert
+            current_placement = {k: list(v) for k, v in best_placement.items()}
+            # Recompute state
+            p_l = [0.0]*gpu_num
+            p_u = [0.0]*gpu_num
+            for g in range(gpu_num):
+                for m in current_placement[g]:
+                    p_l[g] += m.req_rate/m.slo
+                    p_u[g] += m.model_size
+            pressures = [calc_pressure(p_l[g], p_u[g]) for g in range(gpu_num)]
+            
+            if it > max_iters * 0.9: break
+
+    return best_placement
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

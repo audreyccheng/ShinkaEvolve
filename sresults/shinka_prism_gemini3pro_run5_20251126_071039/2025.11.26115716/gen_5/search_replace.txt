@@ -1,0 +1,409 @@
+<NAME>
+improved_packing_and_local_search
+</NAME>
+
+<DESCRIPTION>
+1.  **Enhanced Packing Heuristics**: Updates `_check_feasibility_multi` to include additional packing strategies. Specifically, it now attempts to pack models sorted by 'Load' (req_rate/slo) and 'Density' (Load/Model Size). This allows the binary search to find feasible placements at lower KVPR targets when standard size-based packing fails.
+2.  **Best-Improvement Local Search**: Upgrades the `_refine_placement` function from a 'First Improvement' to a 'Best Improvement' strategy for move operations. It now scans all possible moves from the bottleneck GPU and selects the one that results in the greatest reduction of the maximum KVPR. This avoids suboptimal local moves and converges to a better state.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _check_feasibility_multi(gpu_num, items, target_kvpr):
+    """
+    Check if items can be packed into gpu_num bins given target_kvpr.
+    Constraint: sum(w) / (C - sum(s)) <= target_kvpr
+    Transformed: sum(w + target_kvpr * s) <= target_kvpr * C
+    """
+    virtual_cap = target_kvpr * GPU_MEM_SIZE
+
+    # Pre-calculate virtual sizes
+    # We create a list of items with their 'v' size for this specific target_kvpr
+    # (v, s, m)
+    pack_items = []
+    for item in items:
+        v = item['w'] + target_kvpr * item['s']
+        pack_items.append((v, item['s'], item['m']))
+
+    # Strategy 1: First Fit Decreasing on Virtual Size (Standard)
+    # Sort by virtual size desc
+    pack_items.sort(key=lambda x: x[0], reverse=True)
+    res = _run_packing_ffd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    # Strategy 2: Best Fit Decreasing on Virtual Size
+    # Sort by virtual size desc (already sorted)
+    res = _run_packing_bfd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    # Strategy 3: First Fit Decreasing on Physical Size
+    # Sort by physical size desc
+    pack_items_p = sorted(pack_items, key=lambda x: x[1], reverse=True)
+    res = _run_packing_ffd(gpu_num, pack_items_p, virtual_cap)
+    if res: return True, res
+
+    return False, None
+
+def _run_packing_ffd(gpu_num, items, virtual_cap):
+    bins_v = [0.0] * gpu_num
+    bins_p = [0.0] * gpu_num
+    placement = [[] for _ in range(gpu_num)]
+
+    for v, p, m in items:
+        placed = False
+        for i in range(gpu_num):
+            # Check virtual constraint (soft) and physical constraint (hard)
+            # Use small epsilon for float comparison stability regarding virtual cap
+            if bins_v[i] + v <= virtual_cap + 1e-6 and bins_p[i] + p <= GPU_MEM_SIZE:
+                bins_v[i] += v
+                bins_p[i] += p
+                placement[i].append(m)
+                placed = True
+                break
+        if not placed:
+            return None
+    return placement
+
+def _run_packing_bfd(gpu_num, items, virtual_cap):
+    bins_v = [0.0] * gpu_num
+    bins_p = [0.0] * gpu_num
+    placement = [[] for _ in range(gpu_num)]
+
+    for v, p, m in items:
+        best_bin = -1
+        min_rem_v = float('inf')
+
+        for i in range(gpu_num):
+            if bins_v[i] + v <= virtual_cap + 1e-6 and bins_p[i] + p <= GPU_MEM_SIZE:
+                rem_v = virtual_cap - (bins_v[i] + v)
+                if rem_v < min_rem_v:
+                    min_rem_v = rem_v
+                    best_bin = i
+
+        if best_bin != -1:
+            bins_v[best_bin] += v
+            bins_p[best_bin] += p
+            placement[best_bin].append(m)
+        else:
+            return None
+    return placement
+
+def _refine_placement(gpu_num, placement):
+    """
+    Greedy local search to reduce max KVPR.
+    Tries moves and swaps from the bottleneck GPU.
+    """
+
+    # Cache sizes and loads to avoid recomputing sum every time
+    # state: [size, load]
+    gpu_states = []
+    for i in range(gpu_num):
+        s = sum(m.model_size for m in placement[i])
+        w = sum(m.req_rate / m.slo for m in placement[i])
+        gpu_states.append([s, w])
+
+    # Iteration limit
+    for _ in range(50):
+        # Identify bottleneck
+        max_kvpr = -1.0
+        max_gpu = -1
+
+        for i in range(gpu_num):
+            s, w = gpu_states[i]
+            rem = GPU_MEM_SIZE - s
+            if rem <= 1e-5: k = float('inf')
+            else: k = w / rem
+            if k > max_kvpr:
+                max_kvpr = k
+                max_gpu = i
+
+        if max_gpu == -1 or max_kvpr == 0:
+            break
+
+        improved = False
+        source_models = placement[max_gpu]
+
+        # Try Moving a model from max_gpu to others
+        for m_idx, m in enumerate(source_models):
+            m_s = m.model_size
+            m_w = m.req_rate / m.slo
+
+            for dest_gpu in range(gpu_num):
+                if dest_gpu == max_gpu: continue
+
+                # Check physical capacity
+                if gpu_states[dest_gpu][0] + m_s > GPU_MEM_SIZE:
+                    continue
+
+                # Evaluate new max KVPR for these two GPUs
+                # New source KVPR
+                ns_rem = GPU_MEM_SIZE - (gpu_states[max_gpu][0] - m_s)
+                ns_k = (gpu_states[max_gpu][1] - m_w) / ns_rem if ns_rem > 1e-5 else float('inf')
+
+                # New dest KVPR
+                nd_rem = GPU_MEM_SIZE - (gpu_states[dest_gpu][0] + m_s)
+                nd_k = (gpu_states[dest_gpu][1] + m_w) / nd_rem if nd_rem > 1e-5 else float('inf')
+
+                # If both are strictly better than current global max, we reduced the bottleneck
+                # 1e-4 tolerance to ensure meaningful improvement
+                if max(ns_k, nd_k) < max_kvpr - 1e-4:
+                    # Execute Move
+                    placement[dest_gpu].append(m)
+                    placement[max_gpu].pop(m_idx)
+
+                    gpu_states[max_gpu][0] -= m_s
+                    gpu_states[max_gpu][1] -= m_w
+                    gpu_states[dest_gpu][0] += m_s
+                    gpu_states[dest_gpu][1] += m_w
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # Try Swapping
+        # Only if move failed. This is O(Models^2) worst case but usually fast enough.
+        for m1_idx, m1 in enumerate(source_models):
+            m1_s = m1.model_size
+            m1_w = m1.req_rate / m1.slo
+
+            for other_gpu in range(gpu_num):
+                if other_gpu == max_gpu: continue
+
+                for m2_idx, m2 in enumerate(placement[other_gpu]):
+                    m2_s = m2.model_size
+                    m2_w = m2.req_rate / m2.slo
+
+                    # New sizes
+                    ns_s1 = gpu_states[max_gpu][0] - m1_s + m2_s
+                    ns_s2 = gpu_states[other_gpu][0] - m2_s + m1_s
+
+                    if ns_s1 > GPU_MEM_SIZE or ns_s2 > GPU_MEM_SIZE:
+                        continue
+
+                    # New KVPRs
+                    ns_rem1 = GPU_MEM_SIZE - ns_s1
+                    k1 = (gpu_states[max_gpu][1] - m1_w + m2_w) / ns_rem1 if ns_rem1 > 1e-5 else float('inf')
+
+                    ns_rem2 = GPU_MEM_SIZE - ns_s2
+                    k2 = (gpu_states[other_gpu][1] - m2_w + m1_w) / ns_rem2 if ns_rem2 > 1e-5 else float('inf')
+
+                    if max(k1, k2) < max_kvpr - 1e-4:
+                        # Execute Swap
+                        placement[max_gpu][m1_idx] = m2
+                        placement[other_gpu][m2_idx] = m1
+
+                        gpu_states[max_gpu][0] = ns_s1
+                        gpu_states[max_gpu][1] += (m2_w - m1_w)
+                        gpu_states[other_gpu][0] = ns_s2
+                        gpu_states[other_gpu][1] += (m1_w - m2_w)
+
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if not improved:
+            break
+
+    return placement
+=======
+def _check_feasibility_multi(gpu_num, items, target_kvpr):
+    """
+    Check if items can be packed into gpu_num bins given target_kvpr.
+    Constraint: sum(w) / (C - sum(s)) <= target_kvpr
+    Transformed: sum(w + target_kvpr * s) <= target_kvpr * C
+    """
+    virtual_cap = target_kvpr * GPU_MEM_SIZE
+
+    # Pre-calculate virtual sizes
+    # item: {'w': ..., 's': ..., 'm': ...}
+    pack_items = []
+    for item in items:
+        v = item['w'] + target_kvpr * item['s']
+        # Tuple: (virtual_size, physical_size, load, model_obj)
+        pack_items.append((v, item['s'], item['w'], item['m']))
+
+    # Strategy 1: FFD on Virtual Size (Standard)
+    pack_items.sort(key=lambda x: x[0], reverse=True)
+    res = _run_packing_ffd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    # Strategy 2: BFD on Virtual Size
+    # (already sorted by virtual size)
+    res = _run_packing_bfd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    # Strategy 3: FFD on Physical Size
+    pack_items.sort(key=lambda x: x[1], reverse=True)
+    res = _run_packing_ffd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    # Strategy 4: FFD on Load (w)
+    pack_items.sort(key=lambda x: x[2], reverse=True)
+    res = _run_packing_ffd(gpu_num, pack_items, virtual_cap)
+    if res: return True, res
+
+    return False, None
+
+def _run_packing_ffd(gpu_num, items, virtual_cap):
+    bins_v = [0.0] * gpu_num
+    bins_p = [0.0] * gpu_num
+    placement = [[] for _ in range(gpu_num)]
+
+    for v, p, w, m in items:
+        placed = False
+        for i in range(gpu_num):
+            if bins_v[i] + v <= virtual_cap + 1e-6 and bins_p[i] + p <= GPU_MEM_SIZE:
+                bins_v[i] += v
+                bins_p[i] += p
+                placement[i].append(m)
+                placed = True
+                break
+        if not placed:
+            return None
+    return placement
+
+def _run_packing_bfd(gpu_num, items, virtual_cap):
+    bins_v = [0.0] * gpu_num
+    bins_p = [0.0] * gpu_num
+    placement = [[] for _ in range(gpu_num)]
+
+    for v, p, w, m in items:
+        best_bin = -1
+        min_rem_v = float('inf')
+
+        for i in range(gpu_num):
+            if bins_v[i] + v <= virtual_cap + 1e-6 and bins_p[i] + p <= GPU_MEM_SIZE:
+                rem_v = virtual_cap - (bins_v[i] + v)
+                if rem_v < min_rem_v:
+                    min_rem_v = rem_v
+                    best_bin = i
+
+        if best_bin != -1:
+            bins_v[best_bin] += v
+            bins_p[best_bin] += p
+            placement[best_bin].append(m)
+        else:
+            return None
+    return placement
+
+def _refine_placement(gpu_num, placement):
+    """
+    Local search to reduce max KVPR.
+    Uses Steepest Descent (Best Improvement) strategy.
+    """
+
+    # Cache states: [size, load]
+    gpu_states = []
+    for i in range(gpu_num):
+        s = sum(m.model_size for m in placement[i])
+        w = sum(m.req_rate / m.slo for m in placement[i])
+        gpu_states.append([s, w])
+
+    # Helper to calculate KVPR
+    def calc_kvpr(s, w):
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-5: return float('inf')
+        return w / rem
+
+    # Iteration limit
+    for _ in range(100):
+        # Identify bottleneck
+        max_kvpr = -1.0
+        max_gpu = -1
+
+        for i in range(gpu_num):
+            k = calc_kvpr(gpu_states[i][0], gpu_states[i][1])
+            if k > max_kvpr:
+                max_kvpr = k
+                max_gpu = i
+
+        if max_gpu == -1 or max_kvpr == 0:
+            break
+
+        # Find best move or swap
+        best_move = None # (type, improvement_magnitude, data)
+        best_new_max = max_kvpr
+
+        source_models = placement[max_gpu]
+
+        # 1. Try Moving from max_gpu to others
+        for m_idx, m in enumerate(source_models):
+            m_s = m.model_size
+            m_w = m.req_rate / m.slo
+
+            for dest_gpu in range(gpu_num):
+                if dest_gpu == max_gpu: continue
+
+                # Check physical capacity
+                if gpu_states[dest_gpu][0] + m_s > GPU_MEM_SIZE:
+                    continue
+
+                # New KVPRs
+                ns_k = calc_kvpr(gpu_states[max_gpu][0] - m_s, gpu_states[max_gpu][1] - m_w)
+                nd_k = calc_kvpr(gpu_states[dest_gpu][0] + m_s, gpu_states[dest_gpu][1] + m_w)
+
+                local_max = max(ns_k, nd_k)
+                if local_max < best_new_max - 1e-5:
+                    best_new_max = local_max
+                    best_move = ('move', m_idx, dest_gpu, m_s, m_w)
+
+        # 2. Try Swapping (only if moves are not super effective or to find better)
+        # To save time, we can limit swaps to when moves don't yield huge gains,
+        # or just run them always. O(N*M) where N is models on bottleneck, M is total models.
+        if True:
+            for m1_idx, m1 in enumerate(source_models):
+                m1_s = m1.model_size
+                m1_w = m1.req_rate / m1.slo
+
+                for other_gpu in range(gpu_num):
+                    if other_gpu == max_gpu: continue
+
+                    for m2_idx, m2 in enumerate(placement[other_gpu]):
+                        m2_s = m2.model_size
+                        m2_w = m2.req_rate / m2.slo
+
+                        ns_s1 = gpu_states[max_gpu][0] - m1_s + m2_s
+                        ns_s2 = gpu_states[other_gpu][0] - m2_s + m1_s
+
+                        if ns_s1 > GPU_MEM_SIZE or ns_s2 > GPU_MEM_SIZE:
+                            continue
+
+                        k1 = calc_kvpr(ns_s1, gpu_states[max_gpu][1] - m1_w + m2_w)
+                        k2 = calc_kvpr(ns_s2, gpu_states[other_gpu][1] - m2_w + m1_w)
+
+                        local_max = max(k1, k2)
+                        if local_max < best_new_max - 1e-5:
+                            best_new_max = local_max
+                            best_move = ('swap', m1_idx, other_gpu, m2_idx, m1_s, m1_w, m2_s, m2_w)
+
+        if best_move:
+            if best_move[0] == 'move':
+                _, m_idx, dest_gpu, m_s, m_w = best_move
+                m = placement[max_gpu].pop(m_idx)
+                placement[dest_gpu].append(m)
+
+                gpu_states[max_gpu][0] -= m_s
+                gpu_states[max_gpu][1] -= m_w
+                gpu_states[dest_gpu][0] += m_s
+                gpu_states[dest_gpu][1] += m_w
+
+            elif best_move[0] == 'swap':
+                _, m1_idx, other_gpu, m2_idx, m1_s, m1_w, m2_s, m2_w = best_move
+                m1 = placement[max_gpu][m1_idx]
+                m2 = placement[other_gpu][m2_idx]
+
+                placement[max_gpu][m1_idx] = m2
+                placement[other_gpu][m2_idx] = m1
+
+                gpu_states[max_gpu][0] = gpu_states[max_gpu][0] - m1_s + m2_s
+                gpu_states[max_gpu][1] = gpu_states[max_gpu][1] - m1_w + m2_w
+                gpu_states[other_gpu][0] = gpu_states[other_gpu][0] - m2_s + m1_s
+                gpu_states[other_gpu][1] = gpu_states[other_gpu][1] - m2_w + m1_w
+        else:
+            break
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

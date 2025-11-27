@@ -1,0 +1,338 @@
+<NAME>
+init_cached_rem
+</NAME>
+
+<DESCRIPTION>
+Initialize `_cached_rem` in the `GPUState` constructor. This ensures that the attribute exists even for empty GPUs, preventing `AttributeError` during state copying.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        def __init__(self, gpu_id):
+            self.id = gpu_id
+            self.models = []
+            self.load = 0.0
+            self.used_mem = 0.0
+            self._cached_kvpr = 0.0
+=======
+        def __init__(self, gpu_id):
+            self.id = gpu_id
+            self.models = []
+            self.load = 0.0
+            self.used_mem = 0.0
+            self._cached_kvpr = 0.0
+            self._cached_rem = GPU_MEM_SIZE
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+add_gpustate_copy
+</NAME>
+
+<DESCRIPTION>
+Add a `copy_from` method to the `GPUState` class to allow efficient state saving during the Iterated Local Search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        def restore_model(self, idx, model):
+            self.models.insert(idx, model)
+            self.load += model.req_rate / model.slo
+            self.used_mem += model.model_size
+            self.update_cache()
+=======
+        def restore_model(self, idx, model):
+            self.models.insert(idx, model)
+            self.load += model.req_rate / model.slo
+            self.used_mem += model.model_size
+            self.update_cache()
+
+        def copy_from(self, other):
+            self.models = list(other.models)
+            self.load = other.load
+            self.used_mem = other.used_mem
+            self._cached_kvpr = other._cached_kvpr
+            self._cached_rem = other._cached_rem
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+implement_ils_with_2swap
+</NAME>
+
+<DESCRIPTION>
+Replace the basic Local Search loop with a more advanced **Iterated Local Search (ILS)** framework. This update includes:
+1.  **Swap 2-to-2 Operator**: Adds a new move type to exchange two models from the bottleneck GPU with two models from a target GPU, helping to resolve complex fragmentation scenarios.
+2.  **Targeted Perturbation**: When the search stagnates (local optimum), forcefully moves a model from the bottleneck GPU to the *least loaded feasible GPU*. This kick helps escape local optima while trying to minimize damage to the overall balance.
+3.  **Iterative Loop**: Runs the search for a fixed number of iterations, allowing it to explore multiple basins of attraction via perturbation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 2. Local Search Refinement
+    gpus = [GPUState(i) for i in range(gpu_num)]
+    for i, m_list in enumerate(best_init_placement):
+        for m in m_list:
+            gpus[i].add(m)
+
+    def get_vector_fast(current_gpus):
+        # Returns tuple for lexicographical comparison
+        return tuple(sorted((g.kvpr() for g in current_gpus), reverse=True))
+
+    current_vector = get_vector_fast(gpus)
+
+    loop_count = 0
+    max_loops = 150
+
+    while loop_count < max_loops:
+        improved = False
+        loop_count += 1
+
+        # Sort GPUs by pressure to focus on bottlenecks
+        sorted_gpus = sorted(gpus, key=lambda g: g.kvpr(), reverse=True)
+
+        # Focus on the top bottleneck GPUs
+        sources = sorted_gpus[:min(len(sorted_gpus), 4)]
+
+        # --- Operator 1: Move ---
+        for source in sources:
+            for i, model in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.can_fit(model.model_size):
+                        source.remove(i)
+                        dest.add(model)
+
+                        new_vec = get_vector_fast(gpus)
+                        if new_vec < current_vector:
+                            current_vector = new_vec
+                            improved = True
+                            break
+                        else:
+                            dest.remove(len(dest.models)-1)
+                            source.restore_model(i, model)
+                if improved: break
+            if improved: break
+
+        if improved: continue
+
+        # --- Operator 2: Swap (1-to-1) ---
+        for source in sources:
+            for i, m_a in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.kvpr() >= source.kvpr(): continue
+
+                    for j, m_b in enumerate(dest.models):
+                        # Capacity Check
+                        if source.used_mem - m_a.model_size + m_b.model_size <= GPU_MEM_SIZE and \
+                           dest.used_mem - m_b.model_size + m_a.model_size <= GPU_MEM_SIZE:
+
+                            source.remove(i)
+                            dest.remove(j)
+                            source.add(m_b)
+                            dest.add(m_a)
+
+                            new_vec = get_vector_fast(gpus)
+                            if new_vec < current_vector:
+                                current_vector = new_vec
+                                improved = True
+                                break
+                            else:
+                                # Revert
+                                dest.remove(len(dest.models)-1)
+                                source.remove(len(source.models)-1)
+                                dest.restore_model(j, m_b)
+                                source.restore_model(i, m_a)
+                    if improved: break
+                if improved: break
+            if improved: break
+
+        if improved: continue
+
+        # --- Operator 3: Swap (1-to-2) ---
+        # Swap 1 model from Source with 2 models from Dest
+        # Helps when Source is stuck with big models and Dest has fragmentation
+        for source in sources[:2]: # Limit to top bottlenecks for speed
+            for i, m_a in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.kvpr() >= source.kvpr(): continue
+                    if len(dest.models) < 2: continue
+
+                    n_dest = len(dest.models)
+                    pair_found = False
+
+                    # Try pairs in dest
+                    for j1 in range(n_dest):
+                        for j2 in range(j1 + 1, n_dest):
+                            m_b1 = dest.models[j1]
+                            m_b2 = dest.models[j2]
+
+                            # Capacity Check
+                            # Source: -m_a + m_b1 + m_b2
+                            # Dest: -m_b1 - m_b2 + m_a
+                            if source.used_mem - m_a.model_size + m_b1.model_size + m_b2.model_size <= GPU_MEM_SIZE and \
+                               dest.used_mem - m_b1.model_size - m_b2.model_size + m_a.model_size <= GPU_MEM_SIZE:
+
+                                source.remove(i)
+                                # Remove larger index first to preserve smaller index
+                                dest.remove(j2)
+                                dest.remove(j1)
+
+                                source.add(m_b1)
+                                source.add(m_b2)
+                                dest.add(m_a)
+
+                                new_vec = get_vector_fast(gpus)
+                                if new_vec < current_vector:
+                                    current_vector = new_vec
+                                    improved = True
+                                    pair_found = True
+                                    break
+                                else:
+                                    # Revert
+                                    dest.remove(len(dest.models)-1) # m_a
+                                    source.remove(len(source.models)-1) # m_b2
+                                    source.remove(len(source.models)-1) # m_b1
+
+                                    dest.restore_model(j1, m_b1)
+                                    dest.restore_model(j2, m_b2)
+                        if pair_found: break
+                    if pair_found: break
+                if improved: break
+            if improved: break
+
+        if not improved:
+            break
+
+    return {g.id: g.models for g in gpus}
+=======
+    # 2. Local Search Refinement with Perturbation (ILS)
+    import random
+
+    gpus = [GPUState(i) for i in range(gpu_num)]
+    for i, m_list in enumerate(best_init_placement):
+        for m in m_list:
+            gpus[i].add(m)
+
+    def get_vector_fast(current_gpus):
+        # Returns tuple for lexicographical comparison
+        return tuple(sorted((g.kvpr() for g in current_gpus), reverse=True))
+
+    current_vector = get_vector_fast(gpus)
+
+    # Track global best
+    best_gpus = [GPUState(i) for i in range(gpu_num)]
+    for i in range(gpu_num): best_gpus[i].copy_from(gpus[i])
+    best_vector = current_vector
+
+    iter_cnt = 0
+    max_iter = 250 # Increase iterations for ILS
+
+    while iter_cnt < max_iter:
+        improved_step = False
+
+        # Identify bottlenecks
+        sorted_gpus = sorted(gpus, key=lambda g: g.kvpr(), reverse=True)
+        sources = sorted_gpus[:4]
+
+        # --- MOVE ---
+        for source in sources:
+            for i, model in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.can_fit(model.model_size):
+                        source.remove(i)
+                        dest.add(model)
+
+                        new_vec = get_vector_fast(gpus)
+                        if new_vec < current_vector:
+                            current_vector = new_vec
+                            improved_step = True
+                            break
+                        else:
+                            dest.remove(len(dest.models)-1)
+                            source.restore_model(i, model)
+                if improved_step: break
+            if improved_step: break
+
+        if improved_step:
+            if current_vector < best_vector:
+                best_vector = current_vector
+                for k in range(gpu_num): best_gpus[k].copy_from(gpus[k])
+            iter_cnt += 1
+            continue
+
+        # --- SWAP 1-1 ---
+        for source in sources:
+            for i, m_a in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.kvpr() >= source.kvpr(): continue
+
+                    for j, m_b in enumerate(dest.models):
+                        if source.used_mem - m_a.model_size + m_b.model_size <= GPU_MEM_SIZE and \
+                           dest.used_mem - m_b.model_size + m_a.model_size <= GPU_MEM_SIZE:
+                            source.remove(i)
+                            dest.remove(j)
+                            source.add(m_b)
+                            dest.add(m_a)
+
+                            new_vec = get_vector_fast(gpus)
+                            if new_vec < current_vector:
+                                current_vector = new_vec
+                                improved_step = True
+                                break
+                            else:
+                                dest.remove(len(dest.models)-1)
+                                source.remove(len(source.models)-1)
+                                dest.restore_model(j, m_b)
+                                source.restore_model(i, m_a)
+                    if improved_step: break
+                if improved_step: break
+            if improved_step: break
+
+        if improved_step:
+            if current_vector < best_vector:
+                best_vector = current_vector
+                for k in range(gpu_num): best_gpus[k].copy_from(gpus[k])
+            iter_cnt += 1
+            continue
+
+        # --- SWAP 1-2 ---
+        for source in sources[:2]:
+            for i, m_a in enumerate(source.models):
+                for dest in gpus:
+                    if dest.id == source.id: continue
+                    if dest.kvpr() >= source.kvpr(): continue
+                    if len(dest.models) < 2: continue
+
+                    n_d = len(dest.models)
+                    pair_found = False
+                    for j1 in range(n_d):
+                        for j2 in range(j1 + 1, n_d):
+                            m_b1 = dest.models[j1]
+                            m_b2 = dest.models[j2]
+
+                            if source.used_mem - m_a.model_size + m_b1.model_size + m_b2.model_size <= GPU_MEM_SIZE and \
+                               dest.used_mem - m_b1.model_size - m_b2.model_size + m_a.model_size <= GPU_MEM_SIZE:
+                                source.remove(i)
+                                dest.remove(j2); dest.remove(j1)
+                                source.add(m_b1); source.add(m_b2)
+                                dest.add(m_a)
+
+                                new_vec = get_vector_fast(gpus)
+                                if new_vec < current_vector:
+                                    current_vector = new_vec
+                                    improved_step = True
+                                    pair_found = True
+                                    break
+                                else:
+                                    dest.remove(len(dest.models)-1)
+                                    source.remove(len(source.models)-1); source.remove(len(source.models)-1)
+                                    dest.restore_model(j1, m_b1); dest.restore_model(j2, m_b2)
+                        if pair_found: break
+                    if pair_found: break
+                if improved_step: break
+            if improved_

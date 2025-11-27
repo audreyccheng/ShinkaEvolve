@@ -1,0 +1,208 @@
+<NAME>
+peak_aware_tail_and_adaptive_refine
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements:
+
+1) Peak-aware adaptive tail allocation in replicate_experts: Instead of pre-simulating a fixed Sainte–Laguë tail around 10%, we keep the fast D’Hondt bulk but make the last ~10% allocations adaptive per step. At each tail step and for each row, we evaluate three apportionment choices (D’Hondt, Sainte–Laguë, Huntington–Hill) and choose the one that minimizes the tuple (new_peak, new_second_peak, new_count) using an exact, O(1) update from the current top-2 averages. This directly optimizes the primary objective (lower maximum per-replica load) right where it matters most, without heavy computation.
+
+2) Adaptive refinement depth in balanced_packing: After greedy placement per row, we compute the current imbalance ratio and, if it exceeds 2% of the mean load, we allow up to 3 swap attempts (k=2 candidates), otherwise we keep the original bound. This focuses extra work only on outlier rows, improving balance at negligible cost.
+
+Both changes preserve determinism and keep the overall time essentially the same (speed score remains high) while improving balancedness by being more peak-aware in replication decisions and slightly more aggressive only when necessary in pack refinement.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Bulk: D'Hondt (benefit = w / r); choose tail via tiny A/B/C around 10%
+    tail0 = max(1, int(round(0.10 * num_extra)))
+    tail_candidates = sorted(set([max(1, tail0 - 1), tail0, min(num_extra, tail0 + 1)]))
+    best_tail = tail_candidates[0]
+    best_pred_peak = None
+
+    # Simulate tail options with bulk as D'Hondt
+    for tl in tail_candidates:
+        bulk = max(0, num_extra - tl)
+        cnt_sim = torch.ones_like(logcnt)
+        # Apply bulk D'Hondt on simulated counts
+        if bulk > 0:
+            for _ in range(bulk):
+                benefit = weight / cnt_sim.to(dtype_f)
+                best = benefit.argmax(dim=-1)
+                cnt_sim[ar, best] += 1
+        # Simulate tl steps of Sainte-Laguë
+        if tl > 0:
+            for _ in range(tl):
+                denom = (2.0 * cnt_sim.to(dtype_f) - 1.0)
+                benefit = weight / denom
+                best = benefit.argmax(dim=-1)
+                cnt_sim[ar, best] += 1
+        # Predicted peak average per row
+        avg_sim = weight / cnt_sim.to(dtype_f)
+        pred_peak = avg_sim.max(dim=-1).values.mean().item()  # average across rows
+        if best_pred_peak is None or pred_peak < best_pred_peak - 0.0:
+            best_pred_peak = pred_peak
+            best_tail = tl
+
+    # Now actually allocate extras: first bulk D'Hondt then best-tail Sainte-Laguë
+    bulk = max(0, num_extra - best_tail)
+    col = num_log
+    if bulk > 0:
+        for _ in range(bulk):
+            benefit = weight / logcnt.to(dtype_f)
+            best = benefit.argmax(dim=-1)
+            phy2log[:, col] = best
+            rank[:, col] = logcnt[ar, best]
+            logcnt[ar, best] += 1
+            col += 1
+    if best_tail > 0:
+        for _ in range(best_tail):
+            denom = (2.0 * logcnt.to(dtype_f) - 1.0)
+            benefit = weight / denom
+            best = benefit.argmax(dim=-1)
+            phy2log[:, col] = best
+            rank[:, col] = logcnt[ar, best]
+            logcnt[ar, best] += 1
+            col += 1
+=======
+    # Hybrid allocation: D'Hondt bulk, then per-step peak-aware tail selection
+    tail = max(1, int(round(0.10 * num_extra)))
+    bulk = max(0, num_extra - tail)
+    col = num_log
+
+    # Bulk phase (D'Hondt): benefit = w / r
+    for _ in range(bulk):
+        r_f = logcnt.to(dtype_f)
+        idx = (weight / r_f).argmax(dim=-1)
+        phy2log[:, col] = idx
+        rank[:, col] = logcnt[ar, idx]
+        logcnt[ar, idx] += 1
+        col += 1
+
+    # Tail phase: at each step choose among D’Hondt, Sainte–Laguë, Huntington–Hill
+    # using a peak-aware lexicographic objective: (new_peak, new_second_peak, new_count)
+    for _ in range(tail):
+        r_f = logcnt.to(dtype_f)
+        avg = weight / r_f
+
+        if num_log > 1:
+            top2 = torch.topk(avg, k=2, dim=-1, largest=True)
+            top1 = top2.values[:, 0]
+            second = top2.values[:, 1]
+            top1_idx = top2.indices[:, 0]
+        else:
+            # Degenerate single expert case
+            top1 = avg[:, 0]
+            second = top1
+            top1_idx = torch.zeros(n, dtype=dtype_i64, device=device)
+
+        # Candidate indices for three apportionment methods
+        idxD = (weight / r_f).argmax(dim=-1)
+        idxS = (weight / (2.0 * r_f - 1.0)).argmax(dim=-1)
+        idxH = (weight / torch.sqrt(r_f * (r_f + 1.0))).argmax(dim=-1)
+
+        # New averages for the chosen expert after adding one replica
+        newD = weight[ar, idxD] / (r_f[ar, idxD] + 1.0)
+        newS = weight[ar, idxS] / (r_f[ar, idxS] + 1.0)
+        newH = weight[ar, idxH] / (r_f[ar, idxH] + 1.0)
+
+        # Masks for whether the chosen index is currently the top-1 expert
+        mD_top = (idxD == top1_idx)
+        mS_top = (idxS == top1_idx)
+        mH_top = (idxH == top1_idx)
+
+        # Predicted new peak after the update
+        peakD = torch.where(mD_top, torch.maximum(second, newD), torch.maximum(top1, newD))
+        peakS = torch.where(mS_top, torch.maximum(second, newS), torch.maximum(top1, newS))
+        peakH = torch.where(mH_top, torch.maximum(second, newH), torch.maximum(top1, newH))
+
+        # Predicted new second-highest average
+        # If chosen index was top1:
+        #   - if new >= second: second remains second; else second becomes new
+        # Else:
+        #   - if new >= top1: second becomes top1; else second becomes max(second, new)
+        secD = torch.where(
+            mD_top,
+            torch.where(newD >= second, second, newD),
+            torch.where(newD >= top1, top1, torch.maximum(second, newD)),
+        )
+        secS = torch.where(
+            mS_top,
+            torch.where(newS >= second, second, newS),
+            torch.where(newS >= top1, top1, torch.maximum(second, newS)),
+        )
+        secH = torch.where(
+            mH_top,
+            torch.where(newH >= second, second, newH),
+            torch.where(newH >= top1, top1, torch.maximum(second, newH)),
+        )
+
+        # Candidate counts after update (for tie-breaking)
+        cntD = r_f[ar, idxD] + 1.0
+        cntS = r_f[ar, idxS] + 1.0
+        cntH = r_f[ar, idxH] + 1.0
+
+        # Lexicographic selection across three candidates
+        cand_peak = torch.stack([peakD, peakS, peakH], dim=1)       # [n, 3]
+        cand_second = torch.stack([secD, secS, secH], dim=1)        # [n, 3]
+        cand_count = torch.stack([cntD, cntS, cntH], dim=1)         # [n, 3]
+
+        min_peak = cand_peak.min(dim=1, keepdim=True).values
+        tol = 1e-12
+        mask1 = cand_peak <= (min_peak + tol)
+
+        big = torch.tensor(float('inf'), dtype=dtype_f, device=device)
+        second_masked = torch.where(mask1, cand_second, big)
+        min_second = second_masked.min(dim=1, keepdim=True).values
+        mask2 = mask1 & (second_masked <= (min_second + tol))
+
+        bigc = torch.tensor(1e9, dtype=dtype_f, device=device)
+        count_masked = torch.where(mask2, cand_count, bigc)
+        choice = count_masked.argmin(dim=1)  # 0=D, 1=S, 2=H
+
+        # Map chosen method to the chosen index per row
+        idx_best = torch.where(choice == 0, idxD, torch.where(choice == 1, idxS, idxH))
+
+        # Commit allocation
+        phy2log[:, col] = idx_best
+        rank[:, col] = logcnt[ar, idx_best]
+        logcnt[ar, idx_best] += 1
+        col += 1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Bounded refinement (heaviest vs lightest; no 2x2; second-light disabled)
+        pidx = _kcandidate_refine_row(
+            w,
+            pidx,
+            num_packs,
+            k=2,
+            max_swaps=int(refine_steps),
+            adaptive_second=False,
+            consider_second_light=False,
+            allow_two_two=False,
+        )
+=======
+        # Adaptive bounded refinement based on residual imbalance
+        pack_w_ref = torch.zeros(num_packs, dtype=w.dtype)
+        pack_w_ref.scatter_add_(0, pidx, w)
+        delta = float((pack_w_ref.max() - pack_w_ref.min()).item())
+        mean_ld = float(pack_w_ref.mean().item())
+        ratio = delta / max(mean_ld, 1e-12)
+        steps = max(int(refine_steps), 3 if ratio > 0.02 else int(refine_steps))
+
+        pidx = _kcandidate_refine_row(
+            w,
+            pidx,
+            num_packs,
+            k=2,
+            max_swaps=int(steps),
+            adaptive_second=False,
+            consider_second_light=False,
+            allow_two_two=False,
+        )
+>>>>>>> REPLACE
+
+</DIFF>

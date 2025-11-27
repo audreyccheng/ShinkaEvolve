@@ -1,0 +1,268 @@
+<NAME>
+expected_penalty_and_saturating_resync
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements:
+
+1) Expected-penalty router-side selection with dominance awareness:
+   - Instead of always choosing the lower-confidence side to correct router imbalance, we simulate the expected strain of applying the correction to either rx or tx sides. We compute weights w_i = (1 − conf_i)·rate_i, focus on the lowest-confidence 70% capacity, apply dominance caps and ±10% per-interface clips, then estimate a penalty that blends relative adjustment strain, confidence priors, and a small HHI concentration term. We pick the side with the lower estimated penalty, falling back to the prior heuristic when penalties are within 5%. This keeps corrections distributed more safely, improving both counter accuracy and confidence calibration.
+
+2) Saturating, mismatch-proportional re-sync with guarded bilateral micro-step:
+   - Replace the linear, confidence-gap-based re-sync gain with a saturating logistic function of the residual beyond threshold: f = 0.4·sigmoid(5·(gap_norm − 0.5)), scaled by router-balance attenuation. Add a per-direction absolute move cap of 2% and retain the strong-scaling guard. If neither side can safely move and both directions are low-confidence (<0.70) while both adjacent routers are within tolerance, allow a bilateral micro-step toward the mean on both sides with a small gain, also bounded by ±2%. This closes stubborn residuals safely without overcorrecting.
+
+Additionally, I add a new hyperparameter RESYNC_PER_DIR_CAP and import math for the sigmoid. These changes are localized, preserve invariants, and aim to improve combined score by nudging both accuracy and calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from typing import Dict, Any, Tuple, List
+=======
+from typing import Dict, Any, Tuple, List
+import math
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+=======
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    RESYNC_PER_DIR_CAP = 0.02  # per-direction absolute move cap as fraction of max value
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Choose side with lower aggregate confidence to adjust
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+=======
+        # Choose side via expected-penalty simulation with dominance awareness
+        def side_penalty(side: str) -> float:
+            # Build side-specific values and confidences
+            vals = [(i, (hardened_rx[i] if side == 'rx' else hardened_tx[i]),
+                     clamp01(conf_rx[i] if side == 'rx' else conf_tx[i]))
+                    for i in up_ifs]
+            # weights w_i = (1 - conf_i) * rate_i
+            w = {i: (1.0 - c) * max(v, ZERO_THRESH) for (i, v, c) in vals}
+            total_w = sum(w.values()) or 1.0
+            # Focused subset covering WEIGHT_FOCUS
+            order = sorted(up_ifs, key=lambda x: w[x], reverse=True)
+            focus: List[str] = []
+            acc_w = 0.0
+            for i2 in order:
+                if acc_w / total_w >= WEIGHT_FOCUS:
+                    break
+                focus.append(i2)
+                acc_w += w[i2]
+            if not focus:
+                focus = list(up_ifs)
+                acc_w = total_w
+            # Simulated adjustment magnitude to distribute
+            sim_total = ((-imbalance) if side == 'rx' else imbalance) * DAMP_ROUTER
+            # Dominance-aware capped weights in focus
+            cap_per = DOMINANCE_CAP * acc_w
+            eff_w = {i3: min(w[i3], cap_per) for i3 in focus}
+            eff_total = sum(eff_w.values()) or 1.0
+            # Estimate per-interface move with ±10% clip
+            penalty = 0.0
+            # HHI term for concentration
+            hhi = sum((eff_w[i4] / eff_total) ** 2 for i4 in focus)
+            for i5 in focus:
+                vi = hardened_rx[i5] if side == 'rx' else hardened_tx[i5]
+                wi = eff_w[i5] / eff_total
+                adj_raw = sim_total * wi
+                cap = PER_LINK_CLIP * max(vi, ZERO_THRESH)
+                adj = max(-cap, min(cap, adj_raw))
+                # relative strain contribution and low-confidence prior
+                penalty += abs(adj) / max(1.0, abs(vi)) + 0.5 * (1.0 - (conf_rx[i5] if side == 'rx' else conf_tx[i5]))
+            penalty += 0.05 * hhi * len(focus)
+            return penalty
+
+        pen_rx = side_penalty('rx')
+        pen_tx = side_penalty('tx')
+        if pen_rx + 1e-9 < 0.95 * (pen_tx + 1e-9):
+            adjust_side = 'rx'
+        elif pen_tx + 1e-9 < 0.95 * (pen_rx + 1e-9):
+            adjust_side = 'tx'
+        else:
+            avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+            avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+            adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if d1 > tau1:
+                ca, cb = conf_tx.get(a, 0.6), conf_rx.get(b, 0.6)
+                # Skip if strong router scaling already applied on the target direction
+                if ca >= cb and abs(scaled_rx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, max(0.0, ca - cb)) * att
+                    if f > 0.0:
+                        old = b_rx
+                        new = max(0.0, nudge_toward_mean(old, a_tx, f))
+                        hardened_rx[b] = new
+                        relc = rel_diff(new, old)
+                        conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.3 * relc))
+                elif cb > ca and abs(scaled_tx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, max(0.0, cb - ca)) * att
+                    if f > 0.0:
+                        old = a_tx
+                        new = max(0.0, nudge_toward_mean(old, b_rx, f))
+                        hardened_tx[a] = new
+                        relc = rel_diff(new, old)
+                        conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.3 * relc))
+=======
+            if d1 > tau1:
+                ca, cb = conf_tx.get(a, 0.6), conf_rx.get(b, 0.6)
+                gap_norm = clamp01((d1 - tau1) / max(tau1, 1e-9))
+                # Saturating mismatch-proportional gain
+                f_base = 0.4 * (1.0 / (1.0 + math.exp(-5.0 * (gap_norm - 0.5))))
+                f_base *= att
+                moved = False
+                # Prefer moving the higher-confidence peer whose target dir hasn't been strongly scaled
+                if ca >= cb and abs(scaled_rx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, f_base)
+                    if f > 0.0:
+                        old = b_rx
+                        target = a_tx
+                        step = nudge_toward_mean(old, target, f)
+                        # cap absolute move per direction
+                        cap_abs = RESYNC_PER_DIR_CAP * max(target, old, 1.0)
+                        step = max(0.0, min(old + cap_abs, max(0.0, step)))
+                        step = max(0.0, max(old - cap_abs, step))
+                        new = step
+                        hardened_rx[b] = new
+                        relc = rel_diff(new, old)
+                        conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.3 * relc))
+                        moved = True
+                elif cb > ca and abs(scaled_tx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, f_base)
+                    if f > 0.0:
+                        old = a_tx
+                        target = b_rx
+                        step = nudge_toward_mean(old, target, f)
+                        cap_abs = RESYNC_PER_DIR_CAP * max(target, old, 1.0)
+                        step = max(0.0, min(old + cap_abs, max(0.0, step)))
+                        step = max(0.0, max(old - cap_abs, step))
+                        new = step
+                        hardened_tx[a] = new
+                        relc = rel_diff(new, old)
+                        conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.3 * relc))
+                        moved = True
+                # bilateral micro-step when both sides low-confidence and routers within tolerance
+                if not moved and ca < 0.70 and cb < 0.70:
+                    ra = local_router_of.get(a); rb = local_router_of.get(b)
+                    na = len([i for i in router_ifaces.get(ra, []) if status.get(i) == 'up'])
+                    nb = len([i for i in router_ifaces.get(rb, []) if status.get(i) == 'up'])
+                    tau_ra = min(0.07, max(0.03, 0.05 * (2.0 / max(2, na)) ** 0.5))
+                    tau_rb = min(0.07, max(0.03, 0.05 * (2.0 / max(2, nb)) ** 0.5))
+                    if router_residual_mid.get(ra, 0.0) <= tau_ra and router_residual_mid.get(rb, 0.0) <= tau_rb:
+                        f_bi = min(0.10, 0.5 * gap_norm) * att
+                        if f_bi > 0.0:
+                            # move both a.tx and b.rx toward their mean
+                            old_a = a_tx; old_b = b_rx
+                            tgt = 0.5 * (old_a + old_b)
+                            cap_a = RESYNC_PER_DIR_CAP * max(old_a, tgt, 1.0)
+                            cap_b = RESYNC_PER_DIR_CAP * max(old_b, tgt, 1.0)
+                            new_a = old_a + clamp01(f_bi) * (tgt - old_a)
+                            new_b = old_b + clamp01(f_bi) * (tgt - old_b)
+                            new_a = max(0.0, min(old_a + cap_a, max(old_a - cap_a, new_a)))
+                            new_b = max(0.0, min(old_b + cap_b, max(old_b - cap_b, new_b)))
+                            hardened_tx[a] = new_a
+                            hardened_rx[b] = new_b
+                            conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.2 * rel_diff(new_a, old_a)))
+                            conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.2 * rel_diff(new_b, old_b)))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if d2 > tau2:
+                ca, cb = conf_rx.get(a, 0.6), conf_tx.get(b, 0.6)
+                if ca >= cb and abs(scaled_tx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, max(0.0, ca - cb)) * att
+                    if f > 0.0:
+                        old = b_tx
+                        new = max(0.0, nudge_toward_mean(old, a_rx, f))
+                        hardened_tx[b] = new
+                        relc = rel_diff(new, old)
+                        conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.3 * relc))
+                elif cb > ca and abs(scaled_rx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, max(0.0, cb - ca)) * att
+                    if f > 0.0:
+                        old = a_rx
+                        new = max(0.0, nudge_toward_mean(old, b_tx, f))
+                        hardened_rx[a] = new
+                        relc = rel_diff(new, old)
+                        conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.3 * relc))
+=======
+            if d2 > tau2:
+                ca, cb = conf_rx.get(a, 0.6), conf_tx.get(b, 0.6)
+                gap_norm = clamp01((d2 - tau2) / max(tau2, 1e-9))
+                f_base = 0.4 * (1.0 / (1.0 + math.exp(-5.0 * (gap_norm - 0.5))))
+                f_base *= att
+                moved = False
+                if ca >= cb and abs(scaled_tx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, f_base)
+                    if f > 0.0:
+                        old = b_tx
+                        target = a_rx
+                        step = nudge_toward_mean(old, target, f)
+                        cap_abs = RESYNC_PER_DIR_CAP * max(target, old, 1.0)
+                        step = max(0.0, min(old + cap_abs, max(0.0, step)))
+                        step = max(0.0, max(old - cap_abs, step))
+                        new = step
+                        hardened_tx[b] = new
+                        relc = rel_diff(new, old)
+                        conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.3 * relc))
+                        moved = True
+                elif cb > ca and abs(scaled_rx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
+                    f = min(RESYNC_MAX_F, f_base)
+                    if f > 0.0:
+                        old = a_rx
+                        target = b_tx
+                        step = nudge_toward_mean(old, target, f)
+                        cap_abs = RESYNC_PER_DIR_CAP * max(target, old, 1.0)
+                        step = max(0.0, min(old + cap_abs, max(0.0, step)))
+                        step = max(0.0, max(old - cap_abs, step))
+                        new = step
+                        hardened_rx[a] = new
+                        relc = rel_diff(new, old)
+                        conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.3 * relc))
+                        moved = True
+                if not moved and ca < 0.70 and cb < 0.70:
+                    ra = local_router_of.get(a); rb = local_router_of.get(b)
+                    na = len([i for i in router_ifaces.get(ra, []) if status.get(i) == 'up'])
+                    nb = len([i for i in router_ifaces.get(rb, []) if status.get(i) == 'up'])
+                    tau_ra = min(0.07, max(0.03, 0.05 * (2.0 / max(2, na)) ** 0.5))
+                    tau_rb = min(0.07, max(0.03, 0.05 * (2.0 / max(2, nb)) ** 0.5))
+                    if router_residual_mid.get(ra, 0.0) <= tau_ra and router_residual_mid.get(rb, 0.0) <= tau_rb:
+                        f_bi = min(0.10, 0.5 * gap_norm) * att
+                        if f_bi > 0.0:
+                            old_a = a_rx; old_b = b_tx
+                            tgt = 0.5 * (old_a + old_b)
+                            cap_a = RESYNC_PER_DIR_CAP * max(old_a, tgt, 1.0)
+                            cap_b = RESYNC_PER_DIR_CAP * max(old_b, tgt, 1.0)
+                            new_a = old_a + clamp01(f_bi) * (tgt - old_a)
+                            new_b = old_b + clamp01(f_bi) * (tgt - old_b)
+                            new_a = max(0.0, min(old_a + cap_a, max(old_a - cap_a, new_a)))
+                            new_b = max(0.0, min(old_b + cap_b, max(old_b - cap_b, new_b)))
+                            hardened_rx[a] = new_a
+                            hardened_tx[b] = new_b
+                            conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.2 * rel_diff(new_a, old_a)))
+                            conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.2 * rel_diff(new_b, old_b)))
+>>>>>>> REPLACE
+
+</DIFF>

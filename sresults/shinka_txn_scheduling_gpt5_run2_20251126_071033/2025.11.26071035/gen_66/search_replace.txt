@@ -1,0 +1,244 @@
+<NAME>
+beam_insertion_memo
+</NAME>
+
+<DESCRIPTION>
+I improve makespan by making the search expansions reflect true insertion decisions and by caching insertion evaluations. Specifically:
+- Add deterministic, focus-aware position sampling and an insertion memo (best-two cache) keyed by the sequence, transaction, and position signature. This avoids repeated simulator calls and stabilizes regret estimates across construction, beam, and LNS.
+- Upgrade beam expansions to insert the candidate transaction at its best position (not simple append), and compute lookahead using best insertion of the next step. This aligns beam scoring with the actual schedule cost dynamics.
+- Change greedy completion to use best-insertion placement instead of appending.
+These changes reduce conflicts’ delay more accurately and reuse evaluations aggressively, improving both quality and speed. Parameters remain consistent, and all changes are localized and compatible with existing components.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    pos_sample_cap = 18 if large else (None if small else 22)
+=======
+    pos_sample_cap = 18 if large else (None if small else 22)
+    EXHAUSTIVE_THRESHOLD = 20  # use exhaustive insertion positions when sequence is small
+    RING_SPAN = 3  # +- window for focus-aware position sampling
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # ---------- Insertion helpers ----------
+    def best_two_insertions(seq, txn):
+        positions = sample_positions(len(seq))
+        best = (float('inf'), None)
+        second = (float('inf'), None)
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best[0]:
+                second = best
+                best = (c, pos)
+            elif c < second[0]:
+                second = (c, pos)
+        return best, second
+=======
+    # ---------- Insertion helpers (deterministic sampling + memoization) ----------
+    best_two_cache = {}
+
+    def positions_signature(seq_len, exhaustive=False, focus_idx=None):
+        total = seq_len + 1
+        if exhaustive or pos_sample_cap is None or total <= pos_sample_cap:
+            return ('all', seq_len)
+        anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+        if focus_idx is not None:
+            for d in range(-RING_SPAN, RING_SPAN + 1):
+                p = focus_idx + d
+                if 0 <= p <= seq_len:
+                    anchors.add(p)
+        # deterministically fill evenly spaced positions up to cap
+        need_cap = max(0, (pos_sample_cap - len(anchors)))
+        if need_cap > 0:
+            for i in range(1, need_cap + 1):
+                pos = round(i * seq_len / (need_cap + 1))
+                if 0 <= pos <= seq_len:
+                    anchors.add(pos)
+                if len(anchors) >= pos_sample_cap:
+                    break
+        return tuple(sorted(anchors))
+
+    def positions_for_insertion(seq_len, exhaustive=False, focus_idx=None):
+        sig = positions_signature(seq_len, exhaustive=exhaustive, focus_idx=focus_idx)
+        if sig == ('all', seq_len):
+            return list(range(seq_len + 1)), sig
+        return list(sig), sig
+
+    def best_two_insertions(seq, txn, focus_idx=None, exhaustive=None):
+        if exhaustive is None:
+            exhaustive = (len(seq) <= EXHAUSTIVE_THRESHOLD)
+        positions, sig = positions_for_insertion(len(seq), exhaustive=exhaustive, focus_idx=focus_idx)
+        all_sig = ('all', len(seq))
+        all_key = (tuple(seq), txn, all_sig)
+        if all_key in best_two_cache:
+            return best_two_cache[all_key]
+        key = (tuple(seq), txn, sig)
+        cached = best_two_cache.get(key)
+        if cached is not None:
+            return cached
+        best = (float('inf'), None)
+        second = (float('inf'), None)
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best[0]:
+                second = best
+                best = (c, pos)
+            elif c < second[0]:
+                second = (c, pos)
+        if second[0] == float('inf'):
+            second = best
+        res = (best, second)
+        best_two_cache[key] = res
+        if sig == all_sig:
+            best_two_cache[all_key] = res
+        return res
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+                scored = []
+                for t in expand_list:
+                    seq1 = seq + [t]
+                    c1 = eval_cost(seq1)
+
+                    # lookahead: best among k sampled second steps
+                    rem_after = [x for x in rem if x != t]
+                    if rem_after:
+                        k2 = min(lookahead_k, len(rem_after))
+                        second = random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        second_costs = []
+                        for u in second:
+                            cu = eval_cost(seq1 + [u])
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        # regret approx on second step spread
+                        if len(second_costs) >= 2:
+                            mx = max(second_costs)
+                            mn = min(second_costs)
+                            regret = mx - mn
+                        else:
+                            regret = 0.0
+                        score = 0.7 * c1 + 0.3 * best_c2
+                    else:
+                        regret = 0.0
+                        score = c1
+
+                    scored.append((score, c1, regret, t))
+=======
+                scored = []
+                for t in expand_list:
+                    # Insert t at its best position for this prefix
+                    (best1, pos1), (second1, _) = best_two_insertions(seq, t, exhaustive=(len(seq) <= EXHAUSTIVE_THRESHOLD))
+                    c1 = best1
+                    new_seq = seq[:]
+                    new_seq.insert(pos1, t)
+
+                    # lookahead: best-insertion among k sampled second steps
+                    rem_after = [x for x in rem if x != t]
+                    if rem_after:
+                        k2 = min(lookahead_k, len(rem_after))
+                        second = random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        second_costs = []
+                        for u in second:
+                            (cu, _), _ = best_two_insertions(new_seq, u, exhaustive=(len(new_seq) <= EXHAUSTIVE_THRESHOLD))
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        spread = (max(second_costs) - min(second_costs)) if len(second_costs) >= 2 else 0.0
+                        primary_regret = max(0.0, second1 - c1)
+                        regret = 0.5 * spread + 0.5 * primary_regret
+                        score = 0.7 * c1 + 0.3 * best_c2
+                    else:
+                        regret = max(0.0, second1 - c1)
+                        score = c1
+
+                    scored.append((score, c1, regret, t, pos1))
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+                cand_acts = top_cost + top_regret
+                uniq = {}
+                for sc, c1, rg, t in cand_acts:
+                    if t not in uniq or c1 < uniq[t][1]:
+                        uniq[t] = (sc, c1, rg)
+                for t, (sc, c1, rg) in uniq.items():
+                    new_seq = seq + [t]
+                    new_rem = frozenset(x for x in rem if x != t)
+
+                    if len(new_seq) >= 2:
+                        sig = (new_seq[-2], new_seq[-1])
+                    else:
+                        sig = (None, new_seq[-1])
+
+                    key = tuple(new_seq)
+                    if key in layer_seen:
+                        continue
+                    if sig in suffix_seen:
+                        # keep diversity
+                        continue
+
+                    layer_seen.add(key)
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, new_seq, new_rem))
+=======
+                cand_acts = top_cost + top_regret
+                # Deduplicate by (txn, pos) to keep distinct placements
+                uniq = {}
+                for sc, c1, rg, t, pos in cand_acts:
+                    k = (t, pos)
+                    if k not in uniq or c1 < uniq[k][1]:
+                        uniq[k] = (sc, c1, rg)
+                for (t, pos), (sc, c1, rg) in uniq.items():
+                    new_seq = seq[:]
+                    new_seq.insert(pos, t)
+                    new_rem = frozenset(x for x in rem if x != t)
+
+                    if len(new_seq) >= 2:
+                        sig = (new_seq[-2], new_seq[-1])
+                    else:
+                        sig = (None, new_seq[-1])
+
+                    key = tuple(new_seq)
+                    if key in layer_seen:
+                        continue
+                    if sig in suffix_seen:
+                        continue
+
+                    layer_seen.add(key)
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, new_seq, new_rem))
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            while rem_list:
+                best_t = None
+                best_c = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur + [t])
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                cur.append(best_t)
+                rem_list.remove(best_t)
+=======
+            while rem_list:
+                best_t = None
+                best_pos = 0
+                best_c = float('inf')
+                for t in rem_list:
+                    (c2, p2), _ = best_two_insertions(cur, t, exhaustive=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                        best_pos = p2
+                cur.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+>>>>>>> REPLACE
+
+</DIFF>

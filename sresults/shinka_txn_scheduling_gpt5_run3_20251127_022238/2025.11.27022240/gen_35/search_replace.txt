@@ -1,0 +1,181 @@
+<beam_seed_prefix_dominance>
+Introduce a shallow beam-seeding phase with buddy-biased lookahead and prefix-dominance pruning to generate a stronger incumbent before LNS. The beam explores only the first ~40% of the depth, greedily completes the top prefixes to update an incumbent, and uses a signature-based dominance map keyed by (remaining set, last-3 suffix) to prune inferior partial states. This adds focused breadth early while keeping runtime bounded. We then keep the existing tournament-guided greedy builder and adjacent cleanup, selecting the best seed from both paths for LNS. This should reduce makespan by avoiding poor early commitments and leveraging pairwise costs (M) and margins (W) more effectively.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # Multi-start: build a few diverse initial sequences and pick the best as LNS seed
+    starts = max(2, min(5, int(num_seqs // 3) + 2))
+    seed_best_cost = float('inf')
+    seed_best_seq = None
+    for _ in range(starts):
+        seq0 = build_initial_sequence()
+        cost0 = eval_seq(seq0)
+        # quick local cleanup
+        seq0, cost0 = adjacent_pass(seq0, cost0)
+        if cost0 < seed_best_cost:
+            seed_best_cost = cost0
+            seed_best_seq = seq0
+
+    # LNS improvement on best seed
+    final_seq, final_cost = lns_improve(seed_best_seq, seed_best_cost, budget_factor=max(1, int(num_seqs)))
+=======
+    # Multi-start: beam-seeded plus greedy seeds; pick best as LNS seed
+
+    def greedy_complete(seq):
+        rem = [t for t in range(n) if t not in seq]
+        cur = seq[:]
+        while rem:
+            t = min(rem, key=lambda u: eval_seq(cur + [u]))
+            cur.append(t)
+            rem.remove(t)
+        return cur, eval_seq(cur)
+
+    def beam_seed(inc=None):
+        beam_width = max(6, min(16, int(num_seqs)))
+        cand_per_expand = max(6, min(12, n // 7 + 6))
+        lookahead_top = 3
+        next_k = 5
+        depth_limit = max(3, int(0.4 * n))
+
+        # Starts: tournament-best, a good singleton, then randoms
+        starts = []
+        starts.append(tournament_order[0])
+        topk = min(10, n)
+        singles_sorted = sorted(range(n), key=lambda t: c1[t])[:topk]
+        starts.append(rng.choice(singles_sorted))
+        remcands = [t for t in range(n) if t not in starts]
+        rng.shuffle(remcands)
+        starts.extend(remcands[:max(0, beam_width - len(starts))])
+
+        beam = []
+        dom = {}  # prefix-dominance: (remaining_fset, suffix<=3) -> best cost
+        for t in starts:
+            seq = [t]
+            rem = frozenset(set(range(n)) - {t})
+            cost = eval_seq(seq)
+            sig = (rem, tuple(seq[-1:]))
+            if sig in dom and cost >= dom[sig]:
+                continue
+            dom[sig] = cost
+            beam.append((cost, seq, rem))
+
+        incumbent_cost = inc if inc is not None else float('inf')
+        incumbent_seq = None
+
+        depth = 1
+        while depth < min(depth_limit, n) and beam:
+            next_beam = []
+            local_seen = set()
+            for cost, seq, rem in beam:
+                rem_list = list(rem)
+                if not rem_list:
+                    next_beam.append((cost, seq, rem))
+                    continue
+
+                # Tournament-guided preselection
+                if len(rem_list) > cand_per_expand * 2:
+                    pre = preselect_by_tournament(seq, rem_list, cand_per_expand * 2)
+                else:
+                    pre = rem_list
+
+                # Immediate costs
+                imm = [(t, eval_seq(seq + [t])) for t in pre]
+                imm.sort(key=lambda z: z[1])
+
+                # Buddy-biased lookahead on top-L
+                L = min(lookahead_top, len(imm))
+                scored = []
+                for t, imc in imm[:L]:
+                    nexts = [u for u in rem_list if u != t]
+                    if not nexts:
+                        la = imc
+                    else:
+                        buddy_pref = [u for u in buddies[t] if u in nexts]
+                        pool = buddy_pref[:next_k]
+                        if len(pool) < next_k:
+                            extra = preselect_by_tournament(seq + [t], [u for u in nexts if u not in pool], next_k - len(pool), recent_k=3)
+                            pool.extend(extra)
+                        if not pool:
+                            pool = nexts[:min(next_k, len(nexts))]
+                        la = min(eval_seq(seq + [t, u]) for u in pool)
+                    scored.append((t, min(imc, la)))
+
+                # Add a few immediate-best without lookahead for diversity
+                diversity = min(max(2, cand_per_expand // 3), len(imm))
+                for t, imc in imm[:diversity]:
+                    scored.append((t, imc))
+
+                # Unique by child and keep best-k
+                uniq = {}
+                for t, m in scored:
+                    if (t not in uniq) or (m < uniq[t]):
+                        uniq[t] = m
+                items = sorted(uniq.items(), key=lambda z: z[1])
+                take = min(cand_per_expand, len(items))
+                for t, _ in items[:take]:
+                    new_seq = seq + [t]
+                    new_rem = rem - {t}
+                    new_cost = eval_seq(new_seq)
+                    sig = (new_rem, tuple(new_seq[-3:]) if len(new_seq) >= 3 else tuple(new_seq))
+                    if sig in dom and new_cost >= dom[sig]:
+                        continue
+                    dom[sig] = new_cost
+                    key = (tuple(new_seq), new_rem)
+                    if key in local_seen:
+                        continue
+                    local_seen.add(key)
+                    next_beam.append((new_cost, new_seq, new_rem))
+
+            if not next_beam:
+                break
+
+            # Update incumbent by greedily completing top prefixes
+            next_beam.sort(key=lambda x: x[0])
+            for bc, bseq, brem in next_beam[:2]:
+                if incumbent_cost < float('inf') and bc >= incumbent_cost:
+                    continue
+                full, fc = greedy_complete(bseq)
+                if fc < incumbent_cost:
+                    incumbent_cost = fc
+                    incumbent_seq = full
+
+            # Keep the beam
+            beam = next_beam[:beam_width]
+            depth += 1
+
+        # Choose best prefix and complete greedily
+        if not beam:
+            t = rng.randint(0, n - 1)
+            full, fc = greedy_complete([t])
+            return full, fc
+        beam.sort(key=lambda x: x[0])
+        _, bseq, _ = beam[0]
+        full, fc = greedy_complete(bseq)
+        if incumbent_seq is not None and incumbent_cost < fc:
+            return incumbent_seq, incumbent_cost
+        return full, fc
+
+    # Combine beam-seed and greedy seeds
+    starts = max(2, min(5, int(num_seqs // 3) + 2))
+    seed_best_cost = float('inf')
+    seed_best_seq = None
+
+    # 0) Beam seed once
+    bseq, bcost = beam_seed()
+    bseq, bcost = adjacent_pass(bseq, bcost)
+    seed_best_seq, seed_best_cost = bseq, bcost
+
+    # 1) Greedy seeds
+    for _ in range(starts):
+        seq0 = build_initial_sequence()
+        cost0 = eval_seq(seq0)
+        # quick local cleanup
+        seq0, cost0 = adjacent_pass(seq0, cost0)
+        if cost0 < seed_best_cost:
+            seed_best_cost = cost0
+            seed_best_seq = seq0
+
+    # LNS improvement on best seed
+    final_seq, final_cost = lns_improve(seed_best_seq, seed_best_cost, budget_factor=max(1, int(num_seqs)))
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,370 @@
+<NAME>
+adaptive_gpu_refine_and_second_heaviest_swap
+</NAME>
+
+<DESCRIPTION>
+This change improves GPU-level packing refinement in pack_diverse_heap by:
+- Adding adaptive refinement depth: perform up to two refinement passes only when the imbalance is high (delta/mean > 0.12), otherwise do a single pass. This preserves speed while allowing extra smoothing only when needed.
+- Broadening the swap candidate search to include second-heaviest donor and second-lightest receiver. Specifically, it evaluates 1x1 swaps for (heaviest↔lightest), (heaviest↔second-lightest), and (second-heaviest↔lightest), selecting the single swap that strictly reduces the global maximum load, with tie-breaks on imbalance and label-duplicate penalties.
+- Retaining a bounded 2x2 swap as a fallback for (heaviest↔lightest) only when it strictly reduces the global maximum more than the best 1x1 candidate.
+- Updating label-counts on applied swaps to make subsequent passes consistent.
+
+This is a targeted change that should improve balancedness with minimal overhead and deterministic behavior, aligning with the provided recommendations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Micro refinement: search heaviest vs {lightest, second-lightest}; allow optional 2x2 swap
+        if num_packs >= 2:
+            h = max(range(num_packs), key=lambda k: loads[k])
+            # build candidate light packs: lightest and second-lightest (excluding h)
+            light_candidates = []
+            # first lightest
+            l1 = min([p for p in range(num_packs) if p != h], key=lambda k: loads[k])
+            light_candidates.append(l1)
+            # second-lightest if exists
+            if num_packs >= 3:
+                l2 = min([p for p in range(num_packs) if p != h and p != l1], key=lambda k: loads[k])
+                light_candidates.append(l2)
+
+            # prepare heavy candidates
+            if not pack_groups[h]:
+                pass
+            else:
+                h_idx_tensor = torch.tensor(pack_groups[h], dtype=torch.int64, device=row_w.device)
+                h_w = row_w[h_idx_tensor]
+                kh = min(2, h_w.numel())
+                if kh > 0:
+                    top_h_idx_local = torch.topk(h_w, kh).indices.tolist()
+
+                    cur_max_all = max(loads)
+                    cur_min_all = min(loads)
+                    cur_imb = cur_max_all - cur_min_all
+
+                    best1 = None  # record best 1x1 swap: (new_imb, new_peak, h, l, ai, bi, a_item, b_item, wa, wb, la, lb, penalty)
+                    # label count references if needed
+                    # Use existing label_counts built during assignment when labels aren't unique
+                    for l in light_candidates:
+                        if not pack_groups[l]:
+                            continue
+                        # Only refine if there is actual imbalance
+                        if loads[h] <= loads[l]:
+                            continue
+                        l_idx_tensor = torch.tensor(pack_groups[l], dtype=torch.int64, device=row_w.device)
+                        l_w = row_w[l_idx_tensor]
+                        kl = min(2, l_w.numel())
+                        if kl == 0:
+                            continue
+                        # bottom-k from light
+                        bot_l_idx_local = torch.topk(l_w, kl, largest=False).indices.tolist()
+
+                        # precompute other packs aggregate excluding h and this l
+                        other_max = max([loads[p] for p in range(num_packs) if p != h and p != l], default=float("-inf"))
+                        other_min = min([loads[p] for p in range(num_packs) if p != h and p != l], default=float("inf"))
+
+                        for ai in top_h_idx_local:
+                            wa = float(h_w[ai].item())
+                            a_item = int(h_idx_tensor[ai].item())
+                            la = int(row_labels[a_item].item())
+                            for bi in bot_l_idx_local:
+                                wb = float(l_w[bi].item())
+                                b_item = int(l_idx_tensor[bi].item())
+                                lb = int(row_labels[b_item].item())
+
+                                new_h = loads[h] - wa + wb
+                                new_l = loads[l] - wb + wa
+                                new_peak = max(new_h, new_l, other_max)
+                                new_bottom = min(new_h, new_l, other_min)
+                                new_imb = new_peak - new_bottom
+
+                                penalty = 0
+                                if not all_unique:
+                                    penalty += 1 if label_counts[h].get(lb, 0) > 0 else 0
+                                    penalty += 1 if label_counts[l].get(la, 0) > 0 else 0
+
+                                cand = (new_imb, new_peak, h, l, ai, bi, a_item, b_item, wa, wb, la, lb, penalty)
+                                if best1 is None:
+                                    best1 = cand
+                                else:
+                                    # Primary: minimize imbalance; Secondary: fewer new duplicates; Tertiary: smaller new peak
+                                    if (cand[0] + 1e-9 < best1[0] or
+                                        (abs(cand[0] - best1[0]) <= 1e-9 and (penalty < best1[12] or
+                                         (penalty == best1[12] and cand[1] + 1e-9 < best1[1])))):
+                                        best1 = cand
+
+                    # Optionally evaluate a bounded 2x2 swap against the chosen light pack only if it beats best 1x1
+                    applied = False
+                    best2 = None  # (new_imb, new_peak, h, l, (ai, aj), (bi, bj), (a_item_i, a_item_j), (b_item_i, b_item_j), wa_sum, wb_sum, penalty)
+                    if best1 is not None and best1[0] + 1e-9 < cur_imb:
+                        _, _, h_sel, l_sel, _, _, _, _, _, _, _, _, _ = best1
+                        # Prepare top-2 heavy and bottom-2 light for the selected light pack
+                        l_idx_tensor = torch.tensor(pack_groups[l_sel], dtype=torch.int64, device=row_w.device)
+                        l_w = row_w[l_idx_tensor]
+                        kh2 = min(2, h_w.numel())
+                        kl2 = min(2, l_w.numel())
+                        if kh2 == 2 and kl2 == 2:
+                            top_h2 = torch.topk(h_w, 2).indices.tolist()
+                            bot_l2 = torch.topk(l_w, 2, largest=False).indices.tolist()
+                            ai, aj = top_h2[0], top_h2[1]
+                            bi, bj = bot_l2[0], bot_l2[1]
+                            wa_sum = float(h_w[ai].item() + h_w[aj].item())
+                            wb_sum = float(l_w[bi].item() + l_w[bj].item())
+                            a_items = (int(h_idx_tensor[ai].item()), int(h_idx_tensor[aj].item()))
+                            b_items = (int(l_idx_tensor[bi].item()), int(l_idx_tensor[bj].item()))
+                            la_i = int(row_labels[a_items[0]].item())
+                            la_j = int(row_labels[a_items[1]].item())
+                            lb_i = int(row_labels[b_items[0]].item())
+                            lb_j = int(row_labels[b_items[1]].item())
+
+                            new_h = loads[h_sel] - wa_sum + wb_sum
+                            new_l = loads[l_sel] - wb_sum + wa_sum
+                            other_max = max([loads[p] for p in range(num_packs) if p != h_sel and p != l_sel], default=float("-inf"))
+                            other_min = min([loads[p] for p in range(num_packs) if p != h_sel and p != l_sel], default=float("inf"))
+                            new_peak2 = max(new_h, new_l, other_max)
+                            new_bottom2 = min(new_h, new_l, other_min)
+                            new_imb2 = new_peak2 - new_bottom2
+                            penalty2 = 0
+                            if not all_unique:
+                                penalty2 += (1 if label_counts[h_sel].get(lb_i, 0) > 0 else 0)
+                                penalty2 += (1 if label_counts[h_sel].get(lb_j, 0) > 0 else 0)
+                                penalty2 += (1 if label_counts[l_sel].get(la_i, 0) > 0 else 0)
+                                penalty2 += (1 if label_counts[l_sel].get(la_j, 0) > 0 else 0)
+                            best2 = (new_imb2, new_peak2, h_sel, l_sel,
+                                     (ai, aj), (bi, bj), a_items, b_items, wa_sum, wb_sum, penalty2)
+
+                    # Apply the better swap if it strictly improves cur_imb
+                    if best2 is not None and best2[1] + 1e-9 < best1[1]:
+                        # apply 2x2
+                        _, _, h_sel, l_sel, (ai, aj), (bi, bj), a_items, b_items, wa_sum, wb_sum, _ = best2
+                        # Update loads
+                        loads[h_sel] = loads[h_sel] - wa_sum + wb_sum
+                        loads[l_sel] = loads[l_sel] - wb_sum + wa_sum
+                        # Swap membership
+                        # Important: ai,aj,bi,bj are local indices within pack_groups lists
+                        pack_groups[h_sel][ai] = b_items[0]
+                        pack_groups[h_sel][aj] = b_items[1]
+                        pack_groups[l_sel][bi] = a_items[0]
+                        pack_groups[l_sel][bj] = a_items[1]
+                        # Update indices
+                        pack_index[i, a_items[0]] = l_sel
+                        pack_index[i, a_items[1]] = l_sel
+                        pack_index[i, b_items[0]] = h_sel
+                        pack_index[i, b_items[1]] = h_sel
+                        # Update ranks for affected packs
+                        for r, g in enumerate(pack_groups[h_sel]):
+                            rank_in_pack[i, g] = r
+                        for r, g in enumerate(pack_groups[l_sel]):
+                            rank_in_pack[i, g] = r
+                        applied = True
+                    elif best1 is not None and best1[0] + 1e-9 < cur_imb:
+                        # apply best 1x1
+                        _, _, h_sel, l_sel, ai, bi, a_item, b_item, wa, wb, _, _, _ = best1
+                        # Update loads
+                        loads[h_sel] = loads[h_sel] - wa + wb
+                        loads[l_sel] = loads[l_sel] - wb + wa
+                        # Swap membership
+                        pack_groups[h_sel][ai] = b_item
+                        pack_groups[l_sel][bi] = a_item
+                        # Update indices
+                        pack_index[i, a_item] = l_sel
+                        pack_index[i, b_item] = h_sel
+                        # Update ranks only for affected packs
+                        for r, g in enumerate(pack_groups[h_sel]):
+                            rank_in_pack[i, g] = r
+                        for r, g in enumerate(pack_groups[l_sel]):
+                            rank_in_pack[i, g] = r
+                        applied = True
+=======
+        # Adaptive bounded refinement:
+        # - Evaluate best 1x1 among (heaviest↔lightest), (heaviest↔second-lightest), (second-heaviest↔lightest)
+        # - Fallback 2x2 for (heaviest↔lightest) if it beats best 1x1 in reducing global max
+        if num_packs >= 2:
+            def _refine_once() -> bool:
+                # order packs by load ascending
+                order_asc = sorted(range(num_packs), key=lambda p: loads[p])
+                order_desc = list(reversed(order_asc))
+                h1 = order_desc[0]
+                l1 = order_asc[0] if order_asc[0] != h1 else (order_asc[1] if len(order_asc) > 1 else order_asc[0])
+                # candidates per recommendation
+                pairs = []
+                # heaviest↔lightest
+                pairs.append((h1, l1))
+                # heaviest↔second-lightest
+                if len(order_asc) >= 3:
+                    l2 = next(p for p in order_asc if p != h1 and p != l1)
+                    pairs.append((h1, l2))
+                # second-heaviest↔lightest
+                if len(order_desc) >= 3:
+                    h2 = next(p for p in order_desc if p != h1)
+                    pairs.append((h2, l1))
+
+                cur_max = max(loads)
+                cur_min = min(loads)
+                cur_imb = cur_max - cur_min
+
+                best1 = None  # (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+                # evaluate bounded 1x1 swaps
+                for (d, r) in pairs:
+                    if d == r:
+                        continue
+                    if not pack_groups[d] or not pack_groups[r]:
+                        continue
+                    if loads[d] <= loads[r]:
+                        continue
+                    d_idx_tensor = torch.tensor(pack_groups[d], dtype=torch.int64, device=row_w.device)
+                    r_idx_tensor = torch.tensor(pack_groups[r], dtype=torch.int64, device=row_w.device)
+                    d_w = row_w[d_idx_tensor]
+                    r_w = row_w[r_idx_tensor]
+                    kd = min(2, d_w.numel())
+                    kr = min(2, r_w.numel())
+                    if kd == 0 or kr == 0:
+                        continue
+                    d_top = torch.topk(d_w, kd).indices.tolist()
+                    r_bot = torch.topk(r_w, kr, largest=False).indices.tolist()
+
+                    other_max = max([loads[p] for p in range(num_packs) if p != d and p != r], default=float("-inf"))
+                    other_min = min([loads[p] for p in range(num_packs) if p != d and p != r], default=float("inf"))
+
+                    for ai in d_top:
+                        wa = float(d_w[ai].item())
+                        a_item = int(d_idx_tensor[ai].item())
+                        la = int(row_labels[a_item].item())
+                        for bi in r_bot:
+                            wb = float(r_w[bi].item())
+                            b_item = int(r_idx_tensor[bi].item())
+                            lb = int(row_labels[b_item].item())
+                            new_d = loads[d] - wa + wb
+                            new_r = loads[r] - wb + wa
+                            new_peak = max(new_d, new_r, other_max)
+                            new_bottom = min(new_d, new_r, other_min)
+                            new_imb = new_peak - new_bottom
+                            penalty = 0
+                            if not all_unique:
+                                penalty += 1 if label_counts[d].get(lb, 0) > 0 else 0
+                                penalty += 1 if label_counts[r].get(la, 0) > 0 else 0
+                            cand = (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+                            if best1 is None:
+                                best1 = cand
+                            else:
+                                # Primary: minimize new global max; Secondary: imbalance; Tertiary: fewer new duplicates
+                                if (cand[0] + 1e-9 < best1[0] or
+                                    (abs(cand[0] - best1[0]) <= 1e-9 and (cand[1] + 1e-9 < best1[1] or
+                                     (abs(cand[1] - best1[1]) <= 1e-9 and cand[2] < best1[2])))):
+                                    best1 = cand
+
+                # Optional 2x2 bounded swap only for (heaviest↔lightest)
+                best2 = None  # (new_peak2, new_imb2, h_sel, l_sel, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum, penalty2)
+                if pack_groups[h1] and pack_groups[l1]:
+                    h_idx_tensor = torch.tensor(pack_groups[h1], dtype=torch.int64, device=row_w.device)
+                    l_idx_tensor = torch.tensor(pack_groups[l1], dtype=torch.int64, device=row_w.device)
+                    h_w = row_w[h_idx_tensor]
+                    l_w = row_w[l_idx_tensor]
+                    if h_w.numel() >= 2 and l_w.numel() >= 2:
+                        ai, aj = torch.topk(h_w, 2).indices.tolist()
+                        bi, bj = torch.topk(l_w, 2, largest=False).indices.tolist()
+                        wa_sum = float(h_w[ai].item() + h_w[aj].item())
+                        wb_sum = float(l_w[bi].item() + l_w[bj].item())
+                        a_items = (int(h_idx_tensor[ai].item()), int(h_idx_tensor[aj].item()))
+                        b_items = (int(l_idx_tensor[bi].item()), int(l_idx_tensor[bj].item()))
+                        other_max = max([loads[p] for p in range(num_packs) if p != h1 and p != l1], default=float("-inf"))
+                        other_min = min([loads[p] for p in range(num_packs) if p != h1 and p != l1], default=float("inf"))
+                        new_h = loads[h1] - wa_sum + wb_sum
+                        new_l = loads[l1] - wb_sum + wa_sum
+                        new_peak2 = max(new_h, new_l, other_max)
+                        new_bottom2 = min(new_h, new_l, other_min)
+                        new_imb2 = new_peak2 - new_bottom2
+                        penalty2 = 0
+                        if not all_unique:
+                            la_i = int(row_labels[a_items[0]].item())
+                            la_j = int(row_labels[a_items[1]].item())
+                            lb_i = int(row_labels[b_items[0]].item())
+                            lb_j = int(row_labels[b_items[1]].item())
+                            penalty2 += (1 if label_counts[h1].get(lb_i, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[h1].get(lb_j, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[l1].get(la_i, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[l1].get(la_j, 0) > 0 else 0)
+                        best2 = (new_peak2, new_imb2, h1, l1, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum, penalty2)
+
+                applied = False
+                # Prefer 1x1 if it strictly reduces the global max
+                if best1 is not None and best1[0] + 1e-9 < cur_max:
+                    new_peak, new_imb, _, d, r, ai, bi, a_item, b_item, wa, wb, la, lb = best1
+                    # apply 1x1
+                    loads[d] = loads[d] - wa + wb
+                    loads[r] = loads[r] - wb + wa
+                    # swap membership in pack_groups
+                    pack_groups[d][ai] = b_item
+                    pack_groups[r][bi] = a_item
+                    # update indices
+                    pack_index[i, a_item] = r
+                    pack_index[i, b_item] = d
+                    # update ranks for affected packs
+                    for rr, gg in enumerate(pack_groups[d]):
+                        rank_in_pack[i, gg] = rr
+                    for rr, gg in enumerate(pack_groups[r]):
+                        rank_in_pack[i, gg] = rr
+                    # update label counts if duplicates exist
+                    if not all_unique:
+                        label_counts[d][la] -= 1
+                        if label_counts[d][la] == 0:
+                            del label_counts[d][la]
+                        label_counts[d][lb] = label_counts[d].get(lb, 0) + 1
+
+                        label_counts[r][lb] -= 1
+                        if label_counts[r][lb] == 0:
+                            del label_counts[r][lb]
+                        label_counts[r][la] = label_counts[r].get(la, 0) + 1
+                    applied = True
+                # Otherwise try 2x2 if it beats best 1x1 by peak or if no 1x1 improvement exists
+                elif best2 is not None and (best1 is None or best2[0] + 1e-9 < (best1[0] if best1 else cur_max)):
+                    new_peak2, new_imb2, h_sel, l_sel, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum, _ = best2
+                    if new_peak2 + 1e-9 < cur_max:
+                        # apply 2x2
+                        loads[h_sel] = loads[h_sel] - wa_sum + wb_sum
+                        loads[l_sel] = loads[l_sel] - wb_sum + wa_sum
+                        # swap membership
+                        pack_groups[h_sel][ai] = b_items[0]
+                        pack_groups[h_sel][aj] = b_items[1]
+                        pack_groups[l_sel][bi] = a_items[0]
+                        pack_groups[l_sel][bj] = a_items[1]
+                        # update indices
+                        pack_index[i, a_items[0]] = l_sel
+                        pack_index[i, a_items[1]] = l_sel
+                        pack_index[i, b_items[0]] = h_sel
+                        pack_index[i, b_items[1]] = h_sel
+                        # update ranks
+                        for rr, gg in enumerate(pack_groups[h_sel]):
+                            rank_in_pack[i, gg] = rr
+                        for rr, gg in enumerate(pack_groups[l_sel]):
+                            rank_in_pack[i, gg] = rr
+                        # update label counts conservatively if duplicates exist
+                        if not all_unique:
+                            la_i = int(row_labels[a_items[0]].item())
+                            la_j = int(row_labels[a_items[1]].item())
+                            lb_i = int(row_labels[b_items[0]].item())
+                            lb_j = int(row_labels[b_items[1]].item())
+                            # move a_items from h->l; b_items from l->h
+                            for lax in (la_i, la_j):
+                                label_counts[h_sel][lax] -= 1
+                                if label_counts[h_sel][lax] == 0:
+                                    del label_counts[h_sel][lax]
+                                label_counts[l_sel][lax] = label_counts[l_sel].get(lax, 0) + 1
+                            for lbx in (lb_i, lb_j):
+                                label_counts[l_sel][lbx] -= 1
+                                if label_counts[l_sel][lbx] == 0:
+                                    del label_counts[l_sel][lbx]
+                                label_counts[h_sel][lbx] = label_counts[h_sel].get(lbx, 0) + 1
+                        applied = True
+                return applied
+
+            # Adaptive depth: two passes only when imbalance is high
+            mean_load = sum(loads) / max(1, num_packs)
+            delta = max(loads) - min(loads)
+            refine_steps = 2 if (mean_load > 0 and (delta / max(mean_load, 1e-12) > 0.12)) else 1
+            for _ in range(refine_steps):
+                changed = _refine_once()
+                if not changed:
+                    break
+>>>>>>> REPLACE
+
+</DIFF>

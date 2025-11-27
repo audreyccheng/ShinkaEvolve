@@ -1,0 +1,339 @@
+<NAME>
+tighten_bounds_and_candidates_plus_swaps
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements that keep the code simple while reducing the maximum KVPR:
+1) Tighter lower bounds: add a lightweight pair bound and a small k-prefix bound to compute a sharper initial T (KVPR threshold). This improves feasibility guidance and leads to better-balanced placements earlier.
+2) Broaden candidate evaluation around near-optimal T: evaluate placements at T in {T*, 0.995·T*, 1.005·T*} across a few orderings and policies. This captures discrete packing effects that can hide better KVPR configurations.
+3) Smarter candidate selection and local refinement: rank candidates lexicographically (max KVPR, second-worst KVPR, average KVPR) to avoid hidden spikes, and add a short first-improving swap phase after single-item moves to reduce the worst GPU’s KVPR further.
+
+These changes are low-overhead and consistent with the current design, improving the objective without significantly impacting runtime.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------- Lower bound on T ----------
+    indiv_lb = max(safe_div(n, GPU_MEM_SIZE - ms) for _, _, ms, n in items)
+    global_lb = safe_div(total_n, max(total_capacity_mem - total_mem, 1e-9))
+    low_T = max(0.0, indiv_lb, global_lb)
+=======
+    # ---------- Lower bound on T ----------
+    indiv_lb = max(safe_div(n, GPU_MEM_SIZE - ms) for _, _, ms, n in items)
+    global_lb = safe_div(total_n, max(total_capacity_mem - total_mem, 1e-9))
+
+    # Pair bound for models that cannot co-reside on one GPU
+    pair_lb = 0.0
+    P = min(len(items), 200)
+    heavy = sorted(items, key=lambda it: it[2], reverse=True)[:P]
+    for i in range(len(heavy)):
+        _, _, mi, ni = heavy[i]
+        for j in range(i + 1, len(heavy)):
+            _, _, mj, nj = heavy[j]
+            if mi + mj > GPU_MEM_SIZE + 1e-12:
+                denom = 2.0 * GPU_MEM_SIZE - (mi + mj)
+                pair_lb = max(pair_lb, safe_div(ni + nj, max(denom, 1e-9)))
+
+    # Small k-prefix bound
+    kprefix_lb = 0.0
+    items_by_m = sorted(items, key=lambda it: it[2], reverse=True)
+    for k in range(1, min(gpu_num, 4) + 1):
+        sum_m = 0.0
+        sum_n = 0.0
+        for it in items_by_m:
+            sum_m += it[2]
+            sum_n += it[3]
+            if sum_m > (k - 1) * GPU_MEM_SIZE + 1e-12:
+                break
+        denom = k * GPU_MEM_SIZE - sum_m
+        kprefix_lb = max(kprefix_lb, safe_div(sum_n, max(denom, 1e-9)))
+
+    low_T = max(0.0, indiv_lb, global_lb, pair_lb, kprefix_lb)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def try_pack_any(T, need_placement=False):
+        variants = [(0, "resid"), (1, "resid")]
+        feasibles = []
+=======
+    def try_pack_any(T, need_placement=False):
+        variants = [(0, "resid"), (1, "resid"), (0, "minmax")]
+        feasibles = []
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    candidates = []
+
+    # Collect candidates with multiple orderings and policies at high
+    combos = [(0, "resid"), (1, "resid"), (2, "resid"), (0, "minmax"), (1, "minmax")]
+    for ov, pol in combos:
+        ok, plc = try_pack(high, ov, pol, True)
+        if ok:
+            candidates.append(plc)
+
+    # Add greedy candidate
+    gu = greedy_minmax_candidate()
+    if gu is not None:
+        candidates.append(gu)
+
+    if not candidates:
+        # Fallback: at least one feasible must exist
+        ok, plc = try_pack(high, 0, "resid", True)
+        if not ok:
+            raise ValueError("Feasible packing unexpectedly unavailable")
+        candidates.append(plc)
+=======
+    candidates = []
+
+    # Evaluate multiple T variants near the optimal threshold
+    Ts = [high, high * 0.995, high * 1.005]
+    combos = [(0, "resid"), (1, "resid"), (2, "resid"), (0, "minmax"), (1, "minmax")]
+    for Tv in Ts:
+        for ov, pol in combos:
+            ok, plc = try_pack(Tv, ov, pol, True)
+            if ok:
+                candidates.append(plc)
+
+    # Add greedy candidate
+    gu = greedy_minmax_candidate()
+    if gu is not None:
+        candidates.append(gu)
+
+    if not candidates:
+        # Fallback: at least one feasible must exist
+        ok, plc = try_pack(high, 0, "resid", True)
+        if not ok:
+            raise ValueError("Feasible packing unexpectedly unavailable")
+        candidates.append(plc)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # ---------- Select best candidate by measured max KVPR ----------
+    best_plc = None
+    best_score = float('inf')
+    for plc in candidates:
+        score = measured_max_kvpr(plc)
+        if score < best_score:
+            best_score = score
+            best_plc = plc
+=======
+    # ---------- Select best candidate by measured KVPR profile ----------
+    def score_tuple(plc):
+        kvprs = []
+        for g in range(gpu_num):
+            used_mem = sum(getattr(m, "model_size") for m in plc.get(g, []))
+            numer = sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in plc.get(g, []))
+            kvprs.append(kvpr_val(numer, GPU_MEM_SIZE - used_mem))
+        if not kvprs:
+            return (0.0, 0.0, 0.0)
+        kvprs.sort(reverse=True)
+        first = kvprs[0]
+        second = kvprs[1] if len(kvprs) > 1 else first
+        avg = sum(kvprs) / len(kvprs)
+        return (first, second, avg)
+
+    best_plc = None
+    best_score = None
+    for plc in candidates:
+        sc = score_tuple(plc)
+        if best_score is None or sc < best_score:
+            best_score = sc
+            best_plc = plc
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def local_improve(plc, max_moves=200, eps=1e-12):
+        per_g = {g: list(plc.get(g, [])) for g in range(gpu_num)}
+        mem = [sum(getattr(m, "model_size") for m in per_g[g]) for g in range(gpu_num)]
+        num = [sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in per_g[g]) for g in range(gpu_num)]
+
+        def kv_g(g, msum=None, nsum=None):
+            msum = mem[g] if msum is None else msum
+            nsum = num[g] if nsum is None else nsum
+            return kvpr_val(nsum, GPU_MEM_SIZE - msum)
+
+        def global_vals():
+            vals = [kv_g(g) for g in range(gpu_num)]
+            return max(vals), vals
+
+        moves = 0
+        while moves < max_moves:
+            cur_max, vals = global_vals()
+            worst = max(range(gpu_num), key=lambda g: vals[g])
+
+            improved = False
+            best_new_max = cur_max
+            best_move = None
+
+            for mdl in list(per_g[worst]):
+                ms = float(getattr(mdl, "model_size"))
+                dn = float(getattr(mdl, "req_rate")) / float(getattr(mdl, "slo"))
+                for tgt in range(gpu_num):
+                    if tgt == worst:
+                        continue
+                    if mem[tgt] + ms > GPU_MEM_SIZE + 1e-12:
+                        continue
+
+                    src_mem = mem[worst] - ms
+                    src_num = num[worst] - dn
+                    tgt_mem = mem[tgt] + ms
+                    tgt_num = num[tgt] + dn
+
+                    src_k = kvpr_val(src_num, GPU_MEM_SIZE - src_mem)
+                    tgt_k = kvpr_val(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                    new_max = max(src_k, tgt_k)
+                    for g in range(gpu_num):
+                        if g != worst and g != tgt:
+                            if vals[g] > new_max:
+                                new_max = vals[g]
+
+                    if new_max + eps < best_new_max:
+                        best_new_max = new_max
+                        best_move = (mdl, worst, tgt, ms, dn)
+                        improved = True
+
+            if not improved:
+                break
+
+            mdl, src, tgt, ms, dn = best_move
+            per_g[src].remove(mdl)
+            per_g[tgt].append(mdl)
+            mem[src] -= ms
+            num[src] -= dn
+            mem[tgt] += ms
+            num[tgt] += dn
+            moves += 1
+
+        return {g: per_g.get(g, []) for g in range(gpu_num)}
+=======
+    def local_improve(plc, max_moves=200, eps=1e-12):
+        per_g = {g: list(plc.get(g, [])) for g in range(gpu_num)}
+        mem = [sum(getattr(m, "model_size") for m in per_g[g]) for g in range(gpu_num)]
+        num = [sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in per_g[g]) for g in range(gpu_num)]
+
+        def kv_g(g, msum=None, nsum=None):
+            msum = mem[g] if msum is None else msum
+            nsum = num[g] if nsum is None else nsum
+            return kvpr_val(nsum, GPU_MEM_SIZE - msum)
+
+        def global_vals():
+            vals = [kv_g(g) for g in range(gpu_num)]
+            return max(vals), vals
+
+        moves = 0
+        while moves < max_moves:
+            cur_max, vals = global_vals()
+            worst = max(range(gpu_num), key=lambda g: vals[g])
+
+            improved = False
+            best_new_max = cur_max
+            best_move = None
+
+            for mdl in list(per_g[worst]):
+                ms = float(getattr(mdl, "model_size"))
+                dn = float(getattr(mdl, "req_rate")) / float(getattr(mdl, "slo"))
+                for tgt in range(gpu_num):
+                    if tgt == worst:
+                        continue
+                    if mem[tgt] + ms > GPU_MEM_SIZE + 1e-12:
+                        continue
+
+                    src_mem = mem[worst] - ms
+                    src_num = num[worst] - dn
+                    tgt_mem = mem[tgt] + ms
+                    tgt_num = num[tgt] + dn
+
+                    src_k = kvpr_val(src_num, GPU_MEM_SIZE - src_mem)
+                    tgt_k = kvpr_val(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                    new_max = max(src_k, tgt_k)
+                    for g in range(gpu_num):
+                        if g != worst and g != tgt:
+                            if vals[g] > new_max:
+                                new_max = vals[g]
+
+                    if new_max + eps < best_new_max:
+                        best_new_max = new_max
+                        best_move = (mdl, worst, tgt, ms, dn)
+                        improved = True
+
+            if not improved:
+                break
+
+            mdl, src, tgt, ms, dn = best_move
+            per_g[src].remove(mdl)
+            per_g[tgt].append(mdl)
+            mem[src] -= ms
+            num[src] -= dn
+            mem[tgt] += ms
+            num[tgt] += dn
+            moves += 1
+
+        # First-improving swaps involving the current worst GPU (bounded)
+        swap_budget = 8
+        for _ in range(swap_budget):
+            cur_max, vals = global_vals()
+            worst = max(range(gpu_num), key=lambda g: vals[g])
+            improved = False
+
+            for mdl_a in list(per_g[worst]):
+                ms_a = float(getattr(mdl_a, "model_size"))
+                dn_a = float(getattr(mdl_a, "req_rate")) / float(getattr(mdl_a, "slo"))
+                for tgt in range(gpu_num):
+                    if tgt == worst:
+                        continue
+                    for mdl_b in list(per_g[tgt]):
+                        ms_b = float(getattr(mdl_b, "model_size"))
+                        dn_b = float(getattr(mdl_b, "req_rate")) / float(getattr(mdl_b, "slo"))
+
+                        # Memory feasibility
+                        if mem[worst] - ms_a + ms_b > GPU_MEM_SIZE + 1e-12:
+                            continue
+                        if mem[tgt] - ms_b + ms_a > GPU_MEM_SIZE + 1e-12:
+                            continue
+
+                        src_mem = mem[worst] - ms_a + ms_b
+                        src_num = num[worst] - dn_a + dn_b
+                        tgt_mem = mem[tgt] - ms_b + ms_a
+                        tgt_num = num[tgt] - dn_b + dn_a
+
+                        src_k = kvpr_val(src_num, GPU_MEM_SIZE - src_mem)
+                        tgt_k = kvpr_val(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                        new_max = max(src_k, tgt_k)
+                        for g in range(gpu_num):
+                            if g != worst and g != tgt and vals[g] > new_max:
+                                new_max = vals[g]
+
+                        if new_max + eps < cur_max:
+                            # Apply swap
+                            per_g[worst].remove(mdl_a)
+                            per_g[tgt].remove(mdl_b)
+                            per_g[worst].append(mdl_b)
+                            per_g[tgt].append(mdl_a)
+                            mem[worst] = src_mem
+                            num[worst] = src_num
+                            mem[tgt] = tgt_mem
+                            num[tgt] = tgt_num
+                            improved = True
+                            break
+                    if improved:
+                        break
+                if improved:
+                    break
+            if not improved:
+                break
+
+        return {g: per_g.get(g, []) for g in range(gpu_num)}
+>>>>>>> REPLACE
+
+</DIFF>

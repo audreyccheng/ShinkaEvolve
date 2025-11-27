@@ -1,0 +1,170 @@
+<NAME>
+ensemble_chunked_greedy
+</NAME>
+
+<DESCRIPTION>
+Replaces the single-pass Chunked Sorted Greedy strategy with a Parallel Ensemble Chunked Sorted Greedy strategy.
+It generates multiple candidate packings by perturbing the item weights (which alters the sort order and chunk boundaries). It then runs the chunked greedy allocation in parallel for all candidates and selects the one minimizing load imbalance. This allows the algorithm to explore the local neighborhood of the sorted configuration to break ties or avoid suboptimal chunk alignments, improving load balance while maintaining high efficiency through vectorization.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using a Chunked Sorted Greedy strategy.
+
+    Items are sorted and processed in chunks of size m. In each chunk,
+    items are assigned to packs such that the heaviest item in the chunk
+    goes to the lightest pack, effectively balancing the load iteratively.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+
+    # Sort all items by weight descending
+    # sorted_weights: [layers, n]
+    sorted_weights, sorted_indices = weight.sort(dim=-1, descending=True)
+
+    # Track current load of each pack
+    pack_loads = torch.zeros(num_layers, num_packs, device=device, dtype=weight.dtype)
+
+    # Prepare aligned outputs to store results in sorted order first
+    aligned_pack_ids = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+    aligned_ranks = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+
+    # Number of chunks (each pack gets exactly 1 item per chunk)
+    num_chunks = num_items // num_packs
+
+    for k in range(num_chunks):
+        # Indices for the current chunk in the sorted array
+        start = k * num_packs
+        end = start + num_packs
+
+        # Weights of items in this chunk: [layers, num_packs]
+        chunk_weights = sorted_weights[:, start:end]
+
+        # Sort packs by current load ascending to find the best fit
+        # sorted_bin_indices[:, 0] is the pack with the smallest load
+        _, sorted_bin_indices = pack_loads.sort(dim=-1)
+
+        # Assign items to packs:
+        # Largest item in chunk (col 0) -> Pack with min load (col 0)
+        # ...
+        # Smallest item in chunk (col m-1) -> Pack with max load (col m-1)
+        aligned_pack_ids[:, start:end] = sorted_bin_indices
+        aligned_ranks[:, start:end] = k
+
+        # Update pack loads
+        # We add the weights of the items to their assigned packs
+        pack_loads.scatter_add_(1, sorted_bin_indices, chunk_weights)
+
+    # Scatter results back to original item order
+    pack_index = torch.empty_like(aligned_pack_ids)
+    rank_in_pack = torch.empty_like(aligned_ranks)
+
+    pack_index.scatter_(1, sorted_indices, aligned_pack_ids)
+    rank_in_pack.scatter_(1, sorted_indices, aligned_ranks)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using an Ensemble of Chunked Sorted Greedy strategies.
+
+    We generate multiple candidates by adding random noise to weights, which perturbs
+    the sorting order. We then apply the Chunked Sorted Greedy strategy to each
+    candidate and select the one that minimizes load imbalance on the original weights.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+    num_candidates = 8  # Process multiple perturbations in parallel
+
+    # 1. Generate Candidates
+    # Perturb weights to create diverse sort orders (chunk boundaries)
+    # Candidate 0: Original weights (scale=1.0)
+    # Candidates 1..N: Noisy weights
+    noise = (torch.rand(num_layers, num_candidates - 1, num_items, device=device) * 0.2) + 0.9
+    scales = torch.cat([torch.ones(num_layers, 1, num_items, device=device), noise], dim=1)
+
+    # [Layers, Candidates, Items]
+    perturbed_weights = weight.unsqueeze(1) * scales
+
+    # Sort descending based on perturbed weights
+    # This determines which items fall into which chunk
+    _, sorted_indices = perturbed_weights.sort(dim=-1, descending=True)
+
+    # Gather original weights in the sorted order to calculate actual loads
+    original_expanded = weight.unsqueeze(1).expand(-1, num_candidates, -1)
+    sorted_original_weights = original_expanded.gather(-1, sorted_indices)
+
+    # 2. Parallel Chunked Greedy Execution
+    # State: [Layers, Candidates, Packs]
+    pack_loads = torch.zeros(num_layers, num_candidates, num_packs, device=device, dtype=weight.dtype)
+
+    # Aligned outputs: [Layers, Candidates, Items]
+    aligned_pack_ids = torch.empty(num_layers, num_candidates, num_items, device=device, dtype=torch.int64)
+    aligned_ranks = torch.empty(num_layers, num_candidates, num_items, device=device, dtype=torch.int64)
+
+    num_chunks = num_items // num_packs
+
+    for k in range(num_chunks):
+        start = k * num_packs
+        end = start + num_packs
+
+        # Weights of items in this chunk: [L, C, Packs]
+        chunk_weights = sorted_original_weights[:, :, start:end]
+
+        # Sort packs by current load ascending
+        # [L, C, Packs]
+        _, sorted_bin_indices = pack_loads.sort(dim=-1)
+
+        # Assign items:
+        # Heaviest in chunk (idx 0) -> Lightest Pack (sorted_bin_idx 0)
+        aligned_pack_ids[:, :, start:end] = sorted_bin_indices
+        aligned_ranks[:, :, start:end] = k
+
+        # Update pack loads
+        # Scatter add: pack_loads.scatter_add_(dim=2, index=sorted_bin_indices, src=chunk_weights)
+        pack_loads.scatter_add_(2, sorted_bin_indices, chunk_weights)
+
+    # 3. Select Best Candidate
+    # Imbalance: [Layers, Candidates]
+    imbalance = pack_loads.max(dim=-1).values - pack_loads.min(dim=-1).values
+    best_candidate_idx = imbalance.argmin(dim=-1)  # [Layers]
+
+    # 4. Gather Final Results
+    # Expand indices for gathering: [L, 1, N]
+    gather_idx = best_candidate_idx.view(num_layers, 1, 1).expand(-1, 1, num_items)
+
+    final_sorted_indices = sorted_indices.gather(1, gather_idx).squeeze(1)
+    final_aligned_pack_ids = aligned_pack_ids.gather(1, gather_idx).squeeze(1)
+    final_aligned_ranks = aligned_ranks.gather(1, gather_idx).squeeze(1)
+
+    # Scatter back to original item order
+    pack_index = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+    rank_in_pack = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+
+    pack_index.scatter_(1, final_sorted_indices, final_aligned_pack_ids)
+    rank_in_pack.scatter_(1, final_sorted_indices, final_aligned_ranks)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+</DIFF>

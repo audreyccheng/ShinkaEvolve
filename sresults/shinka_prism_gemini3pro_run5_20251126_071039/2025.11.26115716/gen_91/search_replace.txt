@@ -1,0 +1,379 @@
+<NAME>
+lns_steepest_descent_refinement
+</NAME>
+
+<DESCRIPTION>
+Replaces the existing randomized LNS refinement with a deterministic "Steepest Descent" approach on the bottleneck GPU, supplemented by Ruin & Recreate kicks to escape local optima.
+1. Explicitly identifies the bottleneck GPU (`src`).
+2. Iterates through ALL models on `src` to find the best possible Move to any other GPU that reduces the bottleneck pressure.
+3. If no Move is found, iterates through all Swaps to find a valid Swap that reduces pressure.
+4. Uses a "Best-Improvement" (Steepest Descent) policy instead of First-Improvement or Random selection to maximize gain per step.
+5. Retains the Ruin & Recreate mechanism as a perturbation strategy when no greedy moves are available (`no_improve > patience`).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _lns_refinement(gpu_num, placement):
+    """
+    Refines placement using Large Neighborhood Search (Ruin and Recreate).
+    Target: Minimize Max KVPR.
+    """
+    # Initialize State
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    current_ks = [get_k(i) for i in range(gpu_num)]
+    max_k = max(current_ks)
+
+    best_max_k = max_k
+    best_placement = copy.deepcopy(placement)
+
+    # Parameters
+    max_steps = 1000
+    patience = 50
+    no_improve = 0
+
+    for step in range(max_steps):
+        # Identify bottleneck
+        # Get all GPUs close to max (within 1%) to diversify target
+        candidates = [i for i in range(gpu_num) if current_ks[i] > max_k * 0.99]
+        if not candidates: candidates = [random.randint(0, gpu_num-1)]
+        src = random.choice(candidates)
+
+        # Heuristic Decision: Small Move vs Ruin
+        # If stuck (no improve), force Ruin. Else mix.
+        do_ruin = (no_improve > patience) or (random.random() < 0.2)
+
+        if do_ruin:
+            # --- RUIN & RECREATE ---
+            # Select subset of GPUs: Bottleneck + Randoms
+            subset_indices = {src}
+            # Add 2-3 random GPUs
+            n_random = min(gpu_num - 1, random.randint(2, 4))
+            others = list(range(gpu_num))
+            random.shuffle(others)
+            for o in others:
+                if len(subset_indices) >= n_random + 1: break
+                if o != src: subset_indices.add(o)
+
+            subset_indices = list(subset_indices)
+
+            # Extract models and Backup
+            repack_models = []
+            backup_state = {}
+            old_subset_sq = 0
+
+            for idx in subset_indices:
+                old_subset_sq += current_ks[idx]**2
+                backup_state[idx] = (list(placement[idx]), gpu_s[idx], gpu_w[idx], current_ks[idx])
+                repack_models.extend(placement[idx])
+                # Clear GPU
+                placement[idx] = []
+                gpu_s[idx] = 0.0
+                gpu_w[idx] = 0.0
+                current_ks[idx] = 0.0
+
+            # Recreate: Sort models
+            # Sort by Size Descending (packing efficiency) and Load Descending (pressure)
+            repack_models.sort(key=lambda m: (m.model_size, m.req_rate/m.slo), reverse=True)
+
+            feasible_repack = True
+
+            # Greedy insertion
+            for m in repack_models:
+                best_idx = -1
+                best_local_k = float('inf')
+
+                m_s = m.model_size
+                m_w = m.req_rate / m.slo
+
+                for idx in subset_indices:
+                    if gpu_s[idx] + m_s <= GPU_MEM_SIZE:
+                        # Hypothetical K
+                        rem = GPU_MEM_SIZE - (gpu_s[idx] + m_s)
+                        k = (gpu_w[idx] + m_w) / rem if rem > 1e-7 else 1e9
+
+                        # We want to minimize the PEAK K generated
+                        if k < best_local_k:
+                            best_local_k = k
+                            best_idx = idx
+
+                if best_idx != -1:
+                    placement[best_idx].append(m)
+                    gpu_s[best_idx] += m_s
+                    gpu_w[best_idx] += m_w
+                else:
+                    feasible_repack = False
+                    break
+
+            if feasible_repack:
+                # Evaluate Move
+                new_subset_sq = 0
+                for idx in subset_indices:
+                    k = get_k(idx)
+                    current_ks[idx] = k
+                    new_subset_sq += k*k
+
+                new_global_max = max(current_ks)
+
+                improved = False
+                if new_global_max < max_k - 1e-7:
+                    improved = True
+                elif new_global_max < max_k + 1e-7:
+                    # Tie-breaking: Variance Reduction
+                    if new_subset_sq < old_subset_sq:
+                        improved = True
+
+                if improved:
+                    max_k = new_global_max
+                    no_improve = 0
+                else:
+                    # Revert
+                    for idx in subset_indices:
+                        placement[idx], gpu_s[idx], gpu_w[idx], current_ks[idx] = backup_state[idx]
+            else:
+                # Revert
+                for idx in subset_indices:
+                    placement[idx], gpu_s[idx], gpu_w[idx], current_ks[idx] = backup_state[idx]
+
+        else:
+            # --- SIMPLE MOVE (Greedy Descent) ---
+            if not placement[src]:
+                no_improve += 1
+                continue
+
+            m_idx = random.randint(0, len(placement[src])-1)
+            m = placement[src][m_idx]
+            m_s = m.model_size
+            m_w = m.req_rate / m.slo
+
+            best_dst = -1
+            best_impact = 0
+
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + m_s > GPU_MEM_SIZE: continue
+
+                # New values
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - m_s)
+                new_k_src = (gpu_w[src] - m_w) / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + m_s)
+                new_k_dst = (gpu_w[dst] + m_w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                old_local_max = max(current_ks[src], current_ks[dst])
+                new_local_max = max(new_k_src, new_k_dst)
+
+                if new_local_max < old_local_max - 1e-7:
+                    # Don't create new global bottleneck
+                    if new_local_max < max_k + 1e-7:
+                        improvement = old_local_max - new_local_max
+                        if improvement > best_impact:
+                            best_impact = improvement
+                            best_dst = dst
+
+            if best_dst != -1:
+                dst = best_dst
+                placement[dst].append(m)
+                placement[src].pop(m_idx)
+
+                gpu_s[src] -= m_s; gpu_w[src] -= m_w
+                gpu_s[dst] += m_s; gpu_w[dst] += m_w
+
+                current_ks[src] = get_k(src)
+                current_ks[dst] = get_k(dst)
+
+                max_k = max(current_ks)
+                no_improve = 0
+            else:
+                no_improve += 1
+
+        # Check Best
+        if max_k < best_max_k - 1e-7:
+            best_max_k = max_k
+            best_placement = copy.deepcopy(placement)
+
+    return best_placement
+=======
+def _lns_refinement(gpu_num, placement):
+    """
+    Refines placement using Steepest Descent (Move/Swap) and LNS Kicks.
+    """
+    # Initialize State
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    current_ks = [get_k(i) for i in range(gpu_num)]
+    best_max_k = max(current_ks)
+    best_placement = copy.deepcopy(placement)
+
+    max_steps = 1000
+    patience = 50
+    no_improve = 0
+
+    for step in range(max_steps):
+        # Identify bottleneck
+        max_k = -1.0
+        src = -1
+        for i in range(gpu_num):
+            if current_ks[i] > max_k:
+                max_k = current_ks[i]
+                src = i
+
+        # Check global best
+        if max_k < best_max_k - 1e-7:
+            best_max_k = max_k
+            best_placement = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 1. KICK (Ruin & Recreate) if stuck
+        if no_improve > patience:
+            subset_indices = {src}
+            n_random = min(gpu_num - 1, random.randint(2, 4))
+            others = list(range(gpu_num))
+            random.shuffle(others)
+            for o in others:
+                if len(subset_indices) >= n_random + 1: break
+                if o != src: subset_indices.add(o)
+            subset_indices = list(subset_indices)
+
+            # Backup
+            backup_state = {}
+            for idx in subset_indices:
+                backup_state[idx] = (list(placement[idx]), gpu_s[idx], gpu_w[idx], current_ks[idx])
+
+            # Collect models
+            repack_models = []
+            for idx in subset_indices:
+                repack_models.extend(placement[idx])
+                placement[idx] = []
+                gpu_s[idx] = 0.0
+                gpu_w[idx] = 0.0
+
+            # Recreate with randomization to escape
+            random.shuffle(repack_models)
+            repack_models.sort(key=lambda m: (m.model_size, m.req_rate/m.slo), reverse=True)
+
+            feasible = True
+            for m in repack_models:
+                best_idx = -1
+                best_val = float('inf')
+                for idx in subset_indices:
+                    if gpu_s[idx] + m.model_size <= GPU_MEM_SIZE:
+                        rem = GPU_MEM_SIZE - (gpu_s[idx] + m.model_size)
+                        k = (gpu_w[idx] + m.req_rate/m.slo) / rem if rem > 1e-7 else 1e9
+                        if k < best_val:
+                            best_val = k
+                            best_idx = idx
+                if best_idx != -1:
+                    placement[best_idx].append(m)
+                    gpu_s[best_idx] += m.model_size
+                    gpu_w[best_idx] += m.req_rate/m.slo
+                else:
+                    feasible = False
+                    break
+
+            if feasible:
+                # Update state
+                for idx in subset_indices:
+                    current_ks[idx] = get_k(idx)
+                no_improve = 0
+            else:
+                # Revert
+                for idx in subset_indices:
+                    placement[idx], gpu_s[idx], gpu_w[idx], current_ks[idx] = backup_state[idx]
+            continue
+
+        # 2. STEEPEST DESCENT (Moves & Swaps) on Bottleneck
+        best_move = None # (gain, type, ...)
+
+        # Sort items in bottleneck by weight descending
+        src_items = sorted(enumerate(placement[src]), key=lambda x: x[1].req_rate/x[1].slo, reverse=True)
+
+        # A. Try Moves
+        for i, m in src_items:
+            w, s = m.req_rate/m.slo, m.model_size
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + s > GPU_MEM_SIZE: continue
+
+                # Pruning
+                if current_ks[dst] > max_k * 0.95: continue
+
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - s)
+                nk_src = (gpu_w[src] - w) / rem_src if rem_src > 1e-7 else 1e9
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + s)
+                nk_dst = (gpu_w[dst] + w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                new_peak = max(nk_src, nk_dst)
+
+                if new_peak < max_k - 1e-7:
+                    gain = max_k - new_peak
+                    if best_move is None or gain > best_move[0]:
+                        best_move = (gain, 'move', i, dst, s, w)
+
+        # B. Try Swaps
+        if best_move is None:
+            for i1, m1 in src_items:
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+                for dst in range(gpu_num):
+                    if dst == src: continue
+                    if current_ks[dst] > max_k * 0.95: continue
+
+                    for i2, m2 in enumerate(placement[dst]):
+                        w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                        ns_src = gpu_s[src] - s1 + s2
+                        ns_dst = gpu_s[dst] - s2 + s1
+                        if ns_src > GPU_MEM_SIZE or ns_dst > GPU_MEM_SIZE: continue
+
+                        rem_src = GPU_MEM_SIZE - ns_src
+                        nk_src = (gpu_w[src] - w1 + w2) / rem_src if rem_src > 1e-7 else 1e9
+                        rem_dst = GPU_MEM_SIZE - ns_dst
+                        nk_dst = (gpu_w[dst] - w2 + w1) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                        new_peak = max(nk_src, nk_dst)
+                        if new_peak < max_k - 1e-7:
+                            gain = max_k - new_peak
+                            if best_move is None or gain > best_move[0]:
+                                best_move = (gain, 'swap', i1, dst, i2, s1, w1, s2, w2)
+
+        # Apply Best Move
+        if best_move:
+            _, type_, *args = best_move
+            if type_ == 'move':
+                i, dst, s, w = args
+                m = placement[src].pop(i)
+                placement[dst].append(m)
+                gpu_s[src] -= s; gpu_w[src] -= w
+                gpu_s[dst] += s; gpu_w[dst] += w
+            elif type_ == 'swap':
+                i1, dst, i2, s1, w1, s2, w2 = args
+                m1 = placement[src][i1]
+                m2 = placement[dst][i2]
+                placement[src][i1] = m2
+                placement[dst][i2] = m1
+                gpu_s[src] = gpu_s[src] - s1 + s2; gpu_w[src] = gpu_w[src] - w1 + w2
+                gpu_s[dst] = gpu_s[dst] - s2 + s1; gpu_w[dst] = gpu_w[dst] - w2 + w1
+
+            current_ks[src] = get_k(src)
+            current_ks[dst] = get_k(dst)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

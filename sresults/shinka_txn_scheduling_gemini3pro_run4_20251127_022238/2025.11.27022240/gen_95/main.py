@@ -1,0 +1,393 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import re
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Optimized Scheduler: Dynamic LAHC with Evolving Probabilities and Non-Linear Greedy.
+
+    Algorithm:
+    1.  **Txn Analysis**: Pre-compute transaction lengths.
+    2.  **Greedy Phase**:
+        -   Uses 'Big Rocks' heuristic (packing long txns).
+        -   **Non-Linear Decay**: Alpha decays with a randomized power curve to vary the transition
+            from "Packing" to "Fitting" (Convex/Concave decay).
+    3.  **Sprint Phase**: Short LAHC on top candidates.
+    4.  **Marathon Phase**:
+        -   **Dynamic LAHC**: Mutation operator probabilities evolve with search progress.
+            -   Early: Disruptive (Smart Insert, Macro Shift) for exploration.
+            -   Late: Fine-tuning (Swap, Micro Shift) for intensification.
+        -   **Operators**: Smart Insert, Macro/Micro Block Shift, Block Reverse, Swap, Single Shift.
+        -   **Cooling**: Strict hill climbing in the final 20% of iterations.
+    """
+
+    # --- Pre-computation ---
+    txn_lens = {}
+    try:
+        for i in range(workload.num_txns):
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            ops = len(re.findall(r'[rw]-\d+', txn_str))
+            txn_lens[i] = ops
+    except Exception:
+        for i in range(workload.num_txns):
+            txn_lens[i] = 1
+
+    # --- Engine: Dynamic LAHC ---
+    def dynamic_lahc(start_seq, start_cost, iterations, history_len, enable_kick=False):
+        curr_s = list(start_seq)
+        curr_c = start_cost
+        best_s = list(start_seq)
+        best_c = start_cost
+
+        history = [curr_c] * history_len
+        last_imp_iter = 0
+
+        # Pre-calculated thresholds for constant ops
+        for i in range(iterations):
+            # Progress 0.0 -> 1.0
+            p = i / iterations
+
+            # 1. Cooling Phase (Last 20%): Strict Hill Climbing
+            is_cooling = p > 0.8
+
+            # 2. Stagnation Kick (Only in Marathon, not in cooling)
+            if enable_kick and not is_cooling and (i - last_imp_iter > 600):
+                slen = len(curr_s)
+                if slen > 15:
+                    # Shuffle a significant segment
+                    seg_len = random.randint(10, 20)
+                    idx = random.randint(0, slen - seg_len)
+                    segment = curr_s[idx : idx + seg_len]
+                    random.shuffle(segment)
+                    curr_s[idx : idx + seg_len] = segment
+
+                    curr_c = workload.get_opt_seq_cost(curr_s)
+                    history = [curr_c] * history_len # Reset history
+                    last_imp_iter = i
+                    continue
+
+            # 3. Dynamic Mutation Selection
+            # Probabilities evolve: High disruption early, fine tuning late.
+
+            # Smart Insert (Exploration): Starts at 5%, decays to 0% by p=0.8
+            p_smart = max(0.0, 0.05 * (1.0 - (p / 0.8)))
+
+            # Macro Block (Structural): Starts at 10%, decays to 0% by p=1.0
+            p_macro = max(0.0, 0.10 * (1.0 - p))
+
+            # Block Reverse (Topology): Constant 5%
+            p_rev = 0.05
+
+            # Micro Block (Local): Increases from 20% to 30%
+            p_micro = 0.20 + (0.10 * p)
+
+            # Swap (Fine): Increases from 10% to 30%
+            p_swap = 0.10 + (0.20 * p)
+
+            # Remainder is Single Shift (~50% -> ~35%)
+
+            r = random.random()
+            neigh_s = list(curr_s)
+            slen = len(neigh_s)
+            neigh_c = -1
+
+            current_threshold = p_smart
+
+            # A. Smart Insert
+            if r < current_threshold:
+                if slen >= 5:
+                    idx = random.randint(0, slen-1)
+                    item = neigh_s.pop(idx)
+                    best_loc_c = float('inf')
+                    best_loc_s = None
+                    # Sample 3 random positions
+                    for _ in range(3):
+                        ins = random.randint(0, len(neigh_s))
+                        tmp = list(neigh_s)
+                        tmp.insert(ins, item)
+                        c = workload.get_opt_seq_cost(tmp)
+                        if c < best_loc_c:
+                            best_loc_c = c
+                            best_loc_s = tmp
+                    neigh_s = best_loc_s
+                    neigh_c = best_loc_c
+
+            # B. Macro Block Shift
+            current_threshold += p_macro
+            if neigh_c == -1 and r < current_threshold:
+                if slen >= 12:
+                    bsize = random.randint(6, 12)
+                    f = random.randint(0, slen - bsize)
+                    block = neigh_s[f : f+bsize]
+                    del neigh_s[f : f+bsize]
+                    t = random.randint(0, len(neigh_s))
+                    neigh_s[t:t] = block
+
+            # C. Block Reverse (New Operator)
+            current_threshold += p_rev
+            if neigh_c == -1 and r < current_threshold:
+                 if slen >= 4:
+                    bsize = random.randint(3, 8)
+                    f = random.randint(0, slen - bsize)
+                    # Reverse segment in place
+                    neigh_s[f : f+bsize] = neigh_s[f : f+bsize][::-1]
+
+            # D. Micro Block Shift
+            current_threshold += p_micro
+            if neigh_c == -1 and r < current_threshold:
+                if slen >= 4:
+                    bsize = random.randint(2, 4)
+                    f = random.randint(0, slen - bsize)
+                    block = neigh_s[f : f+bsize]
+                    del neigh_s[f : f+bsize]
+                    t = random.randint(0, len(neigh_s))
+                    neigh_s[t:t] = block
+
+            # E. Swap
+            current_threshold += p_swap
+            if neigh_c == -1 and r < current_threshold:
+                if slen >= 2:
+                    idx = random.randint(0, slen - 2)
+                    neigh_s[idx], neigh_s[idx+1] = neigh_s[idx+1], neigh_s[idx]
+
+            # F. Single Shift (Default)
+            if neigh_c == -1:
+                if slen >= 2:
+                    f = random.randint(0, slen-1)
+                    t = random.randint(0, slen-1)
+                    if f != t:
+                        item = neigh_s.pop(f)
+                        neigh_s.insert(t, item)
+
+            # Evaluate Cost
+            if neigh_c == -1:
+                neigh_c = workload.get_opt_seq_cost(neigh_s)
+
+            # Acceptance Logic
+            accept = False
+            if is_cooling:
+                # Strict Hill Climbing
+                if neigh_c < curr_c:
+                    accept = True
+            else:
+                # Late Acceptance
+                h_idx = i % history_len
+                if neigh_c <= curr_c or neigh_c <= history[h_idx]:
+                    accept = True
+
+            if accept:
+                curr_s = neigh_s
+                curr_c = neigh_c
+                if curr_c < best_c:
+                    best_c = curr_c
+                    best_s = list(curr_s)
+                    last_imp_iter = i
+
+            if not is_cooling:
+                history[i % history_len] = curr_c
+
+        return best_c, best_s
+
+    # Configuration
+    SAMPLE_SIZE = 20
+    candidates = []
+
+    # --- Phase 1: Diverse Greedy with Non-Linear Decay ---
+    for i in range(num_seqs):
+        # Parameters
+        if i == 0:
+            start_alpha = 0.30
+            decay_power = 1.0 # Linear anchor
+            threshold_ratio = 0.90
+        else:
+            start_alpha = random.uniform(0.1, 0.5)
+            # Power law decay:
+            # < 1.0 (Concave): Stays high longer (Pack big rocks deep into sequence)
+            # > 1.0 (Convex): Drops fast (Switch to cost fit early)
+            decay_power = random.uniform(0.5, 2.0)
+            threshold_ratio = random.uniform(0.85, 0.98)
+
+        remaining = set(range(workload.num_txns))
+        total_txns = workload.num_txns
+
+        start_txn = random.choice(list(remaining))
+        curr_seq = [start_txn]
+        remaining.remove(start_txn)
+
+        while remaining:
+            progress = len(curr_seq) / total_txns
+
+            # Non-linear decay of alpha
+            eff_alpha = start_alpha * ((1.0 - progress) ** decay_power)
+
+            # Pool threshold
+            rem_lens = [txn_lens[t] for t in remaining]
+            max_rem = max(rem_lens) if rem_lens else 0
+            limit = max_rem * threshold_ratio
+
+            # Big Rocks Pool
+            big_rocks = [t for t in remaining if txn_lens[t] >= limit]
+            pool = list(big_rocks)
+
+            # Fill
+            needed = SAMPLE_SIZE - len(pool)
+            if needed > 0:
+                others = [t for t in remaining if t not in big_rocks]
+                if len(others) <= needed:
+                    pool.extend(others)
+                else:
+                    pool.extend(random.sample(others, needed))
+
+            pool = list(set(pool))
+
+            # Selection
+            best_cand = -1
+            best_score = float('inf')
+
+            for t in pool:
+                cost = workload.get_opt_seq_cost(curr_seq + [t])
+                score = cost - (eff_alpha * txn_lens[t])
+
+                if score < best_score:
+                    best_score = score
+                    best_cand = t
+
+            curr_seq.append(best_cand)
+            remaining.remove(best_cand)
+
+        # Quick Polish (Adjacent Swap Descent)
+        c_cost = workload.get_opt_seq_cost(curr_seq)
+        improved = True
+        while improved:
+            improved = False
+            for j in range(len(curr_seq)-1):
+                # Swap
+                curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
+                nc = workload.get_opt_seq_cost(curr_seq)
+                if nc < c_cost:
+                    c_cost = nc
+                    improved = True
+                else:
+                    # Revert
+                    curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
+
+        candidates.append((c_cost, curr_seq))
+
+    # --- Phase 2: Sprint (Filter) ---
+    # Sort and pick unique
+    candidates.sort(key=lambda x: x[0])
+    unique_candidates = []
+    seen = set()
+    for c, s in candidates:
+        if c not in seen:
+            unique_candidates.append((c, list(s)))
+            seen.add(c)
+        if len(unique_candidates) >= 3:
+            break
+
+    if not unique_candidates:
+        unique_candidates = [candidates[0]]
+
+    sprint_results = []
+    SPRINT_ITERS = 400
+    for c, s in unique_candidates:
+        res = dynamic_lahc(s, c, SPRINT_ITERS, history_len=50, enable_kick=False)
+        sprint_results.append(res)
+
+    # --- Phase 3: Marathon (Deep Optimization) ---
+    sprint_results.sort(key=lambda x: x[0])
+    champ_c, champ_s = sprint_results[0]
+
+    # Extended run with all features
+    MARATHON_ITERS = 4000
+    final_c, final_s = dynamic_lahc(champ_s, champ_c, MARATHON_ITERS, history_len=150, enable_kick=True)
+
+    return final_c, final_s
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    NUM_SEQS = 10
+
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, NUM_SEQS)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, NUM_SEQS)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, NUM_SEQS)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

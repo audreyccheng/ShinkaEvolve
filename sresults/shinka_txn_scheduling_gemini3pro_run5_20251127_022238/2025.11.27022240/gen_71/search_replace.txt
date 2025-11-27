@@ -1,0 +1,382 @@
+<NAME>
+tiered_efficiency_beam_search
+</NAME>
+<DESCRIPTION>
+Refine the constructive phase (Beam Search) to use a "Tiered Efficiency Bonus".
+Instead of a continuous quadratic bonus, this introduces a strict tier for "Perfect Parallelism" (zero cost increase), which is heavily rewarded. This encourages the algorithm to greedily lock in moves that hide latency completely (bin packing), while still rewarding high-efficiency partial fits.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            for t in to_eval:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent_work + txn_lengths[t]
+
+                # Base Score
+                new_score = new_cost - (current_gamma * new_work)
+
+                # Continuous Efficiency Bonus
+                # Calculate how much of the transaction was "hidden" by parallelism
+                delta = new_cost - parent_cost
+                t_len = txn_lengths[t]
+
+                if t_len > 1e-6:
+                    # efficiency 1.0 = perfect parallel (delta=0)
+                    # efficiency 0.0 = sequential (delta=t_len)
+                    efficiency = max(0.0, (t_len - delta) / t_len)
+
+                    # Apply quadratic bonus for high efficiency
+                    # Factor 3.0 gives strong pull for perfect fits
+                    if efficiency > 0.01:
+                        bonus = t_len * 3.0 * (efficiency ** 2)
+                        new_score -= bonus
+
+                new_rem = parent['rem'].copy()
+                new_rem.remove(t)
+
+                candidates.append({
+                    'seq': new_seq,
+                    'cost': new_cost,
+                    'score': new_score,
+                    'work': new_work,
+                    'rem': new_rem
+                })
+=======
+            for t in to_eval:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent_work + txn_lengths[t]
+
+                # Base Score: Cost - Work Density
+                new_score = new_cost - (current_gamma * new_work)
+
+                # Tiered Efficiency Bonus
+                # Prioritize perfect packing (Zero Cost Increase) heavily
+                delta_cost = new_cost - parent_cost
+                t_len = txn_lengths[t]
+
+                efficiency = 0.0
+                if t_len > 1e-9:
+                    efficiency = max(0.0, (t_len - delta_cost) / t_len)
+
+                # Tier 1: Perfect Parallelism (Zero Cost Increase)
+                if delta_cost <= 1e-6:
+                    new_score -= (t_len * 3.0)
+                # Tier 2: High Partial Efficiency
+                elif efficiency > 0.5:
+                    # Quadratic scaling favors 0.9 over 0.6 significantly
+                    new_score -= (t_len * 1.5 * (efficiency ** 2))
+
+                new_rem = parent['rem'].copy()
+                new_rem.remove(t)
+
+                candidates.append({
+                    'seq': new_seq,
+                    'cost': new_cost,
+                    'score': new_score,
+                    'work': new_work,
+                    'rem': new_rem
+                })
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+adaptive_ruin_strategy
+</NAME>
+<DESCRIPTION>
+Implement "Adaptive Ruin Intensity" in the ILS phase.
+A `last_improvement_cycle` tracker is added. If the algorithm stagnates (no improvement for several cycles), the `ruin_factor` increases, enlarging the size of the removed blocks (Tail, Block, Scatter). This allows the search to escape local optima by performing more drastic perturbations when necessary.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- 2. Refinement Phase: Deterministic ILS ---
+
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+
+    ILS_CYCLES = 5
+    if num_txns < 20: ILS_CYCLES = 2
+
+    for cycle in range(ILS_CYCLES):
+
+        # A. Restart Strategy
+        if cycle > 0 and current_cost > best_cost:
+            # Periodically revert to best to focus search
+            if random.random() < 0.4:
+                current_schedule = list(best_schedule)
+                current_cost = best_cost
+
+        # B. Multi-Mode Ruin
+        work_seq = list(current_schedule)
+        removed_txns = []
+
+        r_mode = random.random()
+
+        if r_mode < 0.25:
+            # Mode 1: Tail Ruin (Target critical path end)
+            bs = max(4, int(num_txns * 0.25))
+            if len(work_seq) > bs:
+                start = len(work_seq) - bs
+                removed_txns = work_seq[start:]
+                del work_seq[start:]
+
+        elif r_mode < 0.55:
+            # Mode 2: Single Large Block (Locality)
+            bs = max(2, int(num_txns * 0.2))
+            if len(work_seq) > bs:
+                start = random.randint(0, len(work_seq) - bs)
+                removed_txns = work_seq[start : start + bs]
+                del work_seq[start : start + bs]
+
+        elif r_mode < 0.85:
+            # Mode 3: Two Disjoint Blocks (Global shuffle)
+            total_rem = max(4, int(num_txns * 0.20))
+            b1 = total_rem // 2
+            b2 = total_rem - b1
+
+            if len(work_seq) > b1:
+                s1 = random.randint(0, len(work_seq) - b1)
+                removed_txns.extend(work_seq[s1 : s1 + b1])
+                del work_seq[s1 : s1 + b1]
+            if len(work_seq) > b2:
+                s2 = random.randint(0, len(work_seq) - b2)
+                removed_txns.extend(work_seq[s2 : s2 + b2])
+                del work_seq[s2 : s2 + b2]
+
+        else:
+            # Mode 4: Random Scatter (Dependency chains)
+            cnt = max(3, int(num_txns * 0.15))
+            indices = sorted(random.sample(range(len(work_seq)), min(len(work_seq), cnt)), reverse=True)
+            for idx in indices:
+                removed_txns.append(work_seq.pop(idx))
+=======
+    # --- 2. Refinement Phase: Deterministic ILS ---
+
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+    last_improvement_cycle = -1
+
+    ILS_CYCLES = 6
+    if num_txns < 20: ILS_CYCLES = 3
+
+    for cycle in range(ILS_CYCLES):
+
+        # A. Restart Strategy
+        # If we've drifted to a worse solution, probabilistically restart from best
+        if cycle > 0 and current_cost > best_cost:
+            p_restart = 0.4
+            if cycle - last_improvement_cycle > 2:
+                p_restart = 0.8
+
+            if random.random() < p_restart:
+                current_schedule = list(best_schedule)
+                current_cost = best_cost
+
+        # B. Adaptive Multi-Mode Ruin
+        # Calculate ruin intensity based on stagnation
+        stagnation = cycle - last_improvement_cycle
+        ruin_factor = 1.0
+        if stagnation >= 2: ruin_factor = 1.5
+        if stagnation >= 4: ruin_factor = 2.0
+
+        work_seq = list(current_schedule)
+        removed_txns = []
+
+        r_mode = random.random()
+
+        if r_mode < 0.25:
+            # Mode 1: Tail Ruin
+            base_size = max(4, int(num_txns * 0.25))
+            bs = min(len(work_seq), int(base_size * ruin_factor))
+            if len(work_seq) > bs:
+                start = len(work_seq) - bs
+                removed_txns = work_seq[start:]
+                del work_seq[start:]
+
+        elif r_mode < 0.55:
+            # Mode 2: Single Large Block
+            base_size = max(2, int(num_txns * 0.2))
+            bs = min(len(work_seq), int(base_size * ruin_factor))
+            if len(work_seq) > bs:
+                start = random.randint(0, len(work_seq) - bs)
+                removed_txns = work_seq[start : start + bs]
+                del work_seq[start : start + bs]
+
+        elif r_mode < 0.85:
+            # Mode 3: Two Disjoint Blocks
+            base_total = max(4, int(num_txns * 0.20))
+            total_rem = min(len(work_seq), int(base_total * ruin_factor))
+            b1 = total_rem // 2
+            b2 = total_rem - b1
+
+            if len(work_seq) > b1:
+                s1 = random.randint(0, len(work_seq) - b1)
+                removed_txns.extend(work_seq[s1 : s1 + b1])
+                del work_seq[s1 : s1 + b1]
+            if len(work_seq) > b2:
+                s2 = random.randint(0, len(work_seq) - b2)
+                removed_txns.extend(work_seq[s2 : s2 + b2])
+                del work_seq[s2 : s2 + b2]
+
+        else:
+            # Mode 4: Random Scatter
+            base_cnt = max(3, int(num_txns * 0.15))
+            cnt = min(len(work_seq), int(base_cnt * ruin_factor))
+            indices = sorted(random.sample(range(len(work_seq)), cnt), reverse=True)
+            for idx in indices:
+                removed_txns.append(work_seq.pop(idx))
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+track_improvement_cycle
+</NAME>
+<DESCRIPTION>
+Update the `last_improvement_cycle` variable when a new best solution is found after the Recreate phase.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        # Save if improved
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = list(current_schedule)
+
+        # D. Polish: Deterministic Iterative Improvement (Gap Repair)
+=======
+        # Save if improved
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = list(current_schedule)
+            last_improvement_cycle = cycle
+
+        # D. Polish: Deterministic Iterative Improvement (Gap Repair)
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+optimize_polish_phase
+</NAME>
+<DESCRIPTION>
+Significantly enhance the "Polish" (Gap Repair) phase:
+1. Increase `MAX_PASSES` to allow the re-ordering to converge (transactions settling into optimal spots often open up new spots for others).
+2. Implement "Early Exit" optimization: if a transaction is inserted with no cost increase relative to the schedule without it (perfect packing), stop scanning immediately. This drastically reduces runtime, making multiple passes feasible.
+3. Use `last_improvement_cycle` to track improvements in this phase as well.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        # D. Polish: Deterministic Iterative Improvement (Gap Repair)
+        # Scan entire schedule, try to move each transaction to its optimal position.
+        # This is expensive but powerful.
+
+        # Optimization: Only perform if we are close to best or randomly
+        # to save compute on bad candidates.
+        should_polish = (current_cost <= best_cost * 1.05) or (random.random() < 0.3)
+
+        if should_polish and num_txns > 1:
+            improved = True
+            passes = 0
+            MAX_PASSES = 1
+
+            while improved and passes < MAX_PASSES:
+                improved = False
+                passes += 1
+
+                # Check every transaction
+                # Iterate over a snapshot so indices don't get messed up by moves
+                # Sort by LPT: Try to optimize placement of large blocks first
+                txns_to_check = sorted(current_schedule, key=lambda t: txn_lengths.get(t, 0), reverse=True)
+
+                for txn in txns_to_check:
+                    # Find current location
+                    try:
+                        current_idx = current_schedule.index(txn)
+                    except ValueError:
+                        continue # Should not happen
+
+                    # Temporarily remove
+                    del current_schedule[current_idx]
+
+                    # Find best insertion point
+                    best_pos = -1
+                    best_val = float('inf')
+
+                    # Full scan
+                    for pos in range(len(current_schedule) + 1):
+                        current_schedule.insert(pos, txn)
+                        c = workload.get_opt_seq_cost(current_schedule)
+                        if c < best_val:
+                            best_val = c
+                            best_pos = pos
+                        del current_schedule[pos]
+
+                    # Re-insert at best position
+                    current_schedule.insert(best_pos, txn)
+
+                    # If we found a better position that improves the global cost
+                    if best_val < current_cost - 1e-6:
+                        current_cost = best_val
+                        improved = True
+                        if current_cost < best_cost:
+                            best_cost = current_cost
+                            best_schedule = list(current_schedule)
+=======
+        # D. Polish: Deterministic Iterative Improvement (Gap Repair)
+        # Scan entire schedule, try to move each transaction to its optimal position.
+
+        should_polish = (current_cost <= best_cost * 1.05) or (random.random() < 0.3)
+
+        if should_polish and num_txns > 1:
+            improved = True
+            passes = 0
+            # Allow multiple passes for convergence (Gap Repair)
+            MAX_PASSES = 3
+            if num_txns < 50: MAX_PASSES = 5
+
+            while improved and passes < MAX_PASSES:
+                improved = False
+                passes += 1
+
+                # Order to check: LPT (Largest items first)
+                txns_to_check = sorted(current_schedule, key=lambda t: txn_lengths.get(t, 0), reverse=True)
+
+                for txn in txns_to_check:
+                    try:
+                        current_idx = current_schedule.index(txn)
+                    except ValueError: continue
+
+                    # Remove transaction
+                    del current_schedule[current_idx]
+
+                    # Baseline cost without this transaction
+                    base_val = workload.get_opt_seq_cost(current_schedule)
+
+                    best_pos = -1
+                    best_val = float('inf')
+
+                    # Scan for best position
+                    for pos in range(len(current_schedule) + 1):
+                        current_schedule.insert(pos, txn)
+                        c = workload.get_opt_seq_cost(current_schedule)
+                        current_schedule.pop(pos) # Backtrack
+
+                        if c < best_val:
+                            best_val = c
+                            best_pos = pos
+
+                        # Early Exit Optimization: perfect packing
+                        if abs(c - base_val) < 1e-9:
+                            break
+
+                    # Re-insert at best position
+                    current_schedule.insert(best_pos, txn)
+
+                    # Check if this move improved the global best
+                    if best_val < current_cost - 1e-6:
+                        current_cost = best_val
+                        improved = True
+                        if current_cost < best_cost:
+                            best_cost = current_cost
+                            best_schedule = list(current_schedule)
+                            last_improvement_cycle = cycle
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,174 @@
+<NAME>
+router_informed_link_choice
+</NAME>
+
+<DESCRIPTION>
+I propose to improve counter repair accuracy and confidence calibration by integrating router-level flow conservation into the pairwise link hardening step, while retaining the existing dynamic confidence scaling by router residuals.
+
+Currently, when a link direction violates symmetry, the algorithm averages the two sides’ rates. That works when both measurements are similarly noisy, but it performs poorly when one side is clearly faulty (e.g., zero vs non-zero). Inspired by the Hodor “signal hardening” approach and flow conservation (R1), I add a router-informed selection: for each direction (A.tx vs B.rx and B.tx vs A.rx), we evaluate three candidate values (A’s value, B’s value, and their average) and choose the one that minimizes the sum of absolute router imbalances at the two endpoint routers after hypothetically applying that value. This uses redundancy across routers to identify the more plausible measurement, improving counter accuracy especially when one side is clearly wrong.
+
+For confidence calibration, I combine the link discrepancy (1 - relative diff) with the normalized improvement in router imbalance produced by the chosen candidate. This yields higher confidence when the repair both reduces the link discrepancy and improves router flow conservation, and lower confidence otherwise. The final dynamic check (router residual penalty) is kept as-is to avoid overconfidence.
+
+I also precompute router-level base TX/RX sums (treating down interfaces as zero) to support efficient evaluation of repair candidates, without relying on topology lists during this step.
+
+This change is targeted and preserves the rest of the logic, including status handling and the final dynamic scaling of confidences.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build link pairs
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            # Store canonical orientation (A=if_id, B=peer) for deterministic processing
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+=======
+    # Precompute router-level base sums (down interfaces contribute zero)
+    router_tx_base = {}
+    router_rx_base = {}
+    for if_id, d in telemetry.items():
+        r = d.get('local_router')
+        tx = float(d.get('tx_rate', 0.0))
+        rx = float(d.get('rx_rate', 0.0))
+        if d.get('interface_status', 'unknown') == 'down':
+            tx = 0.0
+            rx = 0.0
+        if r is not None:
+            router_tx_base[r] = router_tx_base.get(r, 0.0) + tx
+            router_rx_base[r] = router_rx_base.get(r, 0.0) + rx
+
+    # Build link pairs
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            # Store canonical orientation (A=if_id, B=peer) for deterministic processing
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if pair_status == 'down':
+            # No traffic on a down link
+            rep_a_tx, rep_b_rx, rep_b_tx, rep_a_rx = 0.0, 0.0, 0.0, 0.0
+            # Confidence is high if there was no traffic observed; otherwise moderate
+            base_conf = 0.95 if not (a_has or b_has) else 0.7
+            rx_conf_a = tx_conf_a = rx_conf_b = tx_conf_b = base_conf
+        else:
+            # Link is up: enforce link symmetry with hardening threshold
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+                rep_a_tx = avg_ab
+                rep_b_rx = avg_ab
+            # Confidence decreases with magnitude of violation; if unchanged, slightly boost
+            conf_ab = max(0.0, 1.0 - diff_ab)
+            if diff_ab <= HARDENING_THRESHOLD:
+                conf_ab = min(1.0, max(conf_ab, 0.98))
+            tx_conf_a = conf_ab
+            rx_conf_b = conf_ab
+
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+                rep_b_tx = avg_ba
+                rep_a_rx = avg_ba
+            conf_ba = max(0.0, 1.0 - diff_ba)
+            if diff_ba <= HARDENING_THRESHOLD:
+                conf_ba = min(1.0, max(conf_ba, 0.98))
+            tx_conf_b = conf_ba
+            rx_conf_a = conf_ba
+=======
+        if pair_status == 'down':
+            # No traffic on a down link
+            rep_a_tx, rep_b_rx, rep_b_tx, rep_a_rx = 0.0, 0.0, 0.0, 0.0
+            # Confidence is high if there was no traffic observed; otherwise moderate
+            base_conf = 0.95 if not (a_has or b_has) else 0.7
+            rx_conf_a = tx_conf_a = rx_conf_b = tx_conf_b = base_conf
+        else:
+            # Link is up: enforce link symmetry using router-informed hardening
+            ra = a.get('local_router')
+            rb = b.get('local_router')
+
+            # Helper: clamp to [0,1]
+            def clamp01(x: float) -> float:
+                return max(0.0, min(1.0, float(x)))
+
+            # Pre-cost: current router absolute imbalances
+            imb_ra = abs(router_tx_base.get(ra, 0.0) - router_rx_base.get(ra, 0.0))
+            imb_rb = abs(router_tx_base.get(rb, 0.0) - router_rx_base.get(rb, 0.0))
+            pre_cost_pair = imb_ra + imb_rb
+
+            # Direction A->B (A.tx vs B.rx)
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+
+                def cost_fwd(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = (tx_ra - a_tx + val) - rx_ra
+                    imb_rb_p = tx_rb - (rx_rb - b_rx + val)
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ab = [(a_tx, cost_fwd(a_tx)), (b_rx, cost_fwd(b_rx)), (avg_ab, cost_fwd(avg_ab))]
+                # Choose candidate with minimal router-imbalance cost; tie-breaker prefers non-average if within 1% of best
+                candidates_ab.sort(key=lambda kv: kv[1])
+                best_val_ab, best_cost_ab = candidates_ab[0]
+                # If the best is average but not significantly better, consider choosing the nearest endpoint value
+                if best_val_ab == avg_ab and len(candidates_ab) > 1:
+                    second_cost = candidates_ab[1][1]
+                    if (second_cost - best_cost_ab) / max(second_cost, 1e-9) <= 0.01:
+                        # Pick the endpoint closer to average
+                        best_val_ab = a_tx if abs(a_tx - avg_ab) <= abs(b_rx - avg_ab) else b_rx
+                rep_a_tx = best_val_ab
+                rep_b_rx = best_val_ab
+                improvement_ab = max(0.0, (pre_cost_pair - best_cost_ab) / max(pre_cost_pair, 1e-9))
+                base_ab = max(0.0, 1.0 - min(1.0, diff_ab))
+                conf_ab = clamp01(0.5 * base_ab + 0.5 * improvement_ab)
+                tx_conf_a = conf_ab
+                rx_conf_b = conf_ab
+            else:
+                # Within tolerance; keep unchanged with high confidence
+                conf_ab = min(1.0, max(0.98, 1.0 - diff_ab))
+                tx_conf_a = conf_ab
+                rx_conf_b = conf_ab
+
+            # Direction B->A (B.tx vs A.rx)
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+
+                def cost_rev(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = tx_ra - (rx_ra - a_rx + val)
+                    imb_rb_p = (tx_rb - b_tx + val) - rx_rb
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ba = [(b_tx, cost_rev(b_tx)), (a_rx, cost_rev(a_rx)), (avg_ba, cost_rev(avg_ba))]
+                candidates_ba.sort(key=lambda kv: kv[1])
+                best_val_ba, best_cost_ba = candidates_ba[0]
+                if best_val_ba == avg_ba and len(candidates_ba) > 1:
+                    second_cost = candidates_ba[1][1]
+                    if (second_cost - best_cost_ba) / max(second_cost, 1e-9) <= 0.01:
+                        best_val_ba = b_tx if abs(b_tx - avg_ba) <= abs(a_rx - avg_ba) else a_rx
+                rep_b_tx = best_val_ba
+                rep_a_rx = best_val_ba
+                improvement_ba = max(0.0, (pre_cost_pair - best_cost_ba) / max(pre_cost_pair, 1e-9))
+                base_ba = max(0.0, 1.0 - min(1.0, diff_ba))
+                conf_ba = clamp01(0.5 * base_ba + 0.5 * improvement_ba)
+                tx_conf_b = conf_ba
+                rx_conf_a = conf_ba
+            else:
+                conf_ba = min(1.0, max(0.98, 1.0 - diff_ba))
+                tx_conf_b = conf_ba
+                rx_conf_a = conf_ba
+>>>>>>> REPLACE
+</DIFF>

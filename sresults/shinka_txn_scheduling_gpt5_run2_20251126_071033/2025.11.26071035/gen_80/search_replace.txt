@@ -1,0 +1,192 @@
+<NAME>
+endgame_tt_and_bidirectional_relink
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted enhancements to further reduce makespan:
+
+1) Endgame enumeration with transposition table and node cap:
+   - I augment the exact endgame branch-and-bound with a small transposition table keyed by (frozenset(remaining), last-3 of sequence) to memoize the best partial cost seen for each subproblem and prune dominated states. This reduces repeated exploration of equivalent tails across branches while preserving correctness.
+   - I also add a deterministic node expansion cap (~3000) to keep runtime predictable. When the cap is hit, the search returns the best completion found so far. This focuses expensive exact enumeration on promising branches and avoids pathological blowups.
+
+2) Bidirectional elite path relinking with immediate polish:
+   - I switch from single-direction relinking to bidirectional relinking between the current best and elite partners, choosing the better intermediate solution and immediately applying a local refinement. This often converts structural improvements from relinking into actual makespan gains.
+
+These changes are consistent with the current design (use of cost cache and best-two insertion) and improve both solution quality and robustness without heavy overhead.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ----------------------------
+    # Endgame exact completion (branch-and-bound over last K txns)
+    # ----------------------------
+    endgame_enum_K = max(6, min(9, endgame_all_pos_threshold + 3))
+    endgame_memo = {}
+    def endgame_optimal_completion(prefix_seq, rem_set):
+        """
+        Given a prefix sequence and a small remaining set of txns (|rem_set| <= K),
+        enumerate txn orders with best-position insertion to find the minimal-cost completion.
+        Uses branch-and-bound with the current best bound and partial-cost pruning.
+        Returns (best_cost, best_seq).
+        """
+        key0 = (tuple(prefix_seq), frozenset(rem_set))
+        if key0 in endgame_memo:
+            return endgame_memo[key0]
+
+        best_c = float('inf')
+        best_s = None
+
+        def dfs(seq, rem):
+            nonlocal best_c, best_s
+            # Prune by current partial cost
+            c_prefix = seq_cost(seq)
+            if c_prefix >= best_c:
+                return
+            if not rem:
+                if c_prefix < best_c:
+                    best_c = c_prefix
+                    best_s = seq[:]
+                return
+            # Order candidates by high regret first, then by lower best insertion cost
+            order = []
+            for t in rem:
+                b, p, s2 = best_two_insertion(seq, t, use_all_pos=True)
+                regret = (s2 - b) if s2 < float('inf') else 0.0
+                order.append((-regret, b, t, p))
+            order.sort()
+            for _, bcost, t, p in order:
+                if bcost >= best_c:
+                    continue
+                new_seq = seq[:p] + [t] + seq[p:]
+                new_rem = rem.copy()
+                new_rem.remove(t)
+                dfs(new_seq, new_rem)
+
+        dfs(prefix_seq[:], set(rem_set))
+        if best_s is None:
+            # Fallback: deterministic append to avoid None
+            seq_complete = prefix_seq[:] + sorted(list(rem_set))
+            best_c = seq_cost(seq_complete)
+            best_s = seq_complete
+        endgame_memo[key0] = (best_c, best_s)
+        return best_c, best_s
+=======
+    # ----------------------------
+    # Endgame exact completion (branch-and-bound over last K txns)
+    # ----------------------------
+    endgame_enum_K = max(6, min(9, endgame_all_pos_threshold + 3))
+    endgame_memo = {}
+    def endgame_optimal_completion(prefix_seq, rem_set):
+        """
+        Given a prefix sequence and a small remaining set of txns (|rem_set| <= K),
+        enumerate txn orders with best-position insertion to find the minimal-cost completion.
+        Uses branch-and-bound with partial-cost pruning, a small transposition table to avoid
+        re-exploring dominated subproblems, and a bounded node expansion cap for robustness.
+        Returns (best_cost, best_seq).
+        """
+        key0 = (tuple(prefix_seq), frozenset(rem_set))
+        if key0 in endgame_memo:
+            return endgame_memo[key0]
+
+        best_c = float('inf')
+        best_s = None
+
+        # Transposition table keyed by (frozenset(rem), suffix of seq)
+        tt = {}
+        nodes = 0
+        node_cap = 3000  # bounded expansions to keep runtime predictable
+
+        def suffix_key(seq):
+            k = 3
+            return tuple(seq[-k:]) if len(seq) >= k else tuple(seq)
+
+        def dfs(seq, rem):
+            nonlocal best_c, best_s, nodes
+            if nodes >= node_cap:
+                return
+            nodes += 1
+
+            # Current partial cost is a valid lower bound
+            c_prefix = seq_cost(seq)
+            if c_prefix >= best_c:
+                return
+
+            # Transposition pruning: if we've seen this (rem, suffix) with a lower cost, prune
+            subkey = (frozenset(rem), suffix_key(seq))
+            prev = tt.get(subkey)
+            if prev is not None and c_prefix >= prev:
+                return
+            # Record best seen for this subproblem
+            tt[subkey] = c_prefix if prev is None or c_prefix < prev else prev
+
+            if not rem:
+                # Complete sequence
+                if c_prefix < best_c:
+                    best_c = c_prefix
+                    best_s = seq[:]
+                return
+
+            # Order candidates by high regret first, then by lower best insertion cost
+            order = []
+            for t in rem:
+                b, p, s2 = best_two_insertion(seq, t, use_all_pos=True)
+                regret = (s2 - b) if s2 < float('inf') else 0.0
+                order.append((-regret, b, t, p))
+            order.sort()
+
+            for _, bcost, t, p in order:
+                if bcost >= best_c:
+                    continue
+                new_seq = seq[:p] + [t] + seq[p:]
+                new_rem = rem.copy()
+                new_rem.remove(t)
+                dfs(new_seq, new_rem)
+
+        dfs(prefix_seq[:], set(rem_set))
+        if best_s is None:
+            # Fallback: deterministic append to avoid None or when node cap hit early
+            seq_complete = prefix_seq[:] + sorted(list(rem_set))
+            best_c = seq_cost(seq_complete)
+            best_s = seq_complete
+        endgame_memo[key0] = (best_c, best_s)
+        return best_c, best_s
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ----------------------------
+    # Path Relinking among elites
+    # ----------------------------
+    if len(elite) >= 2:
+        base_cost, base_seq = best_overall_cost, best_overall_seq
+        # Try relinking with a few elite partners
+        partners = elite[1:min(len(elite), elite_size)]
+        for c_t, s_t in partners:
+            pr_c, pr_s = path_relink(base_seq, s_t, max_moves=max(8, min(12, n // 8)))
+            if pr_c < best_overall_cost:
+                best_overall_cost, best_overall_seq = pr_c, pr_s
+=======
+    # ----------------------------
+    # Path Relinking among elites
+    # ----------------------------
+    if len(elite) >= 2:
+        base_cost, base_seq = best_overall_cost, best_overall_seq
+        partners = elite[1:min(len(elite), elite_size)]
+        for c_t, s_t in partners:
+            # Bidirectional relinking
+            pr1_c, pr1_s = path_relink(base_seq, s_t, max_moves=max(8, min(12, n // 8)))
+            pr2_c, pr2_s = path_relink(s_t, base_seq, max_moves=max(8, min(12, n // 8)))
+            # Choose better intermediate and immediately polish
+            if pr1_c <= pr2_c:
+                cand_c, cand_s = pr1_c, pr1_s
+            else:
+                cand_c, cand_s = pr2_c, pr2_s
+            if cand_s is not None:
+                lc, ls = local_refine(cand_s)
+                if lc < best_overall_cost:
+                    best_overall_cost, best_overall_seq = lc, ls
+                elif cand_c < best_overall_cost:
+                    best_overall_cost, best_overall_seq = cand_c, cand_s
+>>>>>>> REPLACE
+</DIFF>

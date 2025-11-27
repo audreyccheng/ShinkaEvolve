@@ -1,0 +1,547 @@
+--- a/original.py
++++ b/original.py
+@@ -1,275 +1,411 @@
+ # EVOLVE-BLOCK-START
+ """Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+ 
+ import time
+ import random
+ import sys
+ import os
+ import re
+ import math
+ 
+ # Add the openevolve_examples directory to the path to import txn_simulator and workloads
+ # Find the repository root by looking for the openevolve_examples directory
+ def find_repo_root(start_path):
+     """Find the repository root by looking for openevolve_examples directory."""
+     current = os.path.abspath(start_path)
+     # Search up the directory tree
+     while current != os.path.dirname(current):  # Stop at filesystem root
+         candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return current
+         current = os.path.dirname(current)
+ 
+     # If not found by searching up, try common locations relative to known paths
+     # This handles when the program is copied to a results directory
+     script_dir = os.path.dirname(os.path.abspath(__file__))
+     possible_roots = [
+         script_dir,  # Current directory
+         os.path.dirname(script_dir),  # Parent
+         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+         '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+         '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+     ]
+     for root in possible_roots:
+         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return root
+ 
+     raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+ 
+ repo_root = find_repo_root(os.path.dirname(__file__))
+ sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+-    Get optimal schedule using Adaptive Greedy and Multi-Stage LAHC Refinement.
++    Get optimal schedule using Non-Linear Greedy and Dynamic LAHC with Time-Varying Probabilities.
+ 
+     Algorithm:
+-    1.  **Txn Analysis**: Compute transaction operation counts.
+-    2.  **Adaptive Greedy Phase**:
+-        -   Generate `num_seqs` candidates.
+-        -   **Adaptive Pool**: Select "Big Rocks" (txns within 90% of max remaining length) + Randoms.
+-        -   **Weighted Selection**: Minimize `cost - (alpha * length)` (Packing heuristic).
+-        -   **Polish**: Adjacent Swap Descent on each greedy candidate.
+-    3.  **Multi-Candidate Sprint**:
+-        -   Select top 3 distinct candidates.
+-        -   Run short Late Acceptance Hill Climbing (LAHC) on each.
+-    4.  **Marathon Refinement**:
+-        -   Select winner of Sprint.
+-        -   Run extended LAHC with Block Moves.
++    1.  **Txn Analysis**: Pre-compute transaction lengths (ops).
++    2.  **Diverse Greedy Construction**:
++        -   Uses randomized "decay power" for the alpha parameter (weight of txn length).
++        -   Allows exploring different trade-off curves between "Big Rocks" logic and "Gap Filling".
++        -   Pool-based selection with adaptive threshold.
++    3.  **Sprint Phase**:
++        -   Top 3 candidates run through a short LAHC.
++    4.  **Marathon Phase**:
++        -   Winner runs through a long LAHC.
++        -   **Dynamic History**: Acceptance history length shrinks linearly (Simulated Annealing effect).
++        -   **Dynamic Operators**: Probability of disruptive moves (Sampled Insert, Macro Shift) decays over time;
++            probability of fine-tuning moves (Swap) increases.
++        -   **Stagnation Kick**: Shuffles a segment if stuck.
+     """
+ 
+     # --- Pre-computation ---
+     txn_lens = {}
+     try:
+         for i in range(workload.num_txns):
+             raw_txn = workload.txns[i]
+             if isinstance(raw_txn, (list, tuple)):
+                 raw_txn = raw_txn[0]
+             txn_str = str(raw_txn)
+             ops = len(re.findall(r'[rw]-\d+', txn_str))
+             txn_lens[i] = ops
+     except Exception:
+         for i in range(workload.num_txns):
+             txn_lens[i] = 1
+ 
+-    # Parameters
+-    SAMPLE_SIZE = 12
+-    BIG_ROCK_THRESHOLD = 0.90
+-    WEIGHT_ALPHA = 0.05
+-
+-    candidates = []
+-
+-    # --- Phase 1: Adaptive Greedy Construction ---
+-    for _ in range(num_seqs):
+-        remaining = set(range(workload.num_txns))
+-
+-        # Random start
+-        start_txn = random.choice(list(remaining))
+-        current_seq = [start_txn]
+-        remaining.remove(start_txn)
+-
+-        while remaining:
+-            # Determine dynamic "Big Rocks" threshold
+-            rem_lens = [txn_lens[t] for t in remaining]
+-            max_rem_len = max(rem_lens) if rem_lens else 0
+-            threshold = max_rem_len * BIG_ROCK_THRESHOLD
+-
+-            # Form pool: Big Rocks + Randoms
+-            big_rocks = [t for t in remaining if txn_lens[t] >= threshold]
+-
+-            pool = list(big_rocks)
+-            needed = SAMPLE_SIZE - len(pool)
+-
+-            if needed > 0:
+-                others = [t for t in remaining if t not in big_rocks]
+-                if len(others) > needed:
+-                    pool.extend(random.sample(others, needed))
+-                else:
+-                    pool.extend(others)
+-
+-            # Deduplicate
+-            pool = list(set(pool))
+-
+-            best_cand = -1
+-            best_score = float('inf')
+-
+-            # Evaluate Pool
+-            for t in pool:
+-                cost = workload.get_opt_seq_cost(current_seq + [t])
+-                # Weighted score: allow worse cost if txn is long
+-                score = cost - (WEIGHT_ALPHA * txn_lens[t])
+-
+-                if score < best_score:
+-                    best_score = score
+-                    best_cand = t
+-
+-            current_seq.append(best_cand)
+-            remaining.remove(best_cand)
+-
+-        # Quick Polish (Hill Climbing)
+-        current_cost = workload.get_opt_seq_cost(current_seq)
+-        improved = True
+-        while improved:
+-            improved = False
+-            for i in range(len(current_seq) - 1):
+-                current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+-                new_cost = workload.get_opt_seq_cost(current_seq)
+-                if new_cost < current_cost:
+-                    current_cost = new_cost
+-                    improved = True
+-                else:
+-                    current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+-
+-        candidates.append((current_cost, current_seq))
+-
+-    # --- Phase 2: Multi-Candidate Sprint (Short LAHC) ---
+-    candidates.sort(key=lambda x: x[0])
+-
+-    # Pick top 3 distinct schedules
+-    unique_candidates = []
+-    seen_costs = set()
+-    for cost, seq in candidates:
+-        if cost not in seen_costs:
+-            unique_candidates.append((cost, list(seq)))
+-            seen_costs.add(cost)
+-        if len(unique_candidates) >= 3:
+-            break
+-
+-    # Fallback
+-    if not unique_candidates:
+-        unique_candidates = [candidates[0]]
+-
+-    sprint_results = []
+-
+-    # LAHC Engine
+-    def run_lahc(start_seq, start_cost, iterations, history_len=50):
++    # --- LAHC Engine ---
++    def dynamic_lahc(start_seq, start_cost, iterations, history_len=50, enable_kick=False, dynamic_mode=False):
+         curr_s = list(start_seq)
+         curr_c = start_cost
+         best_s = list(start_seq)
+         best_c = start_cost
+ 
+         history = [curr_c] * history_len
+-
++        last_imp_iter = 0
++
++        # Pre-calculated probabilities for static mode
++        # Static: 5% Sampled, 5% Macro, 5% Reverse, 25% Micro, 40% Shift, 20% Swap
++        
+         for i in range(iterations):
+-            # Mutate
+-            op = random.random()
++            progress = i / iterations
++            
++            # Dynamic History Compression (Cooling)
++            if dynamic_mode:
++                # Linearly decrease history length to 1 at the end
++                current_h_len = max(1, int(history_len * (1.0 - progress)))
++            else:
++                current_h_len = history_len
++
++            # Stagnation Kick (only in dynamic/marathon mode)
++            if enable_kick and (i - last_imp_iter > 600) and progress < 0.9:
++                slen = len(curr_s)
++                if slen > 15:
++                    # Shuffle a segment
++                    seg_len = random.randint(10, 20)
++                    idx = random.randint(0, slen - seg_len)
++                    segment = curr_s[idx:idx+seg_len]
++                    random.shuffle(segment)
++                    curr_s[idx:idx+seg_len] = segment
++                    
++                    curr_c = workload.get_opt_seq_cost(curr_s)
++                    # Reset history to absorb kick
++                    history = [curr_c] * history_len
++                    last_imp_iter = i
++                    continue
++
++            # Dynamic Operator Probabilities
++            if dynamic_mode:
++                # Decay disruptive operators
++                p_sampled = max(0.0, 0.05 * (1.0 - progress * 1.5)) # Dies at 66%
++                p_macro   = max(0.0, 0.08 * (1.0 - progress))       # Dies at 100%
++                p_reverse = 0.05                                    # Constant
++                p_micro   = 0.25                                    # Constant
++                
++                # Remaining probability goes to Shift/Swap
++                rem = 1.0 - (p_sampled + p_macro + p_reverse + p_micro)
++                # Swap increases from ~0.20 to ~0.50
++                p_swap = 0.20 + (0.30 * progress)
++                if p_swap > rem: p_swap = rem
++                
++                # Shift fills the gap
++                p_shift = rem - p_swap
++            else:
++                # Static probabilities for Sprint
++                p_sampled = 0.02
++                p_macro = 0.05
++                p_reverse = 0.03
++                p_micro = 0.25
++                p_shift = 0.45
++                p_swap = 0.20
++
++            # Select Operator
++            r = random.random()
++            op_type = 'swap'
++            
++            cum = p_sampled
++            if r < cum: op_type = 'sampled'
++            else:
++                cum += p_macro
++                if r < cum: op_type = 'macro'
++                else:
++                    cum += p_reverse
++                    if r < cum: op_type = 'reverse'
++                    else:
++                        cum += p_micro
++                        if r < cum: op_type = 'micro'
++                        else:
++                            cum += p_shift
++                            if r < cum: op_type = 'shift'
++                            else: op_type = 'swap'
++
++            # Execute Mutation
+             neigh_s = list(curr_s)
+             slen = len(neigh_s)
+-
+-            if op < 0.5: # Single Shift
+-                if slen < 2: continue
+-                f = random.randint(0, slen-1)
+-                t = random.randint(0, slen-1)
+-                if f==t: continue
+-                item = neigh_s.pop(f)
+-                neigh_s.insert(t, item)
+-            elif op < 0.8: # Block Shift
++            neigh_c = -1
++            
++            if op_type == 'sampled':
++                if slen < 5: continue
++                idx = random.randint(0, slen-1)
++                item = neigh_s.pop(idx)
++                # Try 3 random positions
++                best_loc_c = float('inf')
++                best_loc_s = None
++                for _ in range(3):
++                    ins = random.randint(0, len(neigh_s))
++                    tmp = list(neigh_s)
++                    tmp.insert(ins, item)
++                    c = workload.get_opt_seq_cost(tmp)
++                    if c < best_loc_c:
++                        best_loc_c = c
++                        best_loc_s = tmp
++                neigh_s = best_loc_s
++                neigh_c = best_loc_c
++
++            elif op_type == 'macro':
++                if slen < 12: continue
++                bsize = random.randint(5, 12)
++                f = random.randint(0, slen-bsize)
++                block = neigh_s[f:f+bsize]
++                del neigh_s[f:f+bsize]
++                t = random.randint(0, len(neigh_s))
++                neigh_s[t:t] = block
++
++            elif op_type == 'reverse':
++                if slen < 4: continue
++                bsize = random.randint(3, 8)
++                f = random.randint(0, slen-bsize)
++                neigh_s[f:f+bsize] = neigh_s[f:f+bsize][::-1]
++
++            elif op_type == 'micro':
+                 if slen < 5: continue
+                 bsize = random.randint(2, 4)
+                 f = random.randint(0, slen-bsize)
+                 block = neigh_s[f:f+bsize]
+                 del neigh_s[f:f+bsize]
+                 t = random.randint(0, len(neigh_s))
+                 neigh_s[t:t] = block
+-            else: # Swap
++
++            elif op_type == 'shift':
++                if slen < 2: continue
++                f = random.randint(0, slen-1)
++                t = random.randint(0, slen-1)
++                if f != t:
++                    item = neigh_s.pop(f)
++                    neigh_s.insert(t, item)
++            
++            else: # swap
+                 if slen < 2: continue
+                 idx = random.randint(0, slen-2)
+                 neigh_s[idx], neigh_s[idx+1] = neigh_s[idx+1], neigh_s[idx]
+ 
+-            neigh_c = workload.get_opt_seq_cost(neigh_s)
++            if neigh_c == -1:
++                neigh_c = workload.get_opt_seq_cost(neigh_s)
+ 
+             # Acceptance
+-            h_idx = i % history_len
+-            if neigh_c <= curr_c or neigh_c <= history[h_idx]:
++            
++            # Standard LAHC lookup
++            comp_val = history[i % history_len]
++            
++            accept = False
++            if neigh_c <= curr_c:
++                accept = True
++            elif dynamic_mode:
++                # Interpolated acceptance
++                # Allows degradation early, forces strictness late
++                tolerance = max(0, comp_val - curr_c)
++                allowed = curr_c + (tolerance * (1.0 - math.pow(progress, 2))) # Quadratic decay of tolerance
++                if neigh_c <= allowed:
++                    accept = True
++            else:
++                # Standard LAHC
++                if neigh_c <= comp_val:
++                    accept = True
++
++            if accept:
+                 curr_s = neigh_s
+                 curr_c = neigh_c
+                 if curr_c < best_c:
+                     best_c = curr_c
+                     best_s = list(curr_s)
+-
+-            history[h_idx] = curr_c
++                    last_imp_iter = i
++            
++            # Update history
++            history[i % history_len] = curr_c
+ 
+         return best_c, best_s
+ 
+-    # Run Sprint
+-    SPRINT_ITERS = 250
+-    for cost, seq in unique_candidates:
+-        res = run_lahc(seq, cost, SPRINT_ITERS)
++    # Configuration
++    SAMPLE_SIZE = 20
++    candidates = []
++
++    # --- Phase 1: Diverse Greedy Construction ---
++    for _ in range(num_seqs):
++        # Randomized Parameters for Search Space Diversity
++        # Alpha: Importance of Txn Length vs Cost
++        # Decay Power: How fast alpha drops (Concave < 1, Convex > 1)
++        start_alpha = random.uniform(0.1, 0.5)
++        decay_power = random.uniform(0.5, 2.5) 
++        threshold_ratio = random.uniform(0.80, 0.98)
++
++        remaining = set(range(workload.num_txns))
++        total_txns = workload.num_txns
++        
++        start_txn = random.choice(list(remaining))
++        curr_seq = [start_txn]
++        remaining.remove(start_txn)
++
++        while remaining:
++            # Non-Linear Decay
++            progress = len(curr_seq) / total_txns
++            eff_alpha = start_alpha * math.pow(1.0 - progress, decay_power)
++
++            # Adaptive Pool
++            rem_lens = [txn_lens[t] for t in remaining]
++            max_rem = max(rem_lens) if rem_lens else 0
++            limit = max_rem * threshold_ratio
++
++            # "Big Rocks"
++            big_rocks = [t for t in remaining if txn_lens[t] >= limit]
++            pool = list(big_rocks)
++            
++            # Fill with randoms
++            needed = SAMPLE_SIZE - len(pool)
++            if needed > 0:
++                others = [t for t in remaining if t not in big_rocks]
++                if len(others) <= needed:
++                    pool.extend(others)
++                else:
++                    pool.extend(random.sample(others, needed))
++            
++            pool = list(set(pool))
++            
++            best_cand = -1
++            best_score = float('inf')
++
++            # Greedy Choice
++            for t in pool:
++                cost = workload.get_opt_seq_cost(curr_seq + [t])
++                score = cost - (eff_alpha * txn_lens[t])
++                
++                if score < best_score:
++                    best_score = score
++                    best_cand = t
++            
++            curr_seq.append(best_cand)
++            remaining.remove(best_cand)
++
++        # Quick Polish (Adjacent Swaps)
++        curr_cost = workload.get_opt_seq_cost(curr_seq)
++        # One pass deterministic polish
++        for j in range(len(curr_seq) - 1):
++            curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
++            nc = workload.get_opt_seq_cost(curr_seq)
++            if nc < curr_cost:
++                curr_cost = nc
++            else:
++                curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
++        
++        candidates.append((curr_cost, curr_seq))
++
++    # --- Phase 2: Sprint (Funnel) ---
++    candidates.sort(key=lambda x: x[0])
++    
++    sprint_cands = []
++    seen = set()
++    for c, s in candidates:
++        if c not in seen:
++            sprint_cands.append((c, list(s)))
++            seen.add(c)
++        if len(sprint_cands) >= 3:
++            break
++    
++    if not sprint_cands:
++        sprint_cands = [candidates[0]]
++
++    sprint_results = []
++    SPRINT_ITERS = 400
++    for c, s in sprint_cands:
++        # Static LAHC for short run
++        res = dynamic_lahc(s, c, SPRINT_ITERS, history_len=30, enable_kick=False, dynamic_mode=False)
+         sprint_results.append(res)
+ 
+-    # --- Phase 3: Marathon Refinement (Long LAHC) ---
++    # --- Phase 3: Marathon (Intensification) ---
+     sprint_results.sort(key=lambda x: x[0])
+-    champion_cost, champion_seq = sprint_results[0]
+-
+-    MARATHON_ITERS = 2500
+-    final_cost, final_seq = run_lahc(champion_seq, champion_cost, MARATHON_ITERS)
+-
+-    return final_cost, final_seq
++    champ_c, champ_s = sprint_results[0]
++    
++    MARATHON_ITERS = 3500
++    # Dynamic LAHC for long run with Kicks and Cooling
++    final_c, final_s = dynamic_lahc(champ_s, champ_c, MARATHON_ITERS, 
++                                    history_len=150, 
++                                    enable_kick=True, 
++                                    dynamic_mode=True)
++
++    return final_c, final_s
+ 
+ def get_random_costs():
+     """
+     Evaluate scheduling algorithm on three different workloads.
+ 
+     Returns:
+         Tuple of (total_makespan, list_of_schedules, execution_time)
+     """
+     start_time = time.time()
+     # Number of initial candidates to generate
+     NUM_SEQS = 10
+ 
+     workload = Workload(WORKLOAD_1)
+     makespan1, schedule1 = get_best_schedule(workload, NUM_SEQS)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, NUM_SEQS)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, NUM_SEQS)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+ 
+     total_makespan = cost1 + cost2 + cost3
+     schedules = [schedule1, schedule2, schedule3]
+     execution_time = time.time() - start_time
+ 
+     return total_makespan, schedules, execution_time
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_scheduling():
+     """Run the transaction scheduling algorithm for all workloads"""
+     total_makespan, schedules, execution_time = get_random_costs()
+     return total_makespan, schedules, execution_time
+ 
+ 
+ if __name__ == "__main__":
+     total_makespan, schedules, execution_time = run_scheduling()
+     print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+     print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

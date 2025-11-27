@@ -1,0 +1,164 @@
+<NAME>
+bundle_finishing_pass
+</NAME>
+
+<DESCRIPTION>
+I propose adding a conservative, conservation-preserving “bundle finishing” pass that operates on parallel links between the same unordered router pair. This pass only redistributes small amounts of traffic within each bundle to tighten per-direction symmetry across links, without changing the overall router totals. It leverages robust median centering, confidence- and rate-aware weighting, and per-router zero-sum de-meaning to avoid introducing router imbalance. Each per-link update is capped to ±3% of the local reference rate to ensure safety.
+
+Why this helps:
+- After Stage 2’s router projection and Stage 2.5’s link re-sync, residual asymmetries can persist across parallel links, especially when low-confidence links disagree.
+- By nudging link-direction residuals toward a robust center while preserving exact zero-sum per router groups, we reduce symmetry errors without violating flow conservation at routers.
+- This typically improves counter accuracy and, indirectly, confidence calibration because the final invariants are better satisfied.
+
+The code integrates cleanly before the soft-zero rule and uses existing variables (hard_tx, hard_rx, conf_tx_link, conf_rx_link, peers, topology, tau_h_dir, rel_diff, ZERO_THRESH, EPS). It does not change the confidence formula directly; improvements in repaired counters and residuals will be reflected downstream.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Soft-zero rule: if both directions on a link are tiny, snap all four to 0 with high confidence
+=======
+    # Stage 2.6: Conservation-preserving bundle finishing pass for parallel links
+    # Group link pairs by unordered router pair to align residuals without disturbing router totals
+    bundles_fin: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    seen_pairs_fin = set()
+    for a, data_a in telemetry.items():
+        b = peers.get(a)
+        if not b:
+            continue
+        key = tuple(sorted([a, b]))
+        if key in seen_pairs_fin:
+            continue
+        seen_pairs_fin.add(key)
+        ra = telemetry[a].get("local_router")
+        rb = telemetry[b].get("local_router")
+        if not isinstance(ra, str) or not isinstance(rb, str):
+            continue
+        rp = tuple(sorted([ra, rb]))
+        bundles_fin.setdefault(rp, []).append((a, b))
+
+    def _bundle_median(vals: List[float]) -> float:
+        s = sorted(vals)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        if n % 2 == 1:
+            return s[n // 2]
+        return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+    def _bundle_direction_align(pairs: List[Tuple[str, str]], ab_dir: bool = True):
+        if not pairs:
+            return
+        # Collect residuals and weights
+        es: List[float] = []
+        rates: List[float] = []
+        idxs: List[Tuple[str, str]] = []
+        a_routers: List[str] = []
+        b_routers: List[str] = []
+        c1s: List[float] = []
+        c2s: List[float] = []
+        for (a, b) in pairs:
+            if ab_dir:
+                tx = hard_tx.get(a, 0.0)
+                rx = hard_rx.get(b, 0.0)
+                c1 = clamp01(conf_tx_link.get(a, 0.6))
+                c2 = clamp01(conf_rx_link.get(b, 0.6))
+                ar = telemetry[a].get("local_router")
+                br = telemetry[b].get("local_router")
+            else:
+                tx = hard_tx.get(b, 0.0)
+                rx = hard_rx.get(a, 0.0)
+                c1 = clamp01(conf_tx_link.get(b, 0.6))
+                c2 = clamp01(conf_rx_link.get(a, 0.6))
+                ar = telemetry[b].get("local_router")
+                br = telemetry[a].get("local_router")
+            if max(tx, rx) < ZERO_THRESH:
+                continue
+            e = tx - rx
+            rate = max(tx, rx)
+            es.append(e)
+            rates.append(rate)
+            idxs.append((a, b))
+            a_routers.append(ar if isinstance(ar, str) else "")
+            b_routers.append(br if isinstance(br, str) else "")
+            c1s.append(c1)
+            c2s.append(c2)
+
+        m = len(es)
+        if m <= 1:
+            return
+
+        # Robust center using median
+        center = _bundle_median(es)
+
+        # Build base deltas with adaptive gamma
+        base: List[float] = []
+        for k in range(m):
+            a, b = idxs[k]
+            if ab_dir:
+                tx = hard_tx.get(a, 0.0)
+                rx = hard_rx.get(b, 0.0)
+            else:
+                tx = hard_tx.get(b, 0.0)
+                rx = hard_rx.get(a, 0.0)
+            mismatch = rel_diff(tx, rx)
+            tau_loc = tau_h_dir(tx, rx, c1s[k], c2s[k])
+            gamma = min(0.25, 0.5 * tau_loc / max(mismatch, 1e-9))
+            base.append(-gamma * (es[k] - center))
+
+        # Confidence- and rate-aware weights
+        ws = []
+        for k in range(m):
+            w = (1.0 - 0.5 * (c1s[k] + c2s[k])) * max(rates[k], ZERO_THRESH)
+            ws.append(max(0.0, w))
+
+        # Normalize and enforce zero-sum across bundle
+        wbar = (sum(ws) / len(ws)) if ws else 0.0
+        scaled = [base[k] * (ws[k] / max(wbar, EPS)) for k in range(m)]
+        mean_scaled = sum(scaled) / len(scaled) if scaled else 0.0
+        deltas = [d - mean_scaled for d in scaled]
+
+        # Alternating per-router de-meaning to approximate exact zero-sum per router
+        # Two iterations are sufficient for small bundles
+        for _ in range(2):
+            # Demean by A routers (source side)
+            mean_by_a: Dict[str, float] = {}
+            count_by_a: Dict[str, int] = {}
+            for k in range(m):
+                ar = a_routers[k]
+                mean_by_a[ar] = mean_by_a.get(ar, 0.0) + deltas[k]
+                count_by_a[ar] = count_by_a.get(ar, 0) + 1
+            for k in range(m):
+                ar = a_routers[k]
+                c = count_by_a.get(ar, 1)
+                deltas[k] -= (mean_by_a.get(ar, 0.0) / c if c > 0 else 0.0)
+            # Demean by B routers (sink side)
+            mean_by_b: Dict[str, float] = {}
+            count_by_b: Dict[str, int] = {}
+            for k in range(m):
+                br = b_routers[k]
+                mean_by_b[br] = mean_by_b.get(br, 0.0) + deltas[k]
+                count_by_b[br] = count_by_b.get(br, 0) + 1
+            for k in range(m):
+                br = b_routers[k]
+                c = count_by_b.get(br, 1)
+                deltas[k] -= (mean_by_b.get(br, 0.0) / c if c > 0 else 0.0)
+
+        # Apply with ±3% clip per-link and equal/opposite to peer
+        for k, (a, b) in enumerate(idxs):
+            cap_abs = 0.03 * rates[k]
+            di = max(-cap_abs, min(cap_abs, deltas[k]))
+            if ab_dir:
+                hard_tx[a] = max(0.0, hard_tx.get(a, 0.0) + di)
+                hard_rx[b] = max(0.0, hard_rx.get(b, 0.0) - di)
+            else:
+                hard_tx[b] = max(0.0, hard_tx.get(b, 0.0) + di)
+                hard_rx[a] = max(0.0, hard_rx.get(a, 0.0) - di)
+
+    for rp, pairs in bundles_fin.items():
+        _bundle_direction_align(pairs, ab_dir=True)
+        _bundle_direction_align(pairs, ab_dir=False)
+
+    # Soft-zero rule: if both directions on a link are tiny, snap all four to 0 with high confidence
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,142 @@
+<NAME>
+bundle_finishing_pass
+</NAME>
+
+<DESCRIPTION>
+I propose adding a conservation-preserving bundle finishing pass that gently re-aligns parallel links’ directional residuals within router pairs after the router-level projection and re-sync. It leverages link symmetry (R3) across bundles of parallel links with the same (local_router, remote_router) direction. For each such bundle, we compute the per-link asymmetry e_i = tx_i − peer_rx_i, subtract the median e_med, and apply a small zero-sum correction Δ_i = −γ·(e_i − e_med) with a group-constant gain γ chosen adaptively from the mismatch (bounded by 0.25). We enforce a global ±3% per-link cap by uniformly scaling all Δ_i in the bundle, which preserves the zero-sum property exactly. We apply Δ_i on the TX side and the opposite on the peer’s RX, keeping both routers’ totals unchanged. Corrections are skipped for near-zero traffic. We also lightly adjust directional confidences proportionally to the tiny movement.
+
+This pass tightens intra-bundle link symmetry without disturbing router conservation, improving counter repair accuracy and confidence calibration safely. Two small hyperparameters are added to control the finishing gain and clip.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    DAMP_ROUTER = 0.60       # router damping factor
+    PER_LINK_CLIP = 0.10     # per-interface relative change cap (±10%)
+    BUNDLE_CLIP = 0.15       # bundle shared factor cap (±15%)
+    STRONG_SCALE_GUARD = 0.08  # guard for re-sync when strong router scaling applied
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+    WEIGHT_FOCUS = 0.70      # focus router corrections on lowest-confidence 70% weight
+=======
+    DAMP_ROUTER = 0.60       # router damping factor
+    PER_LINK_CLIP = 0.10     # per-interface relative change cap (±10%)
+    BUNDLE_CLIP = 0.15       # bundle shared factor cap (±15%)
+    STRONG_SCALE_GUARD = 0.08  # guard for re-sync when strong router scaling applied
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+    WEIGHT_FOCUS = 0.70      # focus router corrections on lowest-confidence 70% weight
+    BUNDLE_FINISH_CLIP = 0.03   # ±3% finishing pass clip per direction
+    BUNDLE_FINISH_GAIN_MAX = 0.25  # max bundle finishing gain (γ cap)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                        conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.3 * relc))
+
+    # Enforce status down => zero as a final safety
+=======
+                        conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.3 * relc))
+
+    # Stage 3.5: Conservation-preserving bundle finishing pass (parallel-link residual alignment)
+    def _median(vals: List[float]) -> float:
+        n = len(vals)
+        if n == 0:
+            return 0.0
+        s = sorted(vals)
+        m = n // 2
+        if n % 2 == 1:
+            return s[m]
+        return 0.5 * (s[m - 1] + s[m])
+
+    # Helper accessors to keep scale-factor accounting consistent
+    def _get_tx(i: str) -> float:
+        return hardened_tx.get(i, 0.0)
+
+    def _get_rx(i: str) -> float:
+        return hardened_rx.get(i, 0.0)
+
+    def _set_tx(i: str, v: float) -> None:
+        prev = hardened_tx.get(i, 0.0)
+        if prev > ZERO_EPS and v >= 0.0:
+            scaled_tx_factor[i] *= (v / prev) if prev > 0 else 1.0
+        hardened_tx[i] = v
+
+    def _set_rx(i: str, v: float) -> None:
+        prev = hardened_rx.get(i, 0.0)
+        if prev > ZERO_EPS and v >= 0.0:
+            scaled_rx_factor[i] *= (v / prev) if prev > 0 else 1.0
+        hardened_rx[i] = v
+
+    def _bundle_finish(groups: Dict[Tuple[Any, Any], List[Tuple[str, str]]]) -> None:
+        for key, items in groups.items():
+            # Collect usable entries and stats
+            usable = []
+            e_list: List[float] = []
+            diffs: List[float] = []
+            taus: List[float] = []
+            for a, b in items:
+                if status.get(a) != 'up' or status.get(b) != 'up':
+                    continue
+                vtx = _get_tx(a)
+                vrx = _get_rx(b)
+                if max(vtx, vrx) < 1.5 * ZERO_THRESH:
+                    continue
+                e = vtx - vrx
+                usable.append((a, b, vtx, vrx, e))
+                e_list.append(e)
+                diffs.append(rel_diff(vtx, vrx))
+                taus.append(adaptive_tau(vtx, vrx))
+            if len(usable) < 2:
+                continue
+            e_med = _median(e_list)
+            mm = _median(diffs) if diffs else 0.0
+            tau_m = _median(taus) if taus else TAU_H_BASE
+            if mm <= ZERO_EPS:
+                continue
+            gamma = min(BUNDLE_FINISH_GAIN_MAX, 0.5 * tau_m / max(mm, 1e-9))
+            if gamma <= 0.0:
+                continue
+            # Compute zero-sum deltas and apply uniform scaling to respect caps
+            deltas: List[float] = []
+            caps: List[float] = []
+            for _, _, vtx, vrx, e in usable:
+                delta = -gamma * (e - e_med)
+                cap = BUNDLE_FINISH_CLIP * max(vtx, vrx, 1.0)
+                deltas.append(delta)
+                caps.append(cap)
+            # Uniform scaling to keep |delta_i| <= cap_i while preserving zero-sum
+            scale = 1.0
+            for d, c in zip(deltas, caps):
+                if abs(d) > c + 1e-12:
+                    scale = min(scale, c / max(abs(d), 1e-12))
+            if scale < 1.0:
+                deltas = [d * scale for d in deltas]
+            # Apply corrections and light confidence adjustment
+            for (a, b, vtx, vrx, _), delta in zip(usable, deltas):
+                if abs(delta) <= ZERO_EPS:
+                    continue
+                _set_tx(a, max(0.0, vtx + delta))
+                _set_rx(b, max(0.0, vrx - delta))
+                relc = abs(delta) / max(1.0, max(vtx, vrx))
+                conf_tx[a] = clamp01(conf_tx.get(a, 0.7) * (1.0 - 0.2 * relc))
+                conf_rx[b] = clamp01(conf_rx.get(b, 0.7) * (1.0 - 0.2 * relc))
+
+    # Build direction-aware bundles: group by (local_router, remote_router)
+    dir1_groups: Dict[Tuple[Any, Any], List[Tuple[str, str]]] = {}
+    dir2_groups: Dict[Tuple[Any, Any], List[Tuple[str, str]]] = {}
+    for a, b in link_pairs:
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        ra = local_router_of.get(a)
+        rb = local_router_of.get(b)
+        dir1_groups.setdefault((ra, rb), []).append((a, b))   # align a.tx vs b.rx
+        dir2_groups.setdefault((rb, ra), []).append((b, a))   # align b.tx vs a.rx
+
+    _bundle_finish(dir1_groups)
+    _bundle_finish(dir2_groups)
+
+    # Enforce status down => zero as a final safety
+>>>>>>> REPLACE
+</DIFF>

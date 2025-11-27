@@ -1,0 +1,180 @@
+<NAME>
+beam_search_packing
+</NAME>
+
+<DESCRIPTION>
+Replacing the multi-heuristic and randomized greedy strategy in `check_placement` with a Beam Search approach. The Beam Search maintains a set of top partial solutions (states), allowing it to explore the placement space more effectively than simple greedy strategies. This reduces false negatives in the feasibility check, enabling the binary search to converge to a lower (better) maximum KVPR. A fast greedy pass is retained as a first attempt for efficiency.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Feasibility Check (Multi-Heuristic Greedy)
+    def check_placement(k_target):
+        lin_cap = k_target * GPU_MEM_SIZE
+
+        def try_pack(ordered_items):
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for item in ordered_items:
+                w, s = item['w'], item['s']
+                v_lin = w + k_target * s
+
+                best_idx = -1
+                best_fill = -1.0
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    # Physical Check
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    # KVPR Check: (current_w + w) + K*(current_s + s) <= K*C
+                    # <=> current_lin + v_lin <= lin_cap
+                    lin_load = b['w'] + k_target * b['s']
+                    if lin_load + v_lin > lin_cap + 1e-7: continue
+
+                    # Best Fit: Maximize current linearized load
+                    if lin_load > best_fill:
+                        best_fill = lin_load
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['w'] += w
+                    bins[best_idx]['s'] += s
+                    bins[best_idx]['items'].append(item['m'])
+                else:
+                    return None
+            return {i: bins[i]['items'] for i in range(gpu_num)}
+
+        # A. Deterministic Sort Strategies
+        keys = [
+            lambda x: x['w'] + k_target * x['s'],   # Linearized Cost
+            lambda x: x['s'],                       # Physical Size
+            lambda x: x['w'],                       # Weight
+            lambda x: x['w'] / (x['s'] + 1e-9)      # Density
+        ]
+
+        for key in keys:
+            res = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # B. Randomized Strategy
+        # Perturb the Linearized Cost key
+        rng = random.Random(42 + int(k_target * 100))
+        base_key = lambda x: x['w'] + k_target * x['s']
+
+        for _ in range(50):
+            # Add noise to the key: key * uniform(0.9, 1.1)
+            noisy_items = []
+            for item in items:
+                score = base_key(item) * rng.uniform(0.9, 1.1)
+                noisy_items.append((score, item))
+
+            noisy_items.sort(key=lambda x: x[0], reverse=True)
+            res = try_pack([x[1] for x in noisy_items])
+            if res: return res
+
+        return None
+=======
+    # 3. Feasibility Check (Beam Search + Greedy)
+    def check_placement(k_target):
+        lin_cap = k_target * GPU_MEM_SIZE
+
+        # Precompute linearized costs
+        weighted_items = []
+        for x in items:
+            cost = x['w'] + k_target * x['s']
+            if cost > lin_cap + 1e-7: return None # Early fail
+            weighted_items.append({'cost': cost, 'item': x})
+
+        # Sort Best Fit Decreasing (Linearized)
+        weighted_items.sort(key=lambda x: x['cost'], reverse=True)
+
+        # --- Strategy A: Fast Greedy (Best Fit) ---
+        bins = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+        placement = [[] for _ in range(gpu_num)]
+        possible = True
+
+        for entry in weighted_items:
+            item = entry['item']
+            cost = entry['cost']
+            w, s = item['w'], item['s']
+
+            best_idx = -1
+            best_fill = -1.0
+
+            for i in range(gpu_num):
+                if bins[i]['s'] + s > GPU_MEM_SIZE: continue
+                current_lin = bins[i]['w'] + k_target * bins[i]['s']
+                if current_lin + cost > lin_cap + 1e-7: continue
+
+                if current_lin > best_fill:
+                    best_fill = current_lin
+                    best_idx = i
+
+            if best_idx != -1:
+                bins[best_idx]['w'] += w
+                bins[best_idx]['s'] += s
+                placement[best_idx].append(item['m'])
+            else:
+                possible = False
+                break
+
+        if possible:
+            return {i: placement[i] for i in range(gpu_num)}
+
+        # --- Strategy B: Beam Search ---
+        beam_width = 8
+        # State: (score, gpu_states_tuple, placement_list_tuple)
+        # gpu_state: (lin_load, s_load)
+
+        beam = [(0.0, tuple([(0.0, 0.0)] * gpu_num), tuple([[] for _ in range(gpu_num)]))]
+
+        for entry in weighted_items:
+            item = entry['item']
+            cost = entry['cost']
+            w, s = item['w'], item['s']
+
+            candidates = []
+            seen_signatures = set()
+
+            for _, gpu_states, pl in beam:
+                tried_states = set()
+
+                for i in range(gpu_num):
+                    g_lin, g_s = gpu_states[i]
+                    if (g_lin, g_s) in tried_states: continue
+
+                    if g_s + s > GPU_MEM_SIZE: continue
+                    if g_lin + cost > lin_cap + 1e-7: continue
+
+                    tried_states.add((g_lin, g_s))
+
+                    new_gpu_states = list(gpu_states)
+                    new_gpu_states[i] = (g_lin + cost, g_s + s)
+
+                    # Symmetry breaking
+                    sig = tuple(sorted(new_gpu_states))
+                    if sig in seen_signatures: continue
+                    seen_signatures.add(sig)
+
+                    new_pl = list(pl)
+                    new_pl[i] = pl[i] + [item['m']]
+
+                    # Heuristic: Sum of Squares of Linearized Loads
+                    new_score = sum(gs[0]**2 for gs in new_gpu_states)
+
+                    candidates.append((new_score, tuple(new_gpu_states), tuple(new_pl)))
+
+            if not candidates:
+                return None
+
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = candidates[:beam_width]
+
+        if beam:
+            best_state = beam[0]
+            return {i: best_state[2][i] for i in range(gpu_num)}
+
+        return None
+>>>>>>> REPLACE
+</DIFF>

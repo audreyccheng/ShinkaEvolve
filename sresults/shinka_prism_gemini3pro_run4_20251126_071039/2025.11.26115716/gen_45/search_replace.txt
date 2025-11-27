@@ -1,0 +1,193 @@
+<NAME>
+stochastic_bs_packing
+</NAME>
+
+<DESCRIPTION>
+Refactor the Binary Search phase to use a robust, multi-strategy packing helper. Instead of relying on a single deterministic sort (Virtual Size), the new `solve_bin_packing_for_k` function attempts to pack using multiple sorting criteria: Virtual Size, Physical Size, and several Stochastic Virtual Size variations (using multiplicative noise). This diversity in packing order allows the algorithm to escape local optima and find feasible configurations for tighter KVPR constraints (lower K), effectively minimizing the global maximum pressure.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 2. Binary Search on Target KVPR (Transformation to Bin Packing)
+    # ---------------------------------------------------------
+    # We want to check if there exists a placement such that KVPR <= K for all GPUs.
+    # Constraint: sum(w) / (C - sum(s)) <= K  <==>  sum(w) + K*sum(s) <= K*C
+    # Let v_i(K) = w_i + K*s_i. We pack items of size v_i into bins of capacity K*C.
+
+    # Lower bound: Perfect fluid balance
+    total_w = sum(m.req_rate / m.slo for m in models)
+    total_s = sum(m.model_size for m in models)
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+
+    if rem_global > 1e-6:
+        low = total_w / rem_global
+        high = best_score if best_score != float('inf') else 1000.0
+
+        # Binary Search loop
+        # Only if the range is significant
+        if high > low + 1e-4:
+            for _ in range(20):
+                mid = (low + high) / 2
+
+                # Sort items by virtual size v_i(mid) descending
+                # This heuristics works well for Bin Packing (Best Fit Decreasing)
+                bs_models = sorted(models, key=lambda m: (m.req_rate/m.slo) + mid * m.model_size, reverse=True)
+
+                temp_placement = {i: [] for i in range(gpu_num)}
+                gpu_w = [0.0] * gpu_num
+                gpu_s = [0.0] * gpu_num
+                possible_k = True
+
+                for model in bs_models:
+                    w = model.req_rate / model.slo
+                    s = model.model_size
+
+                    best_idx = None
+                    min_slack = float('inf')
+
+                    # Best Fit Decreasing logic
+                    for i in range(gpu_num):
+                        if gpu_s[i] + s > GPU_MEM_SIZE: continue
+
+                        # Check KVPR constraint: (W + w) <= mid * (C - S - s)
+                        lhs = gpu_w[i] + w
+                        rhs = mid * (GPU_MEM_SIZE - gpu_s[i] - s)
+
+                        if lhs <= rhs + 1e-5:
+                            slack = rhs - lhs
+                            if slack < min_slack:
+                                min_slack = slack
+                                best_idx = i
+
+                    if best_idx is None:
+                        possible_k = False
+                        break
+
+                    temp_placement[best_idx].append(model)
+                    gpu_w[best_idx] += w
+                    gpu_s[best_idx] += s
+
+                if possible_k:
+                    # Found a valid placement with max KVPR <= mid
+                    current_actual_max = get_max_kvpr(temp_placement)
+                    if current_actual_max < best_score:
+                        best_score = current_actual_max
+                        best_placement = temp_placement
+                    high = mid
+                else:
+                    low = mid
+=======
+    # ---------------------------------------------------------
+    # 2. Binary Search on Target KVPR (Transformation to Bin Packing)
+    # ---------------------------------------------------------
+    # Problem: Minimize K such that for all bins j: sum(w_i) / (C - sum(s_i)) <= K
+    # Transformed to Bin Packing: v_i(K) = w_i + K*s_i <= K*C_j
+
+    import random
+
+    # Precompute data for speed and reuse
+    m_data = []
+    total_w = 0.0
+    total_s = 0.0
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        m_data.append({'w': w, 's': s, 'obj': m, 'id': i})
+        total_w += w
+        total_s += s
+
+    def solve_bin_packing_for_k(target_k):
+        """
+        Attempts to pack models given target pressure K.
+        Uses multiple sorting strategies to find a valid packing.
+        Returns placement dict if feasible, else None.
+        """
+        # Strategies to sort items:
+        # 1. Virtual Size: w + K*s (Standard BFD for this constraint)
+        # 2. Physical Size: s
+        # 3. Weight: w
+        # 4. Stochastic Virtual Size: (w + K*s) * noise
+
+        strategies = []
+        # Deterministic strategies
+        strategies.append(lambda x: x['w'] + target_k * x['s'])
+        strategies.append(lambda x: x['s'])
+
+        # Stochastic trials to break tie/local optima
+        for _ in range(5):
+            strategies.append(lambda x: (x['w'] + target_k * x['s']) * random.uniform(0.9, 1.1))
+
+        for key_func in strategies:
+            # Sort descending
+            sorted_indices = sorted(range(len(m_data)), key=lambda i: key_func(m_data[i]), reverse=True)
+
+            bins = [{'w': 0.0, 's': 0.0, 'idxs': []} for _ in range(gpu_num)]
+            possible = True
+
+            for idx in sorted_indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+
+                best_bin = None
+                min_slack = float('inf')
+
+                # Best Fit Decreasing (Minimizing slack on the constraint)
+                # Constraint: bin_w + w <= K * (C - bin_s - s)
+                # Slack = K * (C - bin_s - s) - (bin_w + w)
+
+                for b_idx in range(gpu_num):
+                    b = bins[b_idx]
+
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    rem_s = GPU_MEM_SIZE - (b['s'] + s)
+                    rhs = target_k * rem_s
+                    lhs = b['w'] + w
+
+                    if lhs <= rhs + 1e-5:
+                        # Feasible
+                        slack = rhs - lhs
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_bin = b_idx
+
+                if best_bin is None:
+                    possible = False
+                    break
+
+                bins[best_bin]['idxs'].append(idx)
+                bins[best_bin]['w'] += w
+                bins[best_bin]['s'] += s
+
+            if possible:
+                # Convert back to object placement
+                res = {}
+                for g in range(gpu_num):
+                    res[g] = [m_data[i]['obj'] for i in bins[g]['idxs']]
+                return res
+        return None
+
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    if rem_global > 1e-6:
+        low = total_w / rem_global
+        high = best_score if best_score != float('inf') else 1000.0
+
+        if high > low + 1e-4:
+            # Binary Search
+            for _ in range(16):
+                mid = (low + high) / 2.0
+
+                placement = solve_bin_packing_for_k(mid)
+
+                if placement:
+                    # Update best known solution
+                    curr_max = get_max_kvpr(placement)
+                    if curr_max < best_score:
+                        best_score = curr_max
+                        best_placement = placement
+                    high = mid
+                else:
+                    low = mid
+>>>>>>> REPLACE
+</DIFF>

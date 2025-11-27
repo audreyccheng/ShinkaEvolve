@@ -1,0 +1,137 @@
+<NAME>
+adaptive_tail_and_2x2_fixup
+</NAME>
+
+<DESCRIPTION>
+I improve the replication stage in two targeted ways to reduce peak load with minimal overhead:
+1) Adaptive tail length in replicate_experts: Instead of a fixed ~10% Sainte-Laguë tail, compute tail length based on dispersion (coefficient of variation) of per-row weights, clamped to a small range. This gives more proportional allocation for skewed rows without extra iterations.
+2) Strengthened one-move fix-up: Upgrade the single donor→receiver move to evaluate a 2×2 candidate set (top-2 donors by avg vs bottom-2 receivers), then apply the strictly best move that minimizes the new peak. This preserves the one-move bound for speed and determinism but finds better improvements than the prior single-pair heuristic.
+
+These changes preserve the same APIs, keep the algorithm fast, and should measurably improve balancedness by reducing the final maximum average load.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Hybrid allocation: D'Hondt for bulk, Sainte-Laguë for the last ~10% (at least 1)
+    tail = max(1, (num_redundant + 9) // 10)
+    bulk = num_redundant - tail
+    col = num_log
+=======
+    # Hybrid allocation with adaptive tail:
+    # Use D'Hondt for bulk and Sainte-Laguë for the tail whose length scales with dispersion.
+    # Tail fraction = alpha * s where s ~ coefficient of variation clamped to [0.7, 1.3]
+    # This keeps tail small but more effective under skew.
+    mean = weight.mean(dim=-1).clamp_min(1e-12)
+    std = weight.std(dim=-1)
+    cv = (std / mean).clamp_min(0)  # per-row CV
+    s = float(cv.mean().item())
+    s = max(0.7, min(1.3, s))
+    alpha = 0.10
+    tail = max(1, min(num_redundant, int(round(alpha * num_redundant * s))))
+    bulk = num_redundant - tail
+    col = num_log
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # One-step replication fix-up per row:
+    # Move one replica from the heaviest-per-replica expert to the lightest if it strictly
+    # reduces the global maximum average load.
+    if num_log > 1 and num_redundant > 0:
+        avg = weight / logcnt.to(weight.dtype)  # [n, num_log]
+        # top-2 to account for ties at the maximum
+        top2_vals, top2_idx = torch.topk(avg, k=2, dim=-1)
+        cur_max = top2_vals[:, 0]
+        second = top2_vals[:, 1]
+        donor = top2_idx[:, 0]
+        receiver = torch.argmin(avg, dim=-1)
+
+        cd = logcnt[arangen, donor]  # donor counts
+        cr = logcnt[arangen, receiver]  # receiver counts
+        # Valid only if donor != receiver and donor has at least 2 replicas
+        valid = (donor != receiver) & (cd > 1)
+
+        # Compute new peak after moving 1 replica
+        new_d = weight[arangen, donor] / (cd.to(weight.dtype) - 1)
+        new_r = weight[arangen, receiver] / (cr.to(weight.dtype) + 1)
+        new_peak = torch.maximum(second, torch.maximum(new_d, new_r))
+        improve = valid & (new_peak + 1e-12 < cur_max)
+
+        rows = torch.nonzero(improve, as_tuple=False).squeeze(1)
+        if rows.numel() > 0:
+            for ri in rows.tolist():
+                d = int(donor[ri].item())
+                r = int(receiver[ri].item())
+                # Choose a physical column corresponding to donor's highest rank (prefer the last replica)
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                # Among donor cols, pick the one with max rank
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                # Assign this physical replica to receiver with new rank equal to current receiver count
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                # Update counts
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+=======
+    # Strengthened replication fix-up per row:
+    # Evaluate donors = top-2 by avg load and receivers = bottom-2, choose the single best
+    # donor->receiver move if it strictly lowers the peak average.
+    if num_log > 1 and num_redundant > 0:
+        avg = weight / logcnt.to(weight.dtype)  # [n, num_log]
+        kdon = min(2, num_log)
+        krec = min(2, num_log)
+        top_vals, top_idx = torch.topk(avg, k=kdon, dim=-1, largest=True)
+        bot_vals, bot_idx = torch.topk(avg, k=krec, dim=-1, largest=False)
+        cur_max = top_vals[:, 0]
+        second = top_vals[:, 1] if kdon > 1 else top_vals[:, 0]
+
+        for ri in range(n):
+            best_new_peak = None
+            best_pair = None
+            donors = top_idx[ri].tolist()
+            receivers = bot_idx[ri].tolist()
+
+            for d in donors:
+                cd = int(logcnt[ri, d].item())
+                if cd <= 1:
+                    continue
+                for r in receivers:
+                    if d == r:
+                        continue
+                    cr = int(logcnt[ri, r].item())
+                    new_d = float(weight[ri, d].item()) / float(cd - 1)
+                    new_r = float(weight[ri, r].item()) / float(cr + 1)
+                    candidate_peak = max(float(second[ri].item()), new_d, new_r)
+                    if candidate_peak + 1e-12 < float(cur_max[ri].item()):
+                        if best_new_peak is None or candidate_peak < best_new_peak:
+                            best_new_peak = candidate_peak
+                            best_pair = (d, r)
+
+            if best_pair is not None:
+                d, r = best_pair
+                # Choose a physical column corresponding to donor's highest rank (prefer the last replica)
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                # Among donor cols, pick the one with max rank
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                # Assign this physical replica to receiver with new rank equal to current receiver count
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                # Update counts
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+>>>>>>> REPLACE
+
+</DIFF>

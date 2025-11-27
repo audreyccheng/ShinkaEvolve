@@ -1,0 +1,459 @@
+<NAME>
+waterfill_and_light_pair_refine
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements that enhance load balance while keeping the algorithm fast:
+
+1) Replace the greedy replicate_experts with a water-filling based allocator plus a single donor→receiver fix-up per row. This directly targets minimizing the maximum per-replica load, which the prior greedy approach approximated via iterative max weight/logcnt choice. The water-filling method finds near-optimal replica counts by binary searching a threshold and then performing a small, constant number of adjustments. The one-step fix-up handles discrete effects cheaply.
+
+2) Add a lightweight refinement to balanced_packing_diverse: after the initial diversity-aware assignment per row, evaluate at most one 1×1 swap between the heaviest pack and the best among the two lightest packs, considering top-2 candidates from the heavy and bottom-2 from the light. This micro-step improves the global peak and imbalance with negligible overhead. It also includes a label-duplication penalty when labels are not unique to keep replicas of the same logical expert spread out.
+
+These changes are consistent with hierarchical/global policies and keep everything on CPU with small, bounded per-row work, preserving the speed score while providing better balancing on skewed instances.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing_diverse(weight: torch.Tensor,
+                             label: torch.Tensor,
+                             num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Balanced packing with diversity: prefer spreading items with the same label
+    across different packs to reduce hotspotting when replicas of the same
+    logical expert are placed on the same GPU.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        label:  [X, n], an integer label for each item (e.g., logical expert id)
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_items = weight.shape
+    assert num_items % num_packs == 0
+    items_per_pack = num_items // num_packs
+
+    # Trivial case: one item per pack, fallback to standard balanced packing
+    if items_per_pack == 1 or num_packs == 1:
+        return balanced_packing(weight, num_packs)
+
+    # Ensure CPU tensors for Python-side loops
+    device = weight.device
+    w = weight.float()
+    labels = label.to(dtype=torch.int64, device=device)
+
+    # Pre-sort indices by descending weights per row
+    sorted_indices = w.sort(dim=-1, descending=True).indices
+
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device=device)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+
+    for i in range(num_layers):
+        row_sorted = sorted_indices[i].tolist()
+        row_w = w[i]
+        row_labels = labels[i]
+
+        # Quick duplicate check to avoid overhead when not needed
+        seen = set()
+        has_dup = False
+        for idx in range(num_items):
+            l = int(row_labels[idx].item())
+            if l in seen:
+                has_dup = True
+                break
+            seen.add(l)
+
+        if not has_dup:
+            # No duplicate labels; standard greedy suffices and is faster
+            pack_loads = [0.0] * num_packs
+            pack_counts = [0] * num_packs
+            for group in row_sorted:
+                # choose among packs with capacity the one with min load
+                best_p = min(
+                    (p for p in range(num_packs) if pack_counts[p] < items_per_pack),
+                    key=lambda p: pack_loads[p],
+                )
+                pack_index[i, group] = best_p
+                rank_in_pack[i, group] = pack_counts[best_p]
+                pack_counts[best_p] += 1
+                pack_loads[best_p] += float(row_w[group].item())
+            continue
+
+        # Diversity-aware greedy
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        label_counts = [defaultdict(int) for _ in range(num_packs)]
+
+        for group in row_sorted:
+            lab = int(row_labels[group].item())
+            # Select pack preferring fewer repetitions of label, then lower load, then fewer items
+            best_p = None
+            best_key = None
+            for p in range(num_packs):
+                if pack_counts[p] >= items_per_pack:
+                    continue
+                rep = label_counts[p].get(lab, 0)
+                key = (rep, pack_loads[p], pack_counts[p])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_p = p
+            # Assign
+            pack_index[i, group] = best_p
+            rank_in_pack[i, group] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(row_w[group].item())
+            label_counts[best_p][lab] += 1
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing_diverse(weight: torch.Tensor,
+                             label: torch.Tensor,
+                             num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Balanced packing with diversity: prefer spreading items with the same label
+    across different packs to reduce hotspotting when replicas of the same
+    logical expert are placed on the same GPU. After the greedy assignment,
+    apply a single bounded refinement swap between the heaviest pack and the
+    best of the two lightest packs to further reduce peak/imbalance.
+    """
+    num_layers, num_items = weight.shape
+    assert num_items % num_packs == 0
+    items_per_pack = num_items // num_packs
+
+    # Trivial case: one item per pack, fallback to standard balanced packing
+    if items_per_pack == 1 or num_packs == 1:
+        return balanced_packing(weight, num_packs)
+
+    device = weight.device
+    w = weight.float()
+    labels = label.to(dtype=torch.int64, device=device)
+
+    # Pre-sort indices by descending weights per row
+    sorted_indices = w.sort(dim=-1, descending=True).indices
+
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device=device)
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+
+    for i in range(num_layers):
+        row_sorted = sorted_indices[i].tolist()
+        row_w = w[i]
+        row_labels = labels[i]
+
+        # Detect duplicates quickly
+        has_dup = torch.unique(row_labels).numel() != row_labels.numel()
+
+        # Greedy assignment
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        label_counts = [defaultdict(int) for _ in range(num_packs)] if has_dup else None
+
+        if not has_dup:
+            for group in row_sorted:
+                wv = float(row_w[group].item())
+                # choose among packs with capacity the one with min load; tie-break by fewer items
+                best_p = None
+                best_load = None
+                best_cnt = None
+                for p in range(num_packs):
+                    if pack_counts[p] >= items_per_pack:
+                        continue
+                    if (best_load is None or pack_loads[p] < best_load or
+                        (abs(pack_loads[p] - best_load) <= 1e-12 and pack_counts[p] < best_cnt)):
+                        best_p = p
+                        best_load = pack_loads[p]
+                        best_cnt = pack_counts[p]
+                pack_index[i, group] = best_p
+                rank_in_pack[i, group] = pack_counts[best_p]
+                pack_counts[best_p] += 1
+                pack_loads[best_p] += wv
+        else:
+            # Diversity-aware greedy: minimize (projected load, repeats, count)
+            eps = 1e-6 * float(row_w.mean().item() if row_w.numel() > 0 else 1.0)
+            for group in row_sorted:
+                lab = int(row_labels[group].item())
+                wv = float(row_w[group].item())
+                best_p = None
+                best_base = None
+                best_rep = None
+                best_cnt = None
+                for p in range(num_packs):
+                    if pack_counts[p] >= items_per_pack:
+                        continue
+                    base = pack_loads[p] + wv
+                    rep = label_counts[p].get(lab, 0)
+                    if best_p is None:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = pack_counts[p]
+                        continue
+                    if base + eps < best_base:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = pack_counts[p]
+                    elif abs(base - best_base) <= eps:
+                        if rep < best_rep or (rep == best_rep and pack_counts[p] < best_cnt):
+                            best_p = p
+                            best_base = base
+                            best_rep = rep
+                            best_cnt = pack_counts[p]
+                pack_index[i, group] = best_p
+                rank_in_pack[i, group] = pack_counts[best_p]
+                pack_counts[best_p] += 1
+                pack_loads[best_p] += wv
+                label_counts[best_p][lab] += 1  # type: ignore[index]
+
+        # Micro refinement: evaluate one 1x1 swap between heaviest and the best of the two lightest packs
+        if num_packs >= 2:
+            cur_max = max(pack_loads)
+            cur_min = min(pack_loads)
+            if cur_max > cur_min:
+                # Build pack membership lists for this row
+                pack_groups = [[] for _ in range(num_packs)]
+                for g in range(num_items):
+                    p = int(pack_index[i, g])
+                    pack_groups[p].append(g)
+
+                h = max(range(num_packs), key=lambda k: pack_loads[k])
+                others = [p for p in range(num_packs) if p != h]
+                if others:
+                    sorted_lights = sorted(others, key=lambda k: pack_loads[k])[:min(2, len(others))]
+                    # Prepare heavy candidates: top-2 by weight
+                    if pack_groups[h]:
+                        h_idx_tensor = torch.tensor(pack_groups[h], dtype=torch.int64, device=row_w.device)
+                        hw = row_w[h_idx_tensor]
+                        kh = min(2, hw.numel())
+                        if kh > 0:
+                            top_h = torch.topk(hw, kh).indices.tolist()
+                            # Optional label histograms for penalty when duplicates exist
+                            label_hist = None
+                            if has_dup:
+                                label_hist = [defaultdict(int) for _ in range(num_packs)]
+                                for p in range(num_packs):
+                                    for g in pack_groups[p]:
+                                        label_hist[p][int(row_labels[g].item())] += 1
+
+                            cur_imb = cur_max - cur_min
+                            best = None
+                            best_key = None  # (new_peak, new_imb, penalty)
+                            for l in sorted_lights:
+                                if not pack_groups[l]:
+                                    continue
+                                l_idx_tensor = torch.tensor(pack_groups[l], dtype=torch.int64, device=row_w.device)
+                                lw = row_w[l_idx_tensor]
+                                kl = min(2, lw.numel())
+                                if kl == 0:
+                                    continue
+                                bot_l = torch.topk(lw, kl, largest=False).indices.tolist()
+
+                                # Precompute others' max/min excluding h and l
+                                other_max = max([pack_loads[p] for p in range(num_packs) if p != h and p != l],
+                                                default=float("-inf"))
+                                other_min = min([pack_loads[p] for p in range(num_packs) if p != h and p != l],
+                                                default=float("inf"))
+
+                                for ai in top_h:
+                                    a_item = int(h_idx_tensor[ai].item())
+                                    wa = float(hw[ai].item())
+                                    la = int(row_labels[a_item].item())
+                                    for bi in bot_l:
+                                        b_item = int(l_idx_tensor[bi].item())
+                                        wb = float(lw[bi].item())
+                                        lb = int(row_labels[b_item].item())
+                                        new_h = pack_loads[h] - wa + wb
+                                        new_l = pack_loads[l] - wb + wa
+                                        new_peak = max(new_h, new_l, other_max)
+                                        new_bottom = min(new_h, new_l, other_min)
+                                        new_imb = new_peak - new_bottom
+                                        penalty = 0
+                                        if has_dup and label_hist is not None:
+                                            penalty += 1 if label_hist[h].get(lb, 0) > 0 else 0
+                                            penalty += 1 if label_hist[l].get(la, 0) > 0 else 0
+                                        cand_key = (new_peak, new_imb, penalty)
+                                        if best_key is None or cand_key < best_key:
+                                            best_key = cand_key
+                                            best = (h, l, ai, bi, a_item, b_item, wa, wb)
+
+                            if best is not None:
+                                new_peak, new_imb, _ = best_key  # type: ignore[misc]
+                                # Apply only if strictly improves either global peak or imbalance
+                                if (new_peak + 1e-12 < cur_max) or (abs(new_peak - cur_max) <= 1e-12 and new_imb + 1e-12 < cur_imb):
+                                    h_sel, l_sel, ai, bi, a_item, b_item, wa, wb = best  # type: ignore[misc]
+                                    # Update loads
+                                    pack_loads[h_sel] = pack_loads[h_sel] - wa + wb
+                                    pack_loads[l_sel] = pack_loads[l_sel] - wb + wa
+                                    # Swap membership and indices
+                                    pack_groups[h_sel][ai] = b_item
+                                    pack_groups[l_sel][bi] = a_item
+                                    pack_index[i, a_item] = l_sel
+                                    pack_index[i, b_item] = h_sel
+                                    # Update ranks for affected packs
+                                    for r, g in enumerate(pack_groups[h_sel]):
+                                        rank_in_pack[i, g] = r
+                                    for r, g in enumerate(pack_groups[l_sel]):
+                                        rank_in_pack[i, g] = r
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+def _waterfill_counts_row(w: torch.Tensor, target_total: int) -> torch.Tensor:
+    """
+    Compute integer replica counts c_i >= 1 that approximately minimize max_i w_i / c_i
+    subject to sum c_i == target_total using water-filling + greedy fill.
+    w: 1D float tensor (CPU)
+    """
+    num_log = w.numel()
+    assert target_total >= num_log
+    if target_total == num_log:
+        return torch.ones(num_log, dtype=torch.int64, device=w.device)
+
+    maxw = float(w.max().item()) if num_log > 0 else 0.0
+    # All-zero quick path: distribute evenly
+    if maxw == 0.0:
+        base = target_total // num_log
+        rem = target_total % num_log
+        counts = torch.full((num_log,), base, dtype=torch.int64, device=w.device)
+        if base == 0:
+            counts[:] = 1
+            extras = target_total - num_log
+            if extras > 0:
+                counts[:extras] += 1
+        else:
+            if rem > 0:
+                counts[:rem] += 1
+        return counts
+
+    lo = 0.0
+    hi = max(maxw, 1.0)
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        c = torch.ceil(w / mid).to(torch.int64)
+        c = torch.maximum(c, torch.ones_like(c))
+        s = int(c.sum().item())
+        if s <= target_total:
+            hi = mid
+        else:
+            lo = mid
+    counts = torch.ceil(w / hi).to(torch.int64)
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    s = int(counts.sum().item())
+    extras = target_total - s
+    while extras > 0:
+        k = min(extras, num_log)
+        score = w / counts.to(w.dtype)
+        idx = torch.argsort(score, descending=True)[:k]
+        counts[idx] += 1
+        extras -= k
+    return counts
+
+
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas using a water-filling
+    allocation to minimize the maximum per-replica load, with a single
+    donor→receiver fix-up for discrete smoothing.
+
+    Parameters:
+        weight: [X, num_log] (float CPU tensor)
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    assert num_phy >= num_log
+    device = weight.device
+
+    phy_rows = []
+    rank_rows = []
+    cnt_rows = []
+
+    exp_ids = torch.arange(num_log, dtype=torch.int64, device=device)
+    for i in range(n):
+        w = weight[i].float()
+        counts = _waterfill_counts_row(w, num_phy)
+
+        # One-step donor->receiver fix-up (only if it strictly reduces peak avg)
+        if num_log > 1:
+            avg = w / counts.to(w.dtype)
+            cur_peak = float(avg.max().item())
+            can_donate = (counts > 1)
+            if bool(can_donate.any()):
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                d = int(torch.argmax(avg_mask).item())
+                r = int(torch.argmin(avg).item())
+                if d != r:
+                    c_try = counts.clone()
+                    c_try[d] -= 1
+                    c_try[r] += 1
+                    peak_try = float((w / c_try.to(w.dtype)).max().item())
+                    if peak_try + 1e-12 < cur_peak:
+                        counts = c_try
+
+        cnt_rows.append(counts)
+
+        # Build phy2log and rank
+        phy2log_i = torch.repeat_interleave(exp_ids, counts)
+        starts = torch.cumsum(counts, dim=0) - counts
+        arange_phy = torch.arange(num_phy, dtype=torch.int64, device=device)
+        rank_i = arange_phy - torch.repeat_interleave(starts, counts)
+
+        phy_rows.append(phy2log_i)
+        rank_rows.append(rank_i)
+
+    phy2log = torch.stack(phy_rows, dim=0)
+    rank = torch.stack(rank_rows, dim=0)
+    logcnt = torch.stack(cnt_rows, dim=0)
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+
+</DIFF>

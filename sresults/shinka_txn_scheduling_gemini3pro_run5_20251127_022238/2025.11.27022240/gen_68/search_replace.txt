@@ -1,0 +1,233 @@
+<NAME>
+optimize_scheduling_pipeline
+</NAME>
+
+<DESCRIPTION>
+This edit revamps the scheduling pipeline to maximize makespan reduction by implementing recommended improvements:
+1.  **Efficiency-Aware Beam Search**: Replaces the greedy Phase 1 construction with an efficiency-aware version. It uses a scoring function `score = cost - (gamma * efficiency * weight)` to prioritize parallelizing heavy transactions ("big rocks") early in the schedule, rather than just minimizing immediate cost.
+2.  **Iterative LPT Polish (Gap Repair)**: Inserts a new Phase 3 after Simulated Annealing. This phase performs deterministic refinement by iteratively removing and re-inserting transactions. It processes transactions in **Longest Processing Time (LPT) order** (descending weight) to ensure larger, dependency-heavy transactions are placed optimally. It runs for multiple passes (up to 3) to ensure convergence and allows "sideways" moves (equal cost) to traverse plateaus in the solution space.
+3.  **Hyperparameter Tuning**: Reduces `SA_ITERATIONS` from 5000 to 3000 to reallocate the computational time budget to the new Polish phase.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Hyperparameters ---
+    BEAM_WIDTH = 4  # Focused beam for construction
+
+    # SA / ILS Parameters
+    SA_ITERATIONS = 5000
+    SA_COOLING_RATE = 0.998
+    SA_START_TEMP_RATIO = 0.05
+=======
+    # --- Hyperparameters ---
+    BEAM_WIDTH = 4  # Focused beam for construction
+
+    # SA / ILS Parameters
+    SA_ITERATIONS = 3000
+    SA_COOLING_RATE = 0.998
+    SA_START_TEMP_RATIO = 0.05
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Cost Cache ---
+    cost_cache = {}
+
+    def get_cost(seq):
+        t_seq = tuple(seq)
+        if t_seq in cost_cache:
+            return cost_cache[t_seq]
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[t_seq] = c
+        return c
+
+    # --- Phase 1: Exhaustive Beam Search ---
+    # Initialize beam
+    candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        candidates.append({'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
+
+    candidates.sort(key=lambda x: x['cost'])
+    beam = candidates[:BEAM_WIDTH]
+
+    # Iteratively build schedule
+    for _ in range(workload.num_txns - 1):
+        next_candidates = []
+
+        for node in beam:
+            p_seq = node['seq']
+            p_rem = node['rem']
+
+            # Exhaustive expansion for quality
+            for cand in p_rem:
+                new_seq = p_seq + [cand]
+                new_cost = get_cost(new_seq)
+                next_candidates.append((new_cost, new_seq, p_rem, cand))
+
+        # Sort by cost (Greedy)
+        next_candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            new_rem = c_parent_rem.copy()
+            new_rem.remove(c_cand)
+            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+
+        beam = new_beam
+
+    if not beam:
+        return float('inf'), []
+
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+=======
+    # --- Cost Cache ---
+    cost_cache = {}
+
+    def get_cost(seq):
+        t_seq = tuple(seq)
+        if t_seq in cost_cache:
+            return cost_cache[t_seq]
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[t_seq] = c
+        return c
+
+    # --- Pre-calculation: Transaction Weights ---
+    # Weight is the standalone cost (latency) of the transaction
+    txn_weights = {}
+    for t in range(workload.num_txns):
+        txn_weights[t] = get_cost([t])
+
+    # --- Phase 1: Efficiency-Aware Beam Search ---
+    # Uses a dynamic scoring function to balance minimizing makespan with maximizing parallelism (efficiency)
+    GAMMA_START = 2.0
+    GAMMA_END = 0.5
+
+    candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        # Initial score: cost - (Gamma * Weight). Prefer starting with heavy items.
+        score = cost - (GAMMA_START * txn_weights[t])
+        candidates.append({
+            'cost': cost,
+            'score': score,
+            'seq': seq,
+            'rem': {x for x in range(workload.num_txns) if x != t}
+        })
+
+    candidates.sort(key=lambda x: x['score'])
+    beam = candidates[:BEAM_WIDTH]
+
+    total_txns = workload.num_txns
+
+    # Iteratively build schedule
+    for _ in range(total_txns - 1):
+        next_candidates = []
+
+        # Dynamic Gamma: decays as schedule fills up
+        current_len = len(beam[0]['seq'])
+        progress = current_len / total_txns
+        gamma = GAMMA_START * (1.0 - progress) + GAMMA_END * progress
+
+        for node in beam:
+            p_seq = node['seq']
+            p_rem = node['rem']
+            p_cost = node['cost']
+
+            for cand in p_rem:
+                new_seq = p_seq + [cand]
+                new_cost = get_cost(new_seq)
+
+                delta = new_cost - p_cost
+                w = txn_weights[cand]
+
+                # Efficiency: fraction of transaction 'hidden' by parallelism
+                efficiency = 0.0
+                if delta < w and w > 0:
+                    efficiency = (w - delta) / w
+
+                # Score: Cost - Bonus. Bonus depends on efficiency and weight.
+                score = new_cost - (gamma * efficiency * w)
+
+                next_candidates.append((score, new_cost, new_seq, p_rem, cand))
+
+        # Sort by score (Efficiency-Aware)
+        next_candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_score, c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            new_rem = c_parent_rem.copy()
+            new_rem.remove(c_cand)
+            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+
+        beam = new_beam
+
+    if not beam:
+        return float('inf'), []
+
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    return best_cost, best_schedule
+=======
+    # --- Phase 3: Iterative LPT Polish (Gap Repair) ---
+    # Sort transactions by weight (descending) to prioritize optimizing placement of large transactions
+    sorted_txns = sorted(range(workload.num_txns), key=lambda x: txn_weights[x], reverse=True)
+
+    polish_seq = list(best_schedule)
+    current_polish_cost = best_cost
+
+    # Run for multiple passes or until convergence
+    MAX_PASSES = 3
+
+    for pass_idx in range(MAX_PASSES):
+        improved_in_pass = False
+
+        for item in sorted_txns:
+            # Remove item from current position
+            try:
+                curr_idx = polish_seq.index(item)
+            except ValueError:
+                continue
+            polish_seq.pop(curr_idx)
+
+            best_pos = -1
+            min_c = float('inf')
+
+            # Find best insertion position
+            # We accept <= to allow sideways moves which can escape local optima structure
+            for j in range(len(polish_seq) + 1):
+                polish_seq.insert(j, item)
+                c = get_cost(polish_seq)
+                if c <= min_c:
+                    min_c = c
+                    best_pos = j
+                polish_seq.pop(j)
+
+            # Re-insert at best position
+            polish_seq.insert(best_pos, item)
+
+            # Check for strict improvement
+            if min_c < current_polish_cost:
+                current_polish_cost = min_c
+                improved_in_pass = True
+
+            # Update global best if found
+            if current_polish_cost < best_cost:
+                best_cost = current_polish_cost
+                best_schedule = list(polish_seq)
+
+        if not improved_in_pass:
+            break
+
+    return best_cost, best_schedule
+>>>>>>> REPLACE
+</DIFF>

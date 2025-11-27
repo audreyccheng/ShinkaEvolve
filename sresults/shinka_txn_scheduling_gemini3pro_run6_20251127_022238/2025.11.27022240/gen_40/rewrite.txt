@@ -1,0 +1,320 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+try:
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+except Exception as e:
+    # Allow execution to proceed if modules are already in path or mock environment
+    pass
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Deep-Lookahead Beam Search and Hybrid Perturbation ILS.
+
+    Architecture:
+    1. Metrics: Computes 'Urgency' based on Duration and Conflict Volume.
+       - Weighting favors conflict heavy items to schedule them early.
+    2. Beam Search with Pilot Lookahead:
+       - Instead of just evaluating the cost of adding a candidate, we perform a 'Pilot' rollout.
+       - We tentatively add the candidate + the top 2 most urgent remaining transactions.
+       - This Depth-2 lookahead avoids "painting into a corner" where a choice looks cheap now
+         but blocks critical tasks immediately after.
+    3. Iterated Local Search (ILS) with Hybrid Kicks:
+       - Uses deterministic windowed insertion for descent.
+       - Uses a mix of 'Block Shuffle' and 'Long-Distance Swap' for perturbation to escape local optima
+         more effectively than simple swaps.
+
+    Args:
+        workload: Workload object
+        num_seqs: Budget parameter
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    num_txns = workload.num_txns
+
+    # --- 1. METRIC PRECOMPUTATION ---
+    txn_durations = {}
+    txn_rw_sets = {}
+
+    for t in range(num_txns):
+        # Duration
+        try:
+            d = workload.txns[t][0][3]
+        except:
+            d = 1.0
+        txn_durations[t] = d
+
+        # R/W Sets
+        reads = set()
+        writes = set()
+        try:
+            ops_str = workload.txns[t][0][1]
+            if isinstance(ops_str, str):
+                for op in ops_str.split():
+                    if '-' in op:
+                        parts = op.split('-')
+                        if len(parts) == 2:
+                            op_type, key = parts
+                            if op_type == 'r': reads.add(key)
+                            elif op_type == 'w': writes.add(key)
+        except:
+            pass
+        txn_rw_sets[t] = (reads, writes)
+
+    # Conflict Volume: Sum of durations of conflicting transactions
+    txn_conflict_vol = {t: 0.0 for t in range(num_txns)}
+
+    for i in range(num_txns):
+        r1, w1 = txn_rw_sets[i]
+        vol = 0.0
+        for j in range(num_txns):
+            if i == j: continue
+            r2, w2 = txn_rw_sets[j]
+            # Conflict: (W1 n (W2 u R2)) or (R1 n W2)
+            if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+                vol += txn_durations[j]
+        txn_conflict_vol[i] = vol
+
+    # Urgency Score
+    # Normalize
+    max_vol = max(txn_conflict_vol.values()) if txn_conflict_vol else 1.0
+    max_dur = max(txn_durations.values()) if txn_durations else 1.0
+    if max_vol == 0: max_vol = 1.0
+
+    txn_urgency = {}
+    for t in range(num_txns):
+        # Weights: Balance duration and conflict.
+        # Slightly higher weight on Conflict Volume to clear bottlenecks early.
+        score = (txn_durations[t] / max_dur) + 0.8 * (txn_conflict_vol[t] / max_vol)
+        txn_urgency[t] = score
+
+    # --- 2. DEEP-LOOKAHEAD BEAM SEARCH ---
+    
+    # Adaptive Beam Width
+    BEAM_WIDTH = max(4, int(num_seqs))
+    
+    # Beam State: (cost, schedule_list, remaining_list)
+    # We initialize with empty schedule
+    beam = [(0, [], list(range(num_txns)))]
+
+    for step in range(num_txns):
+        candidates_pool = []
+        
+        for p_cost, p_sched, p_remain in beam:
+            
+            # 1. Candidate Generation
+            # Sort remaining by urgency
+            sorted_remain = sorted(p_remain, key=lambda x: txn_urgency[x], reverse=True)
+            
+            next_candidates = set()
+            
+            # Greedy: Top 4
+            next_candidates.update(sorted_remain[:4])
+            
+            # Weighted Sampling: 3 from the rest
+            if len(sorted_remain) > 4:
+                pool = sorted_remain[4:]
+                weights = [txn_urgency[x] for x in pool]
+                if pool:
+                    samples = random.choices(pool, weights=weights, k=min(3, len(pool)))
+                    next_candidates.update(samples)
+            
+            # 2. Evaluation with Pilot Lookahead
+            for c in next_candidates:
+                sched_c = p_sched + [c]
+                
+                # Pilot: What happens if we greedily fill the next few slots?
+                # This estimates the "blocking potential" of choosing c.
+                # We pick the Top 2 most urgent items from the remaining (excluding c)
+                
+                # Efficiently find next top 2
+                pilot_items = []
+                count = 0
+                for u in sorted_remain:
+                    if u == c: continue
+                    pilot_items.append(u)
+                    count += 1
+                    if count >= 2: break
+                
+                # Construct Pilot Schedule
+                sched_pilot = sched_c + pilot_items
+                cost_pilot = workload.get_opt_seq_cost(sched_pilot)
+                
+                # Metric: (PilotCost, ImmediateCost, -Urgency)
+                # Primary: Minimize the cost after lookahead
+                # Tie-breaker: Minimize immediate cost
+                metric = (cost_pilot, -txn_urgency[c])
+                
+                new_remain = list(p_remain)
+                new_remain.remove(c)
+                
+                candidates_pool.append((metric, sched_c, new_remain))
+        
+        # Pruning
+        # Sort by Pilot Cost
+        candidates_pool.sort(key=lambda x: x[0])
+        
+        # Select best states
+        best_candidates = candidates_pool[:BEAM_WIDTH]
+        beam = []
+        for _, sched, remain in best_candidates:
+            # We must compute exact cost for the beam state tuple to be correct for next iteration
+            # This avoids error accumulation from the pilot cost
+            real_cost = workload.get_opt_seq_cost(sched)
+            beam.append((real_cost, sched, remain))
+            
+    # Extract Best from final beam
+    best_state = min(beam, key=lambda x: x[0])
+    current_cost = best_state[0]
+    current_schedule = best_state[1]
+
+    # --- 3. REFINEMENT: ITERATED LOCAL SEARCH (ILS) ---
+
+    def local_descent(sched, base_cost, pass_limit=2):
+        """Windowed insertion to improve schedule locally."""
+        improved = True
+        curr_sched = list(sched)
+        curr_c = base_cost
+        
+        passes = 0
+        while improved and passes < pass_limit:
+            improved = False
+            passes += 1
+            
+            # Randomized order of check to avoid bias
+            indices = list(range(len(curr_sched)))
+            random.shuffle(indices)
+            
+            for i in indices:
+                txn = curr_sched[i]
+                
+                # Remove
+                temp = curr_sched[:i] + curr_sched[i+1:]
+                
+                # Window: [-12, +12]
+                window = 12
+                start = max(0, i - window)
+                end = min(len(temp), i + window)
+                
+                best_pos = -1
+                best_val = curr_c
+                
+                # Scan window
+                for p in range(start, end + 1):
+                    cand = temp[:p] + [txn] + temp[p:]
+                    c = workload.get_opt_seq_cost(cand)
+                    if c < best_val:
+                        best_val = c
+                        best_pos = p
+                
+                if best_pos != -1:
+                    curr_sched = temp[:best_pos] + [txn] + temp[best_pos:]
+                    curr_c = best_val
+                    improved = True
+                    
+        return curr_c, curr_sched
+
+    # Initial Descent
+    current_cost, current_schedule = local_descent(current_schedule, current_cost, pass_limit=2)
+
+    # ILS Loop
+    # We use a limited number of kicks to stay within time budget
+    num_kicks = 4
+    
+    for _ in range(num_kicks):
+        neighbor = list(current_schedule)
+        
+        # HYBRID PERTURBATION
+        # 50% Chance: Block Shuffle (Local fix for clustered conflicts)
+        # 50% Chance: Long Swap (Global fix for ordering)
+        
+        if random.random() < 0.5:
+            # Block Shuffle: Pick block of size 4-6, shuffle it
+            bsize = random.randint(4, 6)
+            if num_txns > bsize:
+                start_idx = random.randint(0, num_txns - bsize)
+                sub = neighbor[start_idx : start_idx+bsize]
+                random.shuffle(sub)
+                neighbor[start_idx : start_idx+bsize] = sub
+        else:
+            # Long Swaps: 2 random pairs
+            for _ in range(2):
+                i, j = random.randint(0, num_txns-1), random.randint(0, num_txns-1)
+                neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+
+        kick_cost = workload.get_opt_seq_cost(neighbor)
+        
+        # Repair (Shallow descent for speed)
+        new_cost, new_sched = local_descent(neighbor, kick_cost, pass_limit=1)
+        
+        # Accept if better
+        if new_cost < current_cost:
+            current_cost = new_cost
+            current_schedule = new_sched
+
+    return current_cost, current_schedule
+
+
+def get_random_costs():
+    """Evaluate scheduling algorithm on three different workloads."""
+    start_time = time.time()
+    
+    num_seqs = 10
+    
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, num_seqs)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, num_seqs)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, num_seqs)
+    
+    total_makespan = makespan1 + makespan2 + makespan3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,202 @@
+<NAME>
+adaptive_tail_and_second_fixup
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements that aim to reduce peak average load with minimal overhead:
+
+1) Adaptive tail allocation: For the last ~10% replica placements, switch from Sainte–Laguë vs. Huntington–Hill to a per-row, peak-aware choice between Sainte–Laguë and D’Hondt. This focuses tail assignments on directly minimizing the predicted new peak, following divisor-method insights.
+
+2) Two-step, selective replication fix-up: Keep the current vectorized one-move fix-up, but if that improvement is shallow (<15%), perform a second, local best move for those rows only. This adds significant balancing power at negligible average cost.
+
+Additionally, I make balanced_packing’s refinement depth adaptive based on imbalance ratio, allowing at most one extra swap when the initial greedy packing is more imbalanced.
+
+These changes preserve the algorithm’s speed while targeting high-payoff improvements to peak balance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # bounded refinement (k=2, at most 2 swaps) for this layer
+        w_row = weight[i].cpu()
+        pack_index[i] = _kcandidate_refine_row(
+            w_row, pidx.clone(), num_packs, k=2, max_swaps=2, adaptive_second=False
+        )
+=======
+        # bounded refinement (k=2) with adaptive steps based on imbalance
+        w_row = weight[i].cpu()
+        pack_w = torch.zeros(num_packs, dtype=w_row.dtype)
+        pack_w.scatter_add_(0, pidx, w_row)
+        delta = float((pack_w.max() - pack_w.min()).item())
+        mean_ld = float(pack_w.mean().item())
+        steps = 3 if delta / max(mean_ld, 1e-12) > 0.12 else 2
+        pack_index[i] = _kcandidate_refine_row(
+            w_row, pidx.clone(), num_packs, k=2, max_swaps=int(steps), adaptive_second=False
+        )
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Tail phase: choose per row between Sainte-Laguë and Huntington–Hill based on predicted peak
+    for _ in range(max(0, tail)):
+        r_f = logcnt.to(dtype_f)
+        avg_cur = weight / r_f
+        # current second-highest average per row
+        if num_log > 1:
+            top2_vals = torch.topk(avg_cur, k=2, dim=-1, largest=True).values
+            second = top2_vals[:, 1]
+        else:
+            second = avg_cur[:, 0]
+
+        benef_S = weight / (2.0 * r_f - 1.0)
+        benef_H = weight / torch.sqrt(r_f * (r_f + 1.0))
+        idx_S = _argmax_tiebreak(benef_S, avg_cur)
+        idx_H = _argmax_tiebreak(benef_H, avg_cur)
+
+        newS = weight[arangen, idx_S] / (r_f[arangen, idx_S] + 1.0)
+        newH = weight[arangen, idx_H] / (r_f[arangen, idx_H] + 1.0)
+        peakS = torch.maximum(second, newS)
+        peakH = torch.maximum(second, newH)
+
+        better_S = peakS + 1e-12 < peakH
+        tie_SH = torch.isclose(peakS, peakH, rtol=0.0, atol=1e-12)
+        prefer_S_on_tie = newS <= newH
+        use_S = better_S | (tie_SH & prefer_S_on_tie)
+
+        best_idx = torch.where(use_S, idx_S, idx_H)
+        phy2log[:, col] = best_idx
+        rank[:, col] = logcnt[arangen, best_idx]
+        logcnt[arangen, best_idx] += 1
+        col += 1
+=======
+    # Tail phase: per-row peak-aware choice between Sainte-Laguë and D'Hondt
+    for _ in range(max(0, tail)):
+        r_f = logcnt.to(dtype_f)
+        avg_cur = weight / r_f
+        # current second-highest average per row
+        if num_log > 1:
+            top2_vals = torch.topk(avg_cur, k=2, dim=-1, largest=True).values
+            second = top2_vals[:, 1]
+        else:
+            second = avg_cur[:, 0]
+
+        benef_S = weight / (2.0 * r_f - 1.0)
+        benef_D = weight / r_f
+        idx_S = _argmax_tiebreak(benef_S, avg_cur)
+        idx_D = _argmax_tiebreak(benef_D, avg_cur)
+
+        newS = weight[arangen, idx_S] / (r_f[arangen, idx_S] + 1.0)
+        newD = weight[arangen, idx_D] / (r_f[arangen, idx_D] + 1.0)
+        peakS = torch.maximum(second, newS)
+        peakD = torch.maximum(second, newD)
+
+        better_S = peakS + 1e-12 < peakD
+        tie_SD = torch.isclose(peakS, peakD, rtol=0.0, atol=1e-12)
+        prefer_S_on_tie = newS <= newD
+        use_S = better_S | (tie_SD & prefer_S_on_tie)
+
+        best_idx = torch.where(use_S, idx_S, idx_D)
+        phy2log[:, col] = best_idx
+        rank[:, col] = logcnt[arangen, best_idx]
+        logcnt[arangen, best_idx] += 1
+        col += 1
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if rows.numel() > 0:
+            kr_size = kr
+            for ri in rows.tolist():
+                bf = int(best_flat[ri].item())
+                di = bf // kr_size
+                rj = bf % kr_size
+                d = int(top_idx[ri, di].item())
+                r = int(bot_idx[ri, rj].item())
+
+                # move one physical replica from expert d to r: choose the one with highest rank
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+=======
+        if rows.numel() > 0:
+            kr_size = kr
+            for ri in rows.tolist():
+                bf = int(best_flat[ri].item())
+                di = bf // kr_size
+                rj = bf % kr_size
+                d = int(top_idx[ri, di].item())
+                r = int(bot_idx[ri, rj].item())
+
+                # move one physical replica from expert d to r: choose the one with highest rank
+                donor_cols = torch.nonzero(phy2log[ri] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    continue
+                maxr_idx = torch.argmax(rank[ri, donor_cols]).item()
+                col_idx = donor_cols[maxr_idx]
+
+                new_rank = int(logcnt[ri, r].item())
+                phy2log[ri, col_idx] = r
+                rank[ri, col_idx] = new_rank
+
+                logcnt[ri, d] -= 1
+                logcnt[ri, r] += 1
+
+            # Optional second move for shallow improvements (<15%) only
+            imp = (cur_max[rows] - best_vals[rows]) / cur_max[rows].clamp_min(1e-12)
+            shallow_rows = rows[imp < 0.15]
+            if shallow_rows.numel() > 0:
+                for ri in shallow_rows.tolist():
+                    # recompute best move for this row under updated counts
+                    rfi = logcnt[ri].to(dtype_f)
+                    avgi = weight[ri] / rfi
+                    kdi = min(2, num_log)
+                    kri = min(2, num_log)
+                    top_vals_i, top_idx_i = torch.topk(avgi, k=kdi, largest=True)
+                    bot_vals_i, bot_idx_i = torch.topk(avgi, k=kri, largest=False)
+                    cur_max_i = float(top_vals_i[0].item())
+                    sec_i = float((top_vals_i[1].item() if kdi > 1 else top_vals_i[0].item()))
+                    best_new_peak = None
+                    best_pair = None
+                    for di2 in range(kdi):
+                        d2 = int(top_idx_i[di2].item())
+                        cd2 = int(logcnt[ri, d2].item())
+                        if cd2 <= 1:
+                            continue
+                        for rj2 in range(kri):
+                            r2 = int(bot_idx_i[rj2].item())
+                            if d2 == r2:
+                                continue
+                            cr2 = int(logcnt[ri, r2].item())
+                            new_dv = float(weight[ri, d2].item()) / float(cd2 - 1)
+                            new_rv = float(weight[ri, r2].item()) / float(cr2 + 1)
+                            cand_peak = max(sec_i, new_dv, new_rv)
+                            if cand_peak + 1e-12 < cur_max_i:
+                                if best_new_peak is None or cand_peak < best_new_peak:
+                                    best_new_peak = cand_peak
+                                    best_pair = (d2, r2)
+                    if best_pair is not None:
+                        d2, r2 = best_pair
+                        donor_cols2 = torch.nonzero(phy2log[ri] == d2, as_tuple=False).squeeze(1)
+                        if donor_cols2.numel() > 0:
+                            maxr_idx2 = torch.argmax(rank[ri, donor_cols2]).item()
+                            col_idx2 = donor_cols2[maxr_idx2]
+                            new_rank2 = int(logcnt[ri, r2].item())
+                            phy2log[ri, col_idx2] = r2
+                            rank[ri, col_idx2] = new_rank2
+                            logcnt[ri, d2] -= 1
+                            logcnt[ri, r2] += 1
+>>>>>>> REPLACE
+
+</DIFF>

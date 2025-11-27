@@ -1,0 +1,513 @@
+--- a/original.py
++++ b/original.py
+@@ -1,307 +1,335 @@
+ # EVOLVE-BLOCK-START
+ """Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+ 
+ import time
+ import random
+ import sys
+ import os
+ import math
+ 
+ # Add the openevolve_examples directory to the path to import txn_simulator and workloads
+ # Find the repository root by looking for the openevolve_examples directory
+ def find_repo_root(start_path):
+     """Find the repository root by looking for openevolve_examples directory."""
+     current = os.path.abspath(start_path)
+     # Search up the directory tree
+     while current != os.path.dirname(current):  # Stop at filesystem root
+         candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return current
+         current = os.path.dirname(current)
+ 
+     # If not found by searching up, try common locations relative to known paths
+     script_dir = os.path.dirname(os.path.abspath(__file__))
+     possible_roots = [
+         script_dir,  # Current directory
+         os.path.dirname(script_dir),  # Parent
+         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+         '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+         '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+     ]
+     for root in possible_roots:
+         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return root
+ 
+     raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+ 
+ try:
+     repo_root = find_repo_root(os.path.dirname(__file__))
+     sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+ except Exception as e:
+     # Allow execution to proceed if modules are already in path or mock environment
+     pass
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+-    Get optimal schedule using Conflict-Degree Aware Beam Search and Dual-Phase Refinement.
+-
+-    Improvements:
+-    1. Metrics: Computes Conflict Degree (count of dependencies) alongside Duration.
+-    2. Construction: Beam search with tapered width. Prioritizes clearing high-degree items early.
+-    3. Refinement:
+-       - Phase 1: Global optimization of "Critical" transactions (High Duration * Degree).
+-       - Phase 2: Systematic Windowed Local Search to fix local ordering inefficiencies.
++    Get optimal schedule using Lookahead Beam Search and Block-Move ILS.
++
++    Innovations:
++    1. Metrics: Uses Conflict Volume (sum of conflicting durations) to identify heavy blockers.
++    2. Cubic Sampling: Uses urgency^3 weighting to strongly bias selection towards critical path items.
++    3. 1-Step Lookahead: Evaluates candidates by simulating the next step to avoid greedy traps.
++    4. Block ILS: Moves contiguous blocks of transactions to preserve internal parallel structures.
+ 
+     Args:
+         workload: Workload object
+         num_seqs: Budget parameter
+ 
+     Returns:
+         (lowest_makespan, schedule)
+     """
+ 
+     num_txns = workload.num_txns
+ 
+-    # --- 1. METRIC COMPUTATION ---
++    # --- 1. METRIC PRECOMPUTATION ---
+     txn_durations = {}
+     txn_rw_sets = {}
+ 
+     for t in range(num_txns):
+-        duration = 1.0
++        # Duration
+         try:
+-            duration = workload.txns[t][0][3]
++            d = workload.txns[t][0][3]
+         except:
+-            pass
+-        txn_durations[t] = duration
+-
++            d = 1.0
++        txn_durations[t] = d
++
++        # R/W Sets
+         reads = set()
+         writes = set()
+         try:
+             ops_str = workload.txns[t][0][1]
+             if isinstance(ops_str, str):
+                 for op in ops_str.split():
+                     if '-' in op:
+                         parts = op.split('-')
+                         if len(parts) == 2:
+                             op_type, key = parts
+                             if op_type == 'r': reads.add(key)
+                             elif op_type == 'w': writes.add(key)
+         except:
+             pass
+         txn_rw_sets[t] = (reads, writes)
+ 
+-    # Compute Conflict Degree (Number of other txns this one conflicts with)
+-    # High degree = Bottleneck node
+-    txn_conflict_degree = {t: 0 for t in range(num_txns)}
+-
+-    for i in range(num_txns):
+-        r1, w1 = txn_rw_sets[i]
+-        degree = 0
+-        for j in range(num_txns):
+-            if i == j: continue
+-            r2, w2 = txn_rw_sets[j]
+-            if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+-                degree += 1
+-        txn_conflict_degree[i] = degree
+-
+-    # Normalize metrics for heuristics
+-    max_degree = max(txn_conflict_degree.values()) if txn_conflict_degree else 1
+-    if max_degree == 0: max_degree = 1
+-
+-    # --- 2. TAPERED BEAM SEARCH ---
+-
+-    # Budget allocation
+-    base_width = max(5, int(num_seqs))
+-    start_width = int(base_width * 2.5) # Explore broadly at start
+-    end_width = max(2, int(base_width * 0.5)) # Converge at end
+-
++    # Compute Conflict Volume
++    txn_conflict_vol = {t: 0.0 for t in range(num_txns)}
++
++    # Check limit for O(N^2)
++    if num_txns < 2000:
++        for i in range(num_txns):
++            r1, w1 = txn_rw_sets[i]
++            vol = 0.0
++            for j in range(num_txns):
++                if i == j: continue
++                r2, w2 = txn_rw_sets[j]
++                # Conflict: (W1 n (W2 u R2)) or (R1 n W2)
++                if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
++                    vol += txn_durations[j]
++            txn_conflict_vol[i] = vol
++
++    # Urgency Score
++    max_vol = max(txn_conflict_vol.values()) if txn_conflict_vol else 1.0
++    if max_vol == 0: max_vol = 1.0
++    max_dur = max(txn_durations.values()) if txn_durations else 1.0
++
++    txn_urgency = {}
++    for t in range(num_txns):
++        # Weighted sum of normalized duration and conflict volume
++        # High conflict volume is very important for makespan
++        u = (txn_durations[t] / max_dur) + 0.8 * (txn_conflict_vol[t] / max_vol)
++        txn_urgency[t] = u
++
++    # --- 2. LOOKAHEAD BEAM SEARCH ---
++
++    BEAM_WIDTH = max(5, int(num_seqs))
++
++    # Beam: (cost, schedule, remaining)
+     beam = [(0, [], list(range(num_txns)))]
+ 
+-    for step in range(num_txns):
+-        # Linear taper
+-        progress = step / num_txns
+-        width = int(start_width + (end_width - start_width) * progress)
+-        width = max(2, width)
+-
++    for _ in range(num_txns):
+         candidates_pool = []
+ 
+         for p_cost, p_sched, p_remain in beam:
++
++            # Selection Strategy
++            sorted_remain = sorted(p_remain, key=lambda x: txn_urgency[x], reverse=True)
++
+             next_candidates = set()
+ 
+-            # Tail optimization
+-            if len(p_remain) <= 20:
+-                next_candidates.update(p_remain)
++            # 1. Deterministic Top K (Greedy)
++            next_candidates.update(sorted_remain[:3])
++
++            # 2. Cubic Weighted Sampling
++            # Bias heavily towards high urgency but allow stochasticity
++            if len(sorted_remain) > 3:
++                pool = sorted_remain[3:]
++                # Cubic weights emphasize the head of the distribution
++                weights = [txn_urgency[x]**3 for x in pool]
++                # Sample
++                k_sample = min(4, len(pool))
++                if pool:
++                    samples = random.choices(pool, weights=weights, k=k_sample)
++                    next_candidates.update(samples)
++
++            # 3. Random for diversity (Tail)
++            if len(sorted_remain) > 10:
++                next_candidates.update(random.sample(sorted_remain, 1))
++
++            # Lookahead Evaluation
++            # Pre-calculate the single best remaining item for lookahead context
++            # (Approximation: best overall remaining, not necessarily compatible, but good heuristic)
++            best_future = sorted_remain[0]
++            second_best_future = sorted_remain[1] if len(sorted_remain) > 1 else None
++
++            for c in next_candidates:
++                new_sched = p_sched + [c]
++
++                # Lookahead Step
++                # Tentatively schedule one more item to see if 'c' blocks it
++                metric_cost = 0
++
++                # If c is the best_future, we look ahead with second best
++                lookahead_item = second_best_future if c == best_future else best_future
++
++                if lookahead_item is not None:
++                    # Cost after 2 steps
++                    la_sched = new_sched + [lookahead_item]
++                    metric_cost = workload.get_opt_seq_cost(la_sched)
++                else:
++                    # End of schedule
++                    metric_cost = workload.get_opt_seq_cost(new_sched)
++
++                # Sorting Key: Minimize Lookahead Cost
++                # Tie-break: Maximize Urgency of current choice
++                candidates_pool.append(((metric_cost, -txn_urgency[c]), new_sched, [x for x in p_remain if x != c]))
++
++        # Prune
++        candidates_pool.sort(key=lambda x: x[0])
++        # Reconstruct beam.
++        # Note: We discard the exact 'current cost' in the tuple and just carry forward.
++        # The lookahead cost is not the actual cost of the partial schedule, but that's fine for ranking.
++        # For the next step, we only need the schedule and remaining list.
++        # We can pass 0 as cost since we recalculate.
++        beam = [(0, x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH]]
++
++    best_state = beam[0]
++    current_schedule = best_state[1]
++    current_cost = workload.get_opt_seq_cost(current_schedule)
++
++    # --- 3. REFINEMENT: BLOCK-MOVE ILS ---
++
++    def apply_block_moves(sched, base_cost, num_attempts=50):
++        """Try moving blocks of transactions."""
++        curr_s = list(sched)
++        curr_c = base_cost
++        n = len(curr_s)
++
++        for _ in range(num_attempts):
++            # Pick a block
++            blk_len = random.randint(2, 5) # Small blocks
++            if n < blk_len: continue
++
++            src_start = random.randint(0, n - blk_len)
++            block = curr_s[src_start : src_start + blk_len]
++
++            # Remove block
++            temp_s = curr_s[:src_start] + curr_s[src_start + blk_len:]
++
++            # Insert elsewhere
++            dst = random.randint(0, len(temp_s))
++            cand_s = temp_s[:dst] + block + temp_s[dst:]
++
++            cand_c = workload.get_opt_seq_cost(cand_s)
++
++            if cand_c < curr_c:
++                curr_c = cand_c
++                curr_s = cand_s
++
++        return curr_c, curr_s
++
++    # Global Re-insertion of Top Urgency Items (Fixing beam errors)
++    top_urgent = sorted(range(num_txns), key=lambda x: txn_urgency[x], reverse=True)[:5]
++    for t in top_urgent:
++        if t not in current_schedule: continue
++        idx = current_schedule.index(t)
++        temp = current_schedule[:idx] + current_schedule[idx+1:]
++
++        best_pos = idx
++        best_val = current_cost
++
++        # Scan full range for these critical few
++        for p in range(len(temp)+1):
++            cand = temp[:p] + [t] + temp[p:]
++            c = workload.get_opt_seq_cost(cand)
++            if c < best_val:
++                best_val = c
++                best_pos = p
++
++        if best_val < current_cost:
++            current_cost = best_val
++            current_schedule = temp[:best_pos] + [t] + temp[best_pos:]
++
++    # ILS Loop
++    iterations = 5
++    for _ in range(iterations):
++        # 1. Perturbation: Block Shuffle or Swap
++        neigh = list(current_schedule)
++        if random.random() < 0.4:
++            # Block Move Perturbation
++            current_cost, current_schedule = apply_block_moves(current_schedule, current_cost, num_attempts=20)
++            neigh = list(current_schedule) # Sync
++        else:
++            # Random Swaps
++            for _ in range(3):
++                i, j = random.randint(0, num_txns-1), random.randint(0, num_txns-1)
++                neigh[i], neigh[j] = neigh[j], neigh[i]
++
++        kick_cost = workload.get_opt_seq_cost(neigh)
++
++        # 2. Repair: Greedy Descent (Single Item)
++        # Quick pass to fix obviously bad placements
++        repaired_c = kick_cost
++        repaired_s = neigh
++
++        # Simple random descent
++        for _ in range(50):
++            i = random.randint(0, num_txns-1)
++            val = repaired_s.pop(i)
++            j = random.randint(0, num_txns-1)
++            repaired_s.insert(j, val)
++            c = workload.get_opt_seq_cost(repaired_s)
++            if c < repaired_c:
++                repaired_c = c
+             else:
+-                # Heuristic: Prefer Long items that unlock many conflicts
+-                # Weight = Duration * (1 + NormalizedDegree)
+-                weights = []
+-                for t in p_remain:
+-                    w = txn_durations[t] * (1.0 + (txn_conflict_degree[t] / max_degree))
+-                    weights.append(w)
+-
+-                # Sample
+-                # Deterministic top 2 (Greedy)
+-                sorted_by_w = sorted(zip(p_remain, weights), key=lambda x: x[1], reverse=True)
+-                next_candidates.add(sorted_by_w[0][0])
+-                if len(sorted_by_w) > 1: next_candidates.add(sorted_by_w[1][0])
+-
+-                # Probabilistic sampling
+-                samples = random.choices(p_remain, weights=weights, k=5)
+-                next_candidates.update(samples)
+-
+-                # Random diversity
+-                next_candidates.update(random.sample(p_remain, min(len(p_remain), 2)))
+-
+-            for cand in next_candidates:
+-                new_sched = p_sched + [cand]
+-                cost = workload.get_opt_seq_cost(new_sched)
+-
+-                # Metric: (Cost, -ConflictDegree, -Duration)
+-                # Tie-breaker: If costs equal, prefer schedule that cleared a high-degree node
+-                metric = (cost, -txn_conflict_degree[cand], -txn_durations[cand])
+-
+-                new_remain = list(p_remain)
+-                new_remain.remove(cand)
+-                candidates_pool.append((metric, new_sched, new_remain))
+-
+-        candidates_pool.sort(key=lambda x: x[0])
+-        beam = [(x[0][0], x[1], x[2]) for x in candidates_pool[:width]]
+-
+-    best_state = beam[0]
+-    current_cost = best_state[0]
+-    current_schedule = best_state[1]
+-
+-    # --- 3. REFINEMENT PHASE 1: CRITICAL ITEM RE-INSERTION ---
+-    # Identify items that are both long and high-conflict (Critical)
+-    # Try to re-optimize their position globally.
+-
+-    critical_score = lambda t: txn_durations[t] * (txn_conflict_degree[t] + 1)
+-    critical_items = sorted(range(num_txns), key=critical_score, reverse=True)[:12]
+-
+-    for item in critical_items:
+-        try:
+-            curr_idx = current_schedule.index(item)
+-        except ValueError:
+-            continue
+-
+-        # Remove
+-        base = current_schedule[:curr_idx] + current_schedule[curr_idx+1:]
+-
+-        best_pos_cost = current_cost
+-        best_pos_sched = None
+-
+-        # Try every position for these critical few.
+-        step_size = 1
+-        if len(base) > 200: step_size = 5 # coarse search for very large N
+-
+-        for pos in range(0, len(base) + 1, step_size):
+-            test = list(base)
+-            test.insert(pos, item)
+-            c = workload.get_opt_seq_cost(test)
+-            if c < best_pos_cost:
+-                best_pos_cost = c
+-                best_pos_sched = test
+-
+-        if best_pos_sched:
+-            current_cost = best_pos_cost
+-            current_schedule = best_pos_sched
+-
+-    # --- 4. REFINEMENT PHASE 2: WINDOWED LOCAL SEARCH ---
+-    # Systematic pass over schedule to fix local orderings
+-
+-    improved = True
+-    passes = 0
+-    max_passes = 2
+-
+-    while improved and passes < max_passes:
+-        improved = False
+-        passes += 1
+-
+-        for i in range(num_txns):
+-            txn = current_schedule[i]
+-
+-            # Define window
+-            window = 10
+-            start = max(0, i - window)
+-            end = min(num_txns, i + window + 1)
+-
+-            # Remove txn
+-            base = current_schedule[:i] + current_schedule[i+1:]
+-
+-            local_best = current_cost
+-            local_sched = None
+-
+-            # Try insertion in window
+-            for pos in range(start, end):
+-                if pos == i: continue # roughly same
+-
+-                test = list(base)
+-                test.insert(pos, txn)
+-                c = workload.get_opt_seq_cost(test)
+-
+-                if c < local_best:
+-                    local_best = c
+-                    local_sched = test
+-
+-            if local_sched:
+-                current_cost = local_best
+-                current_schedule = local_sched
+-                improved = True
+-
+-    # Final stochastic cleanup
+-    for _ in range(200):
+-        src, dst = random.randint(0, num_txns-1), random.randint(0, num_txns-1)
+-        if src == dst: continue
+-        neigh = list(current_schedule)
+-        val = neigh.pop(src)
+-        neigh.insert(dst, val)
+-        c = workload.get_opt_seq_cost(neigh)
+-        if c < current_cost:
+-            current_cost = c
+-            current_schedule = neigh
++                # Revert
++                repaired_s.pop(j)
++                repaired_s.insert(i, val)
++
++        if repaired_c < current_cost:
++            current_cost = repaired_c
++            current_schedule = repaired_s
+ 
+     return current_cost, current_schedule
+ 
+ 
+ def get_random_costs():
+     """Evaluate scheduling algorithm on three different workloads."""
+     start_time = time.time()
+ 
+     # Parameter for beam search budget
+     num_seqs = 10
+ 
+     # Process workloads
+     workload1 = Workload(WORKLOAD_1)
+     makespan1, schedule1 = get_best_schedule(workload1, num_seqs)
+ 
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, num_seqs)
+ 
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, num_seqs)
+ 
+     total_makespan = makespan1 + makespan2 + makespan3
+     schedules = [schedule1, schedule2, schedule3]
+     execution_time = time.time() - start_time
+ 
+     return total_makespan, schedules, execution_time
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_scheduling():
+     """Run the transaction scheduling algorithm for all workloads"""
+     total_makespan, schedules, execution_time = get_random_costs()
+     return total_makespan, schedules, execution_time
+ 
+ 
+ if __name__ == "__main__":
+     total_makespan, schedules, execution_time = run_scheduling()
+     print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+     print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

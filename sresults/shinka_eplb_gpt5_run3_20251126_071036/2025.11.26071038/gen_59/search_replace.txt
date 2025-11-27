@@ -1,0 +1,306 @@
+<NAME>
+dhondt_tail_ab_tiebreak_and_refine_light2
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements:
+
+1) In replicate_experts, I add deterministic tie-breaking for benefit argmax (D’Hondt and tail picks). When multiple experts have equal benefit, we break ties by choosing the expert with the lower current average load, then by lower index. This improves stability and tends to avoid exacerbating peaks without extra cost. I also replace the tail-only Sainte-Laguë policy with a per-step micro A/B between Sainte-Laguë and Huntington–Hill, choosing the option that minimizes the predicted new peak (with deterministic tie-breaking). This typically reduces the final peak with negligible overhead.
+
+2) In CapacityPacker._refine_single_layer, I broaden the local refinement to consider swaps with both the lightest and the second-lightest packs, selecting the single swap that minimizes the predicted new global peak, applying it only if it strictly improves the current peak. This provides better balancing across packs (GPUs) with very small additional compute.
+
+These changes align with the recommendations, aim to improve balancedness, and keep runtime overhead minimal to maintain speed.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Targeted refinement by swapping one item between heaviest and lightest packs
+        per iteration (up to self.refine_steps). Uses a searchsorted-based best-swap
+        selection for improved reduction of max imbalance.
+        """
+        if self.refine_steps <= 0:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for _ in range(self.refine_steps):
+            h = int(torch.argmax(pack_w).item())
+            l = int(torch.argmin(pack_w).item())
+            if h == l:
+                break
+            delta = float(pack_w[h] - pack_w[l])
+            if delta <= 1e-9:
+                break
+
+            heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+            light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+            if heavy_idx.numel() == 0 or light_idx.numel() == 0:
+                break
+
+            w = weights
+            hw = w[heavy_idx]
+            lw = w[light_idx]
+            lw_sorted, lw_perm = torch.sort(lw)  # ascending
+
+            if lw_sorted.numel() == 0 or hw.numel() == 0:
+                break
+
+            # For each heavy item, find light item closest to target = hw - delta/2
+            target = hw - (delta / 2.0)
+            pos = torch.searchsorted(lw_sorted, target)
+            pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+            cand_pos = torch.stack(
+                [pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1
+            )  # [H, 2]
+            cand_lw = lw_sorted[cand_pos]  # [H, 2]
+            resid = (delta - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+            best_flat = int(torch.argmin(resid).item())
+            best_h_index = best_flat // 2
+            best_option = best_flat % 2
+            j_sorted_idx = int(cand_pos[best_h_index, best_option].item())
+
+            wi = float(hw[best_h_index].item())
+            wj = float(lw_sorted[j_sorted_idx].item())
+            new_delta = abs(delta - 2.0 * (wi - wj))
+            if new_delta < delta - 1e-9:
+                hi = heavy_idx[best_h_index]
+                lj = light_idx[lw_perm[j_sorted_idx]]
+                pack_idx[hi] = l
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l] = pack_w[l] - wj + wi
+            else:
+                break
+
+        return pack_idx
+=======
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Targeted refinement by swapping one item between the heaviest pack and the
+        lightest or second-lightest packs per iteration (up to self.refine_steps).
+        Chooses the swap that minimizes the predicted new global peak and applies
+        it only if it strictly improves the current peak.
+        """
+        if self.refine_steps <= 0:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for _ in range(self.refine_steps):
+            # Identify heaviest pack
+            h = int(torch.argmax(pack_w).item())
+
+            # Candidate light packs: lightest and (if available) second-lightest excluding h
+            order = torch.argsort(pack_w, descending=False)
+            light_candidates = []
+            for pid in order.tolist():
+                if pid != h:
+                    light_candidates.append(pid)
+                if len(light_candidates) >= 2:
+                    break
+            if not light_candidates:
+                break
+
+            # Indices of items in heaviest pack
+            heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+            if heavy_idx.numel() == 0:
+                break
+
+            w = weights
+            hw = w[heavy_idx]
+            if hw.numel() == 0:
+                break
+
+            # Current global peak
+            cur_peak = float(pack_w.max().item())
+
+            # Track best candidate across light candidates
+            best_candidate = None  # (new_peak, hi, lj, l_sel, wi, wj, new_delta)
+
+            for l in light_candidates:
+                light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+                if light_idx.numel() == 0:
+                    continue
+                lw = w[light_idx]
+                if lw.numel() == 0:
+                    continue
+
+                # Current imbalance between h and this l
+                delta_hl = float(pack_w[h] - pack_w[l])
+                if delta_hl <= 1e-9:
+                    continue
+
+                # Sort light weights ascending and find nearest partners for each heavy item
+                lw_sorted, lw_perm = torch.sort(lw)  # ascending
+                target = hw - (delta_hl / 2.0)
+                pos = torch.searchsorted(lw_sorted, target)
+                pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+                cand_pos = torch.stack(
+                    [pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1
+                )  # [H, 2]
+                cand_lw = lw_sorted[cand_pos]  # [H, 2]
+                resid = (delta_hl - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+                best_flat = int(torch.argmin(resid).item())
+                best_h_index = best_flat // 2
+                best_option = best_flat % 2
+                j_sorted_idx = int(cand_pos[best_h_index, best_option].item())
+
+                wi = float(hw[best_h_index].item())
+                wj = float(lw_sorted[j_sorted_idx].item())
+                # Predicted new delta for (h, l) (for tie-break)
+                new_delta_hl = abs(delta_hl - 2.0 * (wi - wj))
+
+                # Predicted new global peak if we swap (hi <-> lj)
+                if num_packs > 2:
+                    mask = torch.ones(num_packs, dtype=torch.bool, device=pack_w.device)
+                    mask[h] = False
+                    mask[l] = False
+                    other_max = float(pack_w[mask].max().item()) if mask.any() else float('-inf')
+                else:
+                    other_max = float('-inf')
+                new_h = float(pack_w[h].item()) - wi + wj
+                new_l = float(pack_w[l].item()) - wj + wi
+                cand_peak = max(other_max, new_h, new_l)
+
+                # Keep the candidate with smallest new global peak; tie-break by new delta
+                if best_candidate is None or cand_peak < best_candidate[0] - 1e-12 or (
+                    abs(cand_peak - best_candidate[0]) <= 1e-12 and new_delta_hl < best_candidate[6]
+                ):
+                    hi = heavy_idx[best_h_index]
+                    lj = light_idx[lw_perm[j_sorted_idx]]
+                    best_candidate = (cand_peak, hi, lj, l, wi, wj, new_delta_hl)
+
+            if best_candidate is None:
+                break
+
+            # Apply only if it strictly improves the global peak
+            if best_candidate[0] + 1e-12 < cur_peak:
+                _, hi, lj, l_sel, wi, wj, _ = best_candidate
+                pack_idx[hi] = l_sel
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l_sel] = pack_w[l_sel] - wj + wi
+            else:
+                break
+
+        return pack_idx
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    col = num_log
+    # Bulk phase (D'Hondt): benefit = weight / r
+    for _ in range(bulk):
+        benefit = weight / logcnt
+        best = benefit.max(dim=-1).indices
+        phy2log[:, col] = best
+        rank[:, col] = logcnt[arangen, best]
+        logcnt[arangen, best] += 1
+        col += 1
+
+    # Tail phase (Sainte-Laguë): benefit = weight / (2r - 1)
+    if tail > 0:
+        for _ in range(tail):
+            denom = (2 * logcnt - 1).to(weight.dtype)
+            benefit = weight / denom
+            best = benefit.max(dim=-1).indices
+            phy2log[:, col] = best
+            rank[:, col] = logcnt[arangen, best]
+            logcnt[arangen, best] += 1
+            col += 1
+=======
+    col = num_log
+    # Bulk phase (D'Hondt): benefit = weight / r, with deterministic tie-breaking
+    for _ in range(bulk):
+        r_f = logcnt.to(weight.dtype)
+        benefit = weight / r_f
+        avg_cur = weight / r_f
+        maxval = benefit.max(dim=-1).values.unsqueeze(1)
+        mask = benefit == maxval
+        idx_vec = torch.arange(num_log, device=device).view(1, -1).expand(n, -1)
+        infmat = torch.full((n, num_log), float('inf'), dtype=avg_cur.dtype, device=device)
+        # Among maxima, choose smallest current avg; break ties by lower index
+        tie_score = torch.where(mask, avg_cur + 1e-12 * (idx_vec.to(avg_cur.dtype) / float(num_log)), infmat)
+        best = tie_score.argmin(dim=-1)
+        phy2log[:, col] = best
+        rank[:, col] = logcnt[arangen, best]
+        logcnt[arangen, best] += 1
+        col += 1
+
+    # Tail phase: per-step choose between Sainte-Laguë and Huntington–Hill to minimize predicted peak
+    if tail > 0:
+        for _ in range(tail):
+            r_f = logcnt.to(weight.dtype)
+            avg_cur = weight / r_f
+
+            # Compute benefits
+            benef_S = weight / (2.0 * r_f - 1.0)
+            benef_H = weight / torch.sqrt(r_f * (r_f + 1.0))
+
+            # Deterministic tie-broken argmax for S and H
+            maxS = benef_S.max(dim=-1).values.unsqueeze(1)
+            maskS = benef_S == maxS
+            idx_vec = torch.arange(num_log, device=device).view(1, -1).expand(n, -1)
+            infmat = torch.full((n, num_log), float('inf'), dtype=avg_cur.dtype, device=device)
+            scoreS = torch.where(maskS, avg_cur + 1e-12 * (idx_vec.to(avg_cur.dtype) / float(num_log)), infmat)
+            idx_S = scoreS.argmin(dim=-1)
+
+            maxH = benef_H.max(dim=-1).values.unsqueeze(1)
+            maskH = benef_H == maxH
+            scoreH = torch.where(maskH, avg_cur + 1e-12 * (idx_vec.to(avg_cur.dtype) / float(num_log)), infmat)
+            idx_H = scoreH.argmin(dim=-1)
+
+            # Predict new peaks for S and H
+            newS = weight[arangen, idx_S] / (r_f[arangen, idx_S] + 1.0)
+            newH = weight[arangen, idx_H] / (r_f[arangen, idx_H] + 1.0)
+
+            top2 = torch.topk(avg_cur, k=min(2, num_log), dim=-1).values
+            second = top2[:, 1] if num_log >= 2 else top2[:, 0]
+
+            peakS = torch.maximum(second, newS)
+            peakH = torch.maximum(second, newH)
+            use_S = peakS < peakH
+
+            # Tie-break equal peaks by smaller new receiver avg; then lower index
+            equal = ~use_S & ~(peakH < peakS)
+            choose_idx = torch.where(use_S, idx_S, idx_H)
+            if equal.any():
+                idx_eq_S = idx_S[equal]
+                idx_eq_H = idx_H[equal]
+                newS_eq = newS[equal]
+                newH_eq = newH[equal]
+                prefer_S_eq = newS_eq < newH_eq
+                base = torch.where(prefer_S_eq, idx_eq_S, idx_eq_H)
+                tie_equal = ~(newS_eq < newH_eq) & ~(newH_eq < newS_eq)
+                if tie_equal.any():
+                    lower = torch.minimum(idx_eq_S[tie_equal], idx_eq_H[tie_equal])
+                    base[tie_equal] = lower
+                choose_idx[equal] = base
+
+            best = choose_idx
+            phy2log[:, col] = best
+            rank[:, col] = logcnt[arangen, best]
+            logcnt[arangen, best] += 1
+            col += 1
+>>>>>>> REPLACE
+
+</DIFF>

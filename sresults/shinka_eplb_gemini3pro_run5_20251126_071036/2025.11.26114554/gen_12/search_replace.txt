@@ -1,0 +1,185 @@
+<NAME>
+optimize_packing_refinement
+</NAME>
+
+<DESCRIPTION>
+1.  **Global All-Pairs Refinement**: Replaces the `_refine_packing` function with a more aggressive "Max-vs-All" strategy. Instead of only considering swaps between the heaviest and lightest packs (which can get stuck in local optima), this checks swaps between the heaviest pack and *all* other packs. This is computationally feasible because the number of packs (nodes/GPUs) is small. It directly targets the minimization of the maximum load (makespan).
+2.  **Optimized Greedy Initialization**: Updates the inner loop of `balanced_packing` to avoid dynamic indexing (`torch.nonzero`) and instead use efficient masking (`torch.where` with infinity) to select the best pack. This improves the speed of the initialization phase.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 20) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items between the max-load
+    and min-load packs to reduce variance.
+
+    Args:
+        weights: [num_groups] weights of items
+        pack_indices: [num_packs, groups_per_pack] indices of items in each pack
+        pack_weights: [num_packs] total weight of each pack
+
+    Returns:
+        pack_indices: Refined item assignments
+    """
+    for _ in range(max_iters):
+        # Identify extreme packs
+        max_load, max_pid = torch.max(pack_weights, dim=0)
+        min_load, min_pid = torch.min(pack_weights, dim=0)
+
+        diff = max_load - min_load
+        if diff < 1e-6:
+            break
+
+        # Get items currently in these packs
+        items_max = pack_indices[max_pid] # [groups_per_pack]
+        items_min = pack_indices[min_pid] # [groups_per_pack]
+
+        w_max_items = weights[items_max] # [groups_per_pack]
+        w_min_items = weights[items_min] # [groups_per_pack]
+
+        # Calculate potential deltas for all pairs: w_i (from max) - w_j (from min)
+        # Broadcast: [G, 1] - [1, G] -> [G, G]
+        deltas = w_max_items.unsqueeze(1) - w_min_items.unsqueeze(0)
+
+        # We want to perform a swap if it reduces the difference between packs.
+        # New diff = |(max - d) - (min + d)| = |diff - 2d|
+        # Improvement = diff - |diff - 2d|
+        # We also prefer larger reductions.
+
+        scores = diff - torch.abs(diff - 2 * deltas)
+
+        best_score_flat, best_idx_flat = torch.max(scores.flatten(), dim=0)
+
+        if best_score_flat <= 1e-5:
+            # No beneficial swap found between these two packs
+            break
+
+        # Decode indices
+        r_idx = best_idx_flat // groups_per_pack
+        c_idx = best_idx_flat % groups_per_pack
+
+        # Execute swap
+        item_from_max = items_max[r_idx].item()
+        item_from_min = items_min[c_idx].item()
+
+        pack_indices[max_pid, r_idx] = item_from_min
+        pack_indices[min_pid, c_idx] = item_from_max
+
+        # Update weights
+        delta_val = deltas[r_idx, c_idx]
+        pack_weights[max_pid] -= delta_val
+        pack_weights[min_pid] += delta_val
+
+    return pack_indices
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 50) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items between the max-load
+    pack and any other pack to reduce the maximum load.
+
+    Args:
+        weights: [num_groups] weights of items
+        pack_indices: [num_packs, groups_per_pack] indices of items in each pack
+        pack_weights: [num_packs] total weight of each pack
+
+    Returns:
+        pack_indices: Refined item assignments
+    """
+    for _ in range(max_iters):
+        # Identify max pack
+        max_load, max_pid = torch.max(pack_weights, dim=0)
+
+        # Get items currently in max pack
+        items_max = pack_indices[max_pid]  # [groups_per_pack]
+        w_max_items = weights[items_max]   # [groups_per_pack]
+
+        # Get items in all packs
+        all_items = pack_indices           # [num_packs, groups_per_pack]
+        w_all_items = weights[all_items]   # [num_packs, groups_per_pack]
+
+        # Calculate deltas for swapping item i from max pack with item j from any pack k
+        # delta = w_max_i - w_k_j
+        # [1, 1, G] - [P, G, 1] -> [P, G, G]
+        deltas = w_max_items.view(1, 1, -1) - w_all_items.view(num_packs, groups_per_pack, 1)
+
+        # Calculate new loads if swap happens
+        # New max pack load: max_load - delta
+        # New pack k load: current_k_load + delta
+        new_max_load = max_load - deltas
+        new_k_load = pack_weights.view(num_packs, 1, 1) + deltas
+
+        # We want to minimize the larger of the two resulting loads
+        # Objective: max(new_max_load, new_k_load)
+        objectives = torch.max(new_max_load, new_k_load)
+
+        # Mask out swaps with self (k == max_pid)
+        objectives[max_pid] = float('inf')
+
+        # Find best swap
+        min_obj, flat_idx = torch.min(objectives.flatten(), dim=0)
+
+        # If the best swap doesn't improve the max load significantly, stop
+        if min_obj >= max_load - 1e-6:
+            break
+
+        # Decode indices
+        best_pid = flat_idx // (groups_per_pack * groups_per_pack)
+        rem = flat_idx % (groups_per_pack * groups_per_pack)
+        best_k_item_idx = rem // groups_per_pack
+        best_max_item_idx = rem % groups_per_pack
+
+        # Execute swap
+        item_from_max = items_max[best_max_item_idx].item()
+        item_from_k = all_items[best_pid, best_k_item_idx].item()
+
+        pack_indices[max_pid, best_max_item_idx] = item_from_k
+        pack_indices[best_pid, best_k_item_idx] = item_from_max
+
+        # Update weights
+        delta_val = deltas[best_pid, best_k_item_idx, best_max_item_idx]
+        pack_weights[max_pid] -= delta_val
+        pack_weights[best_pid] += delta_val
+
+    return pack_indices
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # Identify packs that are not full
+            mask = current_pack_counts < groups_per_pack
+            valid_packs = torch.nonzero(mask).squeeze(-1)
+
+            # Greedily choose the one with minimum current weight
+            # (argmin over a slice)
+            valid_weights = current_pack_weights[valid_packs]
+            best_local_idx = torch.argmin(valid_weights)
+            best_pack = valid_packs[best_local_idx]
+
+            # Assign
+            slot = current_pack_counts[best_pack]
+            pack_assignment[best_pack, slot] = item_idx
+            current_pack_weights[best_pack] += w
+            current_pack_counts[best_pack] += 1
+=======
+            # Greedily choose the one with minimum current weight
+            # Mask out full packs by setting their weight to infinity
+            is_full = current_pack_counts >= groups_per_pack
+            masked_weights = torch.where(is_full, float('inf'), current_pack_weights)
+            best_pack = torch.argmin(masked_weights)
+
+            # Assign
+            slot = current_pack_counts[best_pack]
+            pack_assignment[best_pack, slot] = item_idx
+            current_pack_weights[best_pack] += w
+            current_pack_counts[best_pack] += 1
+>>>>>>> REPLACE
+</DIFF>

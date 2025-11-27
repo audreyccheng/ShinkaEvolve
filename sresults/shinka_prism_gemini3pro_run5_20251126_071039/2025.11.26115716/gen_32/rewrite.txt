@@ -1,0 +1,297 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure using Robust BFD Binary Search and Best-Improvement ILS"""
+
+import copy
+import random
+import math
+
+GPU_MEM_SIZE = 80.0  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Minimizes max KVPR using Robust Binary Search with Best-Fit Decreasing (BFD) 
+    and Best-Improvement Iterated Local Search with Variance Tie-Breaking.
+    """
+    # 1. Pre-process and Validation
+    total_size = sum(m.model_size for m in models)
+    if total_size > gpu_num * GPU_MEM_SIZE:
+        raise ValueError("Total model size exceeds total GPU memory capacity.")
+
+    # Prepare items: (w, s, m)
+    items = [{'w': m.req_rate / m.slo, 's': m.model_size, 'm': m} for m in models]
+
+    # 2. Binary Search for Initial Solution
+    total_w = sum(x['w'] for x in items)
+    slack = gpu_num * GPU_MEM_SIZE - total_size
+    
+    # Heuristic bound initialization
+    low = 0.0
+    if slack < 1e-6:
+        high = 10000.0
+    else:
+        avg_pressure = total_w / slack
+        high = max(10.0, avg_pressure * 8.0)
+        
+    best_placement = None
+    feasible_high = False
+    
+    # Search for valid upper bound
+    for _ in range(20):
+        feasible, placement = _check_feasibility_bfd(gpu_num, items, high)
+        if feasible:
+            best_placement = placement
+            feasible_high = True
+            break
+        low = high
+        high *= 2.0
+        
+    if not feasible_high:
+        raise ValueError("Unable to place models. Constraints likely too tight.")
+        
+    # Precise Binary Search
+    for _ in range(25):
+        mid = (low + high) / 2.0
+        feasible, placement = _check_feasibility_bfd(gpu_num, items, mid)
+        if feasible:
+            best_placement = placement
+            high = mid
+        else:
+            low = mid
+            
+    # Convert to map
+    placement_map = {i: best_placement[i] for i in range(gpu_num)}
+    
+    # 3. Refinement: Best-Improvement Local Search
+    return _best_improvement_ils(gpu_num, placement_map)
+
+def _check_feasibility_bfd(gpu_num, items, K):
+    """
+    Checks feasibility using Best-Fit Decreasing (BFD) with multiple sorting heuristics.
+    """
+    virtual_cap = K * GPU_MEM_SIZE
+    
+    # Create augmented items for sorting
+    # We calculate keys once per check
+    pack_items = []
+    for x in items:
+        # Virtual Size: v = w + K * s
+        v = x['w'] + K * x['s']
+        # Density: w / s
+        d = x['w'] / (x['s'] + 1e-7)
+        pack_items.append({'v': v, 's': x['s'], 'w': x['w'], 'd': d, 'm': x['m']})
+        
+    # Heuristics: (key_lambda, reverse)
+    heuristics = [
+        (lambda x: x['v'], True),  # Virtual Size Desc
+        (lambda x: x['s'], True),  # Physical Size Desc
+        (lambda x: x['d'], True),  # Density Desc
+        (lambda x: x['w'], True),  # Load Desc (Intensity)
+    ]
+    
+    for key_func, rev in heuristics:
+        pack_items.sort(key=key_func, reverse=rev)
+        
+        # Run Best-Fit Decreasing
+        # BFD places item in the bin with minimum sufficient residual capacity
+        
+        bins_v = [0.0] * gpu_num
+        bins_p = [0.0] * gpu_num
+        placement = [[] for _ in range(gpu_num)]
+        possible = True
+        
+        for item in pack_items:
+            best_bin = -1
+            min_rem_v = float('inf')
+            
+            for i in range(gpu_num):
+                # Check constraints
+                if bins_p[i] + item['s'] <= GPU_MEM_SIZE and bins_v[i] + item['v'] <= virtual_cap + 1e-7:
+                    # Calculate residual virtual capacity
+                    rem = virtual_cap - (bins_v[i] + item['v'])
+                    if rem < min_rem_v:
+                        min_rem_v = rem
+                        best_bin = i
+            
+            if best_bin != -1:
+                bins_p[best_bin] += item['s']
+                bins_v[best_bin] += item['v']
+                placement[best_bin].append(item['m'])
+            else:
+                possible = False
+                break
+        
+        if possible:
+            return True, placement
+            
+    return False, None
+
+def _best_improvement_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Best-Improvement Descent and Variance Tie-Breaking.
+    """
+    # Initialize State
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+    
+    def get_k(i):
+        rem = GPU_MEM_SIZE - gpu_s[i]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[i] / rem
+        
+    current_ks = [get_k(i) for i in range(gpu_num)]
+    max_k = max(current_ks)
+    
+    best_placement = copy.deepcopy(placement)
+    best_max_k = max_k
+    
+    no_improve = 0
+    max_steps = 300
+    patience = 20
+    
+    for _ in range(max_steps):
+        # 1. Identify Bottleneck
+        # Find all GPUs within tolerance of max_k to target
+        bottlenecks = [i for i, k in enumerate(current_ks) if k > max_k - 1e-5]
+        # Target the one with highest K (should be all similar)
+        src = bottlenecks[0]
+        
+        # 2. Greedy Descent: Find Best Move/Swap
+        best_move = None # (type, idx1, dst, idx2)
+        best_gain_k = -1.0
+        best_gain_var = -1.0
+        
+        src_models = placement[src]
+        
+        # Phase A: Moves
+        for i, m in enumerate(src_models):
+            s, w = m.model_size, m.req_rate/m.slo
+            for dst in range(gpu_num):
+                if dst == src: continue
+                if gpu_s[dst] + s > GPU_MEM_SIZE: continue
+                
+                # New Ks
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - s)
+                nk_src = (gpu_w[src] - w) / rem_src if rem_src > 1e-7 else 1e9
+                
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + s)
+                nk_dst = (gpu_w[dst] + w) / rem_dst if rem_dst > 1e-7 else 1e9
+                
+                # Check impact on local max
+                # We want to reduce max(src, dst) compared to old max(src, dst)
+                # Ideally, we want new_max < global_max
+                
+                new_local_max = max(nk_src, nk_dst)
+                
+                if new_local_max < current_ks[src] - 1e-7:
+                    gain_k = current_ks[src] - new_local_max
+                    # Variance reduction (positive is good)
+                    gain_var = (current_ks[src]**2 + current_ks[dst]**2) - (nk_src**2 + nk_dst**2)
+                    
+                    if gain_k > best_gain_k + 1e-7:
+                        best_gain_k = gain_k
+                        best_gain_var = gain_var
+                        best_move = ('move', i, dst, None)
+                    elif abs(gain_k - best_gain_k) < 1e-7:
+                        if gain_var > best_gain_var:
+                            best_gain_var = gain_var
+                            best_move = ('move', i, dst, None)
+
+        # Phase B: Swaps
+        # Only if we haven't found a massive improvement, or to check for better variance
+        # Check swaps with non-bottlenecks to avoid complexity
+        for i, m1 in enumerate(src_models):
+            s1, w1 = m1.model_size, m1.req_rate/m1.slo
+            for dst in range(gpu_num):
+                if dst == src: continue
+                # Skip swapping with other high-pressure GPUs unless desperate
+                if current_ks[dst] > max_k * 0.95: continue
+                
+                for j, m2 in enumerate(placement[dst]):
+                    s2, w2 = m2.model_size, m2.req_rate/m2.slo
+                    
+                    ns_src = gpu_s[src] - s1 + s2
+                    ns_dst = gpu_s[dst] - s2 + s1
+                    if ns_src > GPU_MEM_SIZE or ns_dst > GPU_MEM_SIZE: continue
+                    
+                    rem_src = GPU_MEM_SIZE - ns_src
+                    rem_dst = GPU_MEM_SIZE - ns_dst
+                    nk_src = (gpu_w[src] - w1 + w2) / rem_src if rem_src > 1e-7 else 1e9
+                    nk_dst = (gpu_w[dst] - w2 + w1) / rem_dst if rem_dst > 1e-7 else 1e9
+                    
+                    new_local_max = max(nk_src, nk_dst)
+                    
+                    if new_local_max < current_ks[src] - 1e-7:
+                        gain_k = current_ks[src] - new_local_max
+                        gain_var = (current_ks[src]**2 + current_ks[dst]**2) - (nk_src**2 + nk_dst**2)
+                        
+                        if gain_k > best_gain_k + 1e-7:
+                            best_gain_k = gain_k
+                            best_gain_var = gain_var
+                            best_move = ('swap', i, dst, j)
+                        elif abs(gain_k - best_gain_k) < 1e-7:
+                            if gain_var > best_gain_var:
+                                best_gain_var = gain_var
+                                best_move = ('swap', i, dst, j)
+
+        # 3. Apply Best Move
+        if best_move:
+            mtype, idx1, dst, idx2 = best_move
+            if mtype == 'move':
+                m = placement[src].pop(idx1)
+                placement[dst].append(m)
+                gpu_s[src] -= m.model_size; gpu_w[src] -= m.req_rate/m.slo
+                gpu_s[dst] += m.model_size; gpu_w[dst] += m.req_rate/m.slo
+            else:
+                m1 = placement[src][idx1]
+                m2 = placement[dst][idx2]
+                placement[src][idx1] = m2
+                placement[dst][idx2] = m1
+                gpu_s[src] = gpu_s[src] - m1.model_size + m2.model_size
+                gpu_w[src] = gpu_w[src] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+                gpu_s[dst] = gpu_s[dst] - m2.model_size + m1.model_size
+                gpu_w[dst] = gpu_w[dst] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+            
+            current_ks[src] = get_k(src)
+            current_ks[dst] = get_k(dst)
+            new_global_max = max(current_ks)
+            
+            if new_global_max < best_max_k - 1e-6:
+                best_max_k = new_global_max
+                best_placement = copy.deepcopy(placement)
+                no_improve = 0
+            else:
+                if new_global_max < max_k - 1e-6:
+                    no_improve = 0 # Progress made on local structure
+                else:
+                    no_improve += 1
+            max_k = new_global_max
+        else:
+            no_improve += 1
+            
+        # 4. Burst Kick (Perturbation)
+        if no_improve > patience:
+            # Burst: 3-4 random moves to escape basin
+            for _ in range(4):
+                # Pick random src (weighted towards utilized GPUs slightly by probability?)
+                # Just random is fine for speed and diversity
+                r_src = random.randint(0, gpu_num-1)
+                if not placement[r_src]: continue
+                
+                m_idx = random.randint(0, len(placement[r_src])-1)
+                m = placement[r_src][m_idx]
+                
+                r_dst = random.randint(0, gpu_num-1)
+                if r_src == r_dst: continue
+                
+                if gpu_s[r_dst] + m.model_size <= GPU_MEM_SIZE:
+                    placement[r_dst].append(m)
+                    placement[r_src].pop(m_idx)
+                    gpu_s[r_src] -= m.model_size; gpu_w[r_src] -= m.req_rate/m.slo
+                    gpu_s[r_dst] += m.model_size; gpu_w[r_dst] += m.req_rate/m.slo
+            
+            # Recalculate State
+            current_ks = [get_k(i) for i in range(gpu_num)]
+            max_k = max(current_ks)
+            no_improve = 0
+            
+    return best_placement

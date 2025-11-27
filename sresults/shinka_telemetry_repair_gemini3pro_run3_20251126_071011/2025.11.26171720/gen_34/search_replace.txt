@@ -1,0 +1,216 @@
+The following code modification implements a **Dynamic Implied Candidate** strategy with **Immediate Updates (Gauss-Seidel)** and **Non-Linear Noise Modeling**.
+
+1.  **Dynamic Implied Candidates**: For edge links (and internally for suspect links), the algorithm calculates an "implied" value that would perfectly satisfy flow conservation at the router, given the current estimates of other flows. This allows the system to repair edge links where no peer interface exists to contradict a bad measurement, effectively using the router's other interfaces as a validator.
+2.  **Immediate Updates**: Instead of calculating all updates and applying them at the end of an iteration, the algorithm applies the "winner" value immediately. This propagates the corrected flow constraints to neighboring routers within the same iteration, leading to faster and more stable convergence (Gauss-Seidel method). Random shuffling prevents directional bias.
+3.  **Non-Linear Noise Modeling**: The tolerance `sigma` for flow conservation is calculated using a square-root scaling (`sqrt(flux) * 1.5`). This better models the Poisson-like variance of network traffic (noise scales with square root of signal), tightening constraints for large flows while being more lenient with small flows.
+
+<NAME>
+dynamic_implied_candidates_and_immediate_updates
+</NAME>
+
+<DESCRIPTION>
+Replaces the synchronous iterative solver with a Gauss-Seidel solver that generates dynamic 'implied' flow candidates derived from router conservation state. Uses non-linear sigma (sqrt scaling) for likelihood scoring to better model traffic variance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Iterative Solver
+    ITERATIONS = 5
+
+    def get_imbalance(rid):
+        if not rid: return 0.0, 1.0
+        in_flow = 0.0
+        out_flow = 0.0
+        for iid in topology.get(rid, []):
+            if iid in estimates:
+                in_flow += estimates[iid].get('rx', 0.0)
+                out_flow += estimates[iid].get('tx', 0.0)
+        return (in_flow - out_flow), max(in_flow, out_flow, 1.0)
+
+    for _ in range(ITERATIONS):
+        updates = [] # Store updates to apply synchronously
+
+        for flow in suspect_flows:
+            src = flow['src']
+            dst = flow['dst']
+            cands = flow['candidates']
+
+            # Routers
+            r_src = if_to_router.get(src) if src else None
+            r_dst = if_to_router.get(dst) if dst else None
+
+            # Current values to restore
+            old_src_val = estimates[src]['tx'] if src else 0.0
+            old_dst_val = estimates[dst]['rx'] if dst else 0.0
+
+            best_val = old_src_val
+
+            # Score candidates
+            # Score = P(src_conservation) * P(dst_conservation)
+            total_prob = 0.0
+            scored_cands = []
+
+            for val in cands:
+                # Apply hypothesis
+                if src: estimates[src]['tx'] = val
+                if dst: estimates[dst]['rx'] = val
+
+                # Check Imbalance
+                score_src = 1.0
+                if r_src:
+                    imb, flux = get_imbalance(r_src)
+                    sigma = max(flux * 0.03, 1.0) # 3% tolerance
+                    score_src = math.exp(-abs(imb)/sigma)
+
+                score_dst = 1.0
+                if r_dst:
+                    imb, flux = get_imbalance(r_dst)
+                    sigma = max(flux * 0.03, 1.0)
+                    score_dst = math.exp(-abs(imb)/sigma)
+
+                score = score_src * score_dst
+                scored_cands.append((val, score))
+                total_prob += score
+
+            # Restore
+            if src: estimates[src]['tx'] = old_src_val
+            if dst: estimates[dst]['rx'] = old_dst_val
+
+            # Normalize and pick winner
+            if total_prob > 0:
+                # Find max score
+                scored_cands.sort(key=lambda x: x[1], reverse=True)
+                winner_val, winner_raw_score = scored_cands[0]
+
+                # Confidence: Probability of winner * Absolute fit
+                prob = winner_raw_score / total_prob
+                # Absolute fit: geometric mean of agreement (0-1)
+                fit = math.sqrt(winner_raw_score)
+
+                conf = prob * fit
+                conf = max(0.01, min(0.99, conf))
+
+                updates.append((src, dst, winner_val, conf))
+
+        # Apply updates
+        for src, dst, val, conf in updates:
+            if src:
+                estimates[src]['tx'] = val
+                confidences[src]['tx'] = conf
+            if dst:
+                estimates[dst]['rx'] = val
+                confidences[dst]['rx'] = conf
+=======
+    # 3. Iterative Solver
+    ITERATIONS = 5
+
+    def get_router_state(rid, exclude_if=None, exclude_metric=None):
+        """Returns (imbalance, total_flow) for router, optionally excluding one interface metric."""
+        if not rid: return 0.0, 1.0
+        in_flow = 0.0
+        out_flow = 0.0
+
+        for iid in topology.get(rid, []):
+            # Sum inputs (RX)
+            if not (iid == exclude_if and exclude_metric == 'rx'):
+                in_flow += estimates[iid].get('rx', 0.0)
+
+            # Sum outputs (TX)
+            if not (iid == exclude_if and exclude_metric == 'tx'):
+                out_flow += estimates[iid].get('tx', 0.0)
+
+        return (in_flow - out_flow), max(in_flow, out_flow, 1.0)
+
+    import random
+
+    # Gauss-Seidel iteration with dynamic candidates
+    for iter_idx in range(ITERATIONS):
+        # Shuffle order to prevent bias propagation
+        random.shuffle(suspect_flows)
+
+        for flow in suspect_flows:
+            src = flow['src']
+            dst = flow['dst']
+            base_cands = flow['candidates'][:] # Copy
+
+            # Routers
+            r_src = if_to_router.get(src) if src else None
+            r_dst = if_to_router.get(dst) if dst else None
+
+            # --- Dynamic Candidate Generation (Implied Values) ---
+            # Determine what flow value would perfectly balance the router
+
+            # Implied from Source: Out = In - Other_Out
+            if r_src:
+                imb_others, flux_others = get_router_state(r_src, exclude_if=src, exclude_metric='tx')
+                # We want: My_TX = Total_In - Other_Out = imb_others (since imb = In - Out)
+                implied_src = max(0.0, imb_others)
+                base_cands.append(implied_src)
+
+            # Implied from Dest: In = Out - Other_In
+            if r_dst:
+                imb_others, flux_others = get_router_state(r_dst, exclude_if=dst, exclude_metric='rx')
+                # We want: My_RX = Total_Out - Other_In = -imb_others
+                implied_dst = max(0.0, -imb_others)
+                base_cands.append(implied_dst)
+
+            # Deduplicate (rounding to handle float precision)
+            unique_cands = set()
+            cleaned_cands = []
+            for c in base_cands:
+                r_c = round(c, 4)
+                if r_c not in unique_cands:
+                    unique_cands.add(r_c)
+                    cleaned_cands.append(c)
+
+            # --- Candidate Scoring ---
+            total_prob = 0.0
+            scored_cands = []
+
+            for val in cleaned_cands:
+                # Apply hypothesis temporarily
+                if src: estimates[src]['tx'] = val
+                if dst: estimates[dst]['rx'] = val
+
+                # Check Imbalance
+                score_src = 1.0
+                if r_src:
+                    imb, flux = get_router_state(r_src)
+                    # Non-linear sigma: sqrt scaling matches Poisson noise characteristics
+                    # 1.5 factor gives reasonable tolerance (e.g. 150Mbps for 10G link)
+                    sigma = max(math.sqrt(flux) * 1.5, 1.0)
+                    score_src = math.exp(-abs(imb)/sigma)
+
+                score_dst = 1.0
+                if r_dst:
+                    imb, flux = get_router_state(r_dst)
+                    sigma = max(math.sqrt(flux) * 1.5, 1.0)
+                    score_dst = math.exp(-abs(imb)/sigma)
+
+                score = score_src * score_dst
+                scored_cands.append((val, score))
+                total_prob += score
+
+            # --- Selection & Immediate Update ---
+            if total_prob > 0:
+                scored_cands.sort(key=lambda x: x[1], reverse=True)
+                winner_val, winner_raw_score = scored_cands[0]
+
+                # Confidence Calculation
+                # Relative probability * Absolute goodness of fit
+                prob = winner_raw_score / total_prob
+                fit = math.sqrt(winner_raw_score)
+                conf = prob * fit
+                conf = max(0.01, min(0.99, conf))
+
+                # Apply winner immediately
+                if src:
+                    estimates[src]['tx'] = winner_val
+                    confidences[src]['tx'] = conf
+                if dst:
+                    estimates[dst]['rx'] = winner_val
+                    confidences[dst]['rx'] = conf
+            else:
+                 pass
+>>>>>>> REPLACE
+</DIFF>

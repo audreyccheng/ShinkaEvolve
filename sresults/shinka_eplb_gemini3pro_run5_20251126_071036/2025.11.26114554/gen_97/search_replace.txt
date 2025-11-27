@@ -1,0 +1,140 @@
+<NAME>
+replica_refinement_step
+</NAME>
+
+<DESCRIPTION>
+Implement an iterative refinement step in the hierarchical load balancing strategy. After the initial assignment of physical experts to GPUs (Step 3), the algorithm evaluates the load balance. For nodes with high imbalance, it attempts to adjust the replication counts (transferring a replica from a min-load logical expert to a max-load logical expert) to smooth out the item sizes. This is followed by a re-packing of only the affected nodes. This addresses the root cause of imbalance (large indivisible items) by adaptively resizing them via replication.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Step 3: pack physical_experts to GPUs
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    pphy2phy = inverse(phy2pphy)
+
+    pphy2mlog = phy2mlog.gather(
+        -1, pphy2phy)
+    pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + torch.arange(
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+    logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+=======
+    # Step 3: pack physical_experts to GPUs
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+    num_packs_step3 = num_gpus // num_nodes
+
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy, num_packs_step3)
+
+    # --- Replica Count Refinement ---
+    # Adaptively adjust replication counts to reduce bottlenecks
+    for _ in range(1):
+        B = tokens_per_mlog.shape[0]
+        device = weight.device
+
+        # Calculate Pack Loads
+        current_pack_weights = torch.zeros(B, num_packs_step3, device=device)
+        current_pack_weights.scatter_add_(1, pack_index, tokens_per_phy)
+
+        max_load, max_pid = torch.max(current_pack_weights, dim=1)
+        min_load, min_pid = torch.min(current_pack_weights, dim=1)
+
+        # Identify Candidates
+        is_in_max = (pack_index == max_pid.unsqueeze(1))
+        is_in_min = (pack_index == min_pid.unsqueeze(1))
+
+        curr_w = tokens_per_phy
+
+        # Find heaviest item in Max Pack (best to split)
+        cand_u_vals = torch.where(is_in_max, curr_w, torch.tensor(-float('inf'), device=device))
+        best_u_phy_idx = torch.argmax(cand_u_vals, dim=1)
+        best_u_val = curr_w[torch.arange(B), best_u_phy_idx]
+
+        # Find cheapest item to merge in Min Pack (must have >1 replicas)
+        c_all = mlogcnt.gather(1, phy2mlog)
+        c_minus_1 = c_all - 1
+        valid_v = (c_minus_1 > 0) & is_in_min
+
+        cost_vals = curr_w / c_minus_1.float()
+        cost_vals = torch.where(valid_v, cost_vals, torch.tensor(float('inf'), device=device))
+
+        best_v_phy_idx = torch.argmin(cost_vals, dim=1)
+        min_cost = cost_vals[torch.arange(B), best_v_phy_idx]
+
+        # Gain from splitting u
+        c_u = c_all[torch.arange(B), best_u_phy_idx]
+        gain = best_u_val / (c_u + 1).float()
+
+        # Swap condition
+        should_swap = (gain > min_cost) & (max_load > min_load + 1e-4) & (min_cost != float('inf'))
+
+        if should_swap.any():
+            batch_indices = torch.nonzero(should_swap).squeeze(1)
+
+            u_log_idx = phy2mlog[torch.arange(B), best_u_phy_idx][batch_indices]
+            v_log_idx = phy2mlog[torch.arange(B), best_v_phy_idx][batch_indices]
+
+            # Update counts
+            mlogcnt[batch_indices, u_log_idx] += 1
+            mlogcnt[batch_indices, v_log_idx] -= 1
+
+            # Reconstruct mappings and repack for affected batches
+            n_log = tokens_per_mlog.shape[1]
+            n_phy = tokens_per_phy.shape[1]
+
+            curr_rank = torch.zeros((len(batch_indices), n_phy), dtype=torch.int64, device=device)
+            sub_phy2mlog = phy2mlog[batch_indices]
+
+            # CPU loop for reconstruction (usually fast for small batch count)
+            # Rebuilding phy2mlog and rank
+            b_list = batch_indices.tolist()
+            for k, real_idx in enumerate(b_list):
+                counts = mlogcnt[real_idx]
+                sub_phy2mlog[k] = torch.repeat_interleave(
+                    torch.arange(n_log, device=device), counts
+                )
+                curr = 0
+                for idx in range(n_log):
+                     cnt = counts[idx].item()
+                     curr_rank[k, curr:curr+cnt] = torch.arange(cnt, device=device)
+                     curr += cnt
+
+            phy2mlog[batch_indices] = sub_phy2mlog
+            phyrank[batch_indices] = curr_rank
+
+            # Recompute weights
+            tokens_per_phy[batch_indices] = (tokens_per_mlog[batch_indices] / mlogcnt[batch_indices]).gather(-1, sub_phy2mlog)
+
+            # Repack affected
+            sub_pack_idx, sub_rank = balanced_packing(tokens_per_phy[batch_indices], num_packs_step3)
+
+            pack_index[batch_indices] = sub_pack_idx
+            rank_in_pack[batch_indices] = sub_rank
+
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    pphy2phy = inverse(phy2pphy)
+
+    pphy2mlog = phy2mlog.gather(
+        -1, pphy2phy)
+    pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + torch.arange(
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+    logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+>>>>>>> REPLACE
+</DIFF>

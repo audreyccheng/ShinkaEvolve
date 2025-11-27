@@ -1,0 +1,205 @@
+<NAME>
+micro_refine_groups_to_nodes
+</NAME>
+
+<DESCRIPTION>
+Add a fast, bounded 1x1 swap refinement to the group-to-node balanced_packing stage. After the initial LPT greedy packing, we evaluate swapping the heaviest item from the heaviest pack with the lightest item from either the lightest or second-lightest pack, choosing the swap that strictly reduces the global maximum pack load (and, as a tie-breaker, minimizes imbalance). This keeps the algorithm CPU-only, deterministic, and O(num_packs) per row, but can noticeably reduce skew at the node level before replication and GPU packing. It improves balancedness with negligible runtime overhead.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups,
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(num_layers, num_groups)
+        rank_in_pack = torch.zeros_like(pack_index, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Longest-processing-time greedy with capacity constraints
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full((num_layers, num_groups),
+                             fill_value=-1,
+                             dtype=torch.int64,
+                             device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load
+            best_p = None
+            best_load = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if best_load is None or pack_loads[p] < best_load:
+                    best_load = pack_loads[p]
+                    best_p = p
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups,
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(num_layers, num_groups)
+        rank_in_pack = torch.zeros_like(pack_index, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Longest-processing-time greedy with capacity constraints
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full((num_layers, num_groups),
+                             fill_value=-1,
+                             dtype=torch.int64,
+                             device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load
+            best_p = None
+            best_load = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if best_load is None or pack_loads[p] < best_load:
+                    best_load = pack_loads[p]
+                    best_p = p
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+
+        # Micro 1x1 refinement: swap top from heaviest with bottom from lightest/second-lightest
+        if num_packs >= 2 and groups_per_pack > 1:
+            # Build pack->groups mapping
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(num_groups):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+
+            wi = weight[i]
+            # precise loads
+            loads = [0.0] * num_packs
+            for p in range(num_packs):
+                if pack_groups[p]:
+                    loads[p] = float(wi[pack_groups[p]].sum().item())
+
+            # Identify heaviest pack and two lightest candidates
+            h = max(range(num_packs), key=lambda k: loads[k])
+            # lightest
+            l1 = min(range(num_packs), key=lambda k: loads[k])
+            # second-lightest (excluding l1)
+            l2 = None
+            if num_packs >= 3:
+                candidates = [p for p in range(num_packs) if p != l1]
+                l2 = min(candidates, key=lambda k: loads[k]) if candidates else None
+
+            light_candidates = []
+            if l1 is not None and l1 != h:
+                light_candidates.append(l1)
+            if l2 is not None and l2 != h and l2 != l1:
+                light_candidates.append(l2)
+
+            if pack_groups[h] and light_candidates:
+                # heavy top-1
+                h_idx_tensor = torch.tensor(pack_groups[h], dtype=torch.int64, device=wi.device)
+                h_w = wi[h_idx_tensor]
+                ai = int(torch.topk(h_w, 1).indices.item())
+                a_item = int(h_idx_tensor[ai].item())
+                wa = float(h_w[ai].item())
+
+                cur_max = max(loads)
+                cur_min = min(loads)
+                cur_imb = cur_max - cur_min
+
+                best = None  # (new_peak, new_imb, l_sel, ai, bi, a_item, b_item, wa, wb)
+                for l in light_candidates:
+                    if not pack_groups[l] or loads[h] <= loads[l]:
+                        continue
+                    l_idx_tensor = torch.tensor(pack_groups[l], dtype=torch.int64, device=wi.device)
+                    l_w = wi[l_idx_tensor]
+                    bi = int(torch.topk(l_w, 1, largest=False).indices.item())
+                    b_item = int(l_idx_tensor[bi].item())
+                    wb = float(l_w[bi].item())
+                    if wa <= wb:
+                        continue
+
+                    # compute new global peak and imbalance
+                    other_max = max([loads[p] for p in range(num_packs) if p != h and p != l], default=float("-inf"))
+                    other_min = min([loads[p] for p in range(num_packs) if p != h and p != l], default=float("inf"))
+                    new_h = loads[h] - wa + wb
+                    new_l = loads[l] - wb + wa
+                    new_peak = max(new_h, new_l, other_max)
+                    new_bottom = min(new_h, new_l, other_min)
+                    new_imb = new_peak - new_bottom
+                    cand = (new_peak, new_imb, l, ai, bi, a_item, b_item, wa, wb)
+                    if best is None:
+                        best = cand
+                    else:
+                        # Prefer lower global max, then lower imbalance
+                        if (cand[0] + 1e-9 < best[0] or
+                            (abs(cand[0] - best[0]) <= 1e-9 and cand[1] + 1e-9 < best[1])):
+                            best = cand
+
+                # Apply if strictly improves global max
+                if best is not None and best[0] + 1e-9 < cur_max:
+                    _, _, l_sel, ai_sel, bi_sel, a_item, b_item, wa_sel, wb_sel = best
+                    # Update loads
+                    loads[h] = loads[h] - wa_sel + wb_sel
+                    loads[l_sel] = loads[l_sel] - wb_sel + wa_sel
+                    # Swap membership
+                    pack_groups[h][ai_sel] = b_item
+                    pack_groups[l_sel][bi_sel] = a_item
+                    # Update indices
+                    pack_index[i, a_item] = l_sel
+                    pack_index[i, b_item] = h
+                    # Update ranks only for affected packs
+                    for r, g in enumerate(pack_groups[h]):
+                        rank_in_pack[i, g] = r
+                    for r, g in enumerate(pack_groups[l_sel]):
+                        rank_in_pack[i, g] = r
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,264 @@
+<NAME>
+best_two_block_and_path_relink_upgrade
+</NAME>
+
+<DESCRIPTION>
+I introduce a block-aware best-two insertion with unified memoization keyed by a deterministic position signature and apply it consistently across local search and path relinking. Concretely:
+
+1) Upgrade best_two_insertion to cache by (sequence, txn, pos_policy_signature) rather than just a boolean, making reuse safe and more effective across neighborhoods even when sampled positions differ.
+
+2) Add best_two_block for evaluating the best and second-best reinsertion position of a contiguous block (size 1, 2, or 3) with the same deterministic-position signature and caching. Use this in local refinement for reinsertion and Or-opt(2,3) to avoid iterating all positions repeatedly and to share evaluations across moves. This reduces simulator calls while enabling more informed, regret-style placement for blocks.
+
+3) Enhance path relinking by relocating items via best_two_insertion (best feasible position) rather than forcing moves to the target index. This chooses insertions that minimize conflict-induced delays at each step, often yielding better intermediate solutions and makespan.
+
+These changes increase search effectiveness, reduce redundant cost evaluations, and better align move evaluation with true makespan behavior. The code remains compatible and self-contained.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Memoized best-two insertion per (sequence, txn, use_all_pos) with deterministic stratified positions
+    best_two_cache = {}
+    def best_two_insertion(base_seq, t, use_all_pos=False, focus_idx=None, k_positions=None):
+        """
+        Compute (best_cost, best_pos, second_best_cost) for inserting txn t into base_seq.
+        - If use_all_pos or seq small, evaluate all positions exactly.
+        - Else, deterministically sample anchors + a few interior positions (seeded by sequence suffix and t).
+        Results are cached by (tuple(base_seq), t, use_all_pos) for reuse across beam and LNS phases.
+        """
+        key = (tuple(base_seq), t, bool(use_all_pos))
+        if key in best_two_cache:
+            return best_two_cache[key]
+        L = len(base_seq)
+        if use_all_pos or L <= 12:
+            pos_list = list(range(L + 1))
+        else:
+            # Deterministic sampling: anchors + near focus + seeded interior
+            pos_set = {0, L, L // 2, (L * 1) // 4, (L * 3) // 4}
+            if focus_idx is not None:
+                for d in (-3, -2, -1, 0, 1, 2, 3):
+                    p = focus_idx + d
+                    if 0 <= p <= L:
+                        pos_set.add(p)
+            cap = k_positions if k_positions is not None else k_pos_sample
+            seed = (tuple(base_seq[-min(10, L):]), t, L)
+            rng = random.Random(hash(seed) & 0xffffffff)
+            for _ in range(min(cap, L + 1)):
+                pos_set.add(rng.randint(0, L))
+            pos_list = sorted(pos_set)
+        res = evaluate_best_two_positions(base_seq, t, pos_list)
+        best_two_cache[key] = res
+        return res
+=======
+    # Memoized best-two insertion with deterministic position signature; also support block insertion
+    best_two_cache = {}
+    best_two_block_cache = {}
+
+    def best_two_insertion(base_seq, t, use_all_pos=False, focus_idx=None, k_positions=None):
+        """
+        Compute (best_cost, best_pos, second_best_cost) for inserting txn t into base_seq.
+        Uses deterministic position sampling and caches by (sequence, txn, position_policy_signature)
+        to safely reuse across neighborhoods with different sampling details.
+        """
+        L = len(base_seq)
+        if use_all_pos or L <= 12:
+            pos_list = list(range(L + 1))
+            pos_sig = ('all', L)
+        else:
+            # Deterministic sampling: anchors + optional focus bias + seeded interior
+            pos_set = {0, L, L // 2, (L * 1) // 4, (L * 3) // 4}
+            if focus_idx is not None:
+                for d in (-3, -2, -1, 0, 1, 2, 3):
+                    p = focus_idx + d
+                    if 0 <= p <= L:
+                        pos_set.add(p)
+            cap = k_positions if k_positions is not None else k_pos_sample
+            seed = (tuple(base_seq[-min(10, L):]), t, L)
+            rng = random.Random(hash(seed) & 0xffffffff)
+            for _ in range(min(cap, L + 1)):
+                pos_set.add(rng.randint(0, L))
+            pos_list = sorted(pos_set)
+            pos_sig = ('det', L, tuple(pos_list))
+        key = (tuple(base_seq), t, pos_sig)
+        if key in best_two_cache:
+            return best_two_cache[key]
+        res = evaluate_best_two_positions(base_seq, t, pos_list)
+        best_two_cache[key] = res
+        return res
+
+    def best_two_block(base_seq, block, use_all_pos=False, focus_idx=None, k_positions=None):
+        """
+        Compute (best_cost, best_pos, second_best_cost) for inserting a contiguous block into base_seq.
+        Deterministic position policy with memoization keyed by (sequence, block, policy_signature).
+        """
+        L = len(base_seq)
+        if use_all_pos or L <= 12:
+            pos_list = list(range(L + 1))
+            pos_sig = ('all', L)
+        else:
+            pos_set = {0, L, L // 2, (L * 1) // 4, (L * 3) // 4}
+            if focus_idx is not None:
+                for d in (-3, -2, -1, 0, 1, 2, 3):
+                    p = focus_idx + d
+                    if 0 <= p <= L:
+                        pos_set.add(p)
+            cap = k_positions if k_positions is not None else k_pos_sample
+            seed = (tuple(base_seq[-min(10, L):]), tuple(block), L)
+            rng = random.Random(hash(seed) & 0xffffffff)
+            for _ in range(min(cap, L + 1)):
+                pos_set.add(rng.randint(0, L))
+            pos_list = sorted(pos_set)
+            pos_sig = ('det', L, tuple(pos_list))
+        key = (tuple(base_seq), tuple(block), pos_sig)
+        if key in best_two_block_cache:
+            return best_two_block_cache[key]
+        # Evaluate block insertion over positions
+        best = (float('inf'), None)
+        second = float('inf')
+        for p in pos_list:
+            cand = base_seq[:p] + block + base_seq[p:]
+            c = seq_cost(cand)
+            if c < best[0]:
+                second = best[0]
+                best = (c, p)
+            elif c < second:
+                second = c
+        res = (best[0], best[1], second)
+        best_two_block_cache[key] = res
+        return res
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        def try_reinsertion(cur_seq, cur_cost):
+            k_positions = max(6, int(reinsertion_pos_factor * k_pos_sample))
+            for i in range(n):
+                item = cur_seq[i]
+                base = cur_seq[:i] + cur_seq[i + 1:]
+                # Endgame: exhaustive positions when sequence small
+                if len(base) <= 20:
+                    positions = list(range(len(base) + 1))
+                else:
+                    positions = position_samples(len(base), focus_idx=i, k_positions=k_positions)
+                for p in positions:
+                    cand = base[:p] + [item] + base[p:]
+                    if cand == cur_seq:
+                        continue
+                    c = seq_cost(cand)
+                    if c < cur_cost:
+                        return True, c, cand
+            return False, cur_cost, cur_seq
+=======
+        def try_reinsertion(cur_seq, cur_cost):
+            k_positions_loc = max(6, int(reinsertion_pos_factor * k_pos_sample))
+            # Use best-two block insertion for single-item reinsertion with memoization
+            for i in range(n):
+                item = cur_seq[i]
+                base = cur_seq[:i] + cur_seq[i + 1:]
+                use_all = (len(base) <= 20)
+                best_c, best_p, _ = best_two_block(base, [item], use_all_pos=use_all, focus_idx=i, k_positions=k_positions_loc)
+                cand = base[:best_p] + [item] + base[best_p:]
+                if cand != cur_seq and best_c < cur_cost:
+                    return True, best_c, cand
+            return False, cur_cost, cur_seq
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        def try_or_opt(cur_seq, cur_cost, k):
+            L = len(cur_seq)
+            for i in range(L - k + 1):
+                block = cur_seq[i:i + k]
+                base = cur_seq[:i] + cur_seq[i + k:]
+                # Endgame: exhaustive positions when small; otherwise sample near i
+                if len(base) <= 20:
+                    positions = list(range(len(base) + 1))
+                else:
+                    positions = position_samples(len(base), focus_idx=i, k_positions=k_pos_sample)
+                for p in positions:
+                    # Skip no-op reinsertion at same position
+                    if p == i:
+                        continue
+                    cand = base[:p] + block + base[p:]
+                    if cand == cur_seq:
+                        continue
+                    c = seq_cost(cand)
+                    if c < cur_cost:
+                        return True, c, cand
+            return False, cur_cost, cur_seq
+=======
+        def try_or_opt(cur_seq, cur_cost, k):
+            L = len(cur_seq)
+            for i in range(L - k + 1):
+                block = cur_seq[i:i + k]
+                base = cur_seq[:i] + cur_seq[i + k:]
+                use_all = (len(base) <= 20)
+                best_c, best_p, _ = best_two_block(base, block, use_all_pos=use_all, focus_idx=i, k_positions=k_pos_sample)
+                cand = base[:best_p] + block + base[best_p:]
+                if cand != cur_seq and best_c < cur_cost:
+                    return True, best_c, cand
+            return False, cur_cost, cur_seq
+>>>>>>> REPLACE
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def path_relink(source_seq, target_seq, max_moves=12):
+        pos_in_target = {t: i for i, t in enumerate(target_seq)}
+        s = source_seq[:]
+        best_c = seq_cost(s)
+        best_s = s[:]
+        moves = 0
+        # Choose items with largest position displacement
+        displacement = [(abs(i - pos_in_target[s[i]]), i) for i in range(n)]
+        displacement.sort(reverse=True)
+        for _, idx in displacement:
+            if moves >= max_moves:
+                break
+            item = s[idx]
+            desired = pos_in_target[item]
+            if desired == idx:
+                continue
+            base = s[:idx] + s[idx + 1:]
+            # Insert at desired (bounded within current length)
+            desired = max(0, min(desired, len(base)))
+            cand = base[:desired] + [item] + base[desired:]
+            c = seq_cost(cand)
+            if c < best_c:
+                best_c = c
+                best_s = cand[:]
+                s = cand
+                moves += 1
+        if best_c < float('inf'):
+            return best_c, best_s
+        return seq_cost(source_seq), source_seq
+=======
+    def path_relink(source_seq, target_seq, max_moves=12):
+        pos_in_target = {t: i for i, t in enumerate(target_seq)}
+        s = source_seq[:]
+        best_c = seq_cost(s)
+        best_s = s[:]
+        moves = 0
+        # Choose items with largest position displacement
+        displacement = [(abs(i - pos_in_target[s[i]]), i) for i in range(n)]
+        displacement.sort(reverse=True)
+        for _, idx in displacement:
+            if moves >= max_moves:
+                break
+            item = s[idx]
+            if pos_in_target[item] == idx:
+                continue
+            base = s[:idx] + s[idx + 1:]
+            # Instead of forcing target index, choose the best insertion by best-two
+            use_all = (len(base) <= 18)
+            bc, bp, _ = best_two_insertion(base, item, use_all_pos=use_all)
+            cand = base[:bp] + [item] + base[bp:]
+            c = seq_cost(cand)
+            if c < best_c:
+                best_c = c
+                best_s = cand[:]
+                s = cand
+                moves += 1
+        if best_c < float('inf'):
+            return best_c, best_s
+        return seq_cost(source_seq), source_seq
+>>>>>>> REPLACE
+</DIFF>

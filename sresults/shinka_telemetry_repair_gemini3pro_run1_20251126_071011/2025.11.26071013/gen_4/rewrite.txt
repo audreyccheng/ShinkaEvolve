@@ -1,0 +1,164 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using Flow Symmetry Consensus.
+Combines Link Symmetry, Flow Conservation, and Traffic Evidence to repair
+telemetry with calibrated confidence scores.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by combining Link Symmetry and Flow Conservation
+    signals in a prioritized consensus model.
+    
+    1. Status Repair: Uses traffic evidence (local + peer) to override status flags.
+    2. Rate Repair: 
+       - Checks Link Symmetry (R3) first.
+       - If violated, uses Flow Conservation (R1) hints as a tie-breaker.
+       - repairs to the value supported by the majority of signals (Local, Peer, Hint).
+    """
+    
+    HARDENING_THRESHOLD = 0.02  # 2% tolerance for measurements
+    
+    # --- Phase 1: Topological Context (Flow Hints) ---
+    # Calculate what rates *should* be to satisfy flow conservation at each router.
+    interface_hints = {} 
+    
+    for router_id, iface_ids in topology.items():
+        # Filter to interfaces present in current telemetry slice
+        valid_ifaces = [i for i in iface_ids if i in telemetry]
+        
+        # Calculate sums of raw observed rates for the router
+        sum_rx = sum(telemetry[i].get('rx_rate', 0.0) for i in valid_ifaces)
+        sum_tx = sum(telemetry[i].get('tx_rate', 0.0) for i in valid_ifaces)
+        
+        for iface in valid_ifaces:
+            curr_rx = telemetry[iface].get('rx_rate', 0.0)
+            curr_tx = telemetry[iface].get('tx_rate', 0.0)
+            
+            # Flow Conservation: Sum(RX) must equal Sum(TX) for the router
+            # To balance this specific interface:
+            # target_rx + others_rx = total_tx  =>  target_rx = total_tx - others_rx
+            rx_hint = max(0.0, sum_tx - (sum_rx - curr_rx))
+            tx_hint = max(0.0, sum_rx - (sum_tx - curr_tx))
+            
+            interface_hints[iface] = {'rx': rx_hint, 'tx': tx_hint}
+
+    result = {}
+
+    # --- Phase 2: Repair Execution ---
+    for iface_id, data in telemetry.items():
+        # Retrieve original values
+        orig_rx = data.get('rx_rate', 0.0)
+        orig_tx = data.get('tx_rate', 0.0)
+        orig_status = data.get('interface_status', 'unknown')
+        
+        # Initialize repaired values
+        rep_rx, rep_tx, rep_status = orig_rx, orig_tx, orig_status
+        conf_rx, conf_tx, conf_status = 1.0, 1.0, 1.0
+        
+        # Peer Context
+        connected_to = data.get('connected_to')
+        peer_data = telemetry.get(connected_to, {}) if (connected_to and connected_to in telemetry) else {}
+        has_peer = bool(peer_data)
+        
+        # --- A. Status Repair ---
+        # Robust logic: Traffic implies UP state regardless of flag.
+        peer_status = peer_data.get('interface_status')
+        traffic_evidence = [orig_rx, orig_tx, peer_data.get('rx_rate', 0.0), peer_data.get('tx_rate', 0.0)]
+        max_traffic = max(traffic_evidence)
+        
+        if has_peer and peer_status and orig_status != peer_status:
+            # Status Mismatch
+            if max_traffic > 1.0:
+                rep_status = 'up'
+                conf_status = 0.95 # Confident because traffic exists
+            else:
+                rep_status = 'down'
+                conf_status = 0.8  # Less confident, could be idle link
+        elif orig_status == 'down' and max_traffic > 1.0:
+            # Self-contradiction: Status DOWN but has traffic
+            rep_status = 'up'
+            conf_status = 0.9
+            
+        # --- B. Rate Repair ---
+        
+        if rep_status == 'down':
+            # Enforce physics: Down interfaces have 0 rate
+            rep_rx = 0.0
+            rep_tx = 0.0
+            
+            # If we are changing values significantly, inherit status confidence
+            if orig_rx > 1.0 or orig_tx > 1.0:
+                conf_rx = conf_status
+                conf_tx = conf_status
+        elif has_peer:
+            # Define Consensus Logic for Rates
+            def solve_consensus(local_val: float, peer_val: float, hint_val: float) -> Tuple[float, float]:
+                """
+                Returns (repaired_value, confidence) based on voters.
+                Strategy:
+                1. If Local ~= Peer (Symmetry), trust Local.
+                2. If Disagree, check Hint (Flow Conservation).
+                   - If Hint ~= Peer, trust Peer (2 vs 1).
+                   - If Hint ~= Local, trust Local (2 vs 1).
+                   - Else, trust Peer (heuristic) with low confidence.
+                """
+                # Normalize difference by magnitude to handle scale
+                denom_sym = max(local_val, peer_val, 1.0)
+                diff_sym = abs(local_val - peer_val) / denom_sym
+                
+                # Check 1: Link Symmetry (Strongest Invariant)
+                if diff_sym <= HARDENING_THRESHOLD:
+                    return local_val, 1.0
+                
+                # Check 2: Flow Hint Tie-Breaker
+                if hint_val is not None:
+                    denom_hp = max(hint_val, peer_val, 1.0)
+                    diff_hp = abs(hint_val - peer_val) / denom_hp
+                    
+                    denom_hl = max(hint_val, local_val, 1.0)
+                    diff_hl = abs(hint_val - local_val) / denom_hl
+                    
+                    # Hint corroborates Peer (allow slightly looser tolerance for hints)
+                    if diff_hp <= HARDENING_THRESHOLD * 2:
+                        # We trust Peer because Hint agrees. 
+                        # Confidence is high, but penalized slightly if Symmetry was very bad.
+                        return peer_val, max(0.8, 1.0 - diff_hp)
+                        
+                    # Hint corroborates Local
+                    if diff_hl <= HARDENING_THRESHOLD * 2:
+                        # We trust Local because Hint agrees. Peer is likely wrong.
+                        return local_val, max(0.8, 1.0 - diff_hl)
+                
+                # Fallback: No Hint or Ambiguous Hint.
+                # Standard approach is to trust the Peer in symmetry violations if no other info.
+                # However, confidence must be low because we have a conflict with no tie-breaker.
+                return peer_val, max(0.0, 1.0 - diff_sym)
+
+            # Repair RX Rate
+            # Target: My RX. Peer Voter: Peer TX. Hint Voter: My RX Hint.
+            rx_hint = interface_hints.get(iface_id, {}).get('rx')
+            peer_tx = peer_data.get('tx_rate', 0.0)
+            rep_rx, conf_rx = solve_consensus(orig_rx, peer_tx, rx_hint)
+            
+            # Repair TX Rate
+            # Target: My TX. Peer Voter: Peer RX. Hint Voter: My TX Hint.
+            tx_hint = interface_hints.get(iface_id, {}).get('tx')
+            peer_rx = peer_data.get('rx_rate', 0.0)
+            rep_tx, conf_tx = solve_consensus(orig_tx, peer_rx, tx_hint)
+
+        # Store result tuple: (original, repaired, confidence)
+        result[iface_id] = {
+            'rx_rate': (orig_rx, rep_rx, conf_rx),
+            'tx_rate': (orig_tx, rep_tx, conf_tx),
+            'interface_status': (orig_status, rep_status, conf_status),
+            'connected_to': connected_to,
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router')
+        }
+        
+    return result
+# EVOLVE-BLOCK-END

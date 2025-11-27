@@ -1,0 +1,213 @@
+<NAME>
+router_biased_fusion_and_residual_fix
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements:
+
+1) Router-conservation–biased fusion in Stage 1 hardening for large per-link mismatches:
+   - When a.tx and b.rx (or a.rx and b.tx) disagree beyond tolerance, instead of snapping to the larger reading, compute a fused value biased toward the side that reduces the adjacent routers’ flow imbalance. The bias factor β increases with the average router imbalance relative to router tolerance and is capped at 0.4. This leverages flow conservation earlier, reducing the burden on later stages and improving counter accuracy while maintaining shielding for near-zero cases.
+
+   Implementation details:
+   - Precompute per-router initial sums (from original readings) and imbalance metrics (signed and relative), plus router tolerances as a function of active interfaces.
+   - In mis-match cases, decide between biasing toward local or peer using a simple expected-improvement score based on the sign of desired changes at each router, weighted by their relative imbalance magnitudes.
+   - Keep near-zero and down-interface shielding; fall back to previous behavior when appropriate.
+
+2) Fix router residual computation at the end:
+   - The final router residuals inadvertently included interfaces regardless of status. Restrict to status=='up' to properly reflect conservation and improve confidence calibration.
+
+These changes aim to improve counter_repair_accuracy and maintain or improve confidence_calibration without destabilizing the rest of the pipeline.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Track cumulative router scaling factors for re-sync guard and confidence
+    scaled_rx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
+    scaled_tx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
+    # Track if a direction hit clipping (±10% per-pass cap or strong scaling)
+    clip_hit_rx: Dict[str, bool] = {i: False for i in telemetry}
+    clip_hit_tx: Dict[str, bool] = {i: False for i in telemetry}
+=======
+    # Track cumulative router scaling factors for re-sync guard and confidence
+    scaled_rx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
+    scaled_tx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
+    # Track if a direction hit clipping (±10% per-pass cap or strong scaling)
+    clip_hit_rx: Dict[str, bool] = {i: False for i in telemetry}
+    clip_hit_tx: Dict[str, bool] = {i: False for i in telemetry}
+
+    # Precompute router initial sums and imbalance signatures from original measurements
+    def tau_router_from_count(n: int) -> float:
+        return min(0.07, max(0.03, 0.05 * (2.0 / max(2, n)) ** 0.5))
+
+    router_active_ifs0: Dict[str, List[str]] = {}
+    for r, ifs in router_ifaces.items():
+        router_active_ifs0[r] = [i for i in ifs if status.get(i) == 'up']
+
+    router_sum_rx0: Dict[str, float] = {r: sum(max(0.0, orig_rx[i]) for i in router_active_ifs0.get(r, [])) for r in router_ifaces}
+    router_sum_tx0: Dict[str, float] = {r: sum(max(0.0, orig_tx[i]) for i in router_active_ifs0.get(r, [])) for r in router_ifaces}
+    router_imb_sign0: Dict[str, float] = {}
+    router_imb_rel0: Dict[str, float] = {}
+    tau_router0: Dict[str, float] = {}
+    for r in router_ifaces:
+        srx = router_sum_rx0.get(r, 0.0)
+        stx = router_sum_tx0.get(r, 0.0)
+        router_imb_sign0[r] = srx - stx  # positive => rx > tx
+        denom0 = max(1.0, srx, stx)
+        router_imb_rel0[r] = abs(srx - stx) / denom0
+        tau_router0[r] = tau_router_from_count(len(router_active_ifs0.get(r, [])) or 0)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for a, b in link_pairs:
+        a_up = (status.get(a) == 'up')
+        b_up = (status.get(b) == 'up')
+        a_rx, a_tx = orig_rx[a], orig_tx[a]
+        b_rx, b_tx = orig_rx[b], orig_tx[b]
+=======
+    for a, b in link_pairs:
+        a_up = (status.get(a) == 'up')
+        b_up = (status.get(b) == 'up')
+        a_rx, a_tx = orig_rx[a], orig_tx[a]
+        b_rx, b_tx = orig_rx[b], orig_tx[b]
+        ra = local_router_of.get(a)
+        rb = local_router_of.get(b)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            # Choose the more reliable of the two readings (farther from zero), rely on redundancy
+            choice = b_rx if abs(b_rx) >= abs(a_tx) else a_tx
+            hardened_tx[a] = max(0.0, choice)
+            hardened_rx[b] = max(0.0, choice)
+            c1 = clamp01(1.0 - d1)
+            conf_tx[a] = max(conf_tx[a], c1)
+            conf_rx[b] = max(conf_rx[b], c1)
+=======
+        else:
+            # Router-conservation–biased fusion for large mismatch with shielding
+            if (min(a_tx, b_rx) < ZERO_THRESH) and (max(a_tx, b_rx) > 2.0 * ZERO_THRESH):
+                # Snap to the non-near-zero peer to avoid spurious creation/removal of traffic
+                choice = b_rx if abs(b_rx) >= abs(a_tx) else a_tx
+                fused = max(0.0, choice)
+            else:
+                avg = 0.5 * (a_tx + b_rx)
+                imb_a = router_imb_rel0.get(ra, 0.0)
+                imb_b = router_imb_rel0.get(rb, 0.0)
+                tau_avg = 0.5 * (tau_router0.get(ra, 0.05) + tau_router0.get(rb, 0.05))
+                # β grows with router gap, capped to 0.4
+                beta = min(0.4, max(0.0, 0.5 * ((imb_a + imb_b) / max(tau_avg, 1e-9) - 1.0)))
+                pref_a = avg + beta * (a_tx - avg)
+                pref_b = avg + beta * (b_rx - avg)
+
+                s_a = router_imb_sign0.get(ra, 0.0)
+                s_b = router_imb_sign0.get(rb, 0.0)
+                desired_sign_a = 1 if s_a > 0 else (-1 if s_a < 0 else 0)   # Δa_tx sign to reduce gap
+                desired_sign_b = -1 if s_b > 0 else (1 if s_b < 0 else 0)   # Δb_rx sign to reduce gap
+
+                def _sgn(x: float) -> int:
+                    return 1 if x > 1e-12 else (-1 if x < -1e-12 else 0)
+
+                score_pa = (imb_a if (desired_sign_a != 0 and _sgn(pref_a - a_tx) == desired_sign_a) else 0.0) + \
+                           (imb_b if (desired_sign_b != 0 and _sgn(pref_a - b_rx) == desired_sign_b) else 0.0)
+                score_pb = (imb_a if (desired_sign_a != 0 and _sgn(pref_b - a_tx) == desired_sign_a) else 0.0) + \
+                           (imb_b if (desired_sign_b != 0 and _sgn(pref_b - b_rx) == desired_sign_b) else 0.0)
+
+                if score_pa > score_pb:
+                    fused = max(0.0, pref_a)
+                elif score_pb > score_pa:
+                    fused = max(0.0, pref_b)
+                else:
+                    # Tie-break toward the larger observed value
+                    target = a_tx if a_tx >= b_rx else b_rx
+                    fused = max(0.0, avg + beta * (target - avg))
+
+            hardened_tx[a] = fused
+            hardened_rx[b] = fused
+            c1 = clamp01(1.0 - d1)
+            conf_tx[a] = max(conf_tx[a], c1)
+            conf_rx[b] = max(conf_rx[b], c1)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            choice = b_tx if abs(b_tx) >= abs(a_rx) else a_rx
+            hardened_rx[a] = max(0.0, choice)
+            hardened_tx[b] = max(0.0, choice)
+            c2 = clamp01(1.0 - d2)
+            conf_rx[a] = max(conf_rx[a], c2)
+            conf_tx[b] = max(conf_tx[b], c2)
+=======
+        else:
+            # Router-conservation–biased fusion for large mismatch with shielding
+            if (min(a_rx, b_tx) < ZERO_THRESH) and (max(a_rx, b_tx) > 2.0 * ZERO_THRESH):
+                choice = b_tx if abs(b_tx) >= abs(a_rx) else a_rx
+                fused = max(0.0, choice)
+            else:
+                avg = 0.5 * (a_rx + b_tx)
+                imb_a = router_imb_rel0.get(ra, 0.0)
+                imb_b = router_imb_rel0.get(rb, 0.0)
+                tau_avg = 0.5 * (tau_router0.get(ra, 0.05) + tau_router0.get(rb, 0.05))
+                beta = min(0.4, max(0.0, 0.5 * ((imb_a + imb_b) / max(tau_avg, 1e-9) - 1.0)))
+                pref_a = avg + beta * (a_rx - avg)
+                pref_b = avg + beta * (b_tx - avg)
+
+                s_a = router_imb_sign0.get(ra, 0.0)
+                s_b = router_imb_sign0.get(rb, 0.0)
+                desired_sign_a = -1 if s_a > 0 else (1 if s_a < 0 else 0)   # Δa_rx sign to reduce gap
+                desired_sign_b = 1 if s_b > 0 else (-1 if s_b < 0 else 0)   # Δb_tx sign to reduce gap
+
+                def _sgn(x: float) -> int:
+                    return 1 if x > 1e-12 else (-1 if x < -1e-12 else 0)
+
+                score_pa = (imb_a if (desired_sign_a != 0 and _sgn(pref_a - a_rx) == desired_sign_a) else 0.0) + \
+                           (imb_b if (desired_sign_b != 0 and _sgn(pref_a - b_tx) == desired_sign_b) else 0.0)
+                score_pb = (imb_a if (desired_sign_a != 0 and _sgn(pref_b - a_rx) == desired_sign_a) else 0.0) + \
+                           (imb_b if (desired_sign_b != 0 and _sgn(pref_b - b_tx) == desired_sign_b) else 0.0)
+
+                if score_pa > score_pb:
+                    fused = max(0.0, pref_a)
+                elif score_pb > score_pa:
+                    fused = max(0.0, pref_b)
+                else:
+                    target = a_rx if a_rx >= b_tx else b_tx
+                    fused = max(0.0, avg + beta * (target - avg))
+
+            hardened_rx[a] = fused
+            hardened_tx[b] = fused
+            c2 = clamp01(1.0 - d2)
+            conf_rx[a] = max(conf_rx[a], c2)
+            conf_tx[b] = max(conf_tx[b], c2)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if i in telemetry]
+        if not up_ifs:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+=======
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if not up_ifs:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+>>>>>>> REPLACE
+</DIFF>

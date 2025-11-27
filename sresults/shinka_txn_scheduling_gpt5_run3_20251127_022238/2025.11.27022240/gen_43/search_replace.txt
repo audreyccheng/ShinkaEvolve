@@ -1,0 +1,403 @@
+<NAME>
+two_phase_beam_with_incumbent_pruning
+</NAME>
+
+<DESCRIPTION>
+I am upgrading the beam search to a two-phase, incumbent-pruned strategy with prefix-dominance and greedy completion. This directly targets makespan minimization by:
+
+1) Two-phase beam: Broad phase up to ~0.4n depth (beam=large, cand_per_expand=large, lookahead deeper), followed by a focused phase (beam=narrower with safe pruning). This explores widely early and exploits promising prefixes later.
+
+2) Incumbent pruning: Maintain a global incumbent by greedily completing top prefixes at each depth and prune any prefix whose current cost is already ≥ incumbent cost. This reduces wasted exploration.
+
+3) Prefix-dominance map: Maintain dom[(remaining_fset, suffix<=3)] = best prefix cost; skip expansions that do not improve this signature, cutting duplicate/weak states.
+
+4) Safe full-sequence pruning: For the top expanded children at each step, run a fast greedy completion to compute a full schedule bound; prune children whose full cost ≥ incumbent (while guaranteeing progress by always keeping the best child).
+
+5) Depth-adaptive lookahead: Larger lookahead early, slightly reduced later, improving accuracy with minimal cost.
+
+These changes keep the original tournament-guided candidate preselection and VNS local improvement while significantly strengthening global search using safer, cost-aware pruning rules aligned to makespan. This should consistently reduce schedule makespan across workloads.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def preselect_by_tournament(prefix, remaining, k, recent_k=4):
+        if not remaining:
+            return []
+        recents = prefix[-recent_k:] if recent_k > 0 else []
+        scored = []
+        for t in remaining:
+            sc = 0
+            for x in recents:
+                sc += W[x][t]
+            scored.append((sc, t))
+        scored.sort(key=lambda z: (z[0], z[1]))
+        return [t for _, t in scored[:k]]
+
+    # Beam-search with tournament-guided candidate pools and limited lookahead
+    def beam_search():
+        beam_width = max(6, min(16, int(num_seqs)))  # exploration budget
+        cand_per_expand = max(6, min(14, n // 7 + 6))
+        lookahead_top = 3
+        lookahead_next_k = 5
+
+        # Diverse starts: tournament-best, good singleton, randoms
+        starts = []
+        starts.append(tournament_order[0])
+        # pick one good singleton among top-10
+        topk = min(10, n)
+        good_singletons = sorted(range(n), key=lambda t: c1[t])[:topk]
+        starts.append(rng.choice(good_singletons))
+        # fill remaining with random distinct txns
+        remaining_candidates = [t for t in range(n) if t not in starts]
+        rng.shuffle(remaining_candidates)
+        starts.extend(remaining_candidates[:max(0, beam_width - len(starts))])
+
+        beam = []
+        used = set()
+        for t in starts:
+            seq = [t]
+            remaining = frozenset(set(txns) - {t})
+            c = evaluate_seq(seq)
+            key = (tuple(seq), remaining)
+            if key in used:
+                continue
+            used.add(key)
+            beam.append((c, seq, remaining))
+
+        for _ in range(n - 1):
+            next_beam = []
+            seen = set()
+            # Expand each partial sequence
+            for cost, seq, remaining in beam:
+                rem_list = list(remaining)
+                if not rem_list:
+                    next_beam.append((cost, seq, remaining))
+                    continue
+
+                # Tournament-guided preselection
+                if len(rem_list) > cand_per_expand * 2:
+                    pre = preselect_by_tournament(seq, rem_list, cand_per_expand * 2)
+                else:
+                    pre = rem_list
+
+                # Evaluate immediate cost of candidates
+                imm = []
+                for t in pre:
+                    c_im = evaluate_seq(seq + [t])
+                    imm.append((t, c_im))
+                imm.sort(key=lambda x: x[1])
+
+                # Lookahead over top few
+                L = min(lookahead_top, len(imm))
+                scored_ext = []
+                for t, immediate_c in imm[:L]:
+                    next_pool_all = [x for x in rem_list if x != t]
+                    if not next_pool_all:
+                        la_cost = immediate_c
+                    else:
+                        la_pref = preselect_by_tournament(seq + [t], next_pool_all, min(lookahead_next_k, len(next_pool_all)))
+                        if not la_pref:
+                            la_pref = next_pool_all
+                        la_cost = min(evaluate_seq(seq + [t, u]) for u in la_pref)
+                    # use la_cost as expansion metric, fallback to immediate
+                    scored_ext.append((t, min(la_cost, immediate_c)))
+
+                # Also add a few immediate-best without lookahead to maintain diversity
+                diversity_take = min(max(2, cand_per_expand // 3), len(imm))
+                for t, c_im in imm[:diversity_take]:
+                    scored_ext.append((t, c_im))
+
+                # Deduplicate and keep best-k expansions for this parent
+                unique = {}
+                for t, m in scored_ext:
+                    if (t not in unique) or (m < unique[t]):
+                        unique[t] = m
+                items = sorted(unique.items(), key=lambda z: z[1])
+                expand_k = min(cand_per_expand, len(items))
+                for t, _metric in items[:expand_k]:
+                    new_seq = seq + [t]
+                    new_cost = evaluate_seq(new_seq)
+                    rem_new = remaining - {t}
+                    key = (tuple(new_seq), rem_new)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    next_beam.append((new_cost, new_seq, rem_new))
+
+            if not next_beam:
+                # Fallback: deterministic best extension for each beam item
+                for cost, seq, remaining in beam:
+                    rem_list = list(remaining)
+                    best_t = None
+                    best_c = float('inf')
+                    for t in rem_list:
+                        c = evaluate_seq(seq + [t])
+                        if c < best_c:
+                            best_c = c
+                            best_t = t
+                    if best_t is not None:
+                        new_seq = seq + [best_t]
+                        next_beam.append((best_c, new_seq, remaining - {best_t}))
+
+            # Keep top beam_width partial sequences
+            next_beam.sort(key=lambda x: x[0])
+            beam = next_beam[:beam_width]
+
+        beam.sort(key=lambda x: x[0])
+        best_cost, best_seq, _ = beam[0]
+        return best_cost, best_seq
+=======
+    def preselect_by_tournament(prefix, remaining, k, recent_k=4):
+        if not remaining:
+            return []
+        recents = prefix[-recent_k:] if recent_k > 0 else []
+        scored = []
+        for t in remaining:
+            sc = 0
+            for x in recents:
+                sc += W[x][t]
+            scored.append((sc, t))
+        scored.sort(key=lambda z: (z[0], z[1]))
+        return [t for _, t in scored[:k]]
+
+    # Fast greedy completion utilities for pruning and incumbent updates
+    def greedy_complete(seq):
+        cur = list(seq)
+        rem = [t for t in range(n) if t not in cur]
+        while rem:
+            t = min(rem, key=lambda u: evaluate_seq(cur + [u]))
+            cur.append(t)
+            rem.remove(t)
+        return cur, evaluate_seq(cur)
+
+    def greedy_complete_with_remaining(seq, remaining):
+        cur = list(seq)
+        rem_list = list(remaining)
+        while rem_list:
+            t = min(rem_list, key=lambda u: evaluate_seq(cur + [u]))
+            cur.append(t)
+            rem_list.remove(t)
+        return cur, evaluate_seq(cur)
+
+    # Two-phase beam search with incumbent pruning and prefix-dominance
+    def beam_search():
+        # Phase A (broad exploration)
+        beam_A = max(12, min(20, int(num_seqs) + 6))
+        cand_A = max(10, min(16, n // 6 + 8))
+        la_top_A = 4
+        la_next_A = 6
+        depth_limit_A = max(3, int(0.4 * n))
+
+        # Phase B (focused exploitation)
+        beam_B = max(8, min(14, int(num_seqs)))
+        cand_B = max(8, min(12, n // 7 + 6))
+        la_top_B = 3
+        la_next_B = 5
+
+        # Diverse starts: tournament-best, good singleton, randoms
+        starts = []
+        starts.append(tournament_order[0])
+        topk = min(10, n)
+        good_singletons = sorted(range(n), key=lambda t: c1[t])[:topk]
+        starts.append(rng.choice(good_singletons))
+        remaining_candidates = [t for t in range(n) if t not in starts]
+        rng.shuffle(remaining_candidates)
+        starts.extend(remaining_candidates[:max(0, beam_A - len(starts))])
+
+        dom = {}  # (remaining_fset, suffix<=3) -> best prefix cost
+        incumbent_cost = float('inf')
+        incumbent_seq = None
+
+        beam = []
+        used = set()
+        for t in starts:
+            seq0 = [t]
+            rem0 = frozenset(set(txns) - {t})
+            c0 = evaluate_seq(seq0)
+            sig = (rem0, tuple(seq0))
+            if sig in dom and c0 >= dom[sig]:
+                continue
+            dom[sig] = c0
+            key = (tuple(seq0), rem0)
+            if key in used:
+                continue
+            used.add(key)
+            beam.append((c0, seq0, rem0))
+
+        def expand_level(beam_in, cand_per_expand, lookahead_top, next_k, keep_k, depth, total_depth, focused=False):
+            nonlocal incumbent_cost, incumbent_seq
+            next_beam = []
+            seen = set()
+            # depth-adaptive recent_k for tournament scoring
+            if total_depth <= 1:
+                rk = 5
+            else:
+                frac = depth / max(1, total_depth)
+                rk = 5 if frac < 0.33 else (4 if frac < 0.67 else 3)
+            for cost, seq, remaining in beam_in:
+                if cost >= incumbent_cost:
+                    continue
+                rem_list = list(remaining)
+                if not rem_list:
+                    # Completed prefix; update incumbent
+                    full_c = evaluate_seq(seq)
+                    if full_c < incumbent_cost:
+                        incumbent_cost = full_c
+                        incumbent_seq = list(seq)
+                    next_beam.append((cost, seq, remaining))
+                    continue
+
+                # Tournament-guided preselection
+                if len(rem_list) > cand_per_expand * 2:
+                    pre = preselect_by_tournament(seq, rem_list, cand_per_expand * 2, recent_k=rk)
+                else:
+                    pre = rem_list
+
+                # Immediate costs
+                imm = []
+                for t in pre:
+                    c_im = evaluate_seq(seq + [t])
+                    imm.append((t, c_im))
+                imm.sort(key=lambda x: x[1])
+
+                L = min(lookahead_top, len(imm))
+                scored = []
+                for t, immediate_c in imm[:L]:
+                    next_pool_all = [x for x in rem_list if x != t]
+                    if not next_pool_all:
+                        la_c = immediate_c
+                    else:
+                        la_pref = preselect_by_tournament(seq + [t], next_pool_all, min(next_k, len(next_pool_all)), recent_k=max(2, rk - 1))
+                        if not la_pref:
+                            la_pref = next_pool_all
+                        la_c = min(evaluate_seq(seq + [t, u]) for u in la_pref)
+                    scored.append((t, min(immediate_c, la_c)))
+
+                # Add immediate-best for diversity
+                diversity_take = min(max(2, cand_per_expand // 3), len(imm))
+                for t, c_im in imm[:diversity_take]:
+                    scored.append((t, c_im))
+
+                # Keep best unique children
+                unique = {}
+                for t, m in scored:
+                    if (t not in unique) or (m < unique[t]):
+                        unique[t] = m
+                items = sorted(unique.items(), key=lambda z: z[1])
+
+                keep_any_child = False
+                best_child = None
+                best_child_metric = float('inf')
+
+                expand_k = min(cand_per_expand, len(items))
+                for idx in range(expand_k):
+                    t, _metric = items[idx]
+                    new_seq = seq + [t]
+                    rem_new = remaining - {t}
+                    new_cost = evaluate_seq(new_seq)
+
+                    # Prefix dominance pruning
+                    suffix = tuple(new_seq[-3:]) if len(new_seq) >= 3 else tuple(new_seq)
+                    sig = (rem_new, suffix)
+                    if sig in dom and new_cost >= dom[sig]:
+                        continue
+                    dom[sig] = new_cost
+
+                    # Safe pruning via full greedy completion on top few children
+                    pruned = False
+                    if focused or idx < 4:
+                        full_seq, full_c = greedy_complete_with_remaining(new_seq, rem_new)
+                        if full_c < incumbent_cost:
+                            incumbent_cost = full_c
+                            incumbent_seq = full_seq
+                        else:
+                            # prune if we already know full cost cannot beat incumbent
+                            pruned = True
+
+                    # Always track best child by immediate prefix cost to guarantee progress
+                    if new_cost < best_child_metric:
+                        best_child_metric = new_cost
+                        best_child = (new_cost, new_seq, rem_new)
+
+                    if pruned:
+                        continue
+
+                    key = (tuple(new_seq), rem_new)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    keep_any_child = True
+                    next_beam.append((new_cost, new_seq, rem_new))
+
+                # Guarantee to keep at least the best child even if all pruned
+                if not keep_any_child and best_child is not None:
+                    bc, bs, br = best_child
+                    next_beam.append((bc, bs, br))
+
+            if not next_beam:
+                return []
+
+            # Update incumbent by greedily completing the top-2 prefixes at this depth
+            next_beam.sort(key=lambda x: x[0])
+            for bc, bseq, brem in next_beam[:2]:
+                if bc >= incumbent_cost:
+                    continue
+                full_seq, fc = greedy_complete_with_remaining(bseq, brem)
+                if fc < incumbent_cost:
+                    incumbent_cost = fc
+                    incumbent_seq = full_seq
+
+            # Keep the beam
+            return next_beam[:keep_k]
+
+        # Phase A expansion
+        depth = 1
+        while depth < min(depth_limit_A, n) and beam:
+            beam = expand_level(
+                beam_in=beam,
+                cand_per_expand=cand_A,
+                lookahead_top=la_top_A,
+                next_k=la_next_A,
+                keep_k=beam_A,
+                depth=depth,
+                total_depth=depth_limit_A,
+                focused=False,
+            )
+            depth += 1
+
+        # Phase B: focus on best few prefixes with stronger pruning
+        if not beam:
+            # If beam died, fallback to tournament best greedy completion
+            seq_fallback = [tournament_order[0]]
+            full_seq, full_cost = greedy_complete(seq_fallback)
+            if incumbent_seq is None or full_cost < incumbent_cost:
+                incumbent_seq, incumbent_cost = full_seq, full_cost
+            return incumbent_cost, incumbent_seq
+
+        # Narrow beam and continue expansion
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_B]
+        while depth < n and beam:
+            beam = expand_level(
+                beam_in=beam,
+                cand_per_expand=cand_B,
+                lookahead_top=la_top_B,
+                next_k=la_next_B,
+                keep_k=beam_B,
+                depth=depth,
+                total_depth=max(1, n - 1),
+                focused=True,
+            )
+            depth += 1
+
+        # Return best known incumbent or best prefix completion
+        if incumbent_seq is not None:
+            return incumbent_cost, incumbent_seq
+
+        beam.sort(key=lambda x: x[0])
+        _, bseq, brem = beam[0]
+        full_seq, full_cost = greedy_complete_with_remaining(bseq, brem)
+        return full_cost, full_seq
+>>>>>>> REPLACE
+
+</DIFF>

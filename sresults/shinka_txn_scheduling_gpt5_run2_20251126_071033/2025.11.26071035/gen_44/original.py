@@ -1,0 +1,670 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads
+Redesigned with modular constructor + regret-diverse beam + VND (DLB) + LNS/ILS.
+"""
+
+import time
+import random
+import sys
+import os
+from functools import lru_cache
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Hybrid constructor + regret-diverse beam + VND (DLB) + LNS/ILS.
+    Returns (lowest makespan, schedule)
+    """
+    n = workload.num_txns
+    all_txns = list(range(n))
+
+    # Parameter configuration (adaptive by workload size and effort)
+    small = n <= 50
+    CAND_SAMPLE_BASE = 12 if small else 8
+    POS_SAMPLE_LIMIT = None if small else 15
+    MAX_DLB_CYCLES = 2 if small else 2
+    RELOC_TRIES = (max(10, n // 2) if small else max(12, n // 3))
+    RELOC_TRIES = int(RELOC_TRIES * max(1.0, min(2.0, 0.5 + 0.1 * num_seqs)))
+    JITTER = 2
+    # Beam/search parameters
+    beam_width = max(4, min(10, 4 + num_seqs // 2)) if small else max(5, min(9, 5 + num_seqs // 3))
+    cand_per_state = min(24, max(10, n // 4)) if not small else min(20, max(8, n // 3))
+    lookahead_k = 6 if small else 5
+    alpha = 0.7
+    restarts = max(2, num_seqs // 2)
+    elite_size = max(2, min(5, restarts))
+
+    # Centralized cached evaluation of partial prefixes
+    @lru_cache(maxsize=200_000)
+    def _eval_cost_tuple(seq_tuple):
+        return workload.get_opt_seq_cost(list(seq_tuple))
+
+    def eval_cost(seq):
+        return _eval_cost_tuple(tuple(seq))
+
+    # Helpers
+    def sample_positions(seq_len):
+        if POS_SAMPLE_LIMIT is None or seq_len + 1 <= (POS_SAMPLE_LIMIT or (seq_len + 1)):
+            return list(range(seq_len + 1))
+        # Sample interior but keep ends
+        num_to_sample = max(2, min(POS_SAMPLE_LIMIT, seq_len + 1))
+        mandatory = {0, seq_len}
+        interior = list(range(1, seq_len))
+        if len(interior) <= num_to_sample - 2:
+            chosen = set(interior)
+        else:
+            chosen = set(random.sample(interior, num_to_sample - 2))
+        chosen.update(mandatory)
+        return sorted(chosen)
+
+    def best_insertion_for_txn(current_seq, txn):
+        """Try inserting txn into multiple positions; return (best_cost, best_pos, second_best_cost)."""
+        seq_len = len(current_seq)
+        best_cost = float('inf')
+        second_best = float('inf')
+        best_pos = 0
+        positions = sample_positions(seq_len)
+        for pos in positions:
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                second_best = best_cost
+                best_cost = cost
+                best_pos = pos
+            elif cost < second_best:
+                second_best = cost
+        if second_best == float('inf'):
+            second_best = best_cost
+        return best_cost, best_pos, second_best
+
+    # ------------------------ Constructors ------------------------
+
+    def construct_grasp():
+        """Regret-guided randomized insertion (GRASP seed)."""
+        remaining = all_txns.copy()
+        # Start from a good starter among sampled candidates
+        k_start = min(10, len(remaining))
+        start_cands = random.sample(remaining, k_start)
+        start = min(start_cands, key=lambda t: eval_cost([t]))
+        seq = [start]
+        remaining.remove(start)
+
+        # Try to pick a strong 2nd placement with a small RCL
+        if remaining:
+            k2 = min(8, len(remaining))
+            pairs = []
+            for t in random.sample(remaining, k2):
+                for pos in [0, 1]:
+                    cand = seq.copy()
+                    cand.insert(pos, t)
+                    c = eval_cost(cand)
+                    pairs.append((c, t, pos))
+            if pairs:
+                pairs.sort(key=lambda x: x[0])
+                rcl = pairs[:min(3, len(pairs))]
+                chosen_c, chosen_t, chosen_pos = random.choice(rcl)
+                seq.insert(chosen_pos, chosen_t)
+                remaining.remove(chosen_t)
+
+        # Iteratively insert with regret-based RCL
+        while remaining:
+            # Adapt candidate size; endgame widen
+            dynamic_base = CAND_SAMPLE_BASE
+            if len(remaining) <= max(8, 2 * dynamic_base):
+                cand_txns = list(remaining)
+            else:
+                size = min(len(remaining), max(4, dynamic_base + random.randint(-JITTER, JITTER)))
+                cand_txns = random.sample(remaining, size)
+
+            scored = []
+            for t in cand_txns:
+                c_best, pos_best, c_2nd = best_insertion_for_txn(seq, t)
+                regret = max(0.0, c_2nd - c_best)
+                scored.append((c_best, regret, t, pos_best))
+
+            if not scored:
+                t = random.choice(remaining)
+                seq.append(t)
+                remaining.remove(t)
+                continue
+
+            scored.sort(key=lambda x: x[0])
+            # Compose RCL primarily by cost, but consider regret within it
+            rcl_size = max(1, min(3, len(scored) // 2 if len(scored) > 3 else len(scored)))
+            rcl = scored[:rcl_size]
+            # 40% chance to pick highest regret from RCL to diversify
+            if random.random() < 0.4:
+                chosen = max(rcl, key=lambda x: x[1])
+            else:
+                chosen = random.choice(rcl)
+            c_step, _, t_step, pos_step = chosen
+            seq.insert(pos_step, t_step)
+            remaining.remove(t_step)
+
+        return eval_cost(seq), seq
+
+    def suffix_sig(seq):
+        if not seq:
+            return ()
+        if len(seq) == 1:
+            return (seq[-1],)
+        return (seq[-2], seq[-1])
+
+    def construct_beam():
+        """Regret-diverse beam search with two-step lookahead."""
+        # Initialize beam with best singletons and one GRASP seed
+        starters = [(eval_cost([t]), [t]) for t in range(n)]
+        starters.sort(key=lambda x: x[0])
+        init_count = min(max(beam_width * 2, beam_width), n)
+        beam = []
+        seen = set()
+        for c, seq in starters[:init_count]:
+            key = tuple(seq)
+            if key in seen:
+                continue
+            seen.add(key)
+            rem = tuple(x for x in range(n) if x != seq[0])
+            beam.append((c, seq, rem))
+
+        # Inject a GRASP seed
+        gc, gs = construct_grasp()
+        rem = tuple(x for x in range(n) if x not in set(gs))
+        beam.append((gc, gs, rem))
+
+        best_complete = (float('inf'), [])
+
+        for depth in range(1, n + 1):
+            next_candidates = []  # (score, regret, c1, seq, rem, sig)
+            for c_so_far, prefix, remaining in beam:
+                rem_list = list(remaining)
+                if not rem_list:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    next_candidates.append((c_so_far, 0.0, c_so_far, prefix, remaining, suffix_sig(prefix)))
+                    continue
+
+                # Candidate expansions (endgame widen)
+                if len(rem_list) <= min(cand_per_state, 16):
+                    expand_list = rem_list
+                else:
+                    expand_list = random.sample(rem_list, min(cand_per_state, len(rem_list)))
+
+                local_moves = []
+                for t in expand_list:
+                    new_prefix = prefix + [t]
+                    c1 = eval_cost(new_prefix)
+                    rem_after = [x for x in rem_list if x != t]
+
+                    score = c1
+                    if rem_after:
+                        k2 = len(rem_after) if len(rem_after) <= 6 else min(lookahead_k, len(rem_after))
+                        second = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        for u in second:
+                            c2 = eval_cost(new_prefix + [u])
+                            if c2 < best_c2:
+                                best_c2 = c2
+                        score = alpha * c1 + (1.0 - alpha) * best_c2
+
+                    local_moves.append((score, c1, new_prefix, tuple(rem_after)))
+
+                    if len(new_prefix) == n and c1 < best_complete[0]:
+                        best_complete = (c1, new_prefix)
+
+                if not local_moves:
+                    continue
+                local_moves.sort(key=lambda x: x[0])
+                best_score = local_moves[0][0]
+                second_score = local_moves[1][0] if len(local_moves) > 1 else best_score
+                regret = max(0.0, second_score - best_score)
+                keep_local = local_moves[:min(4, len(local_moves))]
+                for idx, (score, c1, seq_cand, rem_cand) in enumerate(keep_local):
+                    reg = regret if idx == 0 else 0.0
+                    next_candidates.append((score, reg, c1, seq_cand, rem_cand, suffix_sig(seq_cand)))
+
+            if not next_candidates:
+                break
+
+            # Primary selection by score with suffix-2 diversity
+            next_candidates.sort(key=lambda x: x[0])
+            pruned = []
+            used_seq = set()
+            seen_suffix = set()
+            primary_target = max(1, int(0.7 * beam_width))
+            for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                key = tuple(seq_cand)
+                if sig in seen_suffix or key in used_seq:
+                    continue
+                pruned.append((c1, seq_cand, rem_cand))
+                used_seq.add(key)
+                seen_suffix.add(sig)
+                if len(pruned) >= primary_target:
+                    break
+
+            # Fill remaining slots by regret (diversified high-regret) then best score
+            if len(pruned) < beam_width:
+                remaining_pool = [x for x in next_candidates if tuple(x[3]) not in used_seq]
+                # Regret-prioritized
+                remaining_pool.sort(key=lambda x: (-x[1], x[0]))
+                for score, reg, c1, seq_cand, rem_cand, sig in remaining_pool:
+                    key = tuple(seq_cand)
+                    if key in used_seq or sig in seen_suffix:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    seen_suffix.add(sig)
+                    if len(pruned) >= beam_width:
+                        break
+
+            # If still short, fill by best score ignoring suffix
+            if len(pruned) < beam_width:
+                for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                    key = tuple(seq_cand)
+                    if key in used_seq:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    if len(pruned) >= beam_width:
+                        break
+
+            beam = pruned
+
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # Greedy completion from best beam state if not complete
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_t = None
+                best_c = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur_seq + [t])
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                cur_seq.append(best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur_seq), cur_seq
+
+        # Fallback
+        identity = list(range(n))
+        return eval_cost(identity), identity
+
+    # ------------------------ Local Search (VND with DLB) ------------------------
+
+    def local_adjacent_swaps(seq, curr_cost, max_passes=2):
+        """Multiple passes of adjacent swap hill-climbing."""
+        best_seq = list(seq)
+        best_cost = curr_cost
+        passes = 0
+        improved = True
+        while improved and passes < max_passes:
+            improved = False
+            for i in range(len(best_seq) - 1):
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_cost(cand)
+                if c < best_cost:
+                    best_seq, best_cost = cand, c
+                    improved = True
+            passes += 1
+        return best_seq, best_cost
+
+    def local_oropt_dlb(seq, curr_cost, pos_sample_limit=25, cycles=MAX_DLB_CYCLES):
+        """
+        Or-opt blocks (sizes 1..3) with don't-look-bits. Best-improvement per accepted move.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        n_local = len(best_seq)
+        if n_local <= 2:
+            return best_seq, best_cost
+
+        dlb = [False] * n_local
+        cycles_done = 0
+
+        def all_positions(m):
+            if POS_SAMPLE_LIMIT is None or m <= (POS_SAMPLE_LIMIT or m) + 1:
+                return list(range(m))
+            k = min(pos_sample_limit, m - 1)
+            interior = list(range(1, m - 1))
+            sampled = set(random.sample(interior, k)) if interior else set()
+            sampled.update({0, m - 1})
+            return sorted(sampled)
+
+        while cycles_done < cycles:
+            improved_round = False
+            # larger blocks first
+            for blk in (3, 2, 1):
+                if blk > len(best_seq):
+                    continue
+                move_applied = False
+                # Iterate indices; use DLB to skip cold spots
+                for i in range(0, len(best_seq) - blk + 1):
+                    if i < len(dlb) and dlb[i]:
+                        continue
+                    block = best_seq[i:i + blk]
+                    base = best_seq[:i] + best_seq[i + blk:]
+                    m = len(base) + 1
+                    positions = all_positions(m)
+                    move_best_delta = 0.0
+                    move_best_pos = None
+                    for pos in positions:
+                        cand = base[:]
+                        cand[pos:pos] = block
+                        c = eval_cost(cand)
+                        delta = best_cost - c
+                        if delta > move_best_delta:
+                            move_best_delta = delta
+                            move_best_pos = pos
+                    if move_best_pos is not None:
+                        base[move_best_pos:move_best_pos] = block
+                        best_seq = base
+                        best_cost = eval_cost(best_seq)
+                        improved_round = True
+                        move_applied = True
+                        # Reset DLB around affected area
+                        dlb = [False] * len(best_seq)
+                        break
+                    else:
+                        if i < len(dlb):
+                            dlb[i] = True
+                if move_applied:
+                    break
+            if not improved_round:
+                cycles_done += 1
+            else:
+                cycles_done = 0  # reset cycles on improvement
+        return best_seq, best_cost
+
+    def local_pair_swaps_sampled(seq, curr_cost, tries=100):
+        """
+        Sampled non-adjacent pair swaps; accept best improvement in the sample.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        n_local = len(best_seq)
+        if n_local <= 3:
+            return best_seq, best_cost
+        improved = True
+        attempts = 0
+        while improved and attempts < tries:
+            improved = False
+            best_delta = 0.0
+            best_i = best_j = None
+            for _ in range(min(tries // 5 + 5, n_local)):
+                i = random.randint(0, n_local - 1)
+                j = random.randint(0, n_local - 1)
+                if i == j or abs(i - j) <= 1:
+                    continue
+                cand = best_seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                c = eval_cost(cand)
+                delta = best_cost - c
+                if delta > best_delta:
+                    best_delta = delta
+                    best_i, best_j = i, j
+            if best_i is not None:
+                cand = best_seq[:]
+                cand[best_i], cand[best_j] = cand[best_j], cand[best_i]
+                best_seq = cand
+                best_cost = eval_cost(best_seq)
+                improved = True
+            attempts += 1
+        return best_seq, best_cost
+
+    def local_segment_reversals_sampled(seq, curr_cost, tries=80):
+        """
+        Sampled 2-opt-style segment reversals; accept best improvement in the sample.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        n_local = len(best_seq)
+        if n_local <= 4:
+            return best_seq, best_cost
+        improved = True
+        attempts = 0
+        while improved and attempts < tries:
+            improved = False
+            best_delta = 0.0
+            best_i = best_j = None
+            for _ in range(min(tries // 4 + 5, n_local)):
+                i = random.randint(0, n_local - 2)
+                j = random.randint(i + 1, min(n_local - 1, i + 10))  # limit reversal length
+                cand = best_seq[:]
+                cand[i:j + 1] = reversed(cand[i:j + 1])
+                c = eval_cost(cand)
+                delta = best_cost - c
+                if delta > best_delta:
+                    best_delta = delta
+                    best_i, best_j = i, j
+            if best_i is not None:
+                cand = best_seq[:]
+                cand[best_i:best_j + 1] = reversed(cand[best_i:best_j + 1])
+                best_seq = cand
+                best_cost = eval_cost(best_seq)
+                improved = True
+            attempts += 1
+        return best_seq, best_cost
+
+    def vnd_refine(seq):
+        """Variable Neighborhood Descent orchestration with DLB."""
+        c0 = eval_cost(seq)
+        s, c = local_oropt_dlb(seq, c0, cycles=MAX_DLB_CYCLES)
+        s, c = local_adjacent_swaps(s, c, max_passes=2)
+        s, c = local_pair_swaps_sampled(s, c, tries=max(60, n // 2))
+        s, c = local_segment_reversals_sampled(s, c, tries=max(50, n // 2))
+        # Final quick Or-opt + adjacent pass
+        s, c = local_oropt_dlb(s, c, cycles=1)
+        s, c = local_adjacent_swaps(s, c, max_passes=1)
+        return s, c
+
+    # ------------------------ Ruin-and-Recreate LNS ------------------------
+
+    def ruin_and_recreate(seq, curr_cost, rounds=2):
+        """
+        Remove a subset (contiguous + random) and rebuild with regret-guided insertion.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        if len(best_seq) <= 6:
+            return best_seq, best_cost
+
+        for _ in range(rounds):
+            k = min(max(8, int(0.08 * n)), len(best_seq) - 1)
+            k_contig = max(2, k // 2)
+            start = random.randint(0, len(best_seq) - k_contig)
+            remove_idx = set(range(start, start + k_contig))
+            while len(remove_idx) < k:
+                remove_idx.add(random.randint(0, len(best_seq) - 1))
+            remove_idx = sorted(remove_idx)
+
+            removed = [best_seq[i] for i in remove_idx]
+            base = [best_seq[i] for i in range(len(best_seq)) if i not in remove_idx]
+
+            cur = list(base)
+            # Regret-guided reinsertion
+            while removed:
+                # Sample a few removed to consider first
+                sample = removed if len(removed) <= 8 else random.sample(removed, 8)
+                best_t = None
+                best_pos = None
+                best_c = float('inf')
+                best_regret = -1.0
+                for t in sample:
+                    c_best, pos_best, c_2nd = best_insertion_for_txn(cur, t)
+                    regret = max(0.0, c_2nd - c_best)
+                    # Primary: best cost, tie-break by regret
+                    if c_best < best_c or (abs(c_best - best_c) < 1e-9 and regret > best_regret):
+                        best_c, best_pos, best_t, best_regret = c_best, pos_best, t, regret
+                if best_t is None:
+                    best_t = removed[0]
+                    best_pos = len(cur)
+                cur.insert(best_pos, best_t)
+                removed.remove(best_t)
+
+            c_new = eval_cost(cur)
+            if c_new < best_cost:
+                best_cost = c_new
+                best_seq = cur
+
+        return best_seq, best_cost
+
+    # ------------------------ Multi-start + ILS orchestration ------------------------
+
+    # Elite solutions store
+    elites = []  # list of (cost, seq)
+    best_global = (float('inf'), [])
+
+    # Seed strategies: a few GRASP seeds plus a beam result
+    seed_count = max(2, restarts - 1)
+    for _ in range(seed_count):
+        c, s = construct_grasp()
+        elites.append((c, s))
+    # Add beam seed
+    c_beam, s_beam = construct_beam()
+    elites.append((c_beam, s_beam))
+
+    # Keep top elites
+    elites.sort(key=lambda x: x[0])
+    elites = elites[:elite_size]
+
+    # Refine each elite with VND, then run a couple ILS LNS rounds
+    refined = []
+    for c, s in elites:
+        s1, c1 = vnd_refine(s)
+        # LNS escape and quick polish
+        s2, c2 = ruin_and_recreate(s1, c1, rounds=2)
+        if c2 < c1:
+            s1, c1 = vnd_refine(s2)
+        refined.append((c1, s1))
+
+    refined.sort(key=lambda x: x[0])
+    if refined:
+        best_global = refined[0]
+
+    # Iterated Local Search loops with increasing perturbations
+    ils_rounds = max(2, num_seqs)
+    incumbent_seq = list(best_global[1]) if best_global[1] else None
+    incumbent_cost = best_global[0]
+
+    for k_round in range(ils_rounds):
+        if incumbent_seq is None:
+            break
+        # LNS with slightly stronger perturbation after stagnation
+        rounds = 2 if k_round < 2 else 3
+        s_pert, c_pert = ruin_and_recreate(incumbent_seq, incumbent_cost, rounds=rounds)
+        if c_pert < incumbent_cost:
+            s_loc, c_loc = vnd_refine(s_pert)
+            if c_loc < incumbent_cost:
+                incumbent_seq, incumbent_cost = s_loc, c_loc
+                if c_loc < best_global[0]:
+                    best_global = (c_loc, s_loc)
+        else:
+            # Small diversification: apply a few random relocations then refine
+            s_rand = list(incumbent_seq)
+            tries = min(10, max(5, n // 20))
+            for _ in range(tries):
+                i = random.randint(0, n - 1)
+                j = random.randint(0, n - 1)
+                if i == j:
+                    continue
+                t = s_rand.pop(i)
+                if j > i:
+                    j -= 1
+                s_rand.insert(j, t)
+            s_loc, c_loc = vnd_refine(s_rand)
+            if c_loc < incumbent_cost:
+                incumbent_seq, incumbent_cost = s_loc, c_loc
+                if c_loc < best_global[0]:
+                    best_global = (c_loc, s_loc)
+
+    # Safety checks
+    assert best_global[1] and len(best_global[1]) == n and len(set(best_global[1])) == n
+    return best_global[0], best_global[1]
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

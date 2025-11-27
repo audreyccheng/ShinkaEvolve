@@ -1,0 +1,314 @@
+<NAME>
+guard_and_confidence_refine_with_baselines
+</NAME>
+
+<DESCRIPTION>
+I propose to refine router-level guards, enrichment weights, and confidence calibration using baseline signals and usage metrics, to improve confidence calibration without hurting counter repairs.
+
+Key changes:
+- Track baseline pair residuals per interface (using original telemetry) and baseline per-router imbalance.
+- Use an elastic router guard based on imbalance and confidence gap, and track actual guard usage per router. Also track multiplicative scale magnitude per router.
+- Make redistribution weights traffic-aware by using a dynamic tolerance tol_pair = max(0.02, 2.5/max(v,1)) and add a +0.1 boost when pair residuals are large.
+- Integrate these signals into confidence calibration: apply small penalties when multiplicative scaling is strong and when the router guard is nearly fully consumed, and a consumption penalty when an interface consumes >70% of its cap. Add an improvement bonus when both pair residuals drop ≥50% and router imbalance drops ≥30%. Taper edit-penalty weights to avoid over/underconfidence.
+
+These changes should tighten calibration (especially avoiding overconfidence on heavy edits and strong scaling) while preserving the existing strong counter repair logic.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Initialize structures
+    result: Dict[str, Dict[str, Tuple]] = {}
+    # Store interim repaired values and confidences per interface before router-level hardening
+    interim: Dict[str, Dict[str, Any]] = {}
+=======
+    # Initialize structures
+    result: Dict[str, Dict[str, Tuple]] = {}
+    # Store interim repaired values and confidences per interface before router-level hardening
+    interim: Dict[str, Dict[str, Any]] = {}
+    # Router-level calibration helpers
+    router_scale_mag: Dict[str, float] = {}   # |1 - s_bounded| from multiplicative pre-step
+    router_guard: Dict[str, float] = {}       # guard budget per router for additive pass
+    router_delta_used: Dict[str, float] = {}  # actual used portion of guard
+    router_pre_imbalance: Dict[str, float] = {}  # baseline per-router imbalance from original telemetry
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        interim[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'rx_conf': 1.0,
+            'tx_conf': 1.0,
+            'status': data.get('interface_status', 'unknown'),
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            # Keep originals for output tuples
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown'),
+            # Track whether router-level edits touched this interface
+            'touched': False,
+            # Edit tracking and cap indicators for confidence calibration
+            'edit_rx_abs': 0.0,
+            'edit_tx_abs': 0.0,
+            'edit_rx_rel': 0.0,
+            'edit_tx_rel': 0.0,
+            'cap_hit_rx': False,
+            'cap_hit_tx': False,
+            'mult_scaled_rx': False,
+            'mult_scaled_tx': False,
+            'scaled_rel_rx': 0.0,
+            'scaled_rel_tx': 0.0,
+        }
+=======
+        interim[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'rx_conf': 1.0,
+            'tx_conf': 1.0,
+            'status': data.get('interface_status', 'unknown'),
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            # Keep originals for output tuples
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown'),
+            # Track whether router-level edits touched this interface
+            'touched': False,
+            # Edit tracking and cap indicators for confidence calibration
+            'edit_rx_abs': 0.0,
+            'edit_tx_abs': 0.0,
+            'edit_rx_rel': 0.0,
+            'edit_tx_rel': 0.0,
+            'cap_hit_rx': False,
+            'cap_hit_tx': False,
+            'mult_scaled_rx': False,
+            'mult_scaled_tx': False,
+            'scaled_rel_rx': 0.0,
+            'scaled_rel_tx': 0.0,
+            # Baseline pair residuals (from original telemetry) for improvement bonuses
+            'baseline_tx_pair_resid': 0.0,
+            'baseline_rx_pair_resid': 0.0,
+        }
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Pair-level hardening using link symmetry (R3) and interface consistency
+=======
+    # Compute baseline pair residuals using original telemetry for confidence bonuses
+    for a_id, b_id in pairs:
+        a = telemetry[a_id]; b = telemetry[b_id]
+        a_rx0, a_tx0 = float(a.get('rx_rate', 0.0)), float(a.get('tx_rate', 0.0))
+        b_rx0, b_tx0 = float(b.get('rx_rate', 0.0)), float(b.get('tx_rate', 0.0))
+        res_fwd0 = rel_diff(a_tx0, b_rx0)  # a.tx vs b.rx
+        res_rev0 = rel_diff(a_rx0, b_tx0)  # a.rx vs b.tx
+        interim[a_id]['baseline_tx_pair_resid'] = res_fwd0
+        interim[b_id]['baseline_rx_pair_resid'] = res_fwd0
+        interim[a_id]['baseline_rx_pair_resid'] = res_rev0
+        interim[b_id]['baseline_tx_pair_resid'] = res_rev0
+
+    # Pair-level hardening using link symmetry (R3) and interface consistency
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for router, if_list in router_ifaces.items():
+=======
+    # Baseline per-router imbalance from original telemetry (pre-repair)
+    for router, if_list in router_ifaces.items():
+        up_ifaces = [i for i in if_list if telemetry.get(i, {}).get('interface_status', 'up') == 'up']
+        sum_tx0 = sum(max(0.0, float(telemetry[i].get('tx_rate', 0.0))) for i in up_ifaces)
+        sum_rx0 = sum(max(0.0, float(telemetry[i].get('rx_rate', 0.0))) for i in up_ifaces)
+        router_pre_imbalance[router] = rel_diff(sum_tx0, sum_rx0)
+
+    for router, if_list in router_ifaces.items():
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Bound scaling to avoid extreme corrections
+        s_bounded = max(0.5, min(2.0, s))
+=======
+        # Bound scaling to avoid extreme corrections
+        s_bounded = max(0.5, min(2.0, s))
+        # Track multiplicative scale magnitude for confidence calibration
+        router_scale_mag[router] = abs(1.0 - s_bounded)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        need = target_total - sum_old
+        if abs(need) <= max(sum_old, target_total, 1.0) * (HARDENING_THRESHOLD * 0.5):
+            # Tiny residual; skip redistribution
+            continue
+
+        # Per-router total delta cap for additive redistribution
+        router_total = max(sum_old, target_total, 1.0)
+        router_delta_remaining = ROUTER_TOTAL_DELTA_FRAC * router_total
+=======
+        need = target_total - sum_old
+
+        # Dynamic router guard based on imbalance and confidence gap
+        sum_tx_curr = sum(max(0.0, interim[i]['tx']) for i in up_list)
+        sum_rx_curr = sum(max(0.0, interim[i]['rx']) for i in up_list)
+        avg_up_traffic = 0.5 * (sum_tx_curr + sum_rx_curr)
+        conf_gap = abs(avg_tx_conf - avg_rx_conf)
+        guard_frac = clamp(0.15 + 0.4 * imbalance + 0.4 * conf_gap, 0.15, 0.35)
+        router_delta_guard = guard_frac * avg_up_traffic
+        router_delta_remaining = router_delta_guard
+
+        if abs(need) <= max(sum_old, target_total, 1.0) * (HARDENING_THRESHOLD * 0.5):
+            router_guard[router] = router_delta_guard
+            router_delta_used[router] = 0.0
+            # Tiny residual; skip redistribution
+            continue
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            TOL_PAIR_W = HARDENING_THRESHOLD * 1.5
+            weights: Dict[str, float] = {}
+            for i in up_list:
+                conf = base_confs[i]
+                v = max(0.0, values[i])
+                pair_resid = pair_residual_for_dir(i)
+                pair_term = min(3.0, pair_resid / max(TOL_PAIR_W, 1e-9))
+                w = 0.6 * (1.0 - conf) + 0.25 * pair_term + 0.15 * (v / sum_v)
+                if v < 1.0:
+                    w *= 0.5
+                if pass_idx > 0 and consumed_frac_prev.get(i, 0.0) > 0.7:
+                    w *= 0.7
+                weights[i] = max(0.02, w)
+=======
+            weights: Dict[str, float] = {}
+            for i in up_list:
+                conf = base_confs[i]
+                v = max(0.0, values[i])
+                pair_resid = pair_residual_for_dir(i)
+                tol_pair_w = max(0.02, 2.5 / max(v, 1.0))
+                pair_term = min(2.0, pair_resid / max(tol_pair_w, 1e-9))
+                w = 0.6 * (1.0 - conf) + 0.25 * pair_term + 0.15 * (v / sum_v)
+                if pair_resid > 2.0 * tol_pair_w:
+                    w += 0.1
+                if v < 1.0:
+                    w *= 0.5
+                if pass_idx > 0 and consumed_frac_prev.get(i, 0.0) > 0.7:
+                    w *= 0.7
+                weights[i] = max(0.02, w)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            for i in up_list:
+                total_cap_i = max(cap_total[i], EPS)
+                consumed_frac_prev[i] = 1.0 - (cap_rem[i] / total_cap_i)
+=======
+            for i in up_list:
+                total_cap_i = max(cap_total[i], EPS)
+                consumed_frac_prev[i] = 1.0 - (cap_rem[i] / total_cap_i)
+
+            # Record router guard usage for calibration
+            router_delta_used[router] = router_delta_guard - router_delta_remaining
+            router_guard[router] = router_delta_guard
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        def finalize_conf(base: float, edit_rel: float, cap_hit: bool, scaled_rel: float, orig_val: float, new_val: float) -> float:
+            # Two-slope change penalty relative to tolerance; then cap-hit and scale penalties
+            pen_factor = max(0.0, 1.0 - 0.6 * max(0.0, edit_rel - HARDENING_THRESHOLD))
+            conf = clamp(base * pen_factor)
+            if cap_hit:
+                conf *= 0.9
+            if scaled_rel > 0.0:
+                conf *= (1.0 - min(0.15, 0.3 * scaled_rel))
+            # No-edit bonus for stability
+            if rel_diff(orig_val, new_val) <= 1e-3:
+                conf = clamp(conf + 0.05)
+            return clamp(conf)
+=======
+        def finalize_conf(base: float, edit_rel: float, cap_hit: bool, scaled_rel: float, orig_val: float, new_val: float) -> float:
+            # Tapered change penalty: lighter below 15%, stronger beyond
+            weight = 0.4 if edit_rel < 0.15 else 0.55
+            pen = max(0.0, edit_rel - HARDENING_THRESHOLD)
+            pen_factor = max(0.0, 1.0 - weight * pen)
+            conf = clamp(base * pen_factor)
+            if cap_hit:
+                conf *= 0.9
+            if scaled_rel > 0.0:
+                conf *= (1.0 - min(0.15, 0.3 * scaled_rel))
+            # No-edit bonus for stability
+            if rel_diff(orig_val, new_val) <= 1e-3:
+                conf = clamp(conf + 0.05)
+            return clamp(conf)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        final_tx_conf = finalize_conf(base_tx_conf, edit_tx_rel, cap_hit_tx, scaled_rel_tx, r['orig_tx'], r['tx'])
+        final_rx_conf = finalize_conf(base_rx_conf, edit_rx_rel, cap_hit_rx, scaled_rel_rx, r['orig_rx'], r['rx'])
+=======
+        final_tx_conf = finalize_conf(base_tx_conf, edit_tx_rel, cap_hit_tx, scaled_rel_tx, r['orig_tx'], r['tx'])
+        final_rx_conf = finalize_conf(base_rx_conf, edit_rx_rel, cap_hit_rx, scaled_rel_rx, r['orig_rx'], r['rx'])
+
+        # Additional calibration using router guard usage and multiplicative scale
+        guard = router_guard.get(router, 0.0)
+        used = router_delta_used.get(router, 0.0)
+        used_frac = (used / guard) if guard > 0.0 else 0.0
+        scale_mag = router_scale_mag.get(router, 0.0)
+        if scale_mag > 0.25:
+            final_tx_conf = clamp(final_tx_conf - 0.03)
+            final_rx_conf = clamp(final_rx_conf - 0.03)
+        if used_frac >= 0.9:
+            extra = 0.05 * clamp((used_frac - 0.9) / 0.1, 0.0, 1.0)
+            final_tx_conf = clamp(final_tx_conf - extra)
+            final_rx_conf = clamp(final_rx_conf - extra)
+
+        # Cap consumption penalty using cumulative edit magnitude vs max stage cap (0.45)
+        cons_rx = r.get('edit_rx_abs', 0.0) / (CAP_RAMP_FRACS[-1] * max(r['orig_rx'], 1.0))
+        cons_tx = r.get('edit_tx_abs', 0.0) / (CAP_RAMP_FRACS[-1] * max(r['orig_tx'], 1.0))
+        if cons_rx > 0.7:
+            final_rx_conf = clamp(final_rx_conf - 0.04 * (clamp(cons_rx, 0.7, 1.0) - 0.7) / 0.3)
+        if cons_tx > 0.7:
+            final_tx_conf = clamp(final_tx_conf - 0.04 * (clamp(cons_tx, 0.7, 1.0) - 0.7) / 0.3)
+
+        # Improvement bonus: if both pair residuals drop by ≥50% and router imbalance decreases by ≥30%
+        router_pre = router_pre_imbalance.get(router, None)
+        router_post = router_final_imbalance.get(router, None)
+        if peer and interim.get(peer, {}).get('status') == resolved_status and router_pre is not None and router_post is not None:
+            base_tx_resid = r.get('baseline_tx_pair_resid', 0.0)
+            base_rx_resid = r.get('baseline_rx_pair_resid', 0.0)
+            final_tx_resid = rel_diff(r['tx'], interim[peer]['rx'])
+            final_rx_resid = rel_diff(r['rx'], interim[peer]['tx'])
+            pair_improved = ((base_tx_resid > 0 and final_tx_resid <= 0.5 * base_tx_resid) and
+                             (base_rx_resid > 0 and final_rx_resid <= 0.5 * base_rx_resid))
+            router_improved = (router_pre > 0 and router_post <= 0.7 * router_pre)
+            if pair_improved and router_improved:
+                final_tx_conf = clamp(final_tx_conf + 0.04)
+                final_rx_conf = clamp(final_rx_conf + 0.04)
+>>>>>>> REPLACE
+
+</DIFF>

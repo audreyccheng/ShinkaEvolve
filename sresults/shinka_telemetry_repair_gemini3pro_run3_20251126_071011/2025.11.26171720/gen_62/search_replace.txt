@@ -1,0 +1,400 @@
+To improve the performance of the network telemetry repair, I will implement three interconnected changes focused on **status-aware priors**, **mean-value hypothesis injection**, and **calibrated confidence scoring**.
+
+1.  **Status Propagation**: I will modify the suspect flow generation to include interface status. This allows the solver to use "Down" status as a strong prior for zero traffic, helping to differentiate between phantom traffic (noise on down links) and real traffic.
+2.  **Solver Enhancements**:
+    *   **Mean Hypothesis**: For internal links with small discrepancies (<10%), I will add the mean of the two measurements as a hypothesis. This prevents binary flipping between two slightly noisy values.
+    *   **Status Priors**: I will enforce a high prior probability (0.95) for the 0.0 hypothesis if the interface status is 'down'.
+    *   **Cluster Probability**: Instead of just using the winning hypothesis's probability, I will calculate the `win_prob` as the sum of probabilities of all hypotheses *close* to the winner (within 5%). This prevents artificial low confidence when multiple good hypotheses (e.g., Measurement and Implied) are numerically close but distinct.
+3.  **Calibrated Confidence**: I will replace the heuristic confidence calculation with one derived directly from the solver's `win_prob` multiplied by the `router_fit`. This ensures confidence is high only when the solver is certain (one cluster dominates) AND the solution physically makes sense (routers balance).
+
+<NAME>
+propagate_status
+</NAME>
+
+<DESCRIPTION>
+Pass interface status into suspect_flows to allow status-aware priors in the solver.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            else:
+                # Suspect
+                suspect_flows.append({
+                    'type': 'internal', 'src': if1, 'dst': if2,
+                    'cands': [v1, v2]
+                })
+=======
+            else:
+                # Suspect
+                suspect_flows.append({
+                    'type': 'internal', 'src': if1, 'dst': if2,
+                    'cands': [v1, v2],
+                    'status_src': telemetry[if1].get('interface_status', 'unknown'),
+                    'status_dst': telemetry[if2].get('interface_status', 'unknown')
+                })
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            else:
+                suspect_flows.append({
+                    'type': 'internal', 'src': if2, 'dst': if1,
+                    'cands': [v1, v2]
+                })
+=======
+            else:
+                suspect_flows.append({
+                    'type': 'internal', 'src': if2, 'dst': if1,
+                    'cands': [v1, v2],
+                    'status_src': telemetry[if2].get('interface_status', 'unknown'),
+                    'status_dst': telemetry[if1].get('interface_status', 'unknown')
+                })
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        else:
+            # External
+            # Treat as suspect but with single candidate (itself)
+            # We will rely on conservation to confirm or deny it
+            suspect_flows.append({
+                'type': 'external', 'src': if1, 'dst': None,
+                'cands': [estimates[if1]['tx']],
+                'metric': 'tx'
+            })
+            suspect_flows.append({
+                'type': 'external', 'src': None, 'dst': if1,
+                'cands': [estimates[if1]['rx']],
+                'metric': 'rx'
+            })
+=======
+        else:
+            # External
+            # Treat as suspect but with single candidate (itself)
+            # We will rely on conservation to confirm or deny it
+            suspect_flows.append({
+                'type': 'external', 'src': if1, 'dst': None,
+                'cands': [estimates[if1]['tx']],
+                'metric': 'tx',
+                'status_src': telemetry[if1].get('interface_status', 'unknown')
+            })
+            suspect_flows.append({
+                'type': 'external', 'src': None, 'dst': if1,
+                'cands': [estimates[if1]['rx']],
+                'metric': 'rx',
+                'status_dst': telemetry[if1].get('interface_status', 'unknown')
+            })
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+solver_improvements
+</NAME>
+
+<DESCRIPTION>
+Enhance the Bayesian solver with:
+1. Mean-value hypothesis for close candidates (reduces binary flipping noise).
+2. Status-aware priors (prefer 0.0 if status is down).
+3. Confidence calculation based on probability mass of the winning cluster (handles split votes).
+4. Storage of solver confidence for final calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(ITERATIONS):
+        updates = []
+
+        for flow in suspect_flows:
+            # Prepare context
+            if flow['type'] == 'internal':
+                src, dst = flow['src'], flow['dst']
+                r_src = if_to_router.get(src)
+                r_dst = if_to_router.get(dst)
+
+                # Candidates: [Meas1, Meas2, 0.0]
+                # Filter duplicates and negative
+                hyps = sorted(list(set([c for c in flow['cands'] if c >= 0] + [0.0])))
+
+                curr_tx = estimates[src]['tx']
+                curr_rx = estimates[dst]['rx']
+
+                scores = []
+                for h in hyps:
+                    # Apply
+                    estimates[src]['tx'] = h
+                    estimates[dst]['rx'] = h
+
+                    # Eval Src
+                    imb_s, flow_s = get_router_state(r_src)
+                    sig_s = calc_sigma(flow_s)
+                    score_s = math.exp(-abs(imb_s)/sig_s) if r_src else 1.0
+
+                    # Eval Dst
+                    imb_d, flow_d = get_router_state(r_dst)
+                    sig_d = calc_sigma(flow_d)
+                    score_d = math.exp(-abs(imb_d)/sig_d) if r_dst else 1.0
+
+                    # Prior
+                    # Penalize 0.0 if measurements are large (unless conservation dictates)
+                    prior = 1.0
+                    if h == 0.0:
+                        max_meas = max(flow['cands'])
+                        if max_meas > 10.0: prior = 0.01 # Strong penalty for zeroing large flow
+                        elif max_meas > 1.0: prior = 0.5
+
+                    scores.append(score_s * score_d * prior)
+
+                # Restore
+                estimates[src]['tx'] = curr_tx
+                estimates[dst]['rx'] = curr_rx
+
+                # Pick winner
+                best_idx = scores.index(max(scores))
+                win_val = hyps[best_idx]
+                updates.append((src, 'tx', win_val))
+                updates.append((dst, 'rx', win_val))
+
+            elif flow['type'] == 'external':
+                # External: We trust measurement unless implied value from conservation is much better
+                if flow['src']: # TX external
+                    if_id = flow['src']
+                    r_id = if_to_router.get(if_id)
+                    metric = 'tx'
+                    meas = flow['cands'][0]
+                    curr_val = estimates[if_id]['tx']
+
+                    # Implied value: what value balances the router?
+                    # Imb = In - Out. We want Imb=0.
+                    # Current Imb = In_Others + In_Self - (Out_Others + Out_Self)
+                    # We vary Out_Self (TX).
+                    # New_Out = Old_Out + Imb
+                    imb, r_flow = get_router_state(r_id)
+                    implied = max(0.0, curr_val + imb)
+
+                else: # RX external
+                    if_id = flow['dst']
+                    r_id = if_to_router.get(if_id)
+                    metric = 'rx'
+                    meas = flow['cands'][0]
+                    curr_val = estimates[if_id]['rx']
+
+                    # Vary In_Self (RX).
+                    # New_In = Old_In - Imb
+                    imb, r_flow = get_router_state(r_id)
+                    implied = max(0.0, curr_val - imb)
+
+                hyps = sorted(list(set([meas, implied, 0.0])))
+                scores = []
+
+                for h in hyps:
+                    estimates[if_id][metric] = h
+                    imb, rf = get_router_state(r_id)
+                    sig = calc_sigma(rf)
+                    lik = math.exp(-abs(imb)/sig) if r_id else 0.5
+
+                    # Prior: Gaussian centered on measurement
+                    # Sigma for prior: We trust measurement to ~5%
+                    sig_meas = max(meas * 0.05, 2.0)
+                    prior = math.exp(-abs(h - meas)/sig_meas)
+
+                    # Special Prior for 0.0 (Phantom check)
+                    if h == 0.0:
+                        if meas > 10.0: prior *= 0.01
+
+                    scores.append(lik * prior)
+
+                estimates[if_id][metric] = curr_val # Restore
+
+                best_idx = scores.index(max(scores))
+                win_val = hyps[best_idx]
+                updates.append((if_id, metric, win_val))
+
+        # Apply Updates with Momentum
+        for if_id, metric, val in updates:
+            old = estimates[if_id][metric]
+            # Momentum update
+            estimates[if_id][metric] = (old * (1 - MOMENTUM)) + (val * MOMENTUM)
+=======
+    # Track solver confidence to pass to Step 3
+    solver_confidences = {}
+
+    for iter_idx in range(ITERATIONS):
+        updates = []
+
+        for flow in suspect_flows:
+            # Prepare context
+            if flow['type'] == 'internal':
+                src, dst = flow['src'], flow['dst']
+                r_src = if_to_router.get(src)
+                r_dst = if_to_router.get(dst)
+
+                # Candidates: [Meas1, Meas2, Mean?, 0.0]
+                cands = [c for c in flow['cands'] if c >= 0]
+                # Add mean if close
+                if len(cands) == 2:
+                    v1, v2 = cands
+                    if abs(v1 - v2) < 0.1 * max(v1, v2, 1.0):
+                        cands.append((v1 + v2) / 2.0)
+
+                hyps = sorted(list(set(cands + [0.0])))
+
+                curr_tx = estimates[src]['tx']
+                curr_rx = estimates[dst]['rx']
+
+                scores = []
+                for h in hyps:
+                    # Apply
+                    estimates[src]['tx'] = h
+                    estimates[dst]['rx'] = h
+
+                    # Eval Src
+                    imb_s, flow_s = get_router_state(r_src)
+                    sig_s = calc_sigma(flow_s)
+                    score_s = math.exp(-abs(imb_s)/sig_s) if r_src else 1.0
+
+                    # Eval Dst
+                    imb_d, flow_d = get_router_state(r_dst)
+                    sig_d = calc_sigma(flow_d)
+                    score_d = math.exp(-abs(imb_d)/sig_d) if r_dst else 1.0
+
+                    # Prior
+                    prior = 1.0
+                    if h == 0.0:
+                        s_src = flow.get('status_src', 'unknown')
+                        s_dst = flow.get('status_dst', 'unknown')
+                        if s_src == 'down' or s_dst == 'down':
+                            prior = 0.95
+                        else:
+                            max_meas = max(flow['cands'])
+                            if max_meas > 10.0: prior = 0.01
+                            elif max_meas > 1.0: prior = 0.2
+
+                    scores.append(score_s * score_d * prior)
+
+                # Restore
+                estimates[src]['tx'] = curr_tx
+                estimates[dst]['rx'] = curr_rx
+
+                # Pick winner
+                total_score = sum(scores) + 1e-20
+                probs = [s / total_score for s in scores]
+                best_idx = scores.index(max(scores))
+                win_val = hyps[best_idx]
+
+                # Cluster probability for confidence
+                win_prob = sum(p for i, p in enumerate(probs) if abs(hyps[i] - win_val) <= max(win_val * 0.05, 1.0))
+
+                updates.append((src, 'tx', win_val, win_prob))
+                updates.append((dst, 'rx', win_val, win_prob))
+
+            elif flow['type'] == 'external':
+                # External: We trust measurement unless implied value from conservation is much better
+                if flow['src']: # TX external
+                    if_id = flow['src']
+                    r_id = if_to_router.get(if_id)
+                    metric = 'tx'
+                    meas = flow['cands'][0]
+                    curr_val = estimates[if_id]['tx']
+                    stat = flow.get('status_src')
+
+                    imb, r_flow = get_router_state(r_id)
+                    implied = max(0.0, curr_val + imb)
+
+                else: # RX external
+                    if_id = flow['dst']
+                    r_id = if_to_router.get(if_id)
+                    metric = 'rx'
+                    meas = flow['cands'][0]
+                    curr_val = estimates[if_id]['rx']
+                    stat = flow.get('status_dst')
+
+                    imb, r_flow = get_router_state(r_id)
+                    implied = max(0.0, curr_val - imb)
+
+                hyps = sorted(list(set([meas, implied, 0.0])))
+                scores = []
+
+                for h in hyps:
+                    estimates[if_id][metric] = h
+                    imb, rf = get_router_state(r_id)
+                    sig = calc_sigma(rf)
+                    lik = math.exp(-abs(imb)/sig) if r_id else 0.5
+
+                    # Prior: Gaussian centered on measurement
+                    sig_meas = max(meas * 0.05, 2.0)
+                    prior = math.exp(-abs(h - meas)/sig_meas)
+
+                    # Prior for 0.0
+                    if h == 0.0:
+                        if stat == 'down':
+                            prior = 0.95
+                        elif meas > 10.0: prior *= 0.01
+
+                    scores.append(lik * prior)
+
+                estimates[if_id][metric] = curr_val # Restore
+
+                total_score = sum(scores) + 1e-20
+                probs = [s / total_score for s in scores]
+                best_idx = scores.index(max(scores))
+                win_val = hyps[best_idx]
+
+                win_prob = sum(p for i, p in enumerate(probs) if abs(hyps[i] - win_val) <= max(win_val * 0.05, 1.0))
+
+                updates.append((if_id, metric, win_val, win_prob))
+
+        # Apply Updates with Momentum
+        for if_id, metric, val, prob in updates:
+            old = estimates[if_id][metric]
+            # Momentum update
+            estimates[if_id][metric] = (old * (1 - MOMENTUM)) + (val * MOMENTUM)
+            solver_confidences[(if_id, metric)] = prob
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+calibrated_confidence
+</NAME>
+
+<DESCRIPTION>
+Update confidence calculation to use the solver's probability (win_prob) scaled by router fit.
+This ensures we are only confident if:
+1. One hypothesis (or cluster) clearly won (High Solver Prob).
+2. That winner results in a balanced router (High Router Fit).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        def calc_conf(rep_val, orig_val, is_anchor):
+            if is_anchor: return 0.95
+
+            # If not anchor, we relied on conservation
+            # If router conservation is bad, confidence is bad
+            base = r_fit
+
+            # If we changed the value significantly, check if it makes sense
+            if abs(rep_val - orig_val) > max(orig_val * 0.1, 1.0):
+                # Big change.
+                # If fit is perfect (1.0), we are confident we fixed it (Conf ~ 0.9)
+                # If fit is poor (0.5), we are unsure (Conf ~ 0.4)
+                return 0.9 * base
+            else:
+                # Small change. We trust the measurement roughly, adjusted by fit.
+                # If fit is bad, maybe measurement was wrong but we couldn't find better?
+                return 0.8 * base + 0.15
+
+        conf_rx = calc_conf(rep_rx, orig_rx, (if_id, 'rx') in anchors)
+        conf_tx = calc_conf(rep_tx, orig_tx, (if_id, 'tx') in anchors)
+=======
+        def calc_conf(metric):
+            if (if_id, metric) in anchors: return 0.95
+
+            # Retrieve solver probability (margin of victory)
+            sol_prob = solver_confidences.get((if_id, metric), 0.5)
+
+            # Confidence is Solver_Certainty * Router_Fit_Quality
+            # Weighted towards fit because a clear winner that balances poorly is still suspect
+            final_conf = sol_prob * (0.2 + 0.8 * r_fit)
+
+            return final_conf
+
+        conf_rx = calc_conf('rx')
+        conf_tx = calc_conf('tx')
+>>>>>>> REPLACE
+</DIFF>

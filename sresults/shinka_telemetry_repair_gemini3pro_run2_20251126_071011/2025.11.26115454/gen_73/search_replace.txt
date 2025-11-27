@@ -1,0 +1,371 @@
+<NAME>
+dual_sided_flow_repair
+</NAME>
+
+<DESCRIPTION>
+Implements a dual-sided flow verification strategy for candidate generation in the iterative solver. Instead of blindly trusting flow conservation or minimizing global cost freely, this approach generates specific "flow candidates" that satisfy the local router's imbalance but adds them to the candidate pool ONLY if they do not worsen the remote router's imbalance. This protects correctly balanced parts of the network from being disrupted by error propagation. The arbitration uses a cost function dominated by flow consistency with a small data-fidelity penalty to break ties and anchor solutions. Confidence scoring is updated to reflect the solidity of the result (whether it balances the routers).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # --- 1. Fix Direction A: Local TX -> Peer RX ---
+            c_tx = s['tx']
+            c_prx = peer['rx']
+
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local)
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Scoring: Minimize new imbalance
+            def eval_direction_a(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    # New Imb = (Current - c_tx) + (-v) (Actually TX is Out, so -TX. Removing old -c_tx means +c_tx. New is -v)
+                    # Imb = In - Out. Out goes up -> Imb goes down.
+                    # Current Imb includes -c_tx. We want to replace with -v.
+                    # New = Current - (-c_tx) + (-v) = Current + c_tx - v
+                    cost += abs(imb_local + c_tx - v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    # Remote RX is In. Contribution +RX.
+                    # New = Current - c_prx + v
+                    cost += abs(imb_remote - c_prx + v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            cost_tx, n_tx = eval_direction_a(c_tx)
+            cost_prx, n_prx = eval_direction_a(c_prx)
+
+            best_val = c_tx
+            conf = 0.5
+
+            denom = max(c_tx, c_prx, 1.0)
+            diff_ratio = abs(c_tx - c_prx) / denom
+
+            if diff_ratio <= HARDENING_THRESHOLD:
+                # Signals agree
+                best_val = (c_tx + c_prx) / 2.0
+                conf = 1.0
+            elif n_tx == 0:
+                # No topology info, fallback to average
+                best_val = (c_tx + c_prx) / 2.0
+                # Dynamic confidence based on disagreement magnitude (from Prior Program)
+                conf = max(0.0, 1.0 - diff_ratio)
+            else:
+                # Topology info available
+                if cost_tx < cost_prx:
+                    best_val = c_tx
+                    winner_cost = cost_tx
+                    loser_cost = cost_prx
+                else:
+                    best_val = c_prx
+                    winner_cost = cost_prx
+                    loser_cost = cost_tx
+
+                # Solidity Check
+                w_cost_local = 0.0
+                w_cost_remote = 0.0
+                if imb_local is not None:
+                    w_cost_local = abs(imb_local + c_tx - best_val)
+                if imb_remote is not None:
+                    w_cost_remote = abs(imb_remote - c_prx + best_val)
+
+                err_local = w_cost_local / max(best_val, 1.0)
+                err_remote = w_cost_remote / max(best_val, 1.0)
+
+                # Relaxed solidity threshold slightly to account for floating point/noise
+                is_solid_local = (err_local < HARDENING_THRESHOLD * 1.5) and (imb_local is not None)
+                is_solid_remote = (err_remote < HARDENING_THRESHOLD * 1.5) and (imb_remote is not None)
+
+                if is_solid_local and is_solid_remote:
+                    conf = 1.0
+                elif is_solid_local or is_solid_remote:
+                    conf = 0.95
+                else:
+                    margin = (loser_cost - winner_cost) / max(winner_cost + loser_cost, 1.0)
+                    residual_ratio = winner_cost / max(best_val, 1.0)
+                    distinctness_score = min(1.0, margin * 2.0)
+                    fit_score = max(0.0, 1.0 - residual_ratio * 2.0)
+                    conf = 0.5 + 0.45 * distinctness_score * fit_score
+
+            s['tx'] = best_val
+            peer['rx'] = best_val
+            s['tx_conf'] = conf
+            peer['rx_conf'] = conf
+
+
+            # --- 2. Fix Direction B: Local RX <- Peer TX ---
+            c_rx = s['rx']
+            c_ptx = peer['tx']
+
+            # Update imbalances
+            imb_local = get_router_imbalance(r_local)
+            imb_remote = get_router_imbalance(r_remote)
+
+            def eval_direction_b(v):
+                cost = 0.0
+                valid_checks = 0
+                if imb_local is not None:
+                    # RX is In. New = Current - c_rx + v
+                    cost += abs(imb_local - c_rx + v)
+                    valid_checks += 1
+                if imb_remote is not None:
+                    # TX is Out. New = Current - (-c_ptx) + (-v) = Current + c_ptx - v
+                    cost += abs(imb_remote + c_ptx - v)
+                    valid_checks += 1
+                return cost, valid_checks
+
+            cost_rx, n_rx = eval_direction_b(c_rx)
+            cost_ptx, n_ptx = eval_direction_b(c_ptx)
+
+            best_val_b = c_rx
+            conf_b = 0.5
+
+            denom_b = max(c_rx, c_ptx, 1.0)
+            diff_ratio_b = abs(c_rx - c_ptx) / denom_b
+
+            if diff_ratio_b <= HARDENING_THRESHOLD:
+                best_val_b = (c_rx + c_ptx) / 2.0
+                conf_b = 1.0
+            elif n_rx == 0:
+                best_val_b = (c_rx + c_ptx) / 2.0
+                conf_b = max(0.0, 1.0 - diff_ratio_b)
+            else:
+                if cost_rx < cost_ptx:
+                    best_val_b = c_rx
+                    winner_cost = cost_rx
+                    loser_cost = cost_ptx
+                else:
+                    best_val_b = c_ptx
+                    winner_cost = cost_ptx
+                    loser_cost = cost_rx
+
+                w_cost_local = 0.0
+                w_cost_remote = 0.0
+                if imb_local is not None:
+                    w_cost_local = abs(imb_local - c_rx + best_val_b)
+                if imb_remote is not None:
+                    w_cost_remote = abs(imb_remote + c_ptx - best_val_b)
+
+                err_local = w_cost_local / max(best_val_b, 1.0)
+                err_remote = w_cost_remote / max(best_val_b, 1.0)
+
+                is_solid_local = (err_local < HARDENING_THRESHOLD * 1.5) and (imb_local is not None)
+                is_solid_remote = (err_remote < HARDENING_THRESHOLD * 1.5) and (imb_remote is not None)
+
+                if is_solid_local and is_solid_remote:
+                    conf_b = 1.0
+                elif is_solid_local or is_solid_remote:
+                    conf_b = 0.95
+                else:
+                    margin = (loser_cost - winner_cost) / max(winner_cost + loser_cost, 1.0)
+                    residual_ratio = winner_cost / max(best_val_b, 1.0)
+                    distinctness_score = min(1.0, margin * 2.0)
+                    fit_score = max(0.0, 1.0 - residual_ratio * 2.0)
+                    conf_b = 0.5 + 0.45 * distinctness_score * fit_score
+
+            s['rx'] = best_val_b
+            peer['tx'] = best_val_b
+            s['rx_conf'] = conf_b
+            peer['tx_conf'] = conf_b
+=======
+            # --- 1. Fix Direction A: Local TX -> Peer RX ---
+            # Original measurements as anchors
+            m_tx = float(s['orig'].get('tx_rate', 0.0))
+            m_prx = float(peer['orig'].get('rx_rate', 0.0))
+
+            # Current working values
+            c_tx = s['tx']
+            c_prx = peer['rx']
+
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local)
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Candidate Generation
+            candidates = {c_tx, m_tx, m_prx}
+
+            # Add average if measurements are close
+            if abs(m_tx - m_prx) < max(m_tx, m_prx, 1.0) * HARDENING_THRESHOLD:
+                candidates.add((m_tx + m_prx) / 2.0)
+
+            # Add Flow-Inferred Candidates (Dual-Sided Verification)
+            # Only add a flow candidate if it doesn't worsen the OTHER router's imbalance
+
+            if imb_local is not None:
+                # Value that balances local router: imb + current_out = target_out
+                # here: new_imb = imb_local + c_tx - v = 0 => v = imb_local + c_tx
+                flow_local = max(0.0, imb_local + c_tx)
+
+                # Check impact on remote
+                if imb_remote is not None:
+                    # Remote check: New_Imb = imb_remote - c_prx + flow_local
+                    new_rem_imb = abs(imb_remote - c_prx + flow_local)
+                    curr_rem_imb = abs(imb_remote)
+                    # Allow if improves or maintains within tolerance
+                    if new_rem_imb <= curr_rem_imb + 0.01:
+                        candidates.add(flow_local)
+                else:
+                    # If remote is not in topology, we are free to fix local
+                    candidates.add(flow_local)
+
+            if imb_remote is not None:
+                # Value that balances remote: imb - current_in + v = 0 => v = current_in - imb
+                # here: new_imb = imb_remote - c_prx + v = 0 => v = c_prx - imb_remote
+                flow_remote = max(0.0, c_prx - imb_remote)
+
+                # Check impact on local
+                if imb_local is not None:
+                    new_loc_imb = abs(imb_local + c_tx - flow_remote)
+                    curr_loc_imb = abs(imb_local)
+                    if new_loc_imb <= curr_loc_imb + 0.01:
+                        candidates.add(flow_remote)
+                else:
+                    candidates.add(flow_remote)
+
+            # Selection
+            best_val = c_tx
+            min_cost = float('inf')
+
+            for v in candidates:
+                # Cost Components:
+                # 1. Flow Imbalance (Primary)
+                flow_cost = 0.0
+                if imb_local is not None:
+                    flow_cost += abs(imb_local + c_tx - v)
+                if imb_remote is not None:
+                    flow_cost += abs(imb_remote - c_prx + v)
+
+                # 2. Data Deviation (Secondary - tie breaker and anchor)
+                # Weighted low to allow repairs, but high enough to prevent drift when flow is satisfied
+                data_cost = abs(v - m_tx) + abs(v - m_prx)
+
+                total_cost = flow_cost + 0.01 * data_cost
+
+                if total_cost < min_cost:
+                    min_cost = total_cost
+                    best_val = v
+
+            # Confidence Logic
+            conf = 0.5
+
+            # Calculate final residuals
+            res_local = 0.0
+            if imb_local is not None: res_local = abs(imb_local + c_tx - best_val)
+            res_remote = 0.0
+            if imb_remote is not None: res_remote = abs(imb_remote - c_prx + best_val)
+
+            solid_local = (res_local < max(best_val, 1.0) * HARDENING_THRESHOLD) and (imb_local is not None)
+            solid_remote = (res_remote < max(best_val, 1.0) * HARDENING_THRESHOLD) and (imb_remote is not None)
+
+            meas_agree = abs(m_tx - m_prx) < max(m_tx, m_prx, 1.0) * HARDENING_THRESHOLD
+            matches_data = (abs(best_val - m_tx) < 0.1) or (abs(best_val - m_prx) < 0.1)
+
+            if solid_local and solid_remote:
+                conf = 1.0
+            elif meas_agree and matches_data:
+                conf = 1.0 # Trust the agreement
+            elif solid_local or solid_remote:
+                # If one side is perfectly balanced by this value, and it's compatible...
+                if matches_data:
+                    conf = 0.95
+                else:
+                    # Flow inferred value
+                    conf = 0.9
+            else:
+                # Messy situation
+                conf = 0.5
+
+            s['tx'] = best_val
+            peer['rx'] = best_val
+            s['tx_conf'] = conf
+            peer['rx_conf'] = conf
+
+
+            # --- 2. Fix Direction B: Local RX <- Peer TX ---
+            m_rx = float(s['orig'].get('rx_rate', 0.0))
+            m_ptx = float(peer['orig'].get('tx_rate', 0.0))
+
+            c_rx = s['rx']
+            c_ptx = peer['tx']
+
+            imb_local = get_router_imbalance(r_local)
+            imb_remote = get_router_imbalance(r_remote)
+
+            candidates_b = {c_rx, m_rx, m_ptx}
+            if abs(m_rx - m_ptx) < max(m_rx, m_ptx, 1.0) * HARDENING_THRESHOLD:
+                candidates_b.add((m_rx + m_ptx) / 2.0)
+
+            if imb_local is not None:
+                # New_Imb = Imb - c_rx + v = 0 => v = c_rx - Imb
+                flow_loc = max(0.0, c_rx - imb_local)
+                if imb_remote is not None:
+                    # Remote (TX out): New = Imb + c_ptx - v
+                    new_r = abs(imb_remote + c_ptx - flow_loc)
+                    if new_r <= abs(imb_remote) + 0.01:
+                        candidates_b.add(flow_loc)
+                else:
+                    candidates_b.add(flow_loc)
+
+            if imb_remote is not None:
+                # New_Imb = Imb + c_ptx - v = 0 => v = Imb + c_ptx
+                flow_rem = max(0.0, imb_remote + c_ptx)
+                if imb_local is not None:
+                    new_l = abs(imb_local - c_rx + flow_rem)
+                    if new_l <= abs(imb_local) + 0.01:
+                        candidates_b.add(flow_rem)
+                else:
+                    candidates_b.add(flow_rem)
+
+            best_val_b = c_rx
+            min_cost_b = float('inf')
+
+            for v in candidates_b:
+                flow_cost = 0.0
+                if imb_local is not None:
+                    flow_cost += abs(imb_local - c_rx + v)
+                if imb_remote is not None:
+                    flow_cost += abs(imb_remote + c_ptx - v)
+
+                data_cost = abs(v - m_rx) + abs(v - m_ptx)
+                total_cost = flow_cost + 0.01 * data_cost
+
+                if total_cost < min_cost_b:
+                    min_cost_b = total_cost
+                    best_val_b = v
+
+            conf_b = 0.5
+            res_local = 0.0
+            if imb_local is not None: res_local = abs(imb_local - c_rx + best_val_b)
+            res_remote = 0.0
+            if imb_remote is not None: res_remote = abs(imb_remote + c_ptx - best_val_b)
+
+            solid_local = (res_local < max(best_val_b, 1.0) * HARDENING_THRESHOLD) and (imb_local is not None)
+            solid_remote = (res_remote < max(best_val_b, 1.0) * HARDENING_THRESHOLD) and (imb_remote is not None)
+
+            meas_agree = abs(m_rx - m_ptx) < max(m_rx, m_ptx, 1.0) * HARDENING_THRESHOLD
+            matches_data = (abs(best_val_b - m_rx) < 0.1) or (abs(best_val_b - m_ptx) < 0.1)
+
+            if solid_local and solid_remote:
+                conf_b = 1.0
+            elif meas_agree and matches_data:
+                conf_b = 1.0
+            elif solid_local or solid_remote:
+                if matches_data:
+                    conf_b = 0.95
+                else:
+                    conf_b = 0.9
+            else:
+                conf_b = 0.5
+
+            s['rx'] = best_val_b
+            peer['tx'] = best_val_b
+            s['rx_conf'] = conf_b
+            peer['tx_conf'] = conf_b
+>>>>>>> REPLACE
+</DIFF>

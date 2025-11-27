@@ -1,0 +1,295 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Takes interface telemetry data and detects/repairs inconsistencies based on
+network invariants like link symmetry and flow conservation.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by detecting and correcting inconsistencies.
+
+    Core principle: Use network invariants to validate and repair telemetry:
+    1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+    2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+    3. Interface Consistency: Status should be consistent across connected pairs
+
+    Args:
+        telemetry: Dictionary where key is interface_id and value contains:
+            - interface_status: "up" or "down"
+            - rx_rate: receive rate in Mbps
+            - tx_rate: transmit rate in Mbps
+            - connected_to: interface_id this interface connects to
+            - local_router: router_id this interface belongs to
+            - remote_router: router_id on the other side
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary with same structure but telemetry values become tuples of:
+        (original_value, repaired_value, confidence_score)
+        where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+    """
+
+    # Parameters
+    LOCK_THRESHOLD = 0.01      # 1% tolerance for locking a "perfect" repair
+    ITERATIONS = 5             # Number of convergence passes
+
+    # 1. Initialize State
+    # Working structure with mutable rates and lock flags
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'orig': data,
+            'locked_in': False,  # Is the RX value (Peer->Me) locked?
+            'locked_out': False, # Is the TX value (Me->Peer) locked?
+            'conf_rx': 0.5,
+            'conf_tx': 0.5,
+            'conf_status': 1.0
+        }
+
+    # 2. Status Repair (Pre-computation)
+    # We fix statuses first as they determine if rates should be zero
+    for if_id, s in state.items():
+        peer_id = s['orig'].get('connected_to')
+        if peer_id and peer_id in state:
+            peer = state[peer_id]
+            
+            # If statuses disagree, check for physical traffic evidence
+            if s['status'] != peer['status']:
+                traffic_active = max(s['rx'], s['tx'], peer['rx'], peer['tx']) > 1.0
+                if traffic_active:
+                    s['status'] = 'up'
+                    s['conf_status'] = 0.9
+                else:
+                    s['status'] = 'down'
+                    s['conf_status'] = 0.9
+            
+            # Enforce "Down implies Zero"
+            if s['status'] == 'down':
+                s['rx'] = 0.0
+                s['tx'] = 0.0
+                s['locked_in'] = True
+                s['locked_out'] = True
+                s['conf_rx'] = 1.0
+                s['conf_tx'] = 1.0
+
+    # Helper: Get current router imbalance and total flow
+    def get_router_metrics(rid):
+        if not rid or rid not in topology:
+            return 0.0, 0.0, False
+        in_sum = 0.0
+        out_sum = 0.0
+        total_flow = 0.0
+        for iid in topology[rid]:
+            if iid in state:
+                r = state[iid]['rx']
+                t = state[iid]['tx']
+                in_sum += r
+                out_sum += t
+                total_flow += (r + t)
+        return (in_sum - out_sum), total_flow, True
+
+    # 3. Iterative Repair Loop
+    sorted_ifs = sorted(state.keys()) # Deterministic order
+    
+    for _ in range(ITERATIONS):
+        # A. Calculate Router "Stability" weights for this iteration
+        # Trust routers that are nearly balanced more than chaotic ones
+        router_weights = {}
+        for rid in topology:
+            imb, flow, valid = get_router_metrics(rid)
+            if valid and flow > 1.0:
+                rel_imb = abs(imb) / flow
+                # Weight decays as relative imbalance increases
+                router_weights[rid] = 1.0 / (1.0 + 10.0 * rel_imb)
+            else:
+                router_weights[rid] = 0.5 
+
+        # B. Process Links
+        processed_pairs = set()
+        
+        for if_id in sorted_ifs:
+            s = state[if_id]
+            peer_id = s['orig'].get('connected_to')
+            if not peer_id or peer_id not in state: continue
+            
+            # Process each link pair only once
+            pair_key = tuple(sorted([if_id, peer_id]))
+            if pair_key in processed_pairs: continue
+            processed_pairs.add(pair_key)
+            
+            peer = state[peer_id]
+            if s['status'] == 'down': continue
+            
+            # --- Direction 1: Local TX -> Peer RX ---
+            if not s['locked_out']:
+                rid_local = s['orig'].get('local_router')
+                rid_remote = peer['orig'].get('local_router')
+                
+                # Calculate "Implied" values: What value fixes the router?
+                # TX_Target = Current_TX + Current_Imbalance (Imb = In - Out)
+                imb_loc, _, valid_loc = get_router_metrics(rid_local)
+                imp_tx = s['tx'] + imb_loc if valid_loc else None
+                
+                # RX_Target = Current_RX - Current_Imbalance (Imb = In - Out)
+                imb_rem, _, valid_rem = get_router_metrics(rid_remote)
+                imp_rx = peer['rx'] - imb_rem if valid_rem else None
+                
+                # Generate Candidates
+                candidates = set()
+                candidates.add(s['orig'].get('tx_rate', 0.0))
+                candidates.add(peer['orig'].get('rx_rate', 0.0))
+                candidates.add(s['tx']) # Keep current best
+                if imp_tx is not None and imp_tx > 0: candidates.add(imp_tx)
+                if imp_rx is not None and imp_rx > 0: candidates.add(imp_rx)
+                
+                # Select Best Candidate based on Weighted Cost
+                best_val = s['tx']
+                min_cost = float('inf')
+                w_loc = router_weights.get(rid_local, 0.5)
+                w_rem = router_weights.get(rid_remote, 0.5)
+                
+                for val in candidates:
+                    if val < 0: continue
+                    cost = 0.0
+                    if imp_tx is not None:
+                        cost += abs(val - imp_tx) * w_loc
+                    if imp_rx is not None:
+                        cost += abs(val - imp_rx) * w_rem
+                    
+                    # Tie-breaker for original measurements (stability)
+                    if val == s['orig'].get('tx_rate', 0.0): cost -= 0.0001
+                    if val == peer['orig'].get('rx_rate', 0.0): cost -= 0.0001
+                    
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_val = val
+                
+                # Update State
+                s['tx'] = best_val
+                peer['rx'] = best_val
+                
+                # Check Locking Condition (Strict Convergence)
+                # If chosen value satisfies BOTH routers within strict threshold, lock it.
+                is_perfect = True
+                denom = max(best_val, 1.0)
+                if imp_tx is not None and abs(best_val - imp_tx)/denom > LOCK_THRESHOLD:
+                    is_perfect = False
+                if imp_rx is not None and abs(best_val - imp_rx)/denom > LOCK_THRESHOLD:
+                    is_perfect = False
+                
+                # Only lock if we actually had valid constraints to check against
+                if is_perfect and (imp_tx is not None or imp_rx is not None):
+                    s['locked_out'] = True
+                    peer['locked_in'] = True
+                    s['conf_tx'] = 1.0
+                    peer['conf_rx'] = 1.0
+
+            # --- Direction 2: Local RX <- Peer TX ---
+            if not s['locked_in']:
+                rid_local = s['orig'].get('local_router') # Receiver
+                rid_remote = peer['orig'].get('local_router') # Sender
+                
+                # RX_Target = RX_Curr - Imb_Curr
+                imb_loc, _, valid_loc = get_router_metrics(rid_local)
+                imp_rx = s['rx'] - imb_loc if valid_loc else None
+                
+                # TX_Target = TX_Curr + Imb_Curr
+                imb_rem, _, valid_rem = get_router_metrics(rid_remote)
+                imp_tx = peer['tx'] + imb_rem if valid_rem else None
+                
+                candidates = set()
+                candidates.add(s['orig'].get('rx_rate', 0.0))
+                candidates.add(peer['orig'].get('tx_rate', 0.0))
+                candidates.add(s['rx'])
+                if imp_rx is not None and imp_rx > 0: candidates.add(imp_rx)
+                if imp_tx is not None and imp_tx > 0: candidates.add(imp_tx)
+                
+                best_val = s['rx']
+                min_cost = float('inf')
+                w_loc = router_weights.get(rid_local, 0.5)
+                w_rem = router_weights.get(rid_remote, 0.5)
+                
+                for val in candidates:
+                    if val < 0: continue
+                    cost = 0.0
+                    if imp_rx is not None:
+                        cost += abs(val - imp_rx) * w_loc
+                    if imp_tx is not None:
+                        cost += abs(val - imp_tx) * w_rem
+                        
+                    if val == s['orig'].get('rx_rate', 0.0): cost -= 0.0001
+                    if val == peer['orig'].get('tx_rate', 0.0): cost -= 0.0001
+                    
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_val = val
+                        
+                s['rx'] = best_val
+                peer['tx'] = best_val
+                
+                is_perfect = True
+                denom = max(best_val, 1.0)
+                if imp_rx is not None and abs(best_val - imp_rx)/denom > LOCK_THRESHOLD:
+                    is_perfect = False
+                if imp_tx is not None and abs(best_val - imp_tx)/denom > LOCK_THRESHOLD:
+                    is_perfect = False
+                    
+                if is_perfect and (imp_rx is not None or imp_tx is not None):
+                    s['locked_in'] = True
+                    peer['locked_out'] = True
+                    s['conf_rx'] = 1.0
+                    peer['conf_tx'] = 1.0
+
+    # 4. Final Confidence Calibration
+    for if_id, s in state.items():
+        if s['status'] == 'down': continue
+        
+        rid = s['orig'].get('local_router')
+        imb, flow, valid = get_router_metrics(rid)
+        
+        # Calculate Router Fit Score
+        # 1.0 if perfectly balanced, decays linearly to 0.0 at 5% imbalance
+        router_fit = 0.5
+        if valid:
+            rel_err = abs(imb) / max(flow, 1.0)
+            router_fit = max(0.0, 1.0 - (rel_err / 0.05))
+            
+        # Assign Final Confidence
+        # Locked values (proven correct) get 1.0
+        # Others get confidence based on how "happy" the router ended up
+        
+        if not s['locked_in']:
+            s['conf_rx'] = 0.5 + 0.5 * router_fit
+            # Boost if repair is close to original measurement (Confirmation)
+            if abs(s['rx'] - s['orig'].get('rx_rate', -1)) < 1.0:
+                 s['conf_rx'] = max(s['conf_rx'], 0.95)
+
+        if not s['locked_out']:
+            s['conf_tx'] = 0.5 + 0.5 * router_fit
+            if abs(s['tx'] - s['orig'].get('tx_rate', -1)) < 1.0:
+                 s['conf_tx'] = max(s['conf_tx'], 0.95)
+
+    # 5. Construct Result
+    result = {}
+    for if_id, s in state.items():
+        result[if_id] = {
+            'rx_rate': (s['orig'].get('rx_rate', 0.0), s['rx'], s['conf_rx']),
+            'tx_rate': (s['orig'].get('tx_rate', 0.0), s['tx'], s['conf_tx']),
+            'interface_status': (s['orig'].get('interface_status', 'unknown'), s['status'], s['conf_status']),
+            'connected_to': s['orig'].get('connected_to'),
+            'local_router': s['orig'].get('local_router'),
+            'remote_router': s['orig'].get('remote_router')
+        }
+        
+    return result
+
+# EVOLVE-BLOCK-END

@@ -1,0 +1,487 @@
+<NAME>
+dynamic_lowrate_guard_router_reconcile
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to increase counter repair accuracy while maintaining strong confidence calibration:
+
+1) Dynamic low-rate guard and ramp in pair consensus:
+   - For low-rate pairs, use a tighter absolute guard (0.3 Mbps), lower the full-convergence trigger (1.6×tol), and a slightly more aggressive ramp in the partial band by exponentiating the interpolation factor (exp=1.2). This speeds convergence for small flows without destabilizing high-rate links.
+
+2) Safer, benefit-checked micro-adjustments and stricter gating:
+   - Require candidate unpaired interfaces to carry non-trivial traffic (max(tx,rx) ≥ LOW_RATE_CUTOFF) and ensure internal tx/rx imbalance does not increase by more than 3% when applying a nudge. Also reduce the commit improvement threshold to a calibrated 8% to accept only beneficial adjustments that improve flow conservation.
+
+3) Small-budget, benefit-checked router-balanced reconciliation on paired interfaces:
+   - Before the unpaired micro-adjustments, distribute a small budget (≤1.2% of router traffic) across paired interfaces proportional to their directional mass and mirror adjustments on peers. Commit only if the router residual improves by ≥8%. This improves flow conservation holistically without harming link symmetry.
+
+These changes are implemented with minimal code edits: adding an exponent parameter to the asymmetric partial averaging, adding dynamic guards and thresholds in pairwise consensus, improving Stage 0 bias gating, and inserting a small, benefit-checked router-balanced reconciliation stage along with the safer micro-adjustor.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Utility: asymmetric partial averaging update
+        def asym_partial(a_val: float, b_val: float, consensus: float, diff: float, tol: float) -> Tuple[float, float]:
+            k_base = (diff - tol) / max(tol, 1e-9)
+            # compute loudness share
+            s = max(1e-9, a_val + b_val)
+            a_share = a_val / s
+            b_share = b_val / s
+            # louder moves more
+            k_a = clamp(k_base * (1.0 + 0.5 * a_share), 0.0, 1.0)
+            k_b = clamp(k_base * (1.0 + 0.5 * b_share), 0.0, 1.0)
+            # but bias to move louder more: the quieter uses reduced factor
+            if a_val >= b_val:
+                k_b = clamp(k_base * (1.0 - 0.5 * b_share), 0.0, 1.0)
+            else:
+                k_a = clamp(k_base * (1.0 - 0.5 * a_share), 0.0, 1.0)
+            new_a = a_val * (1.0 - k_a) + consensus * k_a
+            new_b = b_val * (1.0 - k_b) + consensus * k_b
+            return new_a, new_b
+=======
+        # Utility: asymmetric partial averaging update with optional exponent for low-rate acceleration
+        def asym_partial(a_val: float, b_val: float, consensus: float, diff: float, tol: float, exp: float = 1.0) -> Tuple[float, float]:
+            k_base_raw = (diff - tol) / max(tol, 1e-9)
+            k_base = k_base_raw ** exp
+            # compute loudness share
+            s = max(1e-9, a_val + b_val)
+            a_share = a_val / s
+            b_share = b_val / s
+            # louder moves more
+            k_a = clamp(k_base * (1.0 + 0.5 * a_share), 0.0, 1.0)
+            k_b = clamp(k_base * (1.0 + 0.5 * b_share), 0.0, 1.0)
+            # but bias to move louder more: the quieter uses reduced factor
+            if a_val >= b_val:
+                k_b = clamp(k_base * (1.0 - 0.5 * b_share), 0.0, 1.0)
+            else:
+                k_a = clamp(k_base * (1.0 - 0.5 * a_share), 0.0, 1.0)
+            new_a = a_val * (1.0 - k_a) + consensus * k_a
+            new_b = b_val * (1.0 - k_b) + consensus * k_b
+            return new_a, new_b
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Direction a->b: compare a_tx with b_rx
+        abs_ab = abs(a_tx - b_rx)
+        tol_ab = dir_threshold(a_tx, b_rx)
+        diff_ab = abs_ab / max(1.0, a_tx, b_rx)
+        if diff_ab > tol_ab and abs_ab > ABS_GUARD:
+            # Residual-tilted weights based on a's local router residual and delta
+            if a_lr in router_resid_frac_orig:
+                resid_local = router_resid_frac_orig[a_lr]
+                delta_local = router_delta_orig.get(a_lr, 0.0)
+            else:
+                resid_local = 0.0
+                delta_local = 0.0
+            w_a, w_b = w_a_base, w_b_base
+            if resid_local > 0.0 and (a_tx - b_rx) * delta_local > 0.0:
+                gamma = min(TILT_GAMMA_MAX, TILT_GAMMA_SCALE * resid_local)
+                w_a = clamp(w_a_base - gamma, 0.1, 0.9)
+                w_b = 1.0 - w_a
+            consensus_ab = w_a * a_tx + w_b * b_rx
+            if diff_ab <= 2 * tol_ab:
+                new_a_tx, new_b_rx = asym_partial(a_tx, b_rx, consensus_ab, diff_ab, tol_ab)
+            else:
+                new_a_tx, new_b_rx = consensus_ab, consensus_ab
+            vals[a_id]['tx'], vals[b_id]['rx'] = new_a_tx, new_b_rx
+=======
+        # Direction a->b: compare a_tx with b_rx
+        abs_ab = abs(a_tx - b_rx)
+        tol_ab = dir_threshold(a_tx, b_rx)
+        diff_ab = abs_ab / max(1.0, a_tx, b_rx)
+        low_band_ab = max(a_tx, b_rx) < LOW_RATE_CUTOFF
+        abs_guard_ab = 0.3 if low_band_ab else ABS_GUARD
+        full_mult_ab = 1.6 if low_band_ab else 2.0
+        exp_ab = 1.2 if low_band_ab else 1.0
+        if diff_ab > tol_ab and abs_ab > abs_guard_ab:
+            # Residual-tilted weights based on a's local router residual and delta
+            if a_lr in router_resid_frac_orig:
+                resid_local = router_resid_frac_orig[a_lr]
+                delta_local = router_delta_orig.get(a_lr, 0.0)
+            else:
+                resid_local = 0.0
+                delta_local = 0.0
+            w_a, w_b = w_a_base, w_b_base
+            if resid_local > 0.0 and (a_tx - b_rx) * delta_local > 0.0:
+                gamma = min(TILT_GAMMA_MAX, TILT_GAMMA_SCALE * resid_local)
+                w_a = clamp(w_a_base - gamma, 0.1, 0.9)
+                w_b = 1.0 - w_a
+            consensus_ab = w_a * a_tx + w_b * b_rx
+            if diff_ab <= full_mult_ab * tol_ab:
+                new_a_tx, new_b_rx = asym_partial(a_tx, b_rx, consensus_ab, diff_ab, tol_ab, exp_ab)
+            else:
+                new_a_tx, new_b_rx = consensus_ab, consensus_ab
+            vals[a_id]['tx'], vals[b_id]['rx'] = new_a_tx, new_b_rx
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Direction b->a: compare b_tx with a_rx
+        abs_ba = abs(b_tx - a_rx)
+        tol_ba = dir_threshold(b_tx, a_rx)
+        diff_ba = abs_ba / max(1.0, b_tx, a_rx)
+        if diff_ba > tol_ba and abs_ba > ABS_GUARD:
+            if b_lr in router_resid_frac_orig:
+                resid_local = router_resid_frac_orig[b_lr]
+                delta_local = router_delta_orig.get(b_lr, 0.0)
+            else:
+                resid_local = 0.0
+                delta_local = 0.0
+            w_a2, w_b2 = w_a_base, w_b_base
+            # Note direction b->a: local side is b
+            if resid_local > 0.0 and (b_tx - a_rx) * delta_local > 0.0:
+                gamma = min(TILT_GAMMA_MAX, TILT_GAMMA_SCALE * resid_local)
+                # shrink b's weight; w_b2 is base weight for b
+                w_b2 = clamp(w_b_base - gamma, 0.1, 0.9)
+                w_a2 = 1.0 - w_b2
+            consensus_ba = w_b2 * b_tx + w_a2 * a_rx
+            if diff_ba <= 2 * tol_ba:
+                new_b_tx, new_a_rx = asym_partial(b_tx, a_rx, consensus_ba, diff_ba, tol_ba)
+            else:
+                new_b_tx, new_a_rx = consensus_ba, consensus_ba
+            vals[b_id]['tx'], vals[a_id]['rx'] = new_b_tx, new_a_rx
+=======
+        # Direction b->a: compare b_tx with a_rx
+        abs_ba = abs(b_tx - a_rx)
+        tol_ba = dir_threshold(b_tx, a_rx)
+        diff_ba = abs_ba / max(1.0, b_tx, a_rx)
+        low_band_ba = max(b_tx, a_rx) < LOW_RATE_CUTOFF
+        abs_guard_ba = 0.3 if low_band_ba else ABS_GUARD
+        full_mult_ba = 1.6 if low_band_ba else 2.0
+        exp_ba = 1.2 if low_band_ba else 1.0
+        if diff_ba > tol_ba and abs_ba > abs_guard_ba:
+            if b_lr in router_resid_frac_orig:
+                resid_local = router_resid_frac_orig[b_lr]
+                delta_local = router_delta_orig.get(b_lr, 0.0)
+            else:
+                resid_local = 0.0
+                delta_local = 0.0
+            w_a2, w_b2 = w_a_base, w_b_base
+            # Note direction b->a: local side is b
+            if resid_local > 0.0 and (b_tx - a_rx) * delta_local > 0.0:
+                gamma = min(TILT_GAMMA_MAX, TILT_GAMMA_SCALE * resid_local)
+                # shrink b's weight; w_b2 is base weight for b
+                w_b2 = clamp(w_b_base - gamma, 0.1, 0.9)
+                w_a2 = 1.0 - w_b2
+            consensus_ba = w_b2 * b_tx + w_a2 * a_rx
+            if diff_ba <= full_mult_ba * tol_ba:
+                new_b_tx, new_a_rx = asym_partial(b_tx, a_rx, consensus_ba, diff_ba, tol_ba, exp_ba)
+            else:
+                new_b_tx, new_a_rx = consensus_ba, consensus_ba
+            vals[b_id]['tx'], vals[a_id]['rx'] = new_b_tx, new_a_rx
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Ratios that should both approximate the same bias factor if one endpoint is scaled
+        r1 = b_rx / max(a_tx, 1e-9)  # their_rx / my_tx
+        r2 = b_tx / max(a_rx, 1e-9)  # their_tx / my_rx
+        s = sqrt(max(1e-18, r1 * r2))  # geometric mean ratio
+
+        # Consistency check between ratios and magnitude-aware gating
+        ratio_consistent = (abs(r1 - r2) / max(1.0, r1, r2)) <= 0.02
+        hi = max(a_tx, a_rx, b_tx, b_rx)
+        tol = LOW_RATE_THRESHOLD if hi < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+        abs_ab = abs(a_tx - b_rx)
+        abs_ba = abs(b_tx - a_rx)
+
+        if (not ratio_consistent) or (abs(s - 1.0) <= tol) or (abs_ab <= ABS_GUARD and abs_ba <= ABS_GUARD):
+            continue
+=======
+        # Ratios that should both approximate the same bias factor if one endpoint is scaled
+        r1 = b_rx / max(a_tx, 1e-9)  # their_rx / my_tx
+        r2 = b_tx / max(a_rx, 1e-9)  # their_tx / my_rx
+        s = sqrt(max(1e-18, r1 * r2))  # geometric mean ratio
+
+        # Consistency check between ratios and magnitude-aware gating
+        ratio_consistent = (abs(r1 - r2) / max(1.0, r1, r2)) <= 0.02
+        hi = max(a_tx, a_rx, b_tx, b_rx)
+        tol = LOW_RATE_THRESHOLD if hi < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+        # Directional diffs and guards must both be significant to apply multiplicative harmonization
+        tol_ab = dir_threshold(a_tx, b_rx)
+        tol_ba = dir_threshold(b_tx, a_rx)
+        diff_ab = abs(a_tx - b_rx) / max(1.0, a_tx, b_rx)
+        diff_ba = abs(b_tx - a_rx) / max(1.0, b_tx, a_rx)
+        abs_guard_dyn = 0.3 if hi < LOW_RATE_CUTOFF else ABS_GUARD
+        abs_ab = abs(a_tx - b_rx)
+        abs_ba = abs(b_tx - a_rx)
+
+        if (not ratio_consistent) or (abs(s - 1.0) <= tol) or (diff_ab <= tol_ab) or (diff_ba <= tol_ba) or (abs_ab <= abs_guard_dyn) or (abs_ba <= abs_guard_dyn):
+            continue
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2: Router-level micro-adjustments (improvement-checked, stronger triggers)
+    # Work on current vals; compute router sums and residuals
+    router_sums = compute_router_sums(vals)
+    router_resid_frac: Dict[str, float] = {}
+    for r, (s_tx, s_rx) in router_sums.items():
+        denom = max(1.0, s_tx, s_rx)
+        router_resid_frac[r] = abs(s_tx - s_rx) / denom
+
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        delta = sum_tx - sum_rx
+        denom_r = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs(delta) / denom_r
+        if resid_frac < ROUTER_RESID_TRIGGER:
+            continue
+        if not if_list:
+            continue
+
+        reduce_tx = delta > 0.0
+        reduce_rx = delta < 0.0
+
+        # Consider only unpaired, up interfaces (dangling)
+        candidates = []
+        total_mass = 0.0
+        for iid in if_list:
+            if iid not in vals:
+                continue
+            if status_orig.get(iid, 'unknown') != 'up':
+                continue
+            peer_id = peers.get(iid)
+            if peer_id is not None:
+                continue  # skip paired
+            vtx = float(vals[iid]['tx'])
+            vrx = float(vals[iid]['rx'])
+            if reduce_tx:
+                mass = vtx
+            elif reduce_rx:
+                mass = vrx
+            else:
+                mass = 0.0
+            if mass > 0.0:
+                candidates.append((mass, iid, vtx, vrx))
+                total_mass += mass
+
+        if not candidates or total_mass <= 0.0:
+            continue
+
+        # Dominance test ≥ 60% of same-direction mass
+        candidates.sort(reverse=True)
+        top_mass, top_if, top_tx, top_rx = candidates[0]
+        if top_mass < DOMINANCE_SHARE * total_mass:
+            continue
+
+        # Tentative nudge
+        alpha = min(MI_ALPHA_CAP, 0.5 * resid_frac)
+        if alpha <= 0.0:
+            continue
+
+        def compute_router_resid_if(vals_mut: Dict[str, Dict[str, float]], router: str) -> float:
+            stx, srx = 0.0, 0.0
+            for iid in router_ifaces.get(router, []):
+                if iid in vals_mut:
+                    stx += float(vals_mut[iid]['tx'])
+                    srx += float(vals_mut[iid]['rx'])
+            return abs(stx - srx) / max(1.0, stx, srx)
+
+        # Clone local changes for tentative application
+        old_tx, old_rx = vals[top_if]['tx'], vals[top_if]['rx']
+        # Adjust only the larger counter in the direction that reduces imbalance
+        if reduce_tx:
+            if old_tx >= old_rx:
+                new_tx = old_tx * (1.0 - alpha)
+                new_rx = old_rx
+            else:
+                new_tx = old_tx
+                new_rx = old_rx * (1.0 + alpha)
+        else:  # reduce_rx
+            if old_rx >= old_tx:
+                new_rx = old_rx * (1.0 - alpha)
+                new_tx = old_tx
+            else:
+                new_rx = old_rx
+                new_tx = old_tx * (1.0 + alpha)
+
+        # Apply tentatively
+        vals[top_if]['tx'], vals[top_if]['rx'] = new_tx, new_rx
+        resid_after = compute_router_resid_if(vals, r)
+        resid_before = resid_frac
+        # Commit only if improves by at least 10%
+        if resid_after <= (1.0 - IMPROVE_REQ) * resid_before:
+            # Commit already applied
+            # Update router_sums for this router
+            router_sums[r] = (sum_tx - old_tx + new_tx, sum_rx - old_rx + new_rx)
+        else:
+            # Revert change
+            vals[top_if]['tx'], vals[top_if]['rx'] = old_tx, old_rx
+=======
+    # Stage 2: Router-balanced reconciliation with mirrored adjustments on peers (small budget, benefit-checked)
+    # Work on current vals; compute router sums and residuals
+    router_sums = compute_router_sums(vals)
+    router_resid_frac: Dict[str, float] = {}
+    for r, (s_tx, s_rx) in router_sums.items():
+        denom = max(1.0, s_tx, s_rx)
+        router_resid_frac[r] = abs(s_tx - s_rx) / denom
+
+    def compute_router_resid_if(vals_mut: Dict[str, Dict[str, float]], router: str) -> float:
+        stx, srx = 0.0, 0.0
+        for iid in router_ifaces.get(router, []):
+            if iid in vals_mut:
+                stx += float(vals_mut[iid]['tx'])
+                srx += float(vals_mut[iid]['rx'])
+        return abs(stx - srx) / max(1.0, stx, srx)
+
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        delta = sum_tx - sum_rx
+        denom_r = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs(delta) / denom_r
+        if resid_frac < ROUTER_RESID_TRIGGER or not if_list:
+            continue
+
+        reduce_tx = delta > 0.0
+        reduce_rx = delta < 0.0
+
+        # Collect paired, up interfaces for proportional distribution
+        if reduce_tx:
+            dirs = [(iid, float(vals[iid]['tx'])) for iid in if_list
+                    if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+        else:
+            dirs = [(iid, float(vals[iid]['rx'])) for iid in if_list
+                    if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+        total_mass = sum(m for _, m in dirs)
+        if total_mass <= 0.0:
+            continue
+
+        budget = min(abs(delta), 0.012 * denom_r)  # small 1.2% cap to protect counters
+
+        # Apply tentatively
+        changes: List[Tuple[str, str, float]] = []
+        for iid, mass in dirs:
+            share = mass / total_mass if total_mass > 0 else 0.0
+            d_i = budget * share
+            if d_i <= 0.0:
+                continue
+            if reduce_tx:
+                old_tx = vals[iid]['tx']
+                vals[iid]['tx'] = max(0.0, old_tx - d_i)
+                changes.append(('tx', iid, old_tx))
+                pid = peers.get(iid)
+                if pid and status_orig.get(pid, 'unknown') != 'down':
+                    old_prx = vals[pid]['rx']
+                    vals[pid]['rx'] = max(0.0, old_prx - d_i)
+                    changes.append(('rx', pid, old_prx))
+            else:
+                old_rx = vals[iid]['rx']
+                vals[iid]['rx'] = max(0.0, old_rx - d_i)
+                changes.append(('rx', iid, old_rx))
+                pid = peers.get(iid)
+                if pid and status_orig.get(pid, 'unknown') != 'down':
+                    old_ptx = vals[pid]['tx']
+                    vals[pid]['tx'] = max(0.0, old_ptx - d_i)
+                    changes.append(('tx', pid, old_ptx))
+
+        resid_after = compute_router_resid_if(vals, r)
+        resid_before = resid_frac
+        # Commit only if improves by at least 8%
+        if resid_after > (1.0 - 0.08) * resid_before:
+            # Revert all tentative changes
+            for kind, iid, old_val in changes:
+                vals[iid][kind] = old_val
+        else:
+            # Update router_sums for this router after commit
+            router_sums[r] = compute_router_sums(vals).get(r, (0.0, 0.0))
+
+    # Stage 2b: Router-level micro-adjustments (improvement-checked, safer gating)
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        delta = sum_tx - sum_rx
+        denom_r = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs(delta) / denom_r
+        if resid_frac < ROUTER_RESID_TRIGGER:
+            continue
+        if not if_list:
+            continue
+
+        reduce_tx = delta > 0.0
+        reduce_rx = delta < 0.0
+
+        # Consider only unpaired, up interfaces (dangling) with non-trivial traffic
+        candidates = []
+        total_mass = 0.0
+        for iid in if_list:
+            if iid not in vals:
+                continue
+            if status_orig.get(iid, 'unknown') != 'up':
+                continue
+            peer_id = peers.get(iid)
+            if peer_id is not None:
+                continue  # skip paired
+            vtx = float(vals[iid]['tx'])
+            vrx = float(vals[iid]['rx'])
+            if max(vtx, vrx) < LOW_RATE_CUTOFF:
+                continue  # avoid nudging tiny flows
+            if reduce_tx:
+                mass = vtx
+            elif reduce_rx:
+                mass = vrx
+            else:
+                mass = 0.0
+            if mass > 0.0:
+                candidates.append((mass, iid, vtx, vrx))
+                total_mass += mass
+
+        if not candidates or total_mass <= 0.0:
+            continue
+
+        # Dominance test ≥ 60% of same-direction mass
+        candidates.sort(reverse=True)
+        top_mass, top_if, top_tx, top_rx = candidates[0]
+        if top_mass < DOMINANCE_SHARE * total_mass:
+            continue
+
+        # Tentative nudge
+        alpha = min(MI_ALPHA_CAP, 0.5 * resid_frac)
+        if alpha <= 0.0:
+            continue
+
+        def compute_router_resid_if(vals_mut: Dict[str, Dict[str, float]], router: str) -> float:
+            stx, srx = 0.0, 0.0
+            for iid in router_ifaces.get(router, []):
+                if iid in vals_mut:
+                    stx += float(vals_mut[iid]['tx'])
+                    srx += float(vals_mut[iid]['rx'])
+            return abs(stx - srx) / max(1.0, stx, srx)
+
+        # Clone local changes for tentative application
+        old_tx, old_rx = vals[top_if]['tx'], vals[top_if]['rx']
+        pre_internal = abs(old_tx - old_rx) / max(1.0, max(old_tx, old_rx))
+        # Adjust only the larger counter in the direction that reduces imbalance
+        if reduce_tx:
+            if old_tx >= old_rx:
+                new_tx = old_tx * (1.0 - alpha)
+                new_rx = old_rx
+            else:
+                new_tx = old_tx
+                new_rx = old_rx * (1.0 + alpha)
+        else:  # reduce_rx
+            if old_rx >= old_tx:
+                new_rx = old_rx * (1.0 - alpha)
+                new_tx = old_tx
+            else:
+                new_rx = old_rx
+                new_tx = old_tx * (1.0 + alpha)
+
+        # Apply tentatively
+        vals[top_if]['tx'], vals[top_if]['rx'] = new_tx, new_rx
+        resid_after = compute_router_resid_if(vals, r)
+        resid_before = resid_frac
+        post_internal = abs(new_tx - new_rx) / max(1.0, max(new_tx, new_rx))
+
+        # Commit only if improves by at least 8% and internal imbalance does not worsen >3%
+        if resid_after <= (1.0 - 0.08) * resid_before and post_internal <= pre_internal + 0.03:
+            # Commit already applied
+            router_sums[r] = (sum_tx - old_tx + new_tx, sum_rx - old_rx + new_rx)
+        else:
+            # Revert change
+            vals[top_if]['tx'], vals[top_if]['rx'] = old_tx, old_rx
+>>>>>>> REPLACE
+</DIFF>

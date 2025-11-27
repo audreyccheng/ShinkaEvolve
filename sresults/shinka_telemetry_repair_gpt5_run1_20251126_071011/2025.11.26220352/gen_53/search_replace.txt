@@ -1,0 +1,187 @@
+<NAME>
+router_additive_pass_and_confidence_taper
+</NAME>
+
+<DESCRIPTION>
+I propose adding an uncertainty-weighted additive redistribution pass at the router level after the existing multiplicative pre-step, and refining the confidence taper for small edits.
+
+Why this helps:
+- Multiplicative scaling quickly reduces router imbalance but can leave residuals. An additive pass redistributes the remaining imbalance toward the least-trusted and most material interfaces, improving counter accuracy.
+- The redistribution weights incorporate pre-pass link residuals, pair residuals after the multiplicative step, and volume share, while protecting tiny links and those already heavily adjusted. This aligns with redundancy-hardening and dynamic checking principles.
+- We cap per-interface additive moves and enforce a per-router total delta guard to avoid overshoot and maintain calibration.
+- Confidence calibration is refined with a tapered change penalty for small edits and additional penalties when an interface consumes a large fraction of its additive cap, improving over/under-confidence balance.
+
+The change is isolated to:
+1) Insert a router-level additive pass and track per-interface additive deltas and cap hits.
+2) Taper change penalties and add cap-hit penalties in the confidence computation.
+
+These targeted improvements should lift counter accuracy and confidence calibration, improving the combined score.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build values after router pass
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+
+    # Targeted pair reconciliation only on links touched by router edits
+    # Track magnitude of pair reconciliation for calibration
+    pair_adj_rel: Dict[str, Dict[str, float]] = {i: {'rx': 0.0, 'tx': 0.0} for i in telemetry}
+=======
+    # Additive router redistribution pass (uncertainty-weighted) to close remaining imbalance
+    add_cap_hit: Dict[str, Dict[str, bool]] = {i: {'rx': False, 'tx': False} for i in telemetry}
+    for router_id, iface_list in topology.items():
+        up_ifaces = [i for i in iface_list if i in telemetry and pre[i]['local_status'] == 'up']
+        if len(up_ifaces) < 2:
+            continue
+
+        sum_rx2 = sum(post_router[i]['rx'] for i in up_ifaces)
+        sum_tx2 = sum(post_router[i]['tx'] for i in up_ifaces)
+        denom2 = max(sum_rx2, sum_tx2, 1.0)
+        if (sum_rx2 + sum_tx2) <= 1e-6:
+            continue
+
+        # Residual after multiplicative scaling
+        if abs(sum_tx2 - sum_rx2) / denom2 <= HARDENING_THRESHOLD:
+            continue
+
+        # Choose direction and compute needed adjustment (positive need means increase that direction)
+        if sum_tx2 > sum_rx2:
+            dir_to_adj = 'tx'
+            need = -(sum_tx2 - sum_rx2)  # decrease TX
+        else:
+            dir_to_adj = 'rx'
+            need = +(sum_rx2 - sum_tx2)  # increase RX
+
+        # Per-router total delta guard (≤ 25% of average traffic)
+        router_cap_abs = 0.25 * ((sum_rx2 + sum_tx2) / 2.0)
+        need = clamp(need, -router_cap_abs, router_cap_abs)
+
+        # Prepare weights and caps
+        vals = {i: post_router[i][dir_to_adj] for i in up_ifaces}
+        sum_v = max(1e-9, sum(vals.values()))
+        weights: Dict[str, float] = {}
+        caps: Dict[str, float] = {}
+        for i in up_ifaces:
+            v_i = vals[i]
+            # Confidence proxy from pre link diffs
+            if dir_to_adj == 'tx':
+                conf_dir = max(0.0, 1.0 - pre[i]['tx_link_diff'])
+            else:
+                conf_dir = max(0.0, 1.0 - pre[i]['rx_link_diff'])
+
+            # Pair residual after multiplicative scaling
+            peer_id = peers.get(i)
+            if peer_id and peer_id in telemetry and pre[peer_id]['local_status'] == 'up':
+                if dir_to_adj == 'tx':
+                    resid_pair = rel_diff(post_router[i]['tx'], post_router[peer_id]['rx'])
+                    tol_pair = pair_tolerance(post_router[i]['tx'], post_router[peer_id]['rx'])
+                else:
+                    resid_pair = rel_diff(post_router[i]['rx'], post_router[peer_id]['tx'])
+                    tol_pair = pair_tolerance(post_router[i]['rx'], post_router[peer_id]['tx'])
+                pair_term = min(2.0, resid_pair / max(tol_pair, 1e-6))
+            else:
+                pair_term = 0.0
+
+            vol_term = (v_i / sum_v) if sum_v > 0 else 0.0
+            w = 0.6 * (1.0 - conf_dir) + 0.25 * pair_term + 0.15 * vol_term
+
+            # Protect tiny links and reduce weight if heavily adjusted multiplicatively already
+            if v_i < 1.0:
+                w *= 0.5
+            prev_rel = router_delta_rel[i]['tx'] if dir_to_adj == 'tx' else router_delta_rel[i]['rx']
+            if prev_rel >= 0.105:  # >70% of 15% multiplicative cap
+                w *= 0.7
+
+            weights[i] = max(0.0, w)
+            caps[i] = 0.15 * max(v_i, 1.0)  # per-interface additive cap
+
+        # Distribute need with caps and weights (iterative to honor caps)
+        applied: Dict[str, float] = {i: 0.0 for i in up_ifaces}
+        remaining = need
+        for _ in range(4):  # a few iterations suffice
+            active = [i for i in up_ifaces if weights[i] > 0.0 and (caps[i] - abs(applied[i])) > 1e-12]
+            if not active or abs(remaining) <= 1e-6:
+                break
+            wsum = sum(weights[i] for i in active)
+            if wsum <= 0.0:
+                break
+            for i in active:
+                if abs(remaining) <= 1e-6:
+                    break
+                rem_cap_i = caps[i] - abs(applied[i])
+                share = weights[i] / wsum
+                prop = remaining * share
+                prop = clamp(prop, -rem_cap_i, rem_cap_i)
+                applied[i] += prop
+                remaining -= prop
+            if abs(remaining) <= 1e-6:
+                break
+
+        # Apply additive adjustments
+        for i, d in applied.items():
+            if abs(d) <= 0.0:
+                continue
+            if dir_to_adj == 'tx':
+                oldv = post_router[i]['tx']
+                post_router[i]['tx'] = max(0.0, oldv + d)
+                router_delta_rel[i]['tx'] += abs(d) / max(oldv, 1.0)
+                if abs(d) >= 0.7 * caps[i]:
+                    add_cap_hit[i]['tx'] = True
+            else:
+                oldv = post_router[i]['rx']
+                post_router[i]['rx'] = max(0.0, oldv + d)
+                router_delta_rel[i]['rx'] += abs(d) / max(oldv, 1.0)
+                if abs(d) >= 0.7 * caps[i]:
+                    add_cap_hit[i]['rx'] = True
+
+    # Build values after router passes
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+
+    # Targeted pair reconciliation only on links touched by router edits
+    # Track magnitude of pair reconciliation for calibration
+    pair_adj_rel: Dict[str, Dict[str, float]] = {i: {'rx': 0.0, 'tx': 0.0} for i in telemetry}
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        rx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, tx_change))
+=======
+        # Taper change penalty weight for small edits to improve calibration
+        rx_weight = 0.4 if rx_change < 0.15 else 0.5
+        tx_weight = 0.4 if tx_change < 0.15 else 0.5
+        rx_change_factor = max(0.2, 1.0 - rx_weight * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - tx_weight * min(1.0, tx_change))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        padj_rx = pair_adj_rel[iface]['rx']
+        padj_tx = pair_adj_rel[iface]['tx']
+        rx_conf -= min(0.05, 0.25 * padj_rx)
+        tx_conf -= min(0.05, 0.25 * padj_tx)
+
+        # Bonus for untouched directions across all passes
+        pre_unchanged_rx = abs(pre[iface]['pre_rx'] - rx_orig) < 1e-9
+=======
+        padj_rx = pair_adj_rel[iface]['rx']
+        padj_tx = pair_adj_rel[iface]['tx']
+        rx_conf -= min(0.05, 0.25 * padj_rx)
+        tx_conf -= min(0.05, 0.25 * padj_tx)
+
+        # Penalty when additive redistribution consumed most of per-interface cap
+        if 'add_cap_hit' in locals():
+            if add_cap_hit.get(iface, {}).get('rx', False):
+                rx_conf -= 0.04
+            if add_cap_hit.get(iface, {}).get('tx', False):
+                tx_conf -= 0.04
+
+        # Bonus for untouched directions across all passes
+        pre_unchanged_rx = abs(pre[iface]['pre_rx'] - rx_orig) < 1e-9
+>>>>>>> REPLACE
+
+</DIFF>

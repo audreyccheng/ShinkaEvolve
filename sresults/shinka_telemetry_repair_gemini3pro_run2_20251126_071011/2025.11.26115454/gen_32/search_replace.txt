@@ -1,0 +1,347 @@
+<NAME>
+improved_cost_function_and_confidence
+</NAME>
+
+<DESCRIPTION>
+Refines the iterative repair logic (Step 2) to use a specific cost function that prioritizes flow conservation while maintaining a slight bias towards the "Source" (TX) measurement as a ground truth anchor when flow is ambiguous. Also completely rewrites the confidence calibration to be explicitly driven by flow balance quality and measurement consistency, ensuring that "Impossible" repairs (creating phantom packets) or highly imbalanced repairs result in lower confidence scores, while well-balanced routers yield high confidence.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Step 2: Iterative Flow & Symmetry Optimization
+    # We treat the network as a system of constraints.
+    # Variables: Flow on each link (Direction A->B, Direction B->A)
+    # Objectives:
+    #   1. Minimize (Flow - Measured_Tx_A) and (Flow - Measured_Rx_B)
+    #   2. Minimize Router Imbalance (Sum In - Sum Out)
+
+    # We use a greedy iterative approach to propagate constraints.
+    ITERATIONS = 4
+    sorted_interfaces = sorted(working_state.keys()) # Deterministic order
+
+    # Helper to calculate router imbalance given CURRENT working_state values
+    def get_router_imbalance(rid):
+        if not rid or rid not in topology: return 0.0
+        in_sum = 0.0
+        out_sum = 0.0
+        for iid in topology[rid]:
+            if iid in working_state:
+                in_sum += working_state[iid]['rx']
+                out_sum += working_state[iid]['tx']
+        return in_sum - out_sum
+
+    for _ in range(ITERATIONS):
+        # We process by LINK (pair of interfaces) to ensure symmetry
+        processed_pairs = set()
+
+        for if_id in sorted_interfaces:
+            state = working_state[if_id]
+            if state['status'] == 'down': continue
+
+            peer_id = state['original'].get('connected_to')
+            if not peer_id or peer_id not in working_state: continue
+
+            pair_key = tuple(sorted([if_id, peer_id]))
+            if pair_key in processed_pairs: continue
+            processed_pairs.add(pair_key)
+
+            peer_state = working_state[peer_id]
+            if peer_state['status'] == 'down': continue
+
+            # --- Direction 1: Local TX -> Peer RX ---
+            # We want to find best flow 'f'
+            meas_tx = float(state['original'].get('tx_rate', 0.0))
+            meas_prx = float(peer_state['original'].get('rx_rate', 0.0))
+
+            # Context: Router Imbalances
+            r_local = state['original'].get('local_router')
+            r_remote = peer_state['original'].get('local_router')
+
+            # Current contribution to imbalance:
+            # Local (Out): currently state['tx']. We want to replace with 'f'.
+            # Remote (In): currently peer_state['rx']. We want to replace with 'f'.
+
+            imb_local_base = get_router_imbalance(r_local) + state['tx'] # Remove current tx
+            imb_remote_base = get_router_imbalance(r_remote) - peer_state['rx'] # Remove current rx
+
+            candidates = [meas_tx, meas_prx]
+            # If close, add average
+            if abs(meas_tx - meas_prx) < max(meas_tx, meas_prx, 10.0) * HARDENING_THRESHOLD:
+                candidates.append((meas_tx + meas_prx) / 2.0)
+
+            best_f = meas_tx # Default to TX
+            min_cost = float('inf')
+
+            for v in candidates:
+                cost = 0.0
+                # Router Constraints
+                if r_local in topology:
+                    cost += abs(imb_local_base - v)
+                if r_remote in topology:
+                    cost += abs(imb_remote_base + v)
+
+                # Tie-breaking: bias slightly towards TX as it's the source
+                tie_breaker = 0.0
+                if v == meas_tx:
+                    tie_breaker = -0.0001
+
+                final_cost = cost + tie_breaker
+
+                if final_cost < min_cost:
+                    min_cost = final_cost
+                    best_f = v
+
+            # Update State
+            state['tx'] = best_f
+            peer_state['rx'] = best_f
+
+            # --- Direction 2: Local RX <- Peer TX ---
+            # Symmetrically identical logic
+            meas_rx = float(state['original'].get('rx_rate', 0.0))
+            meas_ptx = float(peer_state['original'].get('tx_rate', 0.0))
+
+            imb_local_base_rx = get_router_imbalance(r_local) - state['rx'] # Remove current rx
+            imb_remote_base_tx = get_router_imbalance(r_remote) + peer_state['tx'] # Remove current tx
+
+            cands_2 = [meas_rx, meas_ptx]
+            if abs(meas_rx - meas_ptx) < max(meas_rx, meas_ptx, 10.0) * HARDENING_THRESHOLD:
+                cands_2.append((meas_rx + meas_ptx) / 2.0)
+
+            best_f2 = meas_ptx # Default to Sender
+            min_cost2 = float('inf')
+
+            for v in cands_2:
+                cost = 0.0
+                if r_local in topology:
+                    cost += abs(imb_local_base_rx + v) # In
+                if r_remote in topology:
+                    cost += abs(imb_remote_base_tx - v) # Out
+
+                tie_breaker = 0.0
+                if v == meas_ptx:
+                    tie_breaker = -0.0001
+
+                final_cost = cost + tie_breaker
+
+                if final_cost < min_cost2:
+                    min_cost2 = final_cost
+                    best_f2 = v
+
+            state['rx'] = best_f2
+            peer_state['tx'] = best_f2
+
+    # Final Pass: Confidence Calculation
+    for if_id, state in working_state.items():
+        if state['status'] == 'down': continue
+
+        peer_id = state['original'].get('connected_to')
+        peer_state = working_state.get(peer_id) if peer_id else None
+
+        # 1. Router Fit (How bad is the imbalance remaining?)
+        rid = state['original'].get('local_router')
+        flow_err = abs(get_router_imbalance(rid))
+
+        # Normalize error by total flow on router
+        total_flow = 0.0
+        if rid and rid in topology:
+            for iid in topology[rid]:
+                if iid in working_state:
+                    total_flow += working_state[iid]['rx'] + working_state[iid]['tx']
+
+        flow_quality = 1.0
+        if total_flow > 10.0:
+            rel_err = flow_err / total_flow
+            # Sigmoid-ish decay
+            flow_quality = 1.0 / (1.0 + 20.0 * rel_err)
+
+        # Base confidence driven by flow consistency
+        base_conf = 0.5 + 0.5 * flow_quality
+
+        state['rx_conf'] = base_conf
+        state['tx_conf'] = base_conf
+
+        # 2. Boost if original measurements agreed (Confirmation)
+        if peer_state:
+             # Check RX symmetry
+             meas_rx = float(state['original'].get('rx_rate', 0.0))
+             meas_ptx = float(peer_state['original'].get('tx_rate', 0.0))
+             if abs(meas_rx - meas_ptx) / max(meas_rx, meas_ptx, 10.0) < HARDENING_THRESHOLD:
+                 state['rx_conf'] = max(state['rx_conf'], 0.95)
+
+             # Check TX symmetry
+             meas_tx = float(state['original'].get('tx_rate', 0.0))
+             meas_prx = float(peer_state['original'].get('rx_rate', 0.0))
+             if abs(meas_tx - meas_prx) / max(meas_tx, meas_prx, 10.0) < HARDENING_THRESHOLD:
+                 state['tx_conf'] = max(state['tx_conf'], 0.95)
+=======
+    # Step 2: Iterative Flow & Symmetry Optimization
+    # We treat the network as a system of constraints.
+    # We use a greedy iterative approach to propagate constraints.
+    ITERATIONS = 4
+    sorted_interfaces = sorted(working_state.keys()) # Deterministic order
+
+    # Helper to calculate router imbalance given CURRENT working_state values
+    def get_router_imbalance(rid):
+        if not rid or rid not in topology: return 0.0
+        in_sum = 0.0
+        out_sum = 0.0
+        for iid in topology[rid]:
+            if iid in working_state:
+                in_sum += working_state[iid]['rx']
+                out_sum += working_state[iid]['tx']
+        return in_sum - out_sum
+
+    def get_total_throughput(rid):
+        if not rid or rid not in topology: return 1.0
+        total = 0.0
+        for iid in topology[rid]:
+            if iid in working_state:
+                total += working_state[iid]['rx'] + working_state[iid]['tx']
+        return max(total, 1.0)
+
+    for _ in range(ITERATIONS):
+        processed_pairs = set()
+
+        for if_id in sorted_interfaces:
+            state = working_state[if_id]
+            if state['status'] == 'down': continue
+
+            peer_id = state['original'].get('connected_to')
+            if not peer_id or peer_id not in working_state: continue
+
+            pair_key = tuple(sorted([if_id, peer_id]))
+            if pair_key in processed_pairs: continue
+            processed_pairs.add(pair_key)
+
+            peer_state = working_state[peer_id]
+            if peer_state['status'] == 'down': continue
+
+            # --- Solve Direction: Local TX -> Peer RX ---
+            meas_tx = float(state['original'].get('tx_rate', 0.0))
+            meas_prx = float(peer_state['original'].get('rx_rate', 0.0))
+
+            r_local = state['original'].get('local_router')
+            r_remote = peer_state['original'].get('local_router')
+
+            # Base imbalances excluding this link's contribution
+            imb_local_base = get_router_imbalance(r_local) + state['tx']
+            imb_remote_base = get_router_imbalance(r_remote) - peer_state['rx']
+
+            candidates = {meas_tx, meas_prx}
+            if abs(meas_tx - meas_prx) < max(meas_tx, meas_prx, 10.0) * HARDENING_THRESHOLD:
+                candidates.add((meas_tx + meas_prx) / 2.0)
+
+            best_val = meas_tx
+            min_cost = float('inf')
+
+            for v in candidates:
+                cost = 0.0
+
+                # 1. Flow Constraints (Strong)
+                if r_local in topology:
+                    cost += abs(imb_local_base - v)
+                if r_remote in topology:
+                    cost += abs(imb_remote_base + v)
+
+                # 2. Physics & Reliability Heuristics (Weak)
+                # Bias towards measurements to avoid drift in unconstrained parts of graph
+                # Prefer TX (Source) generally as "Ground Truth" for generation
+                # We add larger penalty for deviating from TX, making it the preferred anchor.
+
+                cost += 0.01 * abs(v - meas_tx)
+
+                if cost < min_cost:
+                    min_cost = cost
+                    best_val = v
+
+            state['tx'] = best_val
+            peer_state['rx'] = best_val
+
+            # --- Solve Direction: Local RX <- Peer TX ---
+            meas_rx = float(state['original'].get('rx_rate', 0.0))
+            meas_ptx = float(peer_state['original'].get('tx_rate', 0.0))
+
+            imb_local_base_rx = get_router_imbalance(r_local) - state['rx']
+            imb_remote_base_tx = get_router_imbalance(r_remote) + peer_state['tx']
+
+            candidates_2 = {meas_rx, meas_ptx}
+            if abs(meas_rx - meas_ptx) < max(meas_rx, meas_ptx, 10.0) * HARDENING_THRESHOLD:
+                candidates_2.add((meas_rx + meas_ptx) / 2.0)
+
+            best_val_2 = meas_ptx
+            min_cost_2 = float('inf')
+
+            for v in candidates_2:
+                cost = 0.0
+                if r_local in topology:
+                    cost += abs(imb_local_base_rx + v)
+                if r_remote in topology:
+                    cost += abs(imb_remote_base_tx - v)
+
+                # Prefer Peer TX (Source) over My RX
+                cost += 0.01 * abs(v - meas_ptx)
+
+                if cost < min_cost_2:
+                    min_cost_2 = cost
+                    best_val_2 = v
+
+            state['rx'] = best_val_2
+            peer_state['tx'] = best_val_2
+
+    # Final Pass: Detailed Confidence Calibration
+    for if_id, state in working_state.items():
+        if state['status'] == 'down': continue
+
+        # Calculate consistency scores
+        r_local = state['original'].get('local_router')
+
+        # 1. Flow Consistency (0.0 to 1.0)
+        flow_score = 0.5 # Neutral default
+        if r_local and r_local in topology:
+            imbalance = abs(get_router_imbalance(r_local))
+            throughput = get_total_throughput(r_local)
+            # Strict penalty for imbalance relative to throughput
+            rel_err = imbalance / throughput
+            flow_score = max(0.0, 1.0 - (rel_err * 10.0))
+
+        # 2. Measurement Consistency (0.0 to 1.0)
+        meas_rx = float(state['original'].get('rx_rate', 0.0))
+        meas_tx = float(state['original'].get('tx_rate', 0.0))
+
+        # RX Confidence
+        delta_rx = abs(state['rx'] - meas_rx)
+        dist_rx = delta_rx / max(state['rx'], 1.0)
+        meas_score_rx = max(0.0, 1.0 - (dist_rx * 5.0)) # Drop if > 20% change
+
+        # TX Confidence
+        delta_tx = abs(state['tx'] - meas_tx)
+        dist_tx = delta_tx / max(state['tx'], 1.0)
+        meas_score_tx = max(0.0, 1.0 - (dist_tx * 5.0))
+
+        # Combine scores
+        if r_local in topology:
+            # If flow info is available, it dominates.
+            # High flow score = Valid Network State found.
+            state['rx_conf'] = 0.4 + 0.6 * flow_score
+            state['tx_conf'] = 0.4 + 0.6 * flow_score
+        else:
+            # Fallback to measurement consistency
+            state['rx_conf'] = 0.5 + 0.4 * meas_score_rx
+            state['tx_conf'] = 0.5 + 0.4 * meas_score_tx
+
+        # 3. Boost for Symmetry Confirmation
+        peer_id = state['original'].get('connected_to')
+        if peer_id and peer_id in working_state:
+            peer_state = working_state[peer_id]
+
+            # RX Check (My RX vs Peer TX)
+            p_tx = float(peer_state['original'].get('tx_rate', 0.0))
+            if abs(meas_rx - p_tx) / max(meas_rx, p_tx, 1.0) < HARDENING_THRESHOLD:
+                state['rx_conf'] = max(state['rx_conf'], 0.95)
+
+            # TX Check (My TX vs Peer RX)
+            p_rx = float(peer_state['original'].get('rx_rate', 0.0))
+            if abs(meas_tx - p_rx) / max(meas_tx, p_rx, 1.0) < HARDENING_THRESHOLD:
+                state['tx_conf'] = max(state['tx_conf'], 0.95)
+>>>>>>> REPLACE
+</DIFF>

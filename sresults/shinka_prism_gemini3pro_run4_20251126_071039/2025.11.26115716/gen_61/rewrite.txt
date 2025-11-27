@@ -1,0 +1,316 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+import math
+
+GPU_MEM_SIZE = 80.0  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Computes a model placement minimizing the maximum KV Cache Pressure (KVPR).
+    Uses Binary Search on target KVPR, transforming the problem into a 
+    constrained Bin Packing problem solved via adaptive stochastic heuristics.
+    """
+
+    # ------------------------------------------------------------------
+    # 0. Data Preparation
+    # ------------------------------------------------------------------
+    m_data = []
+    total_w = 0.0
+    total_s = 0.0
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        m_data.append({'w': w, 's': s, 'obj': m, 'id': i})
+        total_w += w
+        total_s += s
+
+    # Lower bound for Binary Search
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    if rem_global <= 1e-9:
+        lb = float('inf') if total_w > 0 else 0.0
+    else:
+        lb = total_w / rem_global
+
+    # ------------------------------------------------------------------
+    # Helper: Calculate Max KVPR
+    # ------------------------------------------------------------------
+    def get_max_kvpr_from_indices(placement_dict):
+        max_p = 0.0
+        for idxs in placement_dict.values():
+            w_sum = sum(m_data[i]['w'] for i in idxs)
+            s_sum = sum(m_data[i]['s'] for i in idxs)
+            rem = GPU_MEM_SIZE - s_sum
+            if rem <= 1e-9:
+                if w_sum > 0: return float('inf')
+                else: continue
+            val = w_sum / rem
+            if val > max_p: max_p = val
+        return max_p
+
+    # ------------------------------------------------------------------
+    # 1. Feasibility Check with Adaptive Stochastic Packing
+    # ------------------------------------------------------------------
+    def try_pack(target_k, effort_level=1):
+        """
+        Attempts to pack models such that for all GPUs: w_sum <= target_k * (C - s_sum).
+        Uses deterministic strategies first, then stochastic strategies with failure memory.
+        """
+        
+        # Internal packing function (Best Fit Decreasing on Virtual Slack)
+        def pack_indices(indices, record_failure=False, failed_set=None):
+            bins = [{'w': 0.0, 's': 0.0, 'idxs': []} for _ in range(gpu_num)]
+            
+            for idx in indices:
+                item = m_data[idx]
+                w, s = item['w'], item['s']
+                
+                best_bin = None
+                min_slack = float('inf')
+                
+                # Check all bins
+                for b_idx in range(gpu_num):
+                    b = bins[b_idx]
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+                    
+                    # Constraint: New_W <= K * New_Rem_S
+                    rem_s_new = GPU_MEM_SIZE - (b['s'] + s)
+                    limit_w = target_k * rem_s_new
+                    current_w = b['w'] + w
+                    
+                    if current_w <= limit_w + 1e-6:
+                        slack = limit_w - current_w
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_bin = b_idx
+                
+                if best_bin is None:
+                    if record_failure and failed_set is not None:
+                        failed_set.add(idx)
+                    return None
+                
+                bins[best_bin]['idxs'].append(idx)
+                bins[best_bin]['w'] += w
+                bins[best_bin]['s'] += s
+                
+            return {i: bins[i]['idxs'] for i in range(gpu_num)}
+
+        # Deterministic Strategies
+        # 1. Linearized Constraint: w + K*s
+        # 2. Physical Size: s
+        # 3. Asymptotic Pressure: w / (C - s)
+        det_strategies = [
+            lambda x: x['w'] + target_k * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'] / (GPU_MEM_SIZE - x['s'] + 1e-6)
+        ]
+
+        for key_fn in det_strategies:
+            sorted_indices = sorted(range(len(m_data)), key=lambda i: key_fn(m_data[i]), reverse=True)
+            res = pack_indices(sorted_indices)
+            if res: return res
+
+        # Stochastic Strategies with Failure Memory
+        failed_items = set()
+        num_attempts = 20 if effort_level == 0 else 100
+
+        for attempt in range(num_attempts):
+            # Rotate base strategy
+            mode = attempt % 3
+            
+            def sort_key(idx):
+                item = m_data[idx]
+                if mode == 0:
+                    val = item['w'] + target_k * item['s']
+                elif mode == 1:
+                    val = item['s']
+                else:
+                    val = item['w'] / (GPU_MEM_SIZE - item['s'] + 1e-6)
+                
+                # Add noise
+                val *= random.uniform(0.9, 1.1)
+                
+                # Prioritize failed items from previous attempts
+                if idx in failed_items:
+                    val += 1e9
+                return val
+
+            sorted_indices = sorted(range(len(m_data)), key=sort_key, reverse=True)
+            res = pack_indices(sorted_indices, record_failure=True, failed_set=failed_items)
+            if res: return res
+            
+        return None
+
+    # ------------------------------------------------------------------
+    # 2. Initialization and Binary Search
+    # ------------------------------------------------------------------
+    best_placement = None
+    best_score = float('inf')
+
+    # Initial Heuristic Upper Bound
+    k_est = 1000.0
+    if total_w > 0 and rem_global > 0:
+        k_est = (total_w / rem_global) * 1.5
+
+    # Try heuristic K
+    sol = try_pack(k_est, effort_level=0)
+    if sol:
+        best_placement = sol
+        best_score = get_max_kvpr_from_indices(sol)
+    else:
+        # Fallback to loose upper bound
+        sol = try_pack(5000.0, effort_level=0)
+        if sol:
+            best_placement = sol
+            best_score = get_max_kvpr_from_indices(sol)
+
+    # Binary Search
+    low = lb
+    high = best_score if best_score != float('inf') else 3000.0
+
+    if high > low + 1e-4:
+        for _ in range(20):
+            mid = (low + high) / 2.0
+            sol = try_pack(mid, effort_level=1)
+            
+            if sol:
+                # Feasible at mid, check actual score
+                # (Actual score might be less than mid due to slack)
+                actual_score = get_max_kvpr_from_indices(sol)
+                if actual_score < best_score:
+                    best_score = actual_score
+                    best_placement = sol
+                
+                # Try lower
+                high = mid
+            else:
+                # Infeasible
+                low = mid
+
+    if best_placement is None:
+         raise ValueError("Unable to place models on GPUs with available memory.")
+
+    # ------------------------------------------------------------------
+    # 3. Local Search Refinement
+    # ------------------------------------------------------------------
+    curr_map = best_placement
+    
+    # Calculate stats for LS
+    g_stats = []
+    for g in range(gpu_num):
+        idxs = curr_map[g]
+        w = sum(m_data[i]['w'] for i in idxs)
+        s = sum(m_data[i]['s'] for i in idxs)
+        rem = GPU_MEM_SIZE - s
+        p = w / rem if rem > 1e-9 else float('inf')
+        g_stats.append({'w': w, 's': s, 'p': p})
+
+    for _ in range(100): # Limit LS steps
+        # Find bottleneck GPU
+        max_p = -1.0
+        src_gpu = -1
+        for g in range(gpu_num):
+            if g_stats[g]['p'] > max_p:
+                max_p = g_stats[g]['p']
+                src_gpu = g
+        
+        if src_gpu == -1 or max_p < 1e-9: break
+        
+        improved = False
+        src_idxs = curr_map[src_gpu]
+        
+        # 3.1 Best Move (Gradient Descent)
+        best_move = None # (idx_in_list, m_idx, dst, new_max_impact)
+
+        for i_idx, m_idx in enumerate(src_idxs):
+            m = m_data[m_idx]
+            
+            # Predict Src if removed
+            src_rem = GPU_MEM_SIZE - (g_stats[src_gpu]['s'] - m['s'])
+            if src_rem <= 1e-9: src_p = float('inf') # Should not happen if removing makes it smaller
+            else: src_p = (g_stats[src_gpu]['w'] - m['w']) / src_rem
+            
+            for dst in range(gpu_num):
+                if dst == src_gpu: continue
+                if g_stats[dst]['s'] + m['s'] > GPU_MEM_SIZE: continue
+                
+                dst_rem = GPU_MEM_SIZE - (g_stats[dst]['s'] + m['s'])
+                if dst_rem <= 1e-9: continue
+                dst_p = (g_stats[dst]['w'] + m['w']) / dst_rem
+                
+                # Check improvement
+                impact = max(src_p, dst_p)
+                if impact < max_p - 1e-6:
+                    if best_move is None or impact < best_move[3]:
+                        best_move = (i_idx, m_idx, dst, impact)
+
+        if best_move:
+            i_idx, m_idx, dst, _ = best_move
+            # Execute Move
+            curr_map[src_gpu].pop(i_idx)
+            curr_map[dst].append(m_idx)
+            
+            # Update Stats
+            for g in [src_gpu, dst]:
+                idxs = curr_map[g]
+                w = sum(m_data[i]['w'] for i in idxs)
+                s = sum(m_data[i]['s'] for i in idxs)
+                rem = GPU_MEM_SIZE - s
+                p = w / rem if rem > 1e-9 else float('inf')
+                g_stats[g] = {'w': w, 's': s, 'p': p}
+            
+            improved = True
+        
+        if improved: continue
+
+        # 3.2 Greedy Swap
+        for i_src, m_src_idx in enumerate(src_idxs):
+            m_src = m_data[m_src_idx]
+            
+            for dst in range(gpu_num):
+                if dst == src_gpu: continue
+                dst_idxs = curr_map[dst]
+                
+                for i_dst, m_dst_idx in enumerate(dst_idxs):
+                    m_dst = m_data[m_dst_idx]
+                    
+                    # Physical Check
+                    s_src_new = g_stats[src_gpu]['s'] - m_src['s'] + m_dst['s']
+                    s_dst_new = g_stats[dst]['s'] - m_dst['s'] + m_src['s']
+                    if s_src_new > GPU_MEM_SIZE or s_dst_new > GPU_MEM_SIZE: continue
+                    
+                    # Pressure Check
+                    rem_src = GPU_MEM_SIZE - s_src_new
+                    rem_dst = GPU_MEM_SIZE - s_dst_new
+                    if rem_src <= 1e-9 or rem_dst <= 1e-9: continue
+                    
+                    p_src_new = (g_stats[src_gpu]['w'] - m_src['w'] + m_dst['w']) / rem_src
+                    p_dst_new = (g_stats[dst]['w'] - m_dst['w'] + m_src['w']) / rem_dst
+                    
+                    if max(p_src_new, p_dst_new) < max_p - 1e-6:
+                        # Execute Swap
+                        curr_map[src_gpu][i_src] = m_dst_idx
+                        curr_map[dst][i_dst] = m_src_idx
+                        
+                        # Update Stats
+                        g_stats[src_gpu]['w'] = g_stats[src_gpu]['w'] - m_src['w'] + m_dst['w']
+                        g_stats[src_gpu]['s'] = s_src_new
+                        g_stats[src_gpu]['p'] = p_src_new
+                        
+                        g_stats[dst]['w'] = g_stats[dst]['w'] - m_dst['w'] + m_src['w']
+                        g_stats[dst]['s'] = s_dst_new
+                        g_stats[dst]['p'] = p_dst_new
+                        
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+            
+        if not improved: break
+
+    # 4. Result Formatting
+    result = {}
+    for g, idxs in curr_map.items():
+        result[g] = [m_data[i]['obj'] for i in idxs]
+    return result

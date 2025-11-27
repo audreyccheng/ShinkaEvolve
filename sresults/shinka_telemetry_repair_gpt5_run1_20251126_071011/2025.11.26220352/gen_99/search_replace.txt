@@ -1,0 +1,149 @@
+<NAME>
+targeted_router_scaling_and_confidence_penalty
+</NAME>
+
+<DESCRIPTION>
+I propose replacing the uniform per-router scaling with a targeted multiplicative pre-step on the less-trusted direction, applied only to low-confidence or high-residual interfaces, with per-interface caps and rate-aware weighting. This change leverages redundant signals more precisely, reducing the risk of overcorrecting good counters and improving counter repair accuracy. Additionally, I add a bounded router ratio penalty to the confidence calculation, which improves confidence calibration by lowering confidence when the router-level correction implied a large aggregate discrepancy.
+
+Concretely:
+- Introduce s_bounded_map to capture how aggressive the router-level correction would be, and use it in confidence calibration.
+- Compute desired_factor from s_bounded and imbalance; apply per-interface, capped updates based on confidence proxies, residual severity, and volumetric share, protecting tiny links.
+- Add a small confidence penalty when |1 − s_bounded| is large, improving calibration consistency.
+
+These changes are inspired by the Hodor system principles and the provided recommendations, aiming to increase combined_score by balancing accuracy gains with better-calibrated confidence.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    router_imbalance: Dict[str, float] = {}
+=======
+    router_imbalance: Dict[str, float] = {}
+    # Store bounded router ratio per router for confidence calibration
+    s_bounded_map: Dict[str, float] = {}
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Compute a single bounded scaling factor and apply uniformly to active interfaces
+            if dir_to_scale == 'tx':
+                k_raw = sum_rx / max(sum_tx, 1.0e-9)
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    scale_tx[i] = k
+            else:
+                k_raw = sum_tx / max(sum_rx, 1.0e-9)
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    scale_rx[i] = k
+=======
+            # Targeted multiplicative pre-step on the less-trusted direction with per-interface caps
+            if dir_to_scale == 'tx':
+                s = sum_rx / max(sum_tx, 1.0e-9)
+            else:
+                s = sum_tx / max(sum_rx, 1.0e-9)
+            s_bounded = clamp(s, 0.6, 1.7)
+            desired_alpha = clamp(imbalance / 0.12, 0.25, 0.55)
+            desired_factor = 1.0 + desired_alpha * (s_bounded - 1.0)
+            s_bounded_map[router_id] = s_bounded
+
+            # Build per-interface metrics on chosen direction
+            if dir_to_scale == 'tx':
+                sum_dir = max(sum(pre[i]['pre_tx'] for i in up_ifaces), 1.0)
+            else:
+                sum_dir = max(sum(pre[i]['pre_rx'] for i in up_ifaces), 1.0)
+
+            confs: List[float] = []
+            conf_map: Dict[str, float] = {}
+            resid_map: Dict[str, float] = {}
+            tol_map: Dict[str, float] = {}
+            vol_map: Dict[str, float] = {}
+
+            for i in up_ifaces:
+                p = peers.get(i)
+                if dir_to_scale == 'tx':
+                    conf = max(0.0, 1.0 - pre[i]['tx_link_diff'])
+                    v = pre[i]['pre_tx']
+                    if p and p in telemetry and pre.get(p, {}).get('local_status') == 'up':
+                        resid = rel_diff(pre[i]['pre_tx'], pre[p]['pre_rx'])
+                        tol = pair_tolerance(pre[i]['pre_tx'], pre[p]['pre_rx'])
+                    else:
+                        resid = 0.0
+                        tol = HARDENING_THRESHOLD
+                else:
+                    conf = max(0.0, 1.0 - pre[i]['rx_link_diff'])
+                    v = pre[i]['pre_rx']
+                    if p and p in telemetry and pre.get(p, {}).get('local_status') == 'up':
+                        resid = rel_diff(pre[i]['pre_rx'], pre[p]['pre_tx'])
+                        tol = pair_tolerance(pre[i]['pre_rx'], pre[p]['pre_tx'])
+                    else:
+                        resid = 0.0
+                        tol = HARDENING_THRESHOLD
+                conf_map[i] = conf
+                resid_map[i] = resid
+                tol_map[i] = tol
+                vol_map[i] = v
+                confs.append(conf)
+
+            # Determine bottom 40% confidence cutoff
+            confs_sorted = sorted(confs)
+            idx = int(0.4 * len(confs_sorted)) - 1
+            cutoff = confs_sorted[0] if idx < 0 else confs_sorted[idx]
+
+            for i in up_ifaces:
+                conf = conf_map[i]
+                resid = resid_map[i]
+                tol = tol_map[i]
+                v = vol_map[i]
+                qualifies = (conf <= cutoff) or (resid > tol)
+
+                factor_i = 1.0
+                if qualifies:
+                    sev = min(2.0, resid / max(tol, 1.0e-9))
+                    vol_share = v / sum_dir
+                    w = 0.6 * (1.0 - conf) + 0.25 * sev + 0.15 * vol_share
+                    if v < 1.0:
+                        w *= 0.5
+                    w = max(0.02, w)
+                    # Per-interface multiplicative cap ±15%
+                    delta_factor = clamp((desired_factor - 1.0) * w, -0.15, 0.15)
+                    factor_i = 1.0 + delta_factor
+
+                if dir_to_scale == 'tx':
+                    scale_tx[i] *= factor_i
+                else:
+                    scale_rx[i] *= factor_i
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if s_dev_rx > 0.5:
+            rx_confidence -= 0.05
+        elif s_dev_rx > 0.25:
+            rx_confidence -= 0.03
+        if s_dev_tx > 0.5:
+            tx_confidence -= 0.05
+        elif s_dev_tx > 0.25:
+            tx_confidence -= 0.03
+=======
+        if s_dev_rx > 0.5:
+            rx_confidence -= 0.05
+        elif s_dev_rx > 0.25:
+            rx_confidence -= 0.03
+        if s_dev_tx > 0.5:
+            tx_confidence -= 0.05
+        elif s_dev_tx > 0.25:
+            tx_confidence -= 0.03
+
+        # Router ratio penalty using bounded ratio (improves calibration on heavy router-level corrections)
+        s_b = s_bounded_map.get(router_id, 1.0)
+        if abs(1.0 - s_b) > 0.25:
+            pen = min(0.05, 0.2 * abs(1.0 - s_b))
+            rx_confidence -= pen
+            tx_confidence -= pen
+>>>>>>> REPLACE
+
+</DIFF>

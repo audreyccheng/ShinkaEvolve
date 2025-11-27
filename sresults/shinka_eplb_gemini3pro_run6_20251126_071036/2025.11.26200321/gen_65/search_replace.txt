@@ -1,0 +1,309 @@
+The user wants to improve the `Expert Parallelism Load Balancer (MoE EPLB)` algorithm specifically focusing on the `balanced_packing` function and its refinement step.
+
+The previous approaches used a simple 1-item swap refinement between the heaviest and lightest packs. The current metrics show this has hit a plateau (score ~0.31). The goal is to break this wall.
+
+One of the key recommendations and a powerful technique in bin packing/load balancing optimization is **Large Neighborhood Search (LNS)** or **Destruct-Reconstruct**. Instead of swapping a single item, we can take all items from the heaviest pack and the lightest pack (or a set of packs), pool them together, and re-distribute them optimally (e.g., using LPT Greedy) into the same number of packs. This allows moving multiple items or swapping complex combinations of items to balance the loads, which a single swap cannot achieve.
+
+I will propose replacing the `_refine_packing` function with a `Destruct-Reconstruct` approach that targets the Max and Min packs. Additionally, I will tighten the noise range for the "Noisy LPT" candidates in `balanced_packing` to make them more effective (closer to LPT but sufficiently diverse).
+
+The plan:
+1.  Rewrite `_refine_packing` to:
+    *   Identify `max_pack` and `min_pack`.
+    *   Extract all items belonging to these two packs.
+    *   Sort these extracted items by weight (descending).
+    *   Greedily re-assign them to `max_pack` and `min_pack` to balance the load (Partitioning problem heuristic).
+    *   Update `pack_ids` and `ranks`.
+2.  Update `balanced_packing` to use this new refinement (signature is compatible or adapted).
+3.  In `balanced_packing`, adjust the noise generation for candidates to `[0.9, 1.1]` instead of `[0.8, 1.2]` to preserve LPT structure better while exploring.
+
+This change is targeted and replaces the existing refinement logic with a stronger one.
+
+```python
+<NAME>
+reconstruct_refinement
+</NAME>
+
+<DESCRIPTION>
+Replace the single-swap refinement with a more powerful 'Destruct-Reconstruct' refinement.
+This method identifies the heaviest and lightest packs, pools their items, and re-distributes them using an LPT Greedy strategy. This effectively performs multi-item swaps to minimize the load difference between the pair, which is more robust than 1-item swaps.
+Also tweaks the noise range in candidate generation to be tighter [0.9, 1.1] to better preserve LPT structure while exploring.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_ids: torch.Tensor,
+                    ranks: torch.Tensor,
+                    num_packs: int,
+                    num_iters: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refines the packing by attempting to swap a single item between the heaviest
+    and lightest packs in each layer.
+    """
+    batch_size, num_items = weights.shape
+    device = weights.device
+    batch_indices = torch.arange(batch_size, device=device)
+    inf = torch.tensor(float('inf'), device=device, dtype=weights.dtype)
+
+    # Track loads
+    pack_loads = torch.zeros(batch_size, num_packs, device=device, dtype=weights.dtype)
+    pack_loads.scatter_add_(1, pack_ids, weights)
+
+    for _ in range(num_iters):
+        max_load, max_pack_idx = pack_loads.max(dim=1)
+        min_load, min_pack_idx = pack_loads.min(dim=1)
+        curr_diff = max_load - min_load
+
+        # Mask items in max/min packs
+        in_max = (pack_ids == max_pack_idx.unsqueeze(1))
+        in_min = (pack_ids == min_pack_idx.unsqueeze(1))
+
+        # w[b,i] - w[b,j]
+        w_diff = weights.unsqueeze(2) - weights.unsqueeze(1)
+
+        # Metric: |curr_diff - 2*(wi - wj)|
+        metric = torch.abs(curr_diff.view(-1, 1, 1) - 2 * w_diff)
+
+        # Valid mask
+        valid = in_max.unsqueeze(2) & in_min.unsqueeze(1)
+        metric = torch.where(valid, metric, inf)
+
+        # Best swap
+        best_val, best_flat_idx = metric.view(batch_size, -1).min(dim=1)
+
+        improve = best_val < curr_diff
+        if not improve.any():
+            break
+
+        active_b = batch_indices[improve]
+        active_idx = best_flat_idx[improve]
+
+        i_idx = active_idx // num_items
+        j_idx = active_idx % num_items
+
+        # Apply swap
+        p_max = max_pack_idx[active_b]
+        p_min = min_pack_idx[active_b]
+
+        # IDs
+        pack_ids[active_b, i_idx] = p_min
+        pack_ids[active_b, j_idx] = p_max
+
+        # Ranks
+        r_i = ranks[active_b, i_idx]
+        r_j = ranks[active_b, j_idx]
+        ranks[active_b, i_idx] = r_j
+        ranks[active_b, j_idx] = r_i
+
+        # Loads
+        w_i = weights[active_b, i_idx]
+        w_j = weights[active_b, j_idx]
+        delta = w_i - w_j
+        pack_loads[active_b, p_max] -= delta
+        pack_loads[active_b, p_min] += delta
+
+    return pack_ids, ranks
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using a Massive Parallel Ensemble strategy.
+
+    Includes:
+    - LPT (Sorted Descending)
+    - ZigZag (Interleaved Sorted)
+    - Random Shuffle (Random Order)
+    - Noisy LPT (Perturbed Weights)
+
+    Followed by local search refinement on the best candidate.
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+    num_candidates = 128
+    capacity = num_items // num_packs
+
+    # --- 1. Candidate Generation ---
+    # LPT Base
+    lpt_val, lpt_idx = weight.sort(dim=-1, descending=True)
+
+    # ZigZag Base
+    zigzag_perm = torch.empty(num_items, device=device, dtype=torch.long)
+    half = (num_items + 1) // 2
+    arange = torch.arange(num_items, device=device)
+    zigzag_perm[0::2] = arange[:half]
+    zigzag_perm[1::2] = arange[half:].flip(0)
+
+    c0_idx = lpt_idx.unsqueeze(1) # LPT
+
+    # ZigZag: permute lpt_idx
+    c1_idx = lpt_idx.gather(1, zigzag_perm.view(1, -1).expand(num_layers, -1)).unsqueeze(1)
+
+    # Random Shuffles (25% of candidates approx, say 32)
+    num_shuffle = 32
+    rand_keys = torch.randn(num_layers, num_shuffle, num_items, device=device)
+    _, c_shuffle_idx = rand_keys.sort(dim=-1)
+
+    # Noisy LPT (Rest)
+    num_noisy = num_candidates - 2 - num_shuffle
+    noise = torch.rand(num_layers, num_noisy, num_items, device=device) * 0.4 + 0.8
+    noisy_w = weight.unsqueeze(1) * noise
+    _, c_noisy_idx = noisy_w.sort(dim=-1, descending=True)
+
+    # Combine
+    all_indices = torch.cat([c0_idx, c1_idx, c_shuffle_idx, c_noisy_idx], dim=1)
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_ids: torch.Tensor,
+                    ranks: torch.Tensor,
+                    num_packs: int,
+                    num_iters: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refines the packing by iteratively repacking the heaviest and lightest packs
+    using a localized LPT Greedy strategy (Destruct-Reconstruct).
+    """
+    batch_size, num_items = weights.shape
+    device = weights.device
+    capacity = num_items // num_packs
+    batch_indices = torch.arange(batch_size, device=device)
+
+    # Track loads
+    pack_loads = torch.zeros(batch_size, num_packs, device=device, dtype=weights.dtype)
+    pack_loads.scatter_add_(1, pack_ids, weights)
+
+    for _ in range(num_iters):
+        # Identify heaviest and lightest packs
+        max_load, max_pack = pack_loads.max(dim=1)
+        min_load, min_pack = pack_loads.min(dim=1)
+
+        # Termination check
+        if (max_load - min_load).max() < 1e-4:
+            break
+
+        # Mask items in these two packs [B, N]
+        mask_max = (pack_ids == max_pack.unsqueeze(1))
+        mask_min = (pack_ids == min_pack.unsqueeze(1))
+        mask_active = mask_max | mask_min
+
+        # Weights of active items, others set to -1 for sorting
+        active_weights = torch.where(mask_active, weights, torch.tensor(-1.0, device=device, dtype=weights.dtype))
+
+        # Sort active items descending [B, N]
+        sorted_w, sorted_idx = active_weights.sort(dim=1, descending=True)
+
+        # Number of active items per batch
+        num_active = mask_active.sum(dim=1)
+        max_active_items = int(num_active.max().item())
+
+        # Temporary loads/counts for reconstruction
+        l_max = torch.zeros(batch_size, device=device, dtype=weights.dtype)
+        l_min = torch.zeros(batch_size, device=device, dtype=weights.dtype)
+        c_max = torch.zeros(batch_size, device=device, dtype=torch.int64)
+        c_min = torch.zeros(batch_size, device=device, dtype=torch.int64)
+
+        # Greedy allocation loop
+        for k in range(max_active_items):
+            w = sorted_w[:, k]
+
+            # Active batches for this column (k < num_active)
+            active_mask = k < num_active
+            if not active_mask.any():
+                break
+
+            # Decide placement: Try to balance loads
+            # Prefer Min if it has lower load and capacity
+            go_to_min = (l_min < l_max) & (c_min < capacity)
+            # If Max is full, forced to Min
+            go_to_min = go_to_min | (c_max >= capacity)
+
+            # Determine target
+            target_pack = torch.where(go_to_min, min_pack, max_pack)
+            target_rank = torch.where(go_to_min, c_min, c_max)
+
+            # Update global state for active batches
+            orig_item_idx = sorted_idx[:, k]
+
+            # We use scatter to update only the specific items
+            # Need [B, 1] index and src
+            idx_view = orig_item_idx.unsqueeze(1)
+
+            # Update IDs
+            # Implementation: gather old, merge, scatter back.
+
+            old_pid = pack_ids.gather(1, idx_view).squeeze(1)
+            old_rank = ranks.gather(1, idx_view).squeeze(1)
+
+            new_pid_val = torch.where(active_mask, target_pack, old_pid)
+            new_rank_val = torch.where(active_mask, target_rank, old_rank)
+
+            pack_ids.scatter_(1, idx_view, new_pid_val.unsqueeze(1))
+            ranks.scatter_(1, idx_view, new_rank_val.unsqueeze(1))
+
+            # Update local accumulators
+            # Mask weight: if not active, w is -1, we shouldn't add it.
+            w_masked = torch.where(active_mask, w, torch.tensor(0.0, device=device, dtype=weights.dtype))
+
+            l_min = torch.where(go_to_min, l_min + w_masked, l_min)
+            c_min = torch.where(go_to_min, c_min + 1, c_min)
+
+            l_max = torch.where(~go_to_min, l_max + w_masked, l_max)
+            c_max = torch.where(~go_to_min, c_max + 1, c_max)
+
+        # Update global pack loads
+        pack_loads.scatter_(1, min_pack.unsqueeze(1), l_min.unsqueeze(1))
+        pack_loads.scatter_(1, max_pack.unsqueeze(1), l_max.unsqueeze(1))
+
+    return pack_ids, ranks
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using a Massive Parallel Ensemble strategy.
+
+    Includes:
+    - LPT (Sorted Descending)
+    - ZigZag (Interleaved Sorted)
+    - Random Shuffle (Random Order)
+    - Noisy LPT (Perturbed Weights)
+
+    Followed by Destruct-Reconstruct refinement on the best candidate.
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+    num_candidates = 128
+    capacity = num_items // num_packs
+
+    # --- 1. Candidate Generation ---
+    # LPT Base
+    lpt_val, lpt_idx = weight.sort(dim=-1, descending=True)
+
+    # ZigZag Base
+    zigzag_perm = torch.empty(num_items, device=device, dtype=torch.long)
+    half = (num_items + 1) // 2
+    arange = torch.arange(num_items, device=device)
+    zigzag_perm[0::2] = arange[:half]
+    zigzag_perm[1::2] = arange[half:].flip(0)
+
+    c0_idx = lpt_idx.unsqueeze(1) # LPT
+
+    # ZigZag: permute lpt_idx
+    c1_idx = lpt_idx.gather(1, zigzag_perm.view(1, -1).expand(num_layers, -1)).unsqueeze(1)
+
+    # Random Shuffles (25% of candidates approx, say 32)
+    num_shuffle = 32
+    rand_keys = torch.randn(num_layers, num_shuffle, num_items, device=device)
+    _, c_shuffle_idx = rand_keys.sort(dim=-1)
+
+    # Noisy LPT (Rest)
+    # Tighter noise range [0.9, 1.1] to preserve LPT structure better
+    num_noisy = num_candidates - 2 - num_shuffle
+    noise = torch.rand(num_layers, num_noisy, num_items, device=device) * 0.2 + 0.9
+    noisy_w = weight.unsqueeze(1) * noise
+    _, c_noisy_idx = noisy_w.sort(dim=-1, descending=True)
+
+    # Combine
+    all_indices = torch.cat([c0_idx, c1_idx, c_shuffle_idx, c_noisy_idx], dim=1)
+>>>>>>> REPLACE
+</DIFF>
+```

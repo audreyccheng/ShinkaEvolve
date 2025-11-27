@@ -1,0 +1,229 @@
+<NAME>
+beam_seed_and_bubble_cleanup
+</NAME>
+
+<DESCRIPTION>
+I introduce a lightweight beam-seeded prefix explorer to generate a stronger initial incumbent before the greedy restarts, and add a cheap tournament-based bubble cleanup before local search. The beam seed leverages the already computed pairwise costs M, preference margins W, and buddy lists to explore promising prefixes with lookahead and dominance pruning, then greedily completes the best prefix. This raises the global incumbent early and enables stronger pruning during subsequent greedy construction. The tournament bubble pass uses pairwise preferences to quickly fix locally unfavorable adjacencies at very low cost before running heavier local search, improving makespan and reducing the number of expensive evaluations needed.
+
+These changes are targeted: we add two small helper functions (prefer_before, tournament_bubble_pass), define beam_seed and a helper greedy_complete_from, call beam_seed once to set best_cost and best_seq, and invoke tournament_bubble_pass at the start of the local improvement phase. All other logic remains unchanged and consistent with the existing interfaces and data structures.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    tournament_order = list(range(n))
+    tournament_order.sort(key=lambda x: (s[x], x))
+
+    # Buddy list per txn by small M[i][j]
+    buddy_k = 8 if n >= 90 else 6
+    buddies = []
+    for t in range(n):
+        order = sorted((u for u in range(n) if u != t), key=lambda u: M[t][u])
+        buddies.append(order[:buddy_k])
+
+    def preselect_by_tournament(prefix, remaining, k, recent_k=4):
+=======
+    tournament_order = list(range(n))
+    tournament_order.sort(key=lambda x: (s[x], x))
+
+    def prefer_before(a, b):
+        # Heuristic: placing a before b is not worse than b before a if pairwise cost allows
+        return M[a][b] <= M[b][a]
+
+    def tournament_bubble_pass(seq, passes=2):
+        # Cheap pass that bubbles locally unfavorable adjacencies using pairwise preferences.
+        arr = seq[:]
+        for _ in range(max(1, passes)):
+            improved = False
+            for k in range(len(arr) - 1):
+                a, b = arr[k], arr[k + 1]
+                if not prefer_before(a, b):
+                    arr[k], arr[k + 1] = b, a
+                    improved = True
+            if not improved:
+                break
+        return arr
+
+    # Buddy list per txn by small M[i][j]
+    buddy_k = 8 if n >= 90 else 6
+    buddies = []
+    for t in range(n):
+        order = sorted((u for u in range(n) if u != t), key=lambda u: M[t][u])
+        buddies.append(order[:buddy_k])
+
+    def preselect_by_tournament(prefix, remaining, k, recent_k=4):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Prefix-dominance map shared across restarts: (frozenset(remaining), suffix<=3) -> best cost
+    prefix_dom = {}
+
+    restarts = max(1, int(num_seqs))
+=======
+    # Prefix-dominance map shared across restarts: (frozenset(remaining), suffix<=3) -> best cost
+    prefix_dom = {}
+
+    # Greedy completion from a prefix; builds remaining internally
+    def greedy_complete_from(prefix):
+        rem = [t for t in range(n) if t not in prefix]
+        base = prefix[:]
+        while rem:
+            t = min(rem, key=lambda u: seq_cost(base + [u]))
+            base.append(t)
+            rem.remove(t)
+        return base, seq_cost(base)
+
+    # Beam-seeded prefix explorer to raise a strong incumbent for pruning
+    def beam_seed(inc=None):
+        beam_width = max(6, min(16, int(num_seqs)))
+        cand_per_expand = max(6, min(12, n // 7 + 6))
+        lookahead_top = 3
+        next_k = 5
+        depth_limit = max(3, int(0.4 * n))
+
+        # Starts: tournament-best, a good singleton, then randoms
+        starts = []
+        starts.append(tournament_order[0])
+        topk = min(10, n)
+        good_singletons = [t for t, _ in singleton_costs[:topk]]
+        starts.append(rng.choice(good_singletons))
+        remcands = [t for t in range(n) if t not in starts]
+        rng.shuffle(remcands)
+        starts.extend(remcands[:max(0, beam_width - len(starts))])
+
+        beam = []
+        dom = {}  # prefix-dominance: (remaining_fset, suffix<=3) -> best cost
+        seen_init = set()
+        for t in starts:
+            seq = [t]
+            rem = frozenset(set(range(n)) - {t})
+            cost = seq_cost(seq)
+            key = (tuple(seq), rem)
+            if key in seen_init:
+                continue
+            seen_init.add(key)
+            sig = (rem, tuple(seq[-1:]))
+            prev = dom.get(sig)
+            if prev is None or cost < prev:
+                dom[sig] = cost
+                beam.append((cost, seq, rem))
+
+        depth = 1
+        while depth < min(depth_limit, n) and beam:
+            next_beam = []
+            local_seen = set()
+            for cost, seq, rem in beam:
+                rem_list = list(rem)
+                if not rem_list:
+                    next_beam.append((cost, seq, rem))
+                    continue
+
+                # Tournament-guided preselection
+                if len(rem_list) > cand_per_expand * 2:
+                    pre = preselect_by_tournament(seq, rem_list, cand_per_expand * 2, recent_k=4)
+                else:
+                    pre = rem_list
+
+                # Immediate costs
+                imm = [(t, seq_cost(seq + [t])) for t in pre]
+                imm.sort(key=lambda z: z[1])
+
+                # Buddy-biased lookahead on top-L
+                L = min(lookahead_top, len(imm))
+                scored = []
+                for t, imc in imm[:L]:
+                    nexts = [u for u in rem_list if u != t]
+                    if not nexts:
+                        la = imc
+                    else:
+                        buddy_pref = [u for u in buddies[t] if u in nexts][:next_k]
+                        if len(buddy_pref) < next_k:
+                            extra = preselect_by_tournament(seq + [t], [u for u in nexts if u not in buddy_pref], next_k - len(buddy_pref), recent_k=3)
+                            pool = buddy_pref + extra
+                        else:
+                            pool = buddy_pref
+                        if not pool:
+                            pool = nexts[:min(next_k, len(nexts))]
+                        la = min(seq_cost(seq + [t, u]) for u in pool)
+                    scored.append((t, min(imc, la)))
+
+                # Add a few immediate-best without lookahead for diversity
+                diversity = min(max(2, cand_per_expand // 3), len(imm))
+                for t, imc in imm[:diversity]:
+                    scored.append((t, imc))
+
+                # Unique by child and keep best-k
+                uniq = {}
+                for t, m in scored:
+                    if (t not in uniq) or (m < uniq[t]):
+                        uniq[t] = m
+                items = sorted(uniq.items(), key=lambda z: z[1])
+                take = min(cand_per_expand, len(items))
+                for t, _ in items[:take]:
+                    new_seq = seq + [t]
+                    new_rem = rem - {t}
+                    new_cost = seq_cost(new_seq)
+                    sig = (new_rem, tuple(new_seq[-3:]) if len(new_seq) >= 3 else tuple(new_seq))
+                    prev = dom.get(sig)
+                    if (prev is not None) and (new_cost >= prev):
+                        continue
+                    dom[sig] = new_cost
+                    key = (tuple(new_seq), new_rem)
+                    if key in local_seen:
+                        continue
+                    local_seen.add(key)
+                    next_beam.append((new_cost, new_seq, new_rem))
+
+            if not next_beam:
+                break
+            next_beam.sort(key=lambda x: x[0])
+            beam = next_beam[:beam_width]
+            depth += 1
+
+        if not beam:
+            # fallback
+            full, fc = greedy_complete_from([rng.randint(0, n - 1)])
+            return full, fc
+
+        beam.sort(key=lambda x: x[0])
+        _, bseq, brem = beam[0]
+        full, fc = greedy_complete(bseq, list(brem))
+        return full, fc
+
+    # Use beam seed once to set a strong incumbent for pruning
+    try:
+        bseq, bcost = beam_seed()
+        if bcost < best_cost:
+            best_cost, best_seq = bcost, bseq[:]
+    except Exception:
+        pass
+
+    restarts = max(1, int(num_seqs))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Local improvement phase
+        current_cost = seq_cost(seq)
+
+        # 1) Adjacent swap hill-climb passes
+=======
+        # Local improvement phase
+        current_cost = seq_cost(seq)
+
+        # Cheap tournament bubble cleanup to quickly fix bad adjacencies
+        try:
+            seq_tb = tournament_bubble_pass(seq, passes=2)
+            c_tb = seq_cost(seq_tb)
+            if c_tb < current_cost:
+                seq = seq_tb
+                current_cost = c_tb
+        except NameError:
+            # tournament_bubble_pass not available
+            pass
+
+        # 1) Adjacent swap hill-climb passes
+>>>>>>> REPLACE
+</DIFF>

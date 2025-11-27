@@ -1,0 +1,265 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get near-optimal schedule using cached beam search with local refinement.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Search effort parameter (used to scale beam width and restarts)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+
+    # Cost cache for partial prefixes to reduce repeated evaluations
+    cost_cache = {}
+
+    def eval_cost(prefix):
+        """Evaluate and cache the cost for a prefix sequence."""
+        key = tuple(prefix)
+        if key in cost_cache:
+            return cost_cache[key]
+        # Use the simulator's provided evaluator; it accepts partial prefixes.
+        c = workload.get_opt_seq_cost(list(prefix))
+        cost_cache[key] = c
+        return c
+
+    def local_adjacent_refine(seq, max_passes=2):
+        """Simple local improvement via adjacent swaps (accept non-worse)."""
+        current = list(seq)
+        best_c = eval_cost(current)
+        improved = True
+        passes = 0
+        while improved and passes < max_passes:
+            improved = False
+            for i in range(len(current) - 1):
+                cand = current[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_cost(cand)
+                if c <= best_c:
+                    current, best_c = cand, c
+                    improved = True
+            passes += 1
+        return best_c, current
+
+    def beam_search(beam_width, cand_per_state):
+        """
+        Beam search guided by partial-prefix costs.
+
+        beam_width: number of partial sequences to keep at each depth
+        cand_per_state: number of candidates to expand per beam state when remaining is large
+        """
+        # Evaluate all single-transaction starters and pick top starters for initialization
+        starters = []
+        for t in range(n):
+            c = eval_cost([t])
+            starters.append((c, [t]))
+        starters.sort(key=lambda x: x[0])
+
+        init_count = min(max(beam_width * 2, beam_width), n)
+        init_beam = []
+        used_prefixes = set()
+        for c, seq in starters[:init_count]:
+            prefix_key = tuple(seq)
+            if prefix_key in used_prefixes:
+                continue
+            used_prefixes.add(prefix_key)
+            remaining = tuple(x for x in range(n) if x != seq[0])
+            init_beam.append((c, seq, remaining))
+
+        best_complete = (float('inf'), [])
+        beam = init_beam
+
+        # Progressively grow prefixes
+        for depth in range(1, n):
+            next_candidates = []
+            for cost_so_far, prefix, remaining in beam:
+                rem_list = list(remaining)
+                if not rem_list:
+                    # Completed
+                    if cost_so_far < best_complete[0]:
+                        best_complete = (cost_so_far, prefix)
+                    next_candidates.append((cost_so_far, prefix, remaining))
+                    continue
+
+                # Decide candidate set size
+                if len(rem_list) <= min(cand_per_state, 12):
+                    expand_list = rem_list
+                else:
+                    # Random subset for diversity and bounded cost
+                    k = min(cand_per_state, len(rem_list))
+                    expand_list = random.sample(rem_list, k)
+
+                # Expand each candidate and score by partial cost
+                for t in expand_list:
+                    new_prefix = prefix + [t]
+                    c = eval_cost(new_prefix)
+                    new_remaining = tuple(x for x in rem_list if x != t)
+                    if len(new_prefix) == n and c < best_complete[0]:
+                        best_complete = (c, new_prefix)
+                    next_candidates.append((c, new_prefix, new_remaining))
+
+            # Prune to beam width by best partial cost
+            # Deduplicate prefixes with same head to encourage diversity
+            if not next_candidates:
+                break
+            next_candidates.sort(key=lambda x: x[0])
+            pruned = []
+            seen = set()
+            for c, seq, rem in next_candidates:
+                key = tuple(seq)
+                if key in seen:
+                    continue
+                seen.add(key)
+                pruned.append((c, seq, rem))
+                if len(pruned) >= beam_width:
+                    break
+            beam = pruned
+
+        # If we didn't complete during loop, finalize from beam candidates
+        for c, seq, rem in beam:
+            if len(seq) == n and c < best_complete[0]:
+                best_complete = (c, seq)
+        # As a fallback, if no completion found (shouldn't happen), complete greedily
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+        # Greedy completion from best partial
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_ext = None
+                best_ext_cost = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur_seq + [t])
+                    if c2 < best_ext_cost:
+                        best_ext_cost = c2
+                        best_ext = t
+                cur_seq.append(best_ext)
+                rem_list.remove(best_ext)
+            final_cost = eval_cost(cur_seq)
+            return final_cost, cur_seq
+        # Absolute fallback: identity sequence
+        identity = list(range(n))
+        return eval_cost(identity), identity
+
+    # Configure search parameters based on problem size and provided num_seqs "effort" hint
+    # Keep runtime practical while improving quality over the baseline.
+    beam_width = max(3, min(6, num_seqs)) if n > 30 else max(3, min(8, num_seqs + 2))
+    cand_per_state = min(16, max(8, n // 5))  # Bounded expansions per beam state
+    restarts = max(1, num_seqs // 3)  # A few restarts to diversify beams
+
+    best_overall_cost = float('inf')
+    best_overall_seq = []
+
+    # Multiple randomized restarts: shuffle initial priorities by random tie-breaks
+    for r in range(restarts):
+        # Small perturbation to randomization to diversify sampling
+        random.seed((n * 131 + num_seqs * 17 + r * 911) % (2**32 - 1))
+
+        c, seq = beam_search(beam_width=beam_width, cand_per_state=cand_per_state)
+        # Local adjacent-swap refinement to shave extra cost if possible
+        c_ref, seq_ref = local_adjacent_refine(seq, max_passes=2)
+        if c_ref < c:
+            c, seq = c_ref, seq_ref
+
+        if c < best_overall_cost:
+            best_overall_cost, best_overall_seq = c, seq
+
+    # Safety check
+    assert len(set(best_overall_seq)) == n, "Schedule must include each transaction exactly once"
+
+    return best_overall_cost, best_overall_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+    
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+    
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

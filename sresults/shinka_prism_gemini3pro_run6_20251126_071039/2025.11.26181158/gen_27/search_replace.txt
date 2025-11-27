@@ -1,0 +1,254 @@
+<NAME>
+init_multistart_guided_perturbation
+</NAME>
+
+<DESCRIPTION>
+1. Re-introduced Multi-Start Initialization: The algorithm now generates candidate solutions using Binary Search (Weighted Bin Packing) AND three Greedy strategies (sorted by Size, Load, and Density). The best of these is chosen as the starting point for local search. This diversification helps find a better basin of attraction.
+2. Refined Perturbation Strategy: In the perturbation step (kick), instead of moving a model to a completely random feasible GPU, the algorithm now sorts feasible destination GPUs by their KVPR (load) and picks from the top 3 least loaded ones. This "guided kick" helps unload the bottleneck GPU while minimizing the risk of creating a new bottleneck elsewhere.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 1. Binary Search Initialization
+    # -------------------------------------------------------------------------
+    def solve_linearized_bin_packing(target_k):
+        # Constraint: Sum(load) / (Cap - Sum(size)) <= K
+        # <=> Sum(load) <= K * Cap - K * Sum(size)
+        # <=> Sum(load + K * size) <= K * Cap
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            w = (m.req_rate / m.slo) + target_k * m.model_size
+            items.append((w, m))
+
+        # Best Fit Decreasing
+        items.sort(key=lambda x: x[0], reverse=True)
+        bins = [GPUState(i) for i in range(gpu_num)]
+
+        for w, m in items:
+            best_idx = -1
+            min_rem_linear = float('inf')
+
+            for i in range(gpu_num):
+                # Hard memory constraint
+                if not bins[i].can_fit(m.model_size):
+                    continue
+
+                # Soft linearized constraint
+                # Check if adding fits in the "linearized capacity"
+                current_linear_usage = bins[i].load + target_k * bins[i].used_mem
+                added_linear_usage = (m.req_rate / m.slo) + target_k * m.model_size
+
+                if current_linear_usage + added_linear_usage <= bin_cap:
+                    rem = bin_cap - (current_linear_usage + added_linear_usage)
+                    if rem < min_rem_linear:
+                        min_rem_linear = rem
+                        best_idx = i
+
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    # Binary search
+    low = 0.0
+    high = 1000.0
+    if solve_linearized_bin_packing(high) is None: high = 1e9 # Relaxation
+
+    best_init_gpus = None
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bin_packing(mid)
+        if res is not None:
+            best_init_gpus = res
+            high = mid
+        else:
+            low = mid
+
+    if best_init_gpus is None:
+        # Fallback: Simple greedy
+        best_init_gpus = [GPUState(i) for i in range(gpu_num)]
+        for m in sorted(models, key=lambda x: x.model_size, reverse=True):
+            placed = False
+            for i in range(gpu_num):
+                if best_init_gpus[i].can_fit(m.model_size):
+                    best_init_gpus[i].add(m)
+                    placed = True
+                    break
+            if not placed: raise ValueError("OOM")
+
+    # -------------------------------------------------------------------------
+    # 2. Local Search with Perturbation
+    # -------------------------------------------------------------------------
+    current_gpus = best_init_gpus
+
+    def get_vector(gs):
+        return tuple(sorted((g.kvpr() for g in gs), reverse=True))
+
+    current_vector = get_vector(current_gpus)
+
+    # Save best globally
+    best_gpus = [GPUState(i) for i in range(gpu_num)]
+    for i in range(gpu_num): best_gpus[i].copy_from(current_gpus[i])
+    best_vector = current_vector
+=======
+    # -------------------------------------------------------------------------
+    # 1. Initialization Strategies (Multi-Start)
+    # -------------------------------------------------------------------------
+    def get_vector(gs):
+        return tuple(sorted((g.kvpr() for g in gs), reverse=True))
+
+    candidates = []
+
+    # Strategy A: Binary Search Linearization
+    def solve_linearized_bin_packing(target_k):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            w = (m.req_rate / m.slo) + target_k * m.model_size
+            items.append((w, m))
+        items.sort(key=lambda x: x[0], reverse=True)
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m in items:
+            best_idx = -1
+            min_rem_linear = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                add_use = (m.req_rate / m.slo) + target_k * m.model_size
+                if lin_use + add_use <= bin_cap:
+                    rem = bin_cap - (lin_use + add_use)
+                    if rem < min_rem_linear:
+                        min_rem_linear = rem
+                        best_idx = i
+            if best_idx != -1: bins[best_idx].add(m)
+            else: return None
+        return bins
+
+    low, high = 0.0, 1000.0
+    if solve_linearized_bin_packing(high) is None: high = 1e9
+    bs_res = None
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bin_packing(mid)
+        if res:
+            bs_res = res
+            high = mid
+        else:
+            low = mid
+    if bs_res: candidates.append(bs_res)
+
+    # Strategy B, C, D: Greedy heuristics
+    strategies = [
+        ('size', lambda m: m.model_size),
+        ('load', lambda m: m.req_rate / m.slo),
+        ('density', lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 1e-7 else 0)
+    ]
+
+    for _, key_fn in strategies:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        valid = True
+        for m in sorted(models, key=key_fn, reverse=True):
+            best_idx = -1
+            best_val = float('inf')
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    rem = GPU_MEM_SIZE - (gpus[i].used_mem + m.model_size)
+                    val = (gpus[i].load + m.req_rate/m.slo) / rem if rem > 1e-7 else float('inf')
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+            if best_idx != -1:
+                gpus[best_idx].add(m)
+            else:
+                valid = False
+                break
+        if valid: candidates.append(gpus)
+
+    if not candidates:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        for m in sorted(models, key=lambda x: x.model_size, reverse=True):
+            placed = False
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    gpus[i].add(m)
+                    placed = True
+                    break
+            if not placed: raise ValueError("Models do not fit in GPU memory.")
+        candidates.append(gpus)
+
+    # Pick best start
+    current_gpus = min(candidates, key=lambda g: get_vector(g))
+    current_vector = get_vector(current_gpus)
+
+    best_gpus = [GPUState(i) for i in range(gpu_num)]
+    for i in range(gpu_num): best_gpus[i].copy_from(current_gpus[i])
+    best_vector = current_vector
+
+    # -------------------------------------------------------------------------
+    # 2. Iterated Local Search (ILS)
+    # -------------------------------------------------------------------------
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- PERTURBATION ---
+        # If we reach here, we are at a local optimum.
+        # Apply a kick: Force move a model from the absolute worst GPU to a random feasible spot.
+        # Then continue.
+
+        iter_cnt += 1
+        # Stop if near end to avoid returning a perturbed state that hasn't been fixed
+        if iter_cnt > max_iter - 10: break
+
+        worst_gpu = sorted_gpus[0]
+        if not worst_gpu.models: break
+
+        # Pick a random model from worst gpu
+        m_idx = random.randint(0, len(worst_gpu.models)-1)
+        model_to_move = worst_gpu.models[m_idx]
+
+        # Find feasible destinations (exclude self)
+        feasible_dests = [g for g in current_gpus if g.id != worst_gpu.id and g.can_fit(model_to_move.model_size)]
+
+        if feasible_dests:
+            dest = random.choice(feasible_dests)
+            worst_gpu.remove(m_idx)
+            dest.add(model_to_move)
+            current_vector = get_vector(current_gpus)
+            # We don't update best_vector here because the kick likely makes it worse.
+        else:
+            # If cannot move, break to avoid infinite loops
+            break
+=======
+        # --- PERTURBATION (Guided Kick) ---
+        # If we reach here, we are at a local optimum.
+        # Apply a kick: Force move a model from the bottleneck GPU to a *promising* feasible GPU.
+
+        iter_cnt += 1
+        if iter_cnt > max_iter - 10: break
+
+        worst_gpu = sorted_gpus[0]
+        if not worst_gpu.models: break
+
+        # Try to move a random model
+        m_idx = random.randint(0, len(worst_gpu.models)-1)
+        model_to_move = worst_gpu.models[m_idx]
+
+        # Find feasible destinations, exclude self
+        feasible_dests = [g for g in current_gpus if g.id != worst_gpu.id and g.can_fit(model_to_move.model_size)]
+
+        if feasible_dests:
+            # Guided: Prefer GPUs with lower KVPR to avoid creating new bottlenecks.
+            # Pick from top 3 lowest KVPR GPUs to maintain some stochasticity.
+            feasible_dests.sort(key=lambda g: g.kvpr())
+            target_candidates = feasible_dests[:3]
+            dest = random.choice(target_candidates)
+
+            worst_gpu.remove(m_idx)
+            dest.add(model_to_move)
+            current_vector = get_vector(current_gpus)
+        else:
+            break
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,197 @@
+<NAME>
+midpack_t_retune
+</NAME>
+
+<DESCRIPTION>
+Introduce residual-aware mid-placement T retuning inside the parametric packing routine. During try_pack, after placing about 40% and 75% of items, we recompute a tighter lower bound on T using remaining global free memory and remaining items’ per-item bounds. If this bound exceeds the current T by >2%, we increase T, recompute capacities, and (for the weight-based ordering) re-sort the remaining items by the updated transformed weight n + T*m. This keeps the transformed packing aligned with evolving feasibility, reduces overflows and fragmentation, and typically lowers the achieved maximum KVPR with minimal overhead. The change is localized to try_pack and preserves all existing policies and logic.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        def try_pack(T, ordering=0, policy="resid", return_placement=False):
+            cap = GPU_MEM_SIZE * T
+            eps = 1e-12
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            elif ordering == 1:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+            else:
+                # pressure per GB
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(it[1], 1e-12)), it[2]), reverse=True)
+
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            for mdl, ms, n in ordered:
+                w = n + T * ms
+                best_g = None
+                best_key = None
+
+                # Current KVPRs for "minmax"/"hybrid" policy
+                cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)] if policy != "resid" else None
+                # Average memory fraction after placing this model (independent of target GPU)
+                avg_mem_frac = (sum(m_sum) + ms) / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+                Tnorm = max(T, 1e-12)
+                alpha = 0.15
+                beta = 0.05
+
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap - (used_cap[g] + w)
+                    if resid < -eps:
+                        continue
+
+                    if policy == "resid":
+                        # Avoid zero remaining memory with positive load (would create infinite KVPR)
+                        if GPU_MEM_SIZE - (m_sum[g] + ms) <= 1e-12 and (n_sum[g] + n) > 0:
+                            continue
+                        key = (resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    else:
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        # new global max KVPR if placed on g
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        if policy == "minmax":
+                            key = (new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                        else:
+                            # hybrid: balance projected global KVPR, local KVPR, and memory imbalance
+                            mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                            mem_imb = abs(mem_frac_after - avg_mem_frac)
+                            J = (new_max / Tnorm) + alpha * (new_local / Tnorm) + beta * mem_imb
+                            key = (J, new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_g = g
+
+                if best_g is None:
+                    return (False, None) if return_placement else False
+
+                plc[best_g].append(mdl)
+                m_sum[best_g] += ms
+                n_sum[best_g] += n
+                used_cap[best_g] += w
+
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+=======
+        def try_pack(T, ordering=0, policy="resid", return_placement=False):
+            cap = GPU_MEM_SIZE * T
+            eps = 1e-12
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            elif ordering == 1:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+            else:
+                # pressure per GB
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(it[1], 1e-12)), it[2]), reverse=True)
+
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            N = len(ordered)
+            retune_points = set([int(0.4 * N), int(0.75 * N)]) if N > 1 else set()
+
+            # Helper: retune T based on remaining items and remaining free memory
+            def maybe_retune(current_idx, T_current):
+                nonlocal cap, used_cap
+                placed_cnt = current_idx
+                if placed_cnt not in retune_points:
+                    return T_current
+                # Remaining totals
+                total_m_used = sum(m_sum)
+                total_n_used = sum(n_sum)
+                rem_free_mem = gpu_num * GPU_MEM_SIZE - total_m_used
+                rem_n = total_n - total_n_used
+                base_lb = safe_div(rem_n, max(rem_free_mem, 1e-12))
+                # Per-item bound over remaining items
+                indiv_lb_rem = 0.0
+                if current_idx < len(ordered):
+                    for _, ms_r, n_r in ordered[current_idx:]:
+                        indiv_lb_rem = max(indiv_lb_rem, safe_div(n_r, max(GPU_MEM_SIZE - ms_r, 1e-9)))
+                new_T = max(T_current, base_lb, indiv_lb_rem)
+                if new_T > T_current * 1.02:
+                    # Increase T, recompute capacity and used_cap from current m/n sums
+                    cap = GPU_MEM_SIZE * new_T
+                    for g in range(gpu_num):
+                        used_cap[g] = n_sum[g] + new_T * m_sum[g]
+                    # Re-sort remaining items if weight-based ordering
+                    if ordering == 0 and current_idx < len(ordered):
+                        rem = sorted(ordered[current_idx:], key=lambda it: (it[2] + new_T * it[1], it[2], it[1]), reverse=True)
+                        ordered[current_idx:] = rem
+                    return new_T
+                return T_current
+
+            i = 0
+            while i < len(ordered):
+                mdl, ms, n = ordered[i]
+                # Possibly retune T before placing the next chunk
+                T = maybe_retune(i, T)
+                Tnorm = max(T, 1e-12)
+                w = n + T * ms
+                best_g = None
+                best_key = None
+
+                # Current KVPRs for "minmax"/"hybrid" policy
+                cur_kvprs = [kvpr(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)] if policy != "resid" else None
+                # Average memory fraction after placing this model (independent of target GPU)
+                avg_mem_frac = (sum(m_sum) + ms) / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+                alpha = 0.15
+                beta = 0.05
+
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap - (used_cap[g] + w)
+                    if resid < -eps:
+                        continue
+
+                    if policy == "resid":
+                        # Avoid zero remaining memory with positive load (would create infinite KVPR)
+                        if GPU_MEM_SIZE - (m_sum[g] + ms) <= 1e-12 and (n_sum[g] + n) > 0:
+                            continue
+                        key = (resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                    else:
+                        new_local = kvpr(n_sum[g] + n, GPU_MEM_SIZE - (m_sum[g] + ms))
+                        # new global max KVPR if placed on g
+                        new_max = new_local
+                        for k in range(gpu_num):
+                            if k != g and cur_kvprs[k] > new_max:
+                                new_max = cur_kvprs[k]
+                        if policy == "minmax":
+                            key = (new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+                        else:
+                            # hybrid: balance projected global KVPR, local KVPR, and memory imbalance
+                            mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                            mem_imb = abs(mem_frac_after - avg_mem_frac)
+                            J = (new_max / Tnorm) + alpha * (new_local / Tnorm) + beta * mem_imb
+                            key = (J, new_max, new_local, resid, -(GPU_MEM_SIZE - (m_sum[g] + ms)), g)
+
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_g = g
+
+                if best_g is None:
+                    return (False, None) if return_placement else False
+
+                plc[best_g].append(mdl)
+                m_sum[best_g] += ms
+                n_sum[best_g] += n
+                used_cap[best_g] += w
+
+                i += 1
+
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+>>>>>>> REPLACE
+
+</DIFF>

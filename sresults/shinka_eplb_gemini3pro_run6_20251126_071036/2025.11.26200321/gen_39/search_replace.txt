@@ -1,0 +1,441 @@
+<NAME>
+vectorized_ensemble_refinement_v2
+</NAME>
+
+<DESCRIPTION>
+This edit introduces a robust "Massive Parallel Ensemble" strategy for `balanced_packing`. It generates 128 diverse candidate packings per layer using LPT, ZigZag LPT, Noisy LPT, and Random Shuffling. The packing is performed using a "Chunked Greedy" approach that ensures perfect capacity distribution. Crucially, it includes a fully vectorized "Iterative Refinement" step that uses 2-Opt swaps to exchange items between the heaviest and lightest packs for all candidates in parallel on the GPU. This refinement step specifically targets the load imbalance metric (max - min) and significantly improves solution quality. The final assignment is reconstructed efficiently using scatter operations. This replaces the previous implementation and the separate `_refine_packing` function.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_ids: torch.Tensor,
+                    pack_loads: torch.Tensor,
+                    ranks: torch.Tensor,
+                    num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Attempts to swap one item between the heaviest and lightest pack
+    for each candidate to reduce imbalance.
+
+    Args:
+        weights: [Batch, N] (ordered weights used for packing)
+        pack_ids: [Batch, N]
+        pack_loads: [Batch, NumPacks]
+        ranks: [Batch, N]
+        num_packs: int
+
+    Returns:
+        Refined pack_ids, ranks, pack_loads (in-place updated ideally, but we return ids/ranks)
+    """
+    batch_size, num_items = weights.shape
+    device = weights.device
+
+    # Identify heaviest and lightest packs
+    # max_vals: [Batch]
+    max_vals, max_pack_indices = pack_loads.max(dim=1)
+    min_vals, min_pack_indices = pack_loads.min(dim=1)
+
+    current_imbalance = max_vals - min_vals
+
+    # We want to swap item i from max_pack with item j from min_pack
+    # such that |(L_max - w_i + w_j) - (L_min - w_j + w_i)| < L_max - L_min
+    # Simplified target: minimize |(L_max - L_min) - 2(w_i - w_j)|
+
+    # 1. Identify items in max pack and min pack
+    # This involves iterating or masking. Since N is small-ish (experts per layer), masking is okay.
+    # pack_ids: [Batch, N]
+
+    # [Batch, N]
+    mask_max = (pack_ids == max_pack_indices.unsqueeze(1))
+    mask_min = (pack_ids == min_pack_indices.unsqueeze(1))
+
+    # We need to find pair (i, j) where i in max, j in min.
+    # To vectorize efficiently without N^2 memory for large batch:
+    # We only look at top K items? No, items are small enough.
+    # But N can be 256 or so. Batch = Layers * Candidates = 32 * 128 ~ 4096.
+    # 4096 * 256 * 256 * 4 bytes ~ 1 GB. A bit risky for peak memory if N is large.
+    # Let's do a masked search.
+
+    # Extract weights of items in max/min packs.
+    # We set weights of non-member items to NAN or INF to ignore them?
+    # Or just zero and mask later.
+
+    # w_i (from max pack). Others -inf
+    w_max_pack = torch.where(mask_max, weights, torch.tensor(float('nan'), device=device))
+    # w_j (from min pack). Others inf
+    w_min_pack = torch.where(mask_min, weights, torch.tensor(float('nan'), device=device))
+
+    # We want 2*(w_i - w_j) approx current_imbalance
+    # diff = 2 * (w_i.unsqueeze(2) - w_j.unsqueeze(1))  # [Batch, N, N]
+    # This is the memory bottleneck.
+
+    # Optimization: Only consider candidates if current imbalance is high?
+    # Or just process in chunks?
+    # Given the constraints, let's skip the expensive global swap and
+    # rely on the massive ensemble of greedy strategies which is safer for memory.
+    # The "Chunked Greedy" with 128 candidates is usually very strong.
+
+    return pack_ids, ranks
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using a Massive Parallel Ensemble strategy.
+
+    Strategies included:
+    1. LPT (Longest Processing Time)
+    2. ZigZag LPT (Interleaved heavy/light)
+    3. Randomized/Noisy LPT (Multiple variants)
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+    num_candidates = 128 # Scale up candidates
+
+    # --- 1. Generate Permutations (Candidates) ---
+
+    # A. Base LPT
+    # [Layers, Items]
+    lpt_weights, lpt_indices = weight.sort(dim=-1, descending=True)
+
+    # B. ZigZag Permutation
+    # Reorders [0, 1, 2, 3, ... N-1] to [0, N-1, 1, N-2, ...]
+    zigzag_order = torch.empty(num_items, device=device, dtype=torch.long)
+    half = (num_items + 1) // 2
+    arange = torch.arange(num_items, device=device)
+    zigzag_order[0::2] = arange[:half]
+    zigzag_order[1::2] = arange[half:].flip(0)
+
+    # Apply zigzag to LPT indices
+    zigzag_indices = lpt_indices.gather(1, zigzag_order.unsqueeze(0).expand(num_layers, -1))
+
+    # C. Noisy LPT
+    # Generate random noise
+    # We use a mix of noise levels
+    num_noisy = num_candidates - 2
+    # Split noisy candidates into low noise and high noise
+    noise_low = (torch.rand(num_layers, num_noisy // 2, num_items, device=device) * 0.1) + 0.95
+    noise_high = (torch.rand(num_layers, num_noisy - (num_noisy // 2), num_items, device=device) * 0.4) + 0.8
+
+    noise = torch.cat([noise_low, noise_high], dim=1)
+
+    # [Layers, C-2, Items]
+    noisy_w = weight.unsqueeze(1) * noise
+    _, noisy_indices = noisy_w.sort(dim=-1, descending=True)
+
+    # Combine all indices [Layers, Candidates, Items]
+    # Expand lpt and zigzag to match dims
+    c0 = lpt_indices.unsqueeze(1)
+    c1 = zigzag_indices.unsqueeze(1)
+
+    all_indices = torch.cat([c0, c1, noisy_indices], dim=1)
+
+    # Gather original weights in these orders
+    # [Layers, Candidates, Items]
+    expanded_weights = weight.unsqueeze(1).expand(-1, num_candidates, -1)
+    ordered_weights = expanded_weights.gather(2, all_indices)
+
+    # --- 2. Parallel Chunked Greedy Packing ---
+    # State
+    pack_loads = torch.zeros(num_layers, num_candidates, num_packs, device=device, dtype=weight.dtype)
+    aligned_ids = torch.empty(num_layers, num_candidates, num_items, device=device, dtype=torch.int64)
+    aligned_ranks = torch.empty(num_layers, num_candidates, num_items, device=device, dtype=torch.int64)
+
+    num_chunks = num_items // num_packs
+
+    for k in range(num_chunks):
+        start = k * num_packs
+        end = start + num_packs
+
+        # Current chunk weights: [L, C, P]
+        chunk_w = ordered_weights[:, :, start:end]
+
+        # Sort packs by load: [L, C, P]
+        # We want to assign heaviest item in chunk (idx 0) to lightest pack (idx 0 after sort)
+        _, sorted_pack_indices = pack_loads.sort(dim=-1)
+
+        # Assign
+        aligned_ids[:, :, start:end] = sorted_pack_indices
+        aligned_ranks[:, :, start:end] = k
+
+        # Update loads
+        # src is chunk_w, index is sorted_pack_indices
+        # pack_loads[l, c, sorted_pack_indices[l,c,p]] += chunk_w[l,c,p]
+        pack_loads.scatter_add_(2, sorted_pack_indices, chunk_w)
+
+    # --- 3. Selection ---
+    # Calculate imbalance
+    imbalance = pack_loads.max(dim=-1).values - pack_loads.min(dim=-1).values
+
+    # Find best candidate
+    best_candidate_idx = imbalance.argmin(dim=-1) # [Layers]
+
+    # Gather results
+    # best_candidate_idx: [L] -> [L, 1, 1] -> [L, 1, N]
+    gather_idx = best_candidate_idx.view(num_layers, 1, 1).expand(-1, 1, num_items)
+
+    final_sorted_indices = all_indices.gather(1, gather_idx).squeeze(1)
+    final_aligned_ids = aligned_ids.gather(1, gather_idx).squeeze(1)
+    final_aligned_ranks = aligned_ranks.gather(1, gather_idx).squeeze(1)
+
+    # Scatter back to original item order
+    pack_index = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+    rank_in_pack = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+
+    pack_index.scatter_(1, final_sorted_indices, final_aligned_ids)
+    rank_in_pack.scatter_(1, final_sorted_indices, final_aligned_ranks)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using a Massive Parallel Ensemble strategy
+    with Vectorized Refinement.
+
+    Strategies included:
+    1. LPT (Longest Processing Time)
+    2. ZigZag LPT (Interleaved heavy/light)
+    3. Noisy LPT
+    4. Random Shuffling
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_items = weight.shape
+    device = weight.device
+    num_candidates = 128
+    capacity = num_items // num_packs
+
+    # --- 1. Generate Candidates ---
+    # A. Base LPT
+    lpt_weights, lpt_indices = weight.sort(dim=-1, descending=True)
+
+    # B. ZigZag Permutation
+    zigzag_order = torch.empty(num_items, device=device, dtype=torch.long)
+    half = (num_items + 1) // 2
+    arange = torch.arange(num_items, device=device)
+    zigzag_order[0::2] = arange[:half]
+    zigzag_order[1::2] = arange[half:].flip(0)
+    zigzag_indices = lpt_indices.gather(1, zigzag_order.unsqueeze(0).expand(num_layers, -1))
+
+    # C. Randomized Candidates
+    num_others = num_candidates - 2
+    num_noisy = num_others // 2
+    num_random = num_others - num_noisy
+
+    # Noisy LPT
+    noise = (torch.rand(num_layers, num_noisy, num_items, device=device) * 0.4) + 0.8
+    noisy_w = weight.unsqueeze(1) * noise
+    _, noisy_indices = noisy_w.sort(dim=-1, descending=True)
+
+    # Random Shuffle
+    rand_vals = torch.rand(num_layers, num_random, num_items, device=device)
+    _, random_indices = rand_vals.sort(dim=-1)
+
+    # Combine all indices
+    c0 = lpt_indices.unsqueeze(1)
+    c1 = zigzag_indices.unsqueeze(1)
+    all_indices = torch.cat([c0, c1, noisy_indices, random_indices], dim=1)
+
+    # Gather weights [Layers, Candidates, Items]
+    expanded_weights = weight.unsqueeze(1).expand(-1, num_candidates, -1)
+    ordered_weights = expanded_weights.gather(2, all_indices)
+
+    # Flatten batch dimensions for processing
+    batch_size = num_layers * num_candidates
+    flat_weights = ordered_weights.view(batch_size, num_items)
+
+    # --- 2. Parallel Chunked Greedy Packing ---
+    pack_loads = torch.zeros(batch_size, num_packs, device=device, dtype=weight.dtype)
+
+    # Store indices (into flat_weights rows) and weights per pack for refinement
+    # [Batch, Packs, Capacity]
+    item_indices_per_pack = torch.empty(batch_size, num_packs, capacity, device=device, dtype=torch.int64)
+    weights_per_pack = torch.empty(batch_size, num_packs, capacity, device=device, dtype=weight.dtype)
+
+    chunk_indices_template = torch.arange(num_packs, device=device).expand(batch_size, -1)
+
+    for k in range(capacity):
+        start = k * num_packs
+        end = start + num_packs
+        chunk_w = flat_weights[:, start:end]
+
+        # Sort packs by load: heavier items go to lighter packs
+        _, sorted_pack_indices = pack_loads.sort(dim=-1)
+
+        # Map assignments: pack P gets item J from chunk
+        # item index relative to start is J.
+        # sorted_pack_indices[b, j] = p means item j goes to pack p.
+        # We need to fill item_indices_per_pack[b, p, k] = start + j
+
+        # Use scatter to place items into their assigned packs
+        # src: indices of items in the chunk (0..P-1) + start
+        src_indices = chunk_indices_template + start
+        item_indices_per_pack[:, :, k].scatter_(1, sorted_pack_indices, src_indices)
+
+        # Same for weights
+        weights_per_pack[:, :, k].scatter_(1, sorted_pack_indices, chunk_w)
+
+        # Update loads
+        # We add the weight of the item assigned to pack p
+        # weights_per_pack[:, p, k] contains exactly that weight
+        pack_loads += weights_per_pack[:, :, k]
+
+    # --- 3. Vectorized Refinement (2-Opt Swap) ---
+    # Iteratively swap items between max and min load packs
+    for _ in range(20):
+        max_load, max_p = pack_loads.max(dim=1)
+        min_load, min_p = pack_loads.min(dim=1)
+
+        current_imbalance = max_load - min_load
+
+        # Gather items (weights) in these packs
+        # [Batch, Capacity]
+        gather_idx_max = max_p.view(-1, 1, 1).expand(-1, 1, capacity)
+        gather_idx_min = min_p.view(-1, 1, 1).expand(-1, 1, capacity)
+
+        w_max = weights_per_pack.gather(1, gather_idx_max).squeeze(1)
+        w_min = weights_per_pack.gather(1, gather_idx_min).squeeze(1)
+
+        # Compute potential new imbalance for all pairs (i, j)
+        # diff = 2 * (w_max[i] - w_min[j])
+        # new_imbalance = |current - diff|
+        # We want to minimize this.
+
+        # [Batch, Cap, Cap]
+        diff_matrix = 2 * (w_max.unsqueeze(2) - w_min.unsqueeze(1))
+
+        # We only care if new imbalance < current imbalance
+        # projected = |current - diff|
+        # improvement condition: |current - diff| < current
+        # equivalent to 0 < diff < 2*current (assuming current > 0)
+
+        projected_imbalance = torch.abs(current_imbalance.view(-1, 1, 1) - diff_matrix)
+
+        # Mask invalid swaps where packs are same (diff=0) or no improvement
+        # Adding a small epsilon to ensure strict improvement
+        improvement_mask = projected_imbalance < (current_imbalance.view(-1, 1, 1) - 1e-4)
+
+        # Set non-improving to infinity
+        valid_projected = torch.where(improvement_mask, projected_imbalance, torch.tensor(float('inf'), device=device))
+
+        # Find best swap
+        flat_proj = valid_projected.view(batch_size, -1)
+        best_val, best_idx_flat = flat_proj.min(dim=1)
+
+        # Check which batches have a valid swap
+        active_mask = best_val != float('inf')
+        if not active_mask.any():
+            break
+
+        # Perform updates for active batches
+        active_indices = torch.nonzero(active_mask).squeeze(1)
+
+        # Decode best_idx_flat -> (i, j)
+        best_idx = best_idx_flat[active_indices]
+        idx_i = best_idx // capacity # index in max pack
+        idx_j = best_idx % capacity  # index in min pack
+
+        batch_idx = active_indices
+        p_max = max_p[batch_idx]
+        p_min = min_p[batch_idx]
+
+        # Get values to swap
+        val_max = w_max[batch_idx, idx_i]
+        val_min = w_min[batch_idx, idx_j]
+
+        item_max = item_indices_per_pack[batch_idx, p_max, idx_i]
+        item_min = item_indices_per_pack[batch_idx, p_min, idx_j]
+
+        # Update weights_per_pack
+        weights_per_pack[batch_idx, p_max, idx_i] = val_min
+        weights_per_pack[batch_idx, p_min, idx_j] = val_max
+
+        # Update item_indices
+        item_indices_per_pack[batch_idx, p_max, idx_i] = item_min
+        item_indices_per_pack[batch_idx, p_min, idx_j] = item_max
+
+        # Update pack_loads
+        load_diff = val_max - val_min
+        pack_loads[batch_idx, p_max] -= load_diff
+        pack_loads[batch_idx, p_min] += load_diff
+
+    # --- 4. Selection and Reconstruction ---
+    # Find best candidate per layer
+    pack_loads_view = pack_loads.view(num_layers, num_candidates, num_packs)
+    imbalance = pack_loads_view.max(dim=-1).values - pack_loads_view.min(dim=-1).values
+    best_cand_idx = imbalance.argmin(dim=1) # [Layers]
+
+    # Gather best item_indices_per_pack [Layers, Packs, Capacity]
+    # item_indices_per_pack is [L*C, P, K] -> [L, C, P, K]
+    reshaped_assignments = item_indices_per_pack.view(num_layers, num_candidates, num_packs, capacity)
+
+    # Select best candidate
+    gather_idx_assgn = best_cand_idx.view(-1, 1, 1, 1).expand(-1, 1, num_packs, capacity)
+    final_assignments = reshaped_assignments.gather(1, gather_idx_assgn).squeeze(1)
+
+    # Gather best permutation map [Layers, Items]
+    # all_indices is [L, C, Items]
+    gather_idx_perm = best_cand_idx.view(-1, 1, 1).expand(-1, 1, num_items)
+    final_perm = all_indices.gather(1, gather_idx_perm).squeeze(1)
+
+    # Reconstruct Output
+    # final_assignments[l, p, k] = i (index in final_perm)
+    # The item ID is final_perm[l, i]
+    # It is assigned to pack p, rank k
+
+    # Flatten assignment dimensions to scatter
+    # [L, P, K]
+    flat_indices = final_assignments.flatten() # [L*P*K] = [L*N] values are 0..N-1 (local)
+
+    # We need to map local indices 0..N-1 back to original items
+    # We iterate layers or do it vectorized
+    # final_perm [L, N]
+    # We need to gather from final_perm using flat_indices (adjusted for layer offset)
+
+    layer_offsets = torch.arange(num_layers, device=device).unsqueeze(1).expand(-1, num_items * num_candidates).flatten() # Wait, simpler
+
+    # final_assignments values are 0..N-1 relative to the layer's sorted list
+    # We can use gather on final_perm
+    # final_assignments is [L, P, K]. Flatten last two dims -> [L, N] (roughly, since N=P*K)
+    sorted_assignments = final_assignments.view(num_layers, num_items)
+
+    # Get original item IDs
+    # orig_ids[l, x] = final_perm[l, sorted_assignments[l, x]]
+    orig_ids = final_perm.gather(1, sorted_assignments)
+
+    # Now we have: for each slot x (which corresponds to pack p, rank k), the item ID is orig_ids[l, x].
+    # We need output[l, item_id] = pack_id
+
+    # Construct pack_ids tensor matching sorted_assignments geometry
+    # final_assignments index [l, p, k] corresponds to pack p, rank k
+    pack_ids_template = torch.arange(num_packs, device=device).view(1, num_packs, 1).expand(num_layers, -1, capacity)
+    rank_ids_template = torch.arange(capacity, device=device).view(1, 1, capacity).expand(num_layers, num_packs, -1)
+
+    pack_ids_flat = pack_ids_template.flatten(1) # [L, N]
+    rank_ids_flat = rank_ids_template.flatten(1) # [L, N]
+
+    # Scatter
+    pack_index = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+    rank_in_pack = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+
+    pack_index.scatter_(1, orig_ids, pack_ids_flat)
+    rank_in_pack.scatter_(1, orig_ids, rank_ids_flat)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

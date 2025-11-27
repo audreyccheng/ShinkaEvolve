@@ -1,0 +1,384 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import math
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Hybrid Algorithm: Decaying Gamma Beam Search + Tail-Targeted ILS with LPT Repair & Polish.
+
+    1. Constructive Phase (Beam Search):
+       - Uses a Work-Density metric with linear Gamma decay (2.0 -> 0.8).
+       - Starts with high bias for parallelism (work/cost ratio), ends with bias for packing (cost minimization).
+       - Features a 'Zero-Cost Super Bonus' to aggressively seize perfect parallel opportunities.
+       
+    2. Refinement Phase (ILS):
+       - Ruin Strategies: Includes 'Tail Ruin' to specifically target the end-of-schedule bottleneck, 
+         alongside random block removal.
+       - Recreate Strategy: Re-inserts removed transactions in LPT (Longest Processing Time) order 
+         to optimize bin-packing efficiency.
+       - Polish (Local Search): A deterministic 'Gap Repair' pass that attempts to move transactions 
+         to their globally optimal position within the schedule using strided search.
+
+    Args:
+        workload: Workload object
+        num_seqs: Computational budget hint
+
+    Returns:
+        (makespan, schedule)
+    """
+
+    # --- 0. Precomputation ---
+    num_txns = workload.num_txns
+
+    # Extract transaction lengths (Processing Time)
+    # Simulator stores length at index 3 of the first op tuple typically
+    txn_lengths = {}
+    for i in range(num_txns):
+        try:
+            txn_lengths[i] = workload.txns[i][0][3]
+        except (IndexError, TypeError, AttributeError):
+            txn_lengths[i] = 1.0
+
+    # LPT Sorted indices (Longest Processing Time first)
+    lpt_sorted = sorted(txn_lengths.keys(), key=lambda k: txn_lengths[k], reverse=True)
+
+    # --- 1. Constructive Phase: Beam Search with Decay ---
+    
+    # Parameters
+    BEAM_WIDTH = max(8, int(num_seqs * 2.5))
+    GAMMA_START = 2.0
+    GAMMA_END = 0.8
+
+    # Initialization: Seed with single transactions
+    # Heuristic: Pick from top LPT to start strong spines
+    seeds = lpt_sorted[:min(len(lpt_sorted), BEAM_WIDTH * 2)]
+    
+    beam = []
+    for t in seeds:
+        seq = [t]
+        cost = workload.get_opt_seq_cost(seq)
+        work = txn_lengths[t]
+        # Initial score
+        score = cost - (GAMMA_START * work)
+        beam.append({
+            'seq': seq, 
+            'cost': cost, 
+            'work': work, 
+            'score': score, 
+            'rem': set(range(num_txns)) - {t}
+        })
+    
+    # Sort and trim initial beam
+    beam.sort(key=lambda x: x['score'])
+    beam = beam[:BEAM_WIDTH]
+
+    # Main Construction Loop
+    for step in range(num_txns - 1):
+        # Calculate current Gamma
+        # Linear decay from START to END based on % completion
+        progress = (step + 1) / (num_txns - 1)
+        current_gamma = GAMMA_START - (progress * (GAMMA_START - GAMMA_END))
+
+        candidates = []
+        for parent in beam:
+            rem_list = list(parent['rem'])
+            if not rem_list: continue
+
+            # Smart Candidate Selection
+            to_try = set()
+            
+            # A. Top LPT from remaining (Heuristic)
+            added_lpt = 0
+            for t in lpt_sorted:
+                if t in parent['rem']:
+                    to_try.add(t)
+                    added_lpt += 1
+                    if added_lpt >= 4: break # Check top 4 biggest available
+            
+            # B. Random samples (Diversity)
+            if len(rem_list) > len(to_try):
+                needed = 4
+                pool = [x for x in rem_list if x not in to_try]
+                to_try.update(random.sample(pool, min(len(pool), needed)))
+
+            # Expand candidates
+            parent_cost = parent['cost']
+            parent_work = parent['work']
+            
+            for t in to_try:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent_work + txn_lengths[t]
+                
+                # Metric calculation
+                delta = new_cost - parent_cost
+                t_len = txn_lengths[t]
+                
+                # Base Score: Cost penalized by Work * Gamma
+                score = new_cost - (current_gamma * new_work)
+                
+                # Bonuses
+                # 1. Zero-Cost Super Bonus: If cost doesn't increase, it's free real estate.
+                if delta <= 1e-6:
+                    score -= (t_len * 10.0) # Massive incentive
+                # 2. Parallelism Efficiency Bonus: If cost increase < length
+                elif delta < t_len:
+                    efficiency = (t_len - delta) / t_len # 0 to 1
+                    # Bonus grows with efficiency
+                    score -= (t_len * efficiency * 2.0)
+
+                candidates.append({
+                    'seq': new_seq,
+                    'cost': new_cost,
+                    'work': new_work,
+                    'score': score,
+                    'rem': parent['rem'] - {t}
+                })
+
+        if not candidates: break
+
+        # Selection
+        candidates.sort(key=lambda x: x['score'])
+        
+        # Elitism + Diversity
+        # Keep top K best, then sample a few others to prevent convergence
+        k_best = int(BEAM_WIDTH * 0.7)
+        next_beam = candidates[:k_best]
+        
+        if len(candidates) > k_best:
+            # Fill remainder from top 3*BEAM_WIDTH
+            pool = candidates[k_best : min(len(candidates), BEAM_WIDTH * 3)]
+            needed = BEAM_WIDTH - len(next_beam)
+            if len(pool) <= needed:
+                next_beam.extend(pool)
+            else:
+                next_beam.extend(random.sample(pool, needed))
+        
+        beam = next_beam
+
+    # Extract best result from Beam Search
+    beam.sort(key=lambda x: x['cost'])
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+
+    # --- 2. Refinement Phase: ILS with Tail Ruin & LPT Repair ---
+
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+    
+    # Adjust cycles based on problem size
+    ILS_CYCLES = 6 if num_txns > 10 else 2
+    
+    # Polish Budget
+    MAX_POLISH_OPS = 250
+
+    for cycle in range(ILS_CYCLES):
+        
+        # --- A. Ruin ---
+        work_seq = list(current_schedule)
+        removed_txns = []
+        
+        mode = random.random()
+        
+        if mode < 0.35:
+            # Mode 1: Tail Ruin (Bottleneck Optimization)
+            # Remove a block from the end of the schedule
+            # This forces the algorithm to repack the final transactions
+            cut_pct = random.uniform(0.15, 0.25)
+            cut_size = max(2, int(num_txns * cut_pct))
+            if num_txns > cut_size:
+                removed_txns = work_seq[-cut_size:]
+                work_seq = work_seq[:-cut_size]
+        
+        elif mode < 0.70:
+            # Mode 2: Random Block (Locality)
+            cut_pct = random.uniform(0.15, 0.25)
+            cut_size = max(2, int(num_txns * cut_pct))
+            if num_txns > cut_size:
+                start = random.randint(0, len(work_seq) - cut_size)
+                removed_txns = work_seq[start : start + cut_size]
+                del work_seq[start : start + cut_size]
+        
+        else:
+            # Mode 3: Random Scatter (Dependency Breaking)
+            count = max(4, int(num_txns * 0.15))
+            indices = sorted(random.sample(range(len(work_seq)), min(len(work_seq), count)), reverse=True)
+            for idx in indices:
+                removed_txns.append(work_seq.pop(idx))
+
+        # --- B. Recreate (LPT Ordered) ---
+        # Sort removed transactions by length (descending).
+        # Inserting larger items first generally creates better packing structures.
+        removed_txns.sort(key=lambda t: txn_lengths[t], reverse=True)
+
+        for txn in removed_txns:
+            best_pos = -1
+            best_incr = float('inf')
+            
+            # Strided scan for efficiency if sequence is long
+            # Check boundaries (0, end) + strided middle
+            step = 1 if len(work_seq) < 50 else 2
+            check_indices = list(range(0, len(work_seq) + 1, step))
+            if len(work_seq) not in check_indices: check_indices.append(len(work_seq))
+
+            for pos in check_indices:
+                work_seq.insert(pos, txn)
+                cost = workload.get_opt_seq_cost(work_seq)
+                if cost < best_incr:
+                    best_incr = cost
+                    best_pos = pos
+                del work_seq[pos]
+            
+            work_seq.insert(best_pos, txn)
+
+        current_schedule = work_seq
+        current_cost = best_incr # Trust incremental cost from last insert
+        
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = list(current_schedule)
+
+        # --- C. Polish: Deterministic Gap Repair ---
+        # Try to move transactions to their optimal position.
+        # Only run if we are within 10% of best to save time on bad candidates.
+        
+        if current_cost <= best_cost * 1.10:
+            polish_ops = 0
+            improved = True
+            
+            # Only doing one pass per cycle to conserve budget
+            check_order = list(range(len(current_schedule)))
+            # Shuffle order to avoid systematic bias
+            random.shuffle(check_order)
+            
+            # We work on a copy to allow restarts if improvement found
+            polish_seq = list(current_schedule)
+            polish_cost = current_cost
+
+            for idx in check_order:
+                if polish_ops >= MAX_POLISH_OPS: break
+                
+                # Careful: idx refers to initial position.
+                # If we modified sequence, indices shift. 
+                # Simpler approach: grab item by value if unique, or just index if we track it.
+                # Here, we just grab value at current index if valid, else skip (heuristic)
+                if idx >= len(polish_seq): continue
+                
+                txn = polish_seq[idx]
+                
+                # Remove
+                del polish_seq[idx]
+                
+                # Find best insert
+                best_p = -1
+                best_c = float('inf')
+                
+                # Strided search
+                step = 1 if len(polish_seq) < 40 else 4
+                search_rng = list(range(0, len(polish_seq) + 1, step))
+                if len(polish_seq) not in search_rng: search_rng.append(len(polish_seq))
+                
+                for p in search_rng:
+                    polish_seq.insert(p, txn)
+                    c = workload.get_opt_seq_cost(polish_seq)
+                    polish_ops += 1
+                    
+                    if c < best_c:
+                        best_c = c
+                        best_p = p
+                    
+                    del polish_seq[p]
+                    if polish_ops >= MAX_POLISH_OPS: break
+                
+                # Reinsert at best
+                polish_seq.insert(best_p, txn)
+                
+                # Check global improvement
+                if best_c < polish_cost - 1e-6:
+                    polish_cost = best_c
+                    if polish_cost < best_cost:
+                        best_cost = polish_cost
+                        best_schedule = list(polish_seq)
+                    
+                    # If we moved it, indices are now messy relative to `check_order`.
+                    # We continue anyway; it's a heuristic search, not an exact sort.
+            
+            current_schedule = polish_seq
+            current_cost = polish_cost
+
+    return best_cost, best_schedule
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+
+    # Workload 1: Complex mixed read/write transactions
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, 10)
+    cost1 = workload1.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END

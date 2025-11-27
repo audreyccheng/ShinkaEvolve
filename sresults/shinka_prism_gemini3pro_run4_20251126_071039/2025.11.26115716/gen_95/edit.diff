@@ -1,0 +1,488 @@
+--- a/original.py
++++ b/original.py
+@@ -1,333 +1,305 @@
+ # EVOLVE-BLOCK-START
+ """Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+ 
++import math
+ import random
+ 
+-GPU_MEM_SIZE = 80  # GB
++GPU_MEM_SIZE = 80.0
+ 
+ def compute_model_placement(gpu_num, models):
+     """
+     Compute a model placement that minimizes the maximum KVPR across all GPUs.
+     
+     Algorithm:
+     1. Binary Search for optimal max KVPR (K).
+-    2. Feasibility Check:
+-       - Uses 'Linearized Cost' (w + K*s) to transform the 2D constraint (capacity & KVPR) 
+-         into a 1D Bin Packing problem.
+-       - Heuristic: Best Fit Decreasing (BFD) on linearized cost.
+-       - Randomization: Perturbs sort keys with multiplicative noise to explore different packing orders.
+-    3. Local Search (Steepest Descent):
+-       - Post-processes valid placements to minimize the actual max KVPR.
+-       - Evaluates all possible Moves and Swaps involving the bottleneck GPU.
+-       - Applies the single action that results in the lowest local maximum (Steepest Descent),
+-         rather than the first valid one.
++    2. Feasibility Check with Failure-Driven Prioritization:
++       - Uses Best Fit Decreasing on linearized cost w + K*s.
++       - If packing fails, unplaced items are moved to the front (prioritized) and retried.
++       - This adapts the sorting order to the specific 'hard' items of the dataset.
++    3. Steepest Descent Hill Climbing:
++       - Post-optimization that targets the bottleneck GPU.
++       - Moves or swaps models to strictly reduce the maximum KVPR.
+     """
+ 
+-    # Pre-process models
++    # 1. Preprocessing
+     items = []
+     for m in models:
+         items.append({
+             'model': m,
+             'w': m.req_rate / m.slo,
+             's': m.model_size
+         })
+ 
+-    def get_kvpr(w, s):
+-        """Calculate KVPR safely."""
++    # Helper: Safe KVPR calculation
++    def calc_kvpr(w, s):
+         rem = GPU_MEM_SIZE - s
+         if rem <= 1e-9:
+-            return float('inf') if w > 1e-9 else 0.0
++            return 1e15 if w > 1e-9 else 0.0
+         return w / rem
+ 
+     def get_max_kvpr(placement):
+-        """Calculate global max KVPR for a placement."""
+         mx = 0.0
+         for p in placement.values():
+             w = sum(m.req_rate / m.slo for m in p)
+             s = sum(m.model_size for m in p)
+-            mx = max(mx, get_kvpr(w, s))
++            mx = max(mx, calc_kvpr(w, s))
+         return mx
+ 
+-    def solve_packing(k_target, ordered_items):
+-        """
+-        Attempt to pack items into GPUs ensuring KVPR <= k_target.
+-        Uses Best Fit heuristic on linearized load.
+-        """
+-        placement = {i: [] for i in range(gpu_num)}
+-        gpu_state = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+-
+-        for item in ordered_items:
+-            best_idx = -1
+-            best_score = -1.0
+-
+-            for i in range(gpu_num):
+-                st = gpu_state[i]
+-                
+-                # Physical Capacity Check
+-                if st['s'] + item['s'] > GPU_MEM_SIZE: continue
+-
+-                new_w = st['w'] + item['w']
+-                new_s = st['s'] + item['s']
+-                rem = GPU_MEM_SIZE - new_s
+-                
+-                # KVPR Constraint: w <= k * (C - s)
+-                limit = k_target * rem
+-                if rem <= 1e-9:
+-                    if new_w > 1e-9: continue
+-                elif new_w > limit + 1e-7:
+-                    continue
+-
+-                # Best Fit Heuristic: Maximize linearized usage (w + k*s)
+-                # This fills the "K-capacity" effectively.
+-                score = new_w + k_target * new_s
+-                
+-                if score > best_score:
+-                    best_score = score
+-                    best_idx = i
+-
+-            if best_idx != -1:
+-                placement[best_idx].append(item['model'])
+-                gpu_state[best_idx]['w'] += item['w']
+-                gpu_state[best_idx]['s'] += item['s']
+-            else:
+-                return None # Failed to pack
+-
+-        return placement
+-
+-    def optimize(placement):
+-        """
+-        Steepest Descent Hill Climbing.
+-        Iteratively applies the BEST move/swap that reduces the bottleneck.
+-        """
++    # 2. Optimization: Steepest Descent on Bottleneck
++    def optimize_placement(placement):
+         # Convert to mutable state
+         state = []
+         for i in range(gpu_num):
+             p = placement[i]
+             w = sum(m.req_rate / m.slo for m in p)
+             s = sum(m.model_size for m in p)
+             state.append({'w': w, 's': s, 'models': list(p)})
+ 
+-        for _ in range(100): # Max iterations
+-            # Identify Bottleneck GPU
+-            max_k = -1.0
++        # Cache KVPR values to avoid recomputation
++        gpu_k = [calc_kvpr(st['w'], st['s']) for st in state]
++
++        for _ in range(150): # Iteration limit
++            # Find the global bottleneck
++            max_val = -1.0
+             src_idx = -1
+-            for i in range(gpu_num):
+-                k = get_kvpr(state[i]['w'], state[i]['s'])
+-                if k > max_k:
+-                    max_k = k
++            for i, k in enumerate(gpu_k):
++                if k > max_val:
++                    max_val = k
+                     src_idx = i
+-
+-            if max_k <= 1e-9: break
++            
++            if max_val <= 1e-9: break
+             
+             src = state[src_idx]
+-            
+-            best_action = None
+-            # We want to minimize the new local bottleneck: max(new_src, new_dst)
+-            best_local_max = max_k 
+-
+-            # 1. Evaluate Moves
++            improved = False
++            
++            # Action: Move (Try to offload a model from bottleneck)
+             for i, m in enumerate(src['models']):
+                 m_w = m.req_rate / m.slo
+                 m_s = m.model_size
+                 
++                # State of Src after removal
+                 ns_w = src['w'] - m_w
+                 ns_s = src['s'] - m_s
+-                ns_k = get_kvpr(ns_w, ns_s)
+-                
+-                # Pruning: If removing item doesn't drop src below current best found, skip
+-                # (We want steepest descent, so strict improvement over current best)
+-                if ns_k >= best_local_max - 1e-9: continue
+-
++                ns_k = calc_kvpr(ns_w, ns_s)
++                
++                # Pruning: Only proceed if src improves significantly
++                if ns_k >= max_val - 1e-9: continue
++                
+                 for dst_idx in range(gpu_num):
+                     if dst_idx == src_idx: continue
+                     dst = state[dst_idx]
+                     
+                     if dst['s'] + m_s > GPU_MEM_SIZE: continue
+                     
+                     nd_w = dst['w'] + m_w
+                     nd_s = dst['s'] + m_s
+-                    nd_k = get_kvpr(nd_w, nd_s)
+-                    
+-                    # The new bottleneck between these two
+-                    local_max = max(ns_k, nd_k)
+-                    
+-                    if local_max < best_local_max - 1e-9:
+-                        best_local_max = local_max
+-                        best_action = ('move', i, dst_idx)
+-
+-            # 2. Evaluate Swaps
++                    nd_k = calc_kvpr(nd_w, nd_s)
++                    
++                    # Acceptance: The new local max between these two must be better than old global max
++                    if max(ns_k, nd_k) < max_val - 1e-9:
++                        # Apply Move
++                        src['models'].pop(i)
++                        src['w'], src['s'] = ns_w, ns_s
++                        gpu_k[src_idx] = ns_k
++                        
++                        dst['models'].append(m)
++                        dst['w'], dst['s'] = nd_w, nd_s
++                        gpu_k[dst_idx] = nd_k
++                        
++                        improved = True
++                        break
++                if improved: break
++            
++            if improved: continue
++            
++            # Action: Swap (Exchange models to balance load)
+             for i, m1 in enumerate(src['models']):
+                 m1_w = m1.req_rate / m1.slo
+                 m1_s = m1.model_size
+                 
+                 for dst_idx in range(gpu_num):
+                     if dst_idx == src_idx: continue
++                    if gpu_k[dst_idx] > max_val * 0.95: continue # Skip if dst is also stressed
++                    
+                     dst = state[dst_idx]
+-                    
+-                    # Heuristic: Skip if dst is already near max_k (unlikely to improve)
+-                    if get_kvpr(dst['w'], dst['s']) > max_k * 0.95: continue
+                     
+                     for j, m2 in enumerate(dst['models']):
+                         m2_w = m2.req_rate / m2.slo
+                         m2_s = m2.model_size
+                         
+                         # New Src
+                         ns_s = src['s'] - m1_s + m2_s
+                         if ns_s > GPU_MEM_SIZE: continue
+                         ns_w = src['w'] - m1_w + m2_w
+                         
+                         # New Dst
+                         nd_s = dst['s'] - m2_s + m1_s
+                         if nd_s > GPU_MEM_SIZE: continue
+                         nd_w = dst['w'] - m2_w + m1_w
+                         
+-                        ns_k = get_kvpr(ns_w, ns_s)
+-                        nd_k = get_kvpr(nd_w, nd_s)
+-                        
+-                        local_max = max(ns_k, nd_k)
+-                        if local_max < best_local_max - 1e-9:
+-                            best_local_max = local_max
+-                            best_action = ('swap', i, dst_idx, j)
+-
+-            # Apply Best Action
+-            if best_action:
+-                type_ = best_action[0]
+-                if type_ == 'move':
+-                    _, m_idx, dst_idx = best_action
+-                    dst = state[dst_idx]
+-                    
+-                    m = src['models'].pop(m_idx)
+-                    src['w'] -= (m.req_rate / m.slo)
+-                    src['s'] -= m.model_size
+-                    
+-                    dst['models'].append(m)
+-                    dst['w'] += (m.req_rate / m.slo)
+-                    dst['s'] += m.model_size
+-                else: # swap
+-                    _, m1_idx, dst_idx, m2_idx = best_action
+-                    dst = state[dst_idx]
+-                    
+-                    m1 = src['models'][m1_idx]
+-                    m2 = dst['models'][m2_idx]
+-                    
+-                    # Update lists
+-                    src['models'][m1_idx] = m2
+-                    dst['models'][m2_idx] = m1
+-                    
+-                    # Update stats
+-                    src['w'] = src['w'] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+-                    src['s'] = src['s'] - m1.model_size + m2.model_size
+-                    
+-                    dst['w'] = dst['w'] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+-                    dst['s'] = dst['s'] - m2.model_size + m1.model_size
+-            else:
+-                break # Converged (local optimum)
+-
++                        ns_k = calc_kvpr(ns_w, ns_s)
++                        nd_k = calc_kvpr(nd_w, nd_s)
++                        
++                        if max(ns_k, nd_k) < max_val - 1e-9:
++                            # Apply Swap
++                            src['models'][i] = m2
++                            src['w'], src['s'] = ns_w, ns_s
++                            gpu_k[src_idx] = ns_k
++                            
++                            dst['models'][j] = m1
++                            dst['w'], dst['s'] = nd_w, nd_s
++                            gpu_k[dst_idx] = nd_k
++                            
++                            improved = True
++                            break
++                    if improved: break
++                if improved: break
++            
++            if not improved: break # Converged or local optimum
++            
+         return {i: state[i]['models'] for i in range(gpu_num)}
+ 
+-    def check_placement(k_target, effort=10):
+-        # 1. Deterministic Strategy (Linearized Cost)
++    # 3. Feasibility Check with Failure-Driven Retry
++    def check_feasibility(k_target):
++        
++        def try_pack(ordered_items):
++            # Best Fit Heuristic
++            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
++            unplaced = []
++            
++            for item in ordered_items:
++                w, s = item['w'], item['s']
++                
++                best_idx = -1
++                best_score = -1.0
++                
++                for i in range(gpu_num):
++                    b = bins[i]
++                    if b['s'] + s > GPU_MEM_SIZE: continue
++                    
++                    # KVPR Constraint: w_new <= k * (C - s_new)
++                    rem = GPU_MEM_SIZE - (b['s'] + s)
++                    if rem <= 1e-9:
++                        if (b['w'] + w) > 1e-9: continue
++                    elif (b['w'] + w) > k_target * rem + 1e-7:
++                        continue
++                        
++                    # Best Fit Score: Maximize Linearized Load
++                    # This fills the "available capacity" defined by K most effectively
++                    score = (b['w'] + w) + k_target * (b['s'] + s)
++                    if score > best_score:
++                        best_score = score
++                        best_idx = i
++                
++                if best_idx != -1:
++                    bins[best_idx]['w'] += w
++                    bins[best_idx]['s'] += s
++                    bins[best_idx]['items'].append(item['model'])
++                else:
++                    unplaced.append(item)
++            
++            if not unplaced:
++                return {i: bins[i]['items'] for i in range(gpu_num)}, None
++            return None, unplaced
++
++        # Base Heuristic: Linearized Cost Descending
+         base_key = lambda x: x['w'] + k_target * x['s']
+-        strategies = [base_key, lambda x: x['s'], lambda x: x['w']]
++        current_order = sorted(items, key=base_key, reverse=True)
+         
+-        for key in strategies:
+-            res = solve_packing(k_target, sorted(items, key=key, reverse=True))
++        # Failure-Driven Loop
++        rng = random.Random(42 + int(k_target))
++        for _ in range(20): # Try up to 20 re-orderings
++            res, unplaced = try_pack(current_order)
+             if res: return res
+-
+-        # 2. Randomized Strategy (Perturbed Linearized Cost)
+-        if effort > 0:
+-            rng = random.Random(42 + int(k_target))
+-            for _ in range(effort):
+-                # Sort with noise: key * uniform(0.9, 1.1)
+-                # This maintains the general ordering but swaps close items
+-                noisy_items = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+-                res = solve_packing(k_target, noisy_items)
+-                if res: return res
+-        
++            
++            # Key Innovation: Prioritize failures
++            # Move unplaced items to front, shuffling them to find a mutual fit
++            rng.shuffle(unplaced)
++            
++            # Reconstruct order: Unplaced (Priority) + Placed (Relative Order Preserved)
++            unplaced_ids = set(id(x) for x in unplaced)
++            placed = [x for x in current_order if id(x) not in unplaced_ids]
++            current_order = unplaced + placed
++            
+         return None
+ 
+-    # Binary Search Driver
++    # 4. Binary Search Driver
+     high = 1e9
+     
+-    # Fast initial check
+-    best_placement = check_placement(high, effort=1)
++    # Initial valid solution
++    best_placement = check_feasibility(high)
+     if not best_placement:
+         raise ValueError("Unable to place models on GPUs.")
+-
+-    # Optimize initial solution to get a tight upper bound
+-    best_placement = optimize(best_placement)
++    
++    # Optimize initial solution
++    best_placement = optimize_placement(best_placement)
+     high = get_max_kvpr(best_placement)
+     low = 0.0
+ 
+-    # Binary search with adaptive effort
+     for _ in range(25):
+         mid = (low + high) / 2
+-        
+-        # As we get closer to optimal, we might need more effort to pack
+-        res = check_placement(mid, effort=20)
++        res = check_feasibility(mid)
+         if res:
+-            # If feasible, optimize it. It might become even better than 'mid'.
+-            res = optimize(res)
+-            
+-            # Update best placement if this one is better
+-            current_max = get_max_kvpr(res)
+-            if current_max < get_max_kvpr(best_placement):
++            # Optimize feasible solution to see if it beats current best
++            res = optimize_placement(res)
++            mx = get_max_kvpr(res)
++            
++            if mx < get_max_kvpr(best_placement):
+                 best_placement = res
+             
+-            # Tighten upper bound
+-            high = min(mid, current_max)
++            high = min(mid, mx)
+         else:
+             low = mid
+ 
+-    # Final Polish
+-    return optimize(best_placement)
++    # Final polish
++    return optimize_placement(best_placement)
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def run_placement(gpu_num, models):
+     """
+     Main entry point that will be called by the evaluator.
+ 
+     Args:
+         gpu_num: Number of GPUs
+         models: List of models to place
+ 
+     Returns:
+         Dictionary containing GPU placements
+     """
+     return compute_model_placement(gpu_num, models)
+ 
+ 
+ if __name__ == "__main__":
+     # Test the algorithm
+     import os
+     import sys
+ 
+     # Add the openevolve_examples directory to the path to import evaluator
+     def find_repo_root(start_path):
+         """Find the repository root by looking for openevolve_examples directory."""
+         current = os.path.abspath(start_path)
+         while current != os.path.dirname(current):  # Stop at filesystem root
+             if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                 return current
+             current = os.path.dirname(current)
+         raise RuntimeError("Could not find openevolve_examples directory")
+ 
+     repo_root = find_repo_root(os.path.dirname(__file__))
+     sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+ 
+     from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+     import numpy as np
+ 
+     test_cases = generate_test_gpu_models()
+     all_kvpr = []
+     for i, (gpu_num, gpu_models) in enumerate(test_cases):
+         results = compute_model_placement(gpu_num, gpu_models)
+         max_kvpr = calculate_kvcache_pressure(results)
+         all_kvpr.append(safe_float(max_kvpr))
+ 
+     avg_kvpr = np.mean(all_kvpr)
+     if avg_kvpr != 0:
+         avg_kvpr = 1.0 / avg_kvpr
+ 
+     print(f"Max KVPR: {avg_kvpr:.3f}")

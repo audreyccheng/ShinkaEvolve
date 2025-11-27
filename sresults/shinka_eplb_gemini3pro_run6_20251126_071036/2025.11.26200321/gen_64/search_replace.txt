@@ -1,0 +1,237 @@
+The user wants to improve the performance of the MoE EPLB algorithm.
+The proposed changes focus on upgrading the refinement strategy from a simple swap between the heaviest and lightest packs to a "Global Swap" strategy that considers swapping items between the heaviest pack and *any* other pack, provided it reduces the maximum load. This is a more powerful local search move.
+
+I will apply the following changes:
+1.  Replace the `_refine_packing` function with the new implementation that iterates over all packs to find the best swap partner for the heaviest pack.
+2.  Increase `num_refine_candidates` from 8 to 16 in `balanced_packing` to apply this more expensive but effective refinement to more candidates.
+3.  Update the call to `_refine_packing` in `balanced_packing` to pass the `num_packs` argument.
+
+<NAME>
+global_swap_refinement
+</NAME>
+
+<DESCRIPTION>
+Upgrade the local search refinement step from a simple "Max-Min" swap to a "Global Swap" strategy. Instead of only attempting to move items from the heaviest pack to the lightest pack, the new strategy evaluates potential swaps between the heaviest pack and *all other packs*. This allows the algorithm to find load-balancing moves that are blocked when restricting the target to only the lightest pack (e.g., when the lightest pack cannot accommodate a large item from the heaviest pack without creating a new maximum, but a medium-loaded pack can). Additionally, increase the number of candidates selected for refinement from 8 to 16 to broaden the search space.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_ids: torch.Tensor,
+                    pack_loads: torch.Tensor,
+                    ranks: torch.Tensor,
+                    num_iters: int = 5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Refines the packing by attempting to swap a single item between the heaviest
+    and lightest packs in each batch to reduce imbalance.
+    """
+    batch_size, num_items = weights.shape
+    device = weights.device
+    batch_indices = torch.arange(batch_size, device=device)
+
+    # Iterative refinement
+    for _ in range(num_iters):
+        # Identify heaviest and lightest packs
+        max_load, max_pack_idx = pack_loads.max(dim=1)
+        min_load, min_pack_idx = pack_loads.min(dim=1)
+        current_diff = max_load - min_load
+
+        # Items in heaviest and lightest packs [B, N]
+        is_in_max = (pack_ids == max_pack_idx.unsqueeze(1))
+        is_in_min = (pack_ids == min_pack_idx.unsqueeze(1))
+
+        # Calculate diff matrix: delta = w_i (max) - w_j (min)
+        # We want D_new = |D_old - 2*delta| to be minimized.
+        w_diff = weights.unsqueeze(2) - weights.unsqueeze(1)
+
+        # Metric to minimize: |current_diff - 2 * delta|
+        target_delta = current_diff.view(-1, 1, 1)
+        improvement_metric = torch.abs(target_delta - 2 * w_diff)
+
+        # Mask valid swaps: i in max, j in min
+        valid_mask = is_in_max.unsqueeze(2) & is_in_min.unsqueeze(1)
+
+        # Strictly improvement required: D_new < D_old
+        is_improvement = improvement_metric < (target_delta - 1e-5)
+
+        valid_swap = valid_mask & is_improvement
+
+        # Apply mask
+        improvement_metric = torch.where(valid_swap, improvement_metric, torch.tensor(float('inf'), device=device))
+
+        # Find best swap per batch
+        flat_metric = improvement_metric.view(batch_size, -1)
+        min_val, flat_indices = flat_metric.min(dim=1)
+
+        # Identify batches that can improve
+        active_mask = min_val != float('inf')
+        if not active_mask.any():
+            break
+
+        active_batch_idx = batch_indices[active_mask]
+        active_flat_idx = flat_indices[active_mask]
+
+        # Decode indices
+        i_idx = active_flat_idx // num_items
+        j_idx = active_flat_idx % num_items
+
+        # Perform swap on active batches
+        p_max = max_pack_idx[active_batch_idx]
+        p_min = min_pack_idx[active_batch_idx]
+
+        w_i = weights[active_batch_idx, i_idx]
+        w_j = weights[active_batch_idx, j_idx]
+        delta = w_i - w_j
+
+        # Update Loads
+        pack_loads[active_batch_idx, p_max] -= delta
+        pack_loads[active_batch_idx, p_min] += delta
+
+        # Update IDs
+        pack_ids[active_batch_idx, i_idx] = p_min
+        pack_ids[active_batch_idx, j_idx] = p_max
+
+        # Update Ranks
+        r_i = ranks[active_batch_idx, i_idx]
+        r_j = ranks[active_batch_idx, j_idx]
+        ranks[active_batch_idx, i_idx] = r_j
+        ranks[active_batch_idx, j_idx] = r_i
+
+    return pack_ids, ranks, pack_loads
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_ids: torch.Tensor,
+                    pack_loads: torch.Tensor,
+                    ranks: torch.Tensor,
+                    num_packs: int,
+                    num_iters: int = 5) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Refines the packing by attempting to swap a single item between the heaviest
+    pack and ANY other pack to reduce the maximum load.
+    """
+    batch_size, num_items = weights.shape
+    device = weights.device
+    batch_indices = torch.arange(batch_size, device=device)
+
+    # Precompute pairwise weight differences: [B, N, N]
+    # w_diff[b, i, j] = w[b, i] - w[b, j]
+    w_diff = weights.unsqueeze(2) - weights.unsqueeze(1)
+
+    for _ in range(num_iters):
+        max_load, max_pack_idx = pack_loads.max(dim=1)
+
+        best_gain = torch.zeros(batch_size, device=device, dtype=weights.dtype)
+        best_swap_flat = torch.zeros(batch_size, device=device, dtype=torch.int64)
+        best_target_pack = torch.full((batch_size,), -1, device=device, dtype=torch.int64)
+
+        # Identify items in max pack [B, N]
+        is_in_max = (pack_ids == max_pack_idx.unsqueeze(1))
+
+        # Iterate over all possible target packs
+        for p in range(num_packs):
+            # Target pack load [B]
+            target_load = pack_loads[:, p]
+
+            # Gap available: max_load - target_load
+            gap = max_load - target_load
+
+            # Mask valid batches: max_pack != p and gap > 0
+            # (Note: if p == max_pack, gap is 0, so gap > 1e-5 covers it)
+            active_p_mask = gap > 1e-5
+
+            if not active_p_mask.any():
+                continue
+
+            # Identify items in target pack [B, N]
+            is_in_target = (pack_ids == torch.tensor(p, device=device))
+
+            # Valid pairs: i in Max, j in Target
+            # [B, N, N]
+            valid_pair = is_in_max.unsqueeze(2) & is_in_target.unsqueeze(1)
+
+            # We want to swap such that:
+            # 1. New Max Load < Old Max Load => (LoadMax - delta) < LoadMax => delta > 0
+            # 2. New Target Load < Old Max Load => (LoadTarget + delta) < LoadMax => delta < Gap
+            # Objective: Maximize reduction in MaxLoad constrained by TargetLoad not exceeding OldMaxLoad.
+            # Reduction = LoadMax - max(LoadMax - delta, LoadTarget + delta)
+            #           = min(delta, Gap - delta)
+
+            delta = w_diff
+
+            # Filter deltas
+            valid_swap = valid_pair & (delta > 1e-5) & (delta < (gap.view(-1, 1, 1) - 1e-5))
+
+            # Calculate gain
+            gain = torch.min(delta, gap.view(-1, 1, 1) - delta)
+
+            # Mask invalid
+            gain = torch.where(valid_swap, gain, torch.tensor(-1.0, device=device, dtype=weights.dtype))
+
+            # Find best swap for this target pack
+            # Flatten last two dims: [B, N*N]
+            p_max_gain, p_flat_idx = gain.view(batch_size, -1).max(dim=1)
+
+            # Update global best if better
+            improve_mask = (p_max_gain > best_gain) & active_p_mask
+
+            if improve_mask.any():
+                best_gain = torch.where(improve_mask, p_max_gain, best_gain)
+                best_swap_flat = torch.where(improve_mask, p_flat_idx, best_swap_flat)
+                best_target_pack = torch.where(improve_mask, torch.tensor(p, device=device), best_target_pack)
+
+        # Apply best swaps found across all packs
+        active_mask = best_target_pack != -1
+        if not active_mask.any():
+            break
+
+        active_batch_idx = batch_indices[active_mask]
+        active_flat = best_swap_flat[active_mask]
+        active_p = best_target_pack[active_mask]
+
+        i_idx = active_flat // num_items
+        j_idx = active_flat % num_items
+
+        # Get Max Pack for these batches
+        active_max_p = max_pack_idx[active_mask]
+
+        # Weights
+        w_i = weights[active_batch_idx, i_idx]
+        w_j = weights[active_batch_idx, j_idx]
+        delta_val = w_i - w_j
+
+        # Update Loads
+        # We need scatter_add or direct indexing. Direct indexing works because active_batch_idx is unique.
+        pack_loads[active_batch_idx, active_max_p] -= delta_val
+        pack_loads[active_batch_idx, active_p] += delta_val
+
+        # Update IDs
+        pack_ids[active_batch_idx, i_idx] = active_p
+        pack_ids[active_batch_idx, j_idx] = active_max_p
+
+        # Update Ranks
+        r_i = ranks[active_batch_idx, i_idx]
+        r_j = ranks[active_batch_idx, j_idx]
+        ranks[active_batch_idx, i_idx] = r_j
+        ranks[active_batch_idx, j_idx] = r_i
+
+    return pack_ids, ranks, pack_loads
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Configuration
+    num_candidates = 128
+    num_refine_candidates = 8  # Only refine the top K candidates per layer
+=======
+    # Configuration
+    num_candidates = 128
+    num_refine_candidates = 16  # Only refine the top K candidates per layer
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Run Refinement on top K
+    refined_ids, refined_ranks, refined_loads = _refine_packing(
+        refined_weights, refined_ids, refined_loads, refined_ranks, num_iters=5)
+=======
+    # Run Refinement on top K
+    refined_ids, refined_ranks, refined_loads = _refine_packing(
+        refined_weights, refined_ids, refined_loads, refined_ranks, num_packs=num_packs, num_iters=5)
+>>>>>>> REPLACE
+</DIFF>

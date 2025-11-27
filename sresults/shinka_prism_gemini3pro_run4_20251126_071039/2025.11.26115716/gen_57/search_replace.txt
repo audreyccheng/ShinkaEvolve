@@ -1,0 +1,190 @@
+<NAME>
+stochastic_failure_packing
+</NAME>
+
+<DESCRIPTION>
+Replaces the deterministic binary search packing check with a stochastic approach that uses "Failure-Driven Prioritization".
+Instead of checking 3 fixed sort orders, the new method performs multiple trials with random noise added to heuristic sort keys. Crucially, if a packing attempt fails, the item that caused the failure (the first one that didn't fit) is recorded, and in subsequent trials for the same pressure target K, these "difficult" items are heavily prioritized (placed earlier). This helps the algorithm learn which items are bottlenecks for the current constraint and pack them when bins are empty.
+Also increases binary search iterations to 20 and inner trials to 30 to exploit the low execution time for better solutions.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 2. Binary Search with Multi-Heuristic Checking
+    # ---------------------------------------------------------
+    # Theoretical Lower Bound
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    low = total_w / rem_global if rem_global > 1e-6 else best_max_kvpr
+    high = best_max_kvpr if best_max_kvpr != float('inf') else 1000.0
+
+    if high > low + 1e-4:
+        for _ in range(15):
+            mid = (low + high) / 2.0
+
+            # Check feasibility for target K = mid
+            # Effective Size = s + w/mid.
+            # We try multiple sorting orders to pack better.
+            check_sorts = [
+                lambda x: x['s'] + x['w'] / mid, # Effective Size
+                lambda x: x['s'],                # Physical Size
+                lambda x: x['w']                 # Weight
+            ]
+
+            found_config = None
+
+            for sort_key in check_sorts:
+                sorted_idx = sorted(range(len(m_data)), key=lambda i: sort_key(m_data[i]), reverse=True)
+
+                temp_p = {i: [] for i in range(gpu_num)}
+                temp_state = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+                feasible = True
+
+                for idx in sorted_idx:
+                    item = m_data[idx]
+                    eff_size = item['s'] + item['w'] / mid
+
+                    best_gpu = None
+                    min_slack = float('inf')
+
+                    # Best Fit Decreasing on Effective Constraint
+                    for i in range(gpu_num):
+                        # 1. Physical Fit
+                        if temp_state[i]['s'] + item['s'] > GPU_MEM_SIZE: continue
+
+                        # 2. Effective Fit: (Current_W + w) <= mid * (Rem_Physical - s)
+                        phys_rem_after = GPU_MEM_SIZE - (temp_state[i]['s'] + item['s'])
+                        if phys_rem_after < 0: phys_rem_after = 0.0
+
+                        lhs = temp_state[i]['w'] + item['w']
+                        rhs = mid * phys_rem_after
+
+                        if lhs <= rhs + 1e-6:
+                            # Slack represents unused effective capacity
+                            slack = rhs - lhs
+                            if slack < min_slack:
+                                min_slack = slack
+                                best_gpu = i
+
+                    if best_gpu is None:
+                        feasible = False
+                        break
+
+                    temp_p[best_gpu].append(idx)
+                    temp_state[best_gpu]['w'] += item['w']
+                    temp_state[best_gpu]['s'] += item['s']
+
+                if feasible:
+                    found_config = temp_p
+                    break
+
+            if found_config:
+                score = evaluate_indices(found_config)
+                if score < best_max_kvpr:
+                    best_max_kvpr = score
+                    best_placement_indices = found_config
+                high = mid
+            else:
+                low = mid
+
+    if best_placement_indices is None:
+         raise ValueError("Unable to place models on GPUs with available memory.")
+=======
+    # ---------------------------------------------------------
+    # 2. Binary Search with Stochastic Packing
+    # ---------------------------------------------------------
+    # Theoretical Lower Bound
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    low = total_w / rem_global if rem_global > 1e-6 else best_max_kvpr
+    high = best_max_kvpr if best_max_kvpr != float('inf') else 2000.0
+
+    if high > low + 1e-4:
+        for _ in range(20):
+            mid = (low + high) / 2.0
+
+            # Stochastic checks with Failure-Driven Prioritization
+            found_config = None
+            fail_counts = [0] * len(m_data)
+
+            # Base heuristics
+            base_heuristics = [
+                lambda x: x['s'] + x['w'] / mid,  # Effective Size
+                lambda x: x['s'],                 # Physical Size
+                lambda x: x['w'] / (x['s'] + 1e-9) # Density
+            ]
+
+            # Multiple trials per check
+            for attempt in range(30):
+                base_h = base_heuristics[attempt % len(base_heuristics)]
+
+                # Noise factor increases with attempts
+                noise = 0.02 + (attempt * 0.003)
+
+                def sort_key(i):
+                    val = base_h(m_data[i])
+                    # Multiplicative noise
+                    val *= random.uniform(1.0 - noise, 1.0 + noise)
+                    # Failure prioritization: push failed items to front
+                    if fail_counts[i] > 0:
+                        val += fail_counts[i] * 1e9
+                    return val
+
+                sorted_idx = sorted(range(len(m_data)), key=sort_key, reverse=True)
+
+                temp_p = {i: [] for i in range(gpu_num)}
+                temp_state = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+                feasible = True
+                first_fail = None
+
+                for idx in sorted_idx:
+                    item = m_data[idx]
+
+                    best_gpu = None
+                    min_slack = float('inf')
+
+                    for i in range(gpu_num):
+                        # Physical check
+                        if temp_state[i]['s'] + item['s'] > GPU_MEM_SIZE: continue
+
+                        # Pressure check: w_new <= mid * rem_s
+                        phys_rem = GPU_MEM_SIZE - (temp_state[i]['s'] + item['s'])
+                        allowed_w = mid * phys_rem
+
+                        w_new = temp_state[i]['w'] + item['w']
+
+                        if w_new <= allowed_w + 1e-6:
+                            # Slack: how much "pressure capacity" is left
+                            slack = allowed_w - w_new
+                            if slack < min_slack:
+                                min_slack = slack
+                                best_gpu = i
+
+                    if best_gpu is None:
+                        feasible = False
+                        first_fail = idx
+                        break
+
+                    temp_p[best_gpu].append(idx)
+                    temp_state[best_gpu]['w'] += item['w']
+                    temp_state[best_gpu]['s'] += item['s']
+
+                if feasible:
+                    found_config = temp_p
+                    break
+                else:
+                    if first_fail is not None:
+                        fail_counts[first_fail] += 1
+
+            if found_config:
+                score = evaluate_indices(found_config)
+                if score < best_max_kvpr:
+                    best_max_kvpr = score
+                    best_placement_indices = found_config
+                high = mid
+            else:
+                low = mid
+
+    if best_placement_indices is None:
+         raise ValueError("Unable to place models on GPUs with available memory.")
+>>>>>>> REPLACE
+</DIFF>

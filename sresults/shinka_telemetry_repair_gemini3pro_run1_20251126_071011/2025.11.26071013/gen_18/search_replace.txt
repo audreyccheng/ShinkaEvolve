@@ -1,0 +1,279 @@
+<NAME>
+rate_repair_with_synthesis
+</NAME>
+
+<DESCRIPTION>
+Improve rate repair by introducing synthesized candidates derived from flow conservation. This allows the algorithm to recover valid rates even when both local and remote measurements are corrupted (e.g., both zero), provided the rest of the router's flow is verifiable. Also updates the scoring function to penalize zero values slightly to prefer active counters in unverifiable tie scenarios.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            if diff < max(mag * TOLERANCE, MIN_ACTIVITY):
+                # Agree: Average to smooth out small noise
+                best_val = (cand_tx + cand_rx) / 2.0
+            else:
+                # Disagree: Conflict Resolution using Flow Conservation
+                rid_local = s['local_router']
+                rid_remote = state[peer_id]['local_router']
+
+                # Helper to score a candidate value based on flow impact
+                # Lower score is better
+                def get_candidate_score(val):
+                    # Check local router (TX side)
+                    err_local = calc_flow_error(rid_local, if_id, 'tx', val)
+                    # Check remote router (RX side)
+                    err_remote = calc_flow_error(rid_remote, peer_id, 'rx', val)
+
+                    score = 0.0
+
+                    # Cost for Local
+                    if err_local is None: score += 0.02 # Unverifiable = small cost
+                    else: score += min(err_local, 1.0)  # Verifiable = actual error
+
+                    # Cost for Remote
+                    if err_remote is None: score += 0.02
+                    else: score += min(err_remote, 1.0)
+
+                    return score
+
+                score_tx = get_candidate_score(cand_tx)
+                score_rx = get_candidate_score(cand_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                # Penalize the zero value
+                if cand_tx < MIN_ACTIVITY and cand_rx > MIN_ACTIVITY: score_tx += 0.5
+                if cand_rx < MIN_ACTIVITY and cand_tx > MIN_ACTIVITY: score_rx += 0.5
+
+                if score_tx < score_rx:
+                    best_val = cand_tx
+                elif score_rx < score_tx:
+                    best_val = cand_rx
+                else:
+                    best_val = (cand_tx + cand_rx) / 2.0 # Tie -> Average
+=======
+            if diff < max(mag * TOLERANCE, MIN_ACTIVITY):
+                # Agree: Average to smooth out small noise
+                best_val = (cand_tx + cand_rx) / 2.0
+            else:
+                # Disagree: Conflict Resolution using Flow Conservation
+                rid_local = s['local_router']
+                rid_remote = state[peer_id]['local_router']
+
+                # Helper to synthesize a candidate rate from flow conservation
+                def get_flow_prediction(rid, if_target, field):
+                    if rid not in verifiable_routers:
+                        return None
+
+                    total_rx = 0.0
+                    total_tx = 0.0
+
+                    # Sum everyone else
+                    for iface in router_interfaces[rid]:
+                        if iface == if_target: continue
+                        total_rx += state[iface]['rx']
+                        total_tx += state[iface]['tx']
+
+                    # Add 'self' complementary side to balance equation
+                    # Sum(In) = Sum(Out)
+                    if field == 'tx':
+                        # We are solving for Output.
+                        # Input = Other_Rx + My_Rx
+                        # Output = Other_Tx + My_Tx
+                        # My_Tx = (Other_Rx + My_Rx) - Other_Tx
+                        total_rx += state[if_target]['rx']
+                        return max(0.0, total_rx - total_tx)
+                    else:
+                        # Solving for Input (Rx)
+                        # My_Rx = (Other_Tx + My_Tx) - Other_Rx
+                        total_tx += state[if_target]['tx']
+                        return max(0.0, total_tx - total_rx)
+
+                # Collect candidates
+                candidates = [cand_tx, cand_rx]
+
+                # Add synthesized candidates
+                synth_local = get_flow_prediction(rid_local, if_id, 'tx')
+                if synth_local is not None: candidates.append(synth_local)
+
+                synth_remote = get_flow_prediction(rid_remote, peer_id, 'rx')
+                if synth_remote is not None: candidates.append(synth_remote)
+
+                # Helper to score a candidate value based on flow impact
+                def get_candidate_score(val):
+                    # Check local router (TX side)
+                    err_local = calc_flow_error(rid_local, if_id, 'tx', val)
+                    # Check remote router (RX side)
+                    err_remote = calc_flow_error(rid_remote, peer_id, 'rx', val)
+
+                    score = 0.0
+
+                    # Cost for Local
+                    if err_local is None: score += 0.05 # Unverifiable = neutral cost
+                    else: score += min(err_local, 2.0)  # Verifiable = actual error
+
+                    # Cost for Remote
+                    if err_remote is None: score += 0.05
+                    else: score += min(err_remote, 2.0)
+
+                    # Heuristic: Penalize zero values slightly to prefer active measurements
+                    # in unverifiable scenarios (tie-breaking)
+                    if val < MIN_ACTIVITY:
+                        score += 0.01
+
+                    return score
+
+                best_score = float('inf')
+                best_val = cand_tx
+
+                # Iterate all candidates to find minimum score
+                for val in candidates:
+                    s_val = get_candidate_score(val)
+                    if s_val < best_score:
+                        best_score = s_val
+                        best_val = val
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+continuous_confidence_calibration
+</NAME>
+
+<DESCRIPTION>
+Implement continuous confidence calibration based on flow residual magnitude. Instead of discrete buckets (0.95, 0.99), the confidence score now decays continuously as the residual error increases. This provides a more accurate reflection of repair quality, especially for borderline cases.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # -- Calibrate Confidence --
+
+        # Helper: check for peer consistency
+        def is_peer_consistent(val, field):
+            peer_id = data.get('connected_to')
+            if not peer_id or peer_id not in state:
+                return True # Can't check, assume consistent
+
+            # Compare with peer's finalized value (which should be symmetric)
+            peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+
+            # Use same tolerance as repair loop
+            diff = abs(val - peer_val)
+            mag = max(val, peer_val, 1.0)
+            return diff < max(mag * TOLERANCE, MIN_ACTIVITY)
+
+        # Helper: check verification
+        def get_verification_level(val, field):
+            # Local Verification
+            rid = data.get('local_router')
+            local_err = calc_flow_error(rid, if_id, field, val)
+            local_ok = (local_err is not None and local_err < FLOW_TOLERANCE)
+
+            # Remote Verification
+            remote_ok = False
+            peer_id = data.get('connected_to')
+            rem_rid = data.get('remote_router')
+
+            if rem_rid and peer_id:
+                check_field = 'tx' if field == 'rx' else 'rx'
+                rem_err = calc_flow_error(rem_rid, peer_id, check_field, val)
+                if rem_err is not None and rem_err < FLOW_TOLERANCE:
+                    remote_ok = True
+
+            if local_ok and remote_ok: return 3 # Both
+            if local_ok: return 2 # Local only
+            if remote_ok: return 1 # Remote only
+            return 0 # None
+
+        def get_rate_confidence(orig, final, field):
+            changed = abs(orig - final) > 0.001
+            ver_level = get_verification_level(final, field)
+            consistent_with_peer = is_peer_consistent(final, field)
+
+            # 1. High Confidence Scenarios
+            if ver_level == 3: return 0.99 # Verified by both ends
+            if ver_level == 2: return 0.95 # Verified locally (strongest signal)
+
+            # 2. Unchanged Data
+            if not changed:
+                # If we didn't change it, but it contradicts the peer, confidence drops
+                if not consistent_with_peer:
+                    return 0.7
+                # If consistent and unchanged
+                if ver_level == 1: return 0.95 # Verified remote
+                return 0.9 # Good default
+
+            # 3. Changed Data
+            # Smoothing (small change)
+            if orig > MIN_ACTIVITY and abs(orig - final) / orig < 0.05:
+                return 0.95
+
+            # Significant changes
+            if ver_level == 1: return 0.90 # Verified remote
+
+            # Unverified Repairs
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85 # Dead counter repair
+
+            # If we changed it, it's not verified, but now consistent with peer (by definition of repair)
+            # This is a "Trust Peer" repair
+            return 0.75
+=======
+        # -- Calibrate Confidence --
+
+        def get_rate_confidence(orig, final, field):
+            # Calculate residual errors for calibration
+            rid = data.get('local_router')
+            local_err = calc_flow_error(rid, if_id, field, final)
+
+            rem_rid = data.get('remote_router')
+            peer_id = data.get('connected_to')
+            remote_err = None
+            if rem_rid and peer_id:
+                check_field = 'tx' if field == 'rx' else 'rx'
+                remote_err = calc_flow_error(rem_rid, peer_id, check_field, final)
+
+            # Base confidence based on verification level (Continuous)
+            score = 0.0
+
+            # Case 1: Verified (Local or Both)
+            if local_err is not None:
+                # Local verification is strongest
+                # Decay score with error magnitude
+                penalty = min(local_err * 2.0, 0.4)
+                score = 0.98 - penalty
+
+                # Check Remote
+                if remote_err is not None:
+                    if remote_err < FLOW_TOLERANCE:
+                        score += 0.01
+                    else:
+                        score -= min(remote_err, 0.1)
+
+            # Case 2: Only Remote Verified
+            elif remote_err is not None:
+                penalty = min(remote_err * 2.0, 0.4)
+                score = 0.90 - penalty
+
+            # Case 3: Unverifiable (Edge links)
+            else:
+                score = 0.75 # Default for consistent but unverified
+
+            # Adjustments for Change Magnitude
+            changed = abs(orig - final) > max(MIN_ACTIVITY, orig * 0.001)
+
+            if not changed:
+                # If unverified and unchanged, we trust the device
+                if score < 0.8: score = 0.8
+            else:
+                # We changed it
+                # Smoothing bonus
+                if orig > MIN_ACTIVITY and abs(orig - final) / orig < 0.05:
+                     score = max(score, 0.95)
+
+                # "Dead Counter" repair bonus
+                if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                     # If unverified, this is a heuristic repair (0.85)
+                     if score < 0.85: score = 0.85
+
+            return max(0.0, min(1.0, score))
+>>>>>>> REPLACE
+</DIFF>

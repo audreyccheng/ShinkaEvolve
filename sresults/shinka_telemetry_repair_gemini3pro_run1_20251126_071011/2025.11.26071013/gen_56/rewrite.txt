@@ -1,0 +1,265 @@
+# EVOLVE-BLOCK-START
+"""
+Gradient Consensus Network Repair with Discrete Confidence Tiers.
+
+Key Mechanisms:
+- Status Repair: Traffic presence dictates status; forces rates to 0.0 if DOWN.
+- Rate Repair: "Gradient Barrier" consensus.
+    - Errors < Tolerance: Linear penalty (prefer tighter fit).
+    - Errors > Tolerance: Barrier penalty (reject impossible flows).
+- Confidence: Discrete tiers based on structural verification (Local/Remote Flow, Symmetry).
+"""
+import collections
+from typing import Dict, Any, Tuple, List
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    # --- Constants ---
+    TOL_SYM = 0.02          # Symmetry tolerance (2%)
+    TOL_FLOW = 0.05         # Flow conservation tolerance (5%)
+    MIN_ACT = 0.01          # Minimum activity threshold (Mbps)
+    
+    # --- 1. Initialization ---
+    state = {}
+    router_map = collections.defaultdict(list)
+    verifiable_routers = set()
+    
+    # Build topology and identify verifiable routers
+    # A router is verifiable only if ALL its interfaces are in the telemetry dataset
+    for rid, if_list in topology.items():
+        router_map[rid] = if_list
+        if all(if_id in telemetry for if_id in if_list):
+            verifiable_routers.add(rid)
+            
+    # Load initial state
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'down'),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'down'),
+            'local_router': data.get('local_router'),
+            'connected_to': data.get('connected_to'),
+            'remote_router': data.get('remote_router')
+        }
+
+    # --- 2. Status Repair ---
+    status_conf = {}
+    
+    for if_id, s in state.items():
+        orig_st = s['orig_status']
+        peer_id = s['connected_to']
+        
+        # Determine activity
+        has_traffic_local = (s['orig_rx'] > MIN_ACT) or (s['orig_tx'] > MIN_ACT)
+        
+        peer_st = 'unknown'
+        has_traffic_peer = False
+        if peer_id and peer_id in state:
+            p = state[peer_id]
+            peer_st = p['orig_status']
+            has_traffic_peer = (p['orig_rx'] > MIN_ACT) or (p['orig_tx'] > MIN_ACT)
+            
+        # Logic
+        final_st = orig_st
+        conf = 1.0
+        
+        if has_traffic_local or has_traffic_peer:
+            final_st = 'up'
+            if orig_st == 'down':
+                conf = 0.95 # Strong evidence repair
+        elif orig_st == 'up' and peer_st == 'down':
+            final_st = 'down' # Peer is down + no traffic -> down
+            conf = 0.8
+        elif orig_st != peer_st:
+            # Conflict, no traffic. Default to DOWN for safety
+            final_st = 'down'
+            conf = 0.7
+            
+        state[if_id]['status'] = final_st
+        status_conf[if_id] = conf
+        
+        # Force rates to 0 if DOWN
+        if final_st == 'down':
+            state[if_id]['rx'] = 0.0
+            state[if_id]['tx'] = 0.0
+            
+    # --- 3. Rate Repair (Gradient Consensus) ---
+    
+    def calc_flow_imbalance(rid, target_if=None, target_field=None, target_val=None):
+        if rid not in verifiable_routers:
+            return None # Cannot verify
+            
+        total_in, total_out = 0.0, 0.0
+        for iface in router_map[rid]:
+            # Get current values
+            r = state[iface]['rx']
+            t = state[iface]['tx']
+            
+            # Override if this is the target
+            if iface == target_if:
+                if target_field == 'rx': r = target_val
+                else: t = target_val
+                
+            total_in += r
+            total_out += t
+            
+        diff = abs(total_in - total_out)
+        denom = max(total_in, total_out, 1.0)
+        return diff / denom
+
+    for _ in range(3): # Iterations for convergence
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+            
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+            
+            # Link: Local(TX) -> Peer(RX)
+            val_tx = s['tx']
+            val_rx = state[peer_id]['rx']
+            
+            # Check agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+            
+            if diff < max(avg * TOL_SYM, MIN_ACT):
+                # Consistent - Smooth out noise
+                new_val = avg
+            else:
+                # Conflict - Score Candidates
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+                
+                def get_score(val):
+                    # Check Local (TX source)
+                    err_loc = calc_flow_imbalance(rid_local, if_id, 'tx', val)
+                    # Check Remote (RX sink)
+                    err_rem = calc_flow_imbalance(rid_remote, peer_id, 'rx', val)
+                    
+                    cost = 0.0
+                    
+                    # Cost function: Gradient Barrier
+                    for err in [err_loc, err_rem]:
+                        if err is None:
+                            # Unverified: Assume average acceptable error (2%)
+                            # This prefers "Verified Perfect" (0%) over "Unverified" (2%)
+                            # But "Unverified" (2%) over "Verified Bad" (>2%)
+                            cost += 0.02
+                        elif err <= TOL_FLOW:
+                            # Verified & Valid: Linear cost
+                            cost += err
+                        else:
+                            # Verified & Invalid: Barrier penalty
+                            cost += (1.0 + err)
+                            
+                    return cost
+
+                score_tx = get_score(val_tx)
+                score_rx = get_score(val_rx)
+                
+                # Heuristic: Penalize Dead Counters if competing against Active
+                if val_tx < MIN_ACT and val_rx > MIN_ACT: score_tx += 0.5
+                if val_rx < MIN_ACT and val_tx > MIN_ACT: score_rx += 0.5
+                
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = avg
+            
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+            
+    # --- 4. Confidence Scoring (Discrete Tiers) ---
+    result = {}
+    
+    # Recalculate final flow states for validation
+    final_flow_errors = {}
+    for rid in verifiable_routers:
+        final_flow_errors[rid] = calc_flow_imbalance(rid)
+        
+    for if_id, s in state.items():
+        rid = s['local_router']
+        peer_id = s['connected_to']
+        rem_rid = s['remote_router']
+        
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+        
+        def get_conf(orig, final, field):
+            # 1. Structural Verification
+            local_err = final_flow_errors.get(rid)
+            local_ok = (local_err is not None and local_err <= TOL_FLOW)
+            
+            remote_ok = False
+            if rem_rid in final_flow_errors:
+                if final_flow_errors[rem_rid] <= TOL_FLOW:
+                    remote_ok = True
+                    
+            symmetric = True
+            if peer_id and peer_id in state:
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOL_SYM:
+                    symmetric = False
+            
+            # 2. Change Detection
+            changed = abs(orig - final) > max(orig * 0.001, MIN_ACT/2)
+            smoothed = changed and (abs(orig - final) < max(orig * 0.05, 0.5))
+            dead_repair = (orig < MIN_ACT and final > MIN_ACT)
+            
+            # 3. Tiered Confidence Assignment
+            
+            # Tier 1: Gold Standard (Double Verified + Symmetric)
+            if local_ok and remote_ok and symmetric:
+                return 1.0 if not changed else 0.99
+                
+            # Tier 2: Strong Verification (Single Verified + Symmetric)
+            if (local_ok or remote_ok) and symmetric:
+                if not changed or smoothed: return 0.98
+                return 0.95
+                
+            # Tier 3: Verified Unilateral (Locally verified, ignore remote)
+            # If locally verified, we trust our router's math over peer's noise
+            if local_ok:
+                return 0.95
+            
+            # Tier 4: Unverified but Consistent (Heuristics)
+            if symmetric and not local_ok and not remote_ok:
+                if not changed: return 0.90   # "If it ain't broke"
+                if dead_repair: return 0.85   # "It was definitely broke (0)"
+                if smoothed: return 0.90      # "Just noise"
+                return 0.75                   # "Changed arbitrarily to match peer"
+            
+            # Tier 5: Conflict / Low Confidence
+            if not symmetric:
+                if not changed: return 0.7    # Kept original despite conflict
+                return 0.5                    # Changed and still conflicts
+                
+            return 0.6 # Fallback
+            
+        rx_conf = get_conf(orig_rx, final_rx, 'rx')
+        tx_conf = get_conf(orig_tx, final_tx, 'tx')
+        st_conf = status_conf.get(if_id, 1.0)
+        
+        # Sanity Check for DOWN repairs
+        if s['status'] == 'down':
+            if final_rx > MIN_ACT or final_tx > MIN_ACT:
+                rx_conf = 0.0
+                tx_conf = 0.0
+        
+        result[if_id] = {
+            'rx_rate': (orig_rx, final_rx, rx_conf),
+            'tx_rate': (orig_tx, final_tx, tx_conf),
+            'interface_status': (s['orig_status'], s['status'], st_conf),
+            'connected_to': s['connected_to'],
+            'local_router': s['local_router'],
+            'remote_router': s['remote_router']
+        }
+        
+    return result
+# EVOLVE-BLOCK-END

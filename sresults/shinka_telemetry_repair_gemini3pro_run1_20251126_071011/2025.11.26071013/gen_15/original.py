@@ -1,0 +1,303 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using Iterative Invariant Consensus.
+Refines telemetry data through multiple passes of constraint satisfaction,
+allowing Flow Conservation hints to become cleaner and more accurate with each iteration.
+"""
+from typing import Dict, Any, Tuple, List
+import copy
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network telemetry using a multi-pass Iterative Consensus approach.
+    
+    The algorithm maintains a 'current belief' of the network state and refines it:
+    1. Pre-process Status: Trust traffic evidence to fix UP/DOWN flags.
+    2. Iteration Phase:
+       - Calculate Flow Hints based on current beliefs (cleaner than raw data).
+       - For each link, resolve rates by finding the value that best satisfies 
+         Link Symmetry and Flow Conservation.
+       - Update beliefs.
+    3. Finalize: Generate confidence scores based on the agreement between
+       the original raw data, the final repaired value, and the corroborating signals.
+    """
+    
+    # Constants
+    HARDENING_THRESHOLD = 0.02   # 2% tolerance for measurement timing
+    TRAFFIC_THRESHOLD = 1.0      # 1 Mbps threshold for "active" link
+    ITERATIONS = 2               # Number of relaxation passes
+    
+    # --- Phase 1: Initialize State & Repair Status ---
+    # We create a working state dictionary to hold our evolving beliefs.
+    # We also fix Interface Status immediately, as it acts as a gate for rates.
+    
+    # state[iface_id] = {'rx': float, 'tx': float, 'status': str, 'locked': bool}
+    state = {}
+    
+    for iface_id, data in telemetry.items():
+        raw_rx = data.get('rx_rate', 0.0)
+        raw_tx = data.get('tx_rate', 0.0)
+        raw_status = data.get('interface_status', 'unknown')
+        
+        # Check peer for status corroboration
+        peer_id = data.get('connected_to')
+        peer_data = telemetry.get(peer_id, {}) if (peer_id and peer_id in telemetry) else {}
+        
+        # Gather all traffic evidence
+        traffic_signals = [raw_rx, raw_tx, peer_data.get('rx_rate', 0.0), peer_data.get('tx_rate', 0.0)]
+        max_traffic = max(traffic_signals) if traffic_signals else 0.0
+        
+        # Status Logic: Traffic > Flags
+        final_status = raw_status
+        status_conf = 1.0
+        
+        if max_traffic > TRAFFIC_THRESHOLD:
+            # If significant traffic flows, interface must be UP
+            final_status = 'up'
+            if raw_status != 'up':
+                status_conf = 0.95 # High confidence correction
+        elif raw_status == 'up' and peer_data.get('interface_status') == 'down':
+             # Peer says DOWN, I say UP, but no traffic -> Likely DOWN
+             final_status = 'down'
+             status_conf = 0.8
+             
+        # Initialize rates based on status
+        if final_status == 'down':
+            init_rx, init_tx = 0.0, 0.0
+        else:
+            init_rx, init_tx = raw_rx, raw_tx
+            
+        state[iface_id] = {
+            'rx': init_rx,
+            'tx': init_tx,
+            'status': final_status,
+            'status_conf': status_conf,
+            'orig_rx': raw_rx,
+            'orig_tx': raw_tx,
+            'orig_status': raw_status,
+            'peer_id': peer_id
+        }
+
+    # --- Phase 2: Iterative Relaxation ---
+    # We loop to allow corrections to propagate.
+    # E.g., fixing a massive error on Iface A improves the Flow Hint for Iface B.
+    
+    for _ in range(ITERATIONS):
+        next_state_rates = {} # Store updates for synchronous apply
+        
+        # 1. Pre-calculate Flow Sums for all routers using current state
+        router_sums = {}
+        for r_id, ifaces in topology.items():
+            valid_ifaces = [i for i in ifaces if i in state]
+            r_rx = sum(state[i]['rx'] for i in valid_ifaces)
+            r_tx = sum(state[i]['tx'] for i in valid_ifaces)
+            router_sums[r_id] = {'rx': r_rx, 'tx': r_tx}
+            
+        # 2. Update each interface
+        for iface_id, curr_data in state.items():
+            if curr_data['status'] == 'down':
+                next_state_rates[iface_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+                
+            # Get Context
+            local_router = telemetry[iface_id].get('local_router')
+            peer_id = curr_data['peer_id']
+            has_peer = peer_id and peer_id in state
+            
+            # --- RX Update ---
+            # RX Target: Matches Peer TX.
+            # Hint: Calculated from local router flow conservation.
+            
+            curr_rx = curr_data['rx']
+            
+            # Calculate Hint RX: What RX is needed to make Sum(In) == Sum(Out)?
+            # Sum(In) = Sum(Others_Rx) + My_Rx
+            # Sum(Out) = Total_Tx
+            # My_Rx = Total_Tx - Sum(Others_Rx) = Total_Tx - (Total_Rx - My_Rx)
+            r_sums = router_sums.get(local_router)
+            hint_rx = curr_rx # Default to self if no topology
+            if r_sums:
+                # hint_rx + (total_rx - curr_rx) = total_tx
+                hint_rx = max(0.0, r_sums['tx'] - (r_sums['rx'] - curr_rx))
+            
+            # Determine Peer Value
+            peer_tx = state[peer_id]['tx'] if has_peer else curr_rx
+            
+            # Consensus Logic
+            # Check Symmetry first (Strongest signal)
+            denom_sym = max(curr_rx, peer_tx, 1.0)
+            diff_sym = abs(curr_rx - peer_tx) / denom_sym
+            
+            if diff_sym <= HARDENING_THRESHOLD:
+                # Symmetry holds: Reinforce by averaging (noise reduction)
+                next_rx = (curr_rx + peer_tx) / 2.0
+            else:
+                # Symmetry broken: Use Hint to decide
+                # Which candidate is supported by the physics of the router?
+                dist_local = abs(curr_rx - hint_rx)
+                dist_peer = abs(peer_tx - hint_rx)
+                
+                if dist_local < dist_peer:
+                    # Local matches hint better -> Trust Local
+                    next_rx = curr_rx
+                else:
+                    # Peer matches hint better -> Trust Peer
+                    next_rx = peer_tx
+                    
+                    # Heuristic: If Peer and Hint both disagree with Local,
+                    # but also disagree with each other significantly, 
+                    # we might be in a chaotic state. But Peer is usually 
+                    # the best alternative to a broken Local.
+            
+            # --- TX Update ---
+            # Symmetric logic for TX (matches Peer RX)
+            curr_tx = curr_data['tx']
+            
+            hint_tx = curr_tx
+            if r_sums:
+                # hint_tx + (total_tx - curr_tx) = total_rx
+                hint_tx = max(0.0, r_sums['rx'] - (r_sums['tx'] - curr_tx))
+            
+            peer_rx = state[peer_id]['rx'] if has_peer else curr_tx
+            
+            denom_sym_tx = max(curr_tx, peer_rx, 1.0)
+            diff_sym_tx = abs(curr_tx - peer_rx) / denom_sym_tx
+            
+            if diff_sym_tx <= HARDENING_THRESHOLD:
+                next_tx = (curr_tx + peer_rx) / 2.0
+            else:
+                dist_local = abs(curr_tx - hint_tx)
+                dist_peer = abs(peer_rx - hint_tx)
+                if dist_local < dist_peer:
+                    next_tx = curr_tx
+                else:
+                    next_tx = peer_rx
+            
+            next_state_rates[iface_id] = {'rx': next_rx, 'tx': next_tx}
+            
+        # Apply updates
+        for if_id, rates in next_state_rates.items():
+            state[if_id]['rx'] = rates['rx']
+            state[if_id]['tx'] = rates['tx']
+
+    # --- Phase 3: Final Output & Confidence Calibration ---
+    result = {}
+    
+    for iface_id, data in state.items():
+        orig_rx = data['orig_rx']
+        orig_tx = data['orig_tx']
+        rep_rx = data['rx']
+        rep_tx = data['tx']
+        
+        # Recalculate context for final confidence scoring
+        peer_id = data['peer_id']
+        has_peer = peer_id and peer_id in state
+        
+        # --- Confidence Calculation ---
+        # We calculate a 'Corroboration Score' (0.0 to 1.0)
+        # 1.0 = Perfect symmetry or perfect hint match
+        # 0.0 = Complete disagreement
+        
+        # RX Confidence
+        conf_rx = 1.0
+        if data['status'] == 'down':
+            # If we forced down, confidence is tied to status confidence
+            if orig_rx > TRAFFIC_THRESHOLD:
+                conf_rx = data['status_conf']
+        elif has_peer:
+            peer_tx = state[peer_id]['tx'] # Use the repaired peer value
+            
+            # Check agreement between Repaired Value and Peer
+            denom = max(rep_rx, peer_tx, 1.0)
+            disagreement = abs(rep_rx - peer_tx) / denom
+            
+            if disagreement <= HARDENING_THRESHOLD:
+                conf_rx = 1.0
+            else:
+                # If we disagreed with peer, did we have a good reason (Flow Hint)?
+                # We don't have the hint variable here easily, but we know
+                # the algorithm only diverges if it found a better match.
+                # However, persistent disagreement implies unresolvable conflict.
+                # We penalize confidence based on the remaining disagreement.
+                conf_rx = max(0.5, 1.0 - disagreement)
+                
+        # TX Confidence
+        conf_tx = 1.0
+        if data['status'] == 'down':
+            if orig_tx > TRAFFIC_THRESHOLD:
+                conf_tx = data['status_conf']
+        elif has_peer:
+            peer_rx = state[peer_id]['rx']
+            denom = max(rep_tx, peer_rx, 1.0)
+            disagreement = abs(rep_tx - peer_rx) / denom
+            
+            if disagreement <= HARDENING_THRESHOLD:
+                conf_tx = 1.0
+            else:
+                conf_tx = max(0.5, 1.0 - disagreement)
+
+        # Construct result entry
+        result[iface_id] = {
+            'rx_rate': (orig_rx, rep_rx, conf_rx),
+            'tx_rate': (orig_tx, rep_tx, conf_tx),
+            'interface_status': (data['orig_status'], data['status'], data['status_conf']),
+            'connected_to': peer_id,
+            'local_router': telemetry[iface_id].get('local_router'),
+            'remote_router': telemetry[iface_id].get('remote_router')
+        }
+        
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+    
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+    
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+    
+    result = run_repair(test_telemetry, test_topology)
+    
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")
+

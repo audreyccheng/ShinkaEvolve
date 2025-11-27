@@ -1,0 +1,276 @@
+<NAME>
+safer_micro_and_share_aware_penalties
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements to enhance counter repair accuracy and confidence calibration:
+
+1) Safer, benefit-checked router micro-adjustments (Recommendation 5):
+   - Add a residual threshold (≥3%) and require the candidate interface to carry non-trivial traffic (≥ LOW_RATE_CUTOFF) before attempting any nudge.
+   - Perform a tentative adjustment to only the larger counter in the direction that reduces the router residual; commit the change only if it improves the router’s residual by at least 8% and does not worsen the interface’s internal imbalance by more than 3% relative. If not, revert. This prevents harmful nudges, improving both accuracy and calibration.
+
+2) Share-aware, direction-aware router penalties in confidence composition (Recommendation 4):
+   - Compute per-interface directional share on the local router and modulate the local vs remote residual weights accordingly. This aligns penalties with an interface’s influence on conservation and typically improves confidence calibration.
+   - Also, for interfaces repaired to ‘down’, scale their rate confidences by the penalties to keep calibration consistent.
+
+These changes keep the existing strong consensus behavior, but reduce counter-degrading adjustments and produce more calibrated confidences.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Apply tightly scoped micro-adjustments only on dominating dangling interfaces (recommendation 4)
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        imbalance = sum_tx - sum_rx
+        abs_imb = abs(imbalance)
+        if abs_imb <= 0.0:
+            continue
+        denom = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs_imb / denom
+
+        # Identify unpaired, up interfaces
+        candidates = []
+        for if_id in if_list:
+            if if_id not in result:
+                continue
+            # unpaired if peer missing in telemetry
+            connected_to = result[if_id].get('connected_to')
+            is_unpaired = not connected_to or connected_to not in telemetry
+            status = result[if_id]['interface_status'][1]
+            if is_unpaired and status == 'up':
+                txv = float(result[if_id]['tx_rate'][1])
+                rxv = float(result[if_id]['rx_rate'][1])
+                contrib = abs(txv - rxv)
+                candidates.append((contrib, if_id, txv, rxv))
+
+        if not candidates:
+            continue
+
+        candidates.sort(reverse=True)
+        top_contrib, top_if, txv, rxv = candidates[0]
+        if top_contrib < 0.5 * abs_imb:
+            continue  # not dominating enough
+
+        alpha = min(0.02, 0.5 * resid_frac)
+        if alpha <= 0.0:
+            continue
+
+        # Adjust only the larger counter toward reducing the router imbalance
+        orx, rrx, rc = result[top_if]['rx_rate']
+        otx, rtx, tc = result[top_if]['tx_rate']
+        if imbalance > 0.0:
+            # sum_tx > sum_rx: reduce tx or increase rx; nudge only larger counter
+            if rtx >= rrx:
+                new_tx = rtx * (1.0 - alpha)
+                # reduce confidence to reflect heuristic adjustment
+                new_conf = min(tc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['tx_rate'] = (otx, new_tx, clamp(new_conf))
+            else:
+                new_rx = rrx * (1.0 + alpha)
+                new_conf = min(rc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['rx_rate'] = (orx, new_rx, clamp(new_conf))
+        else:
+            # sum_tx < sum_rx: reduce rx or increase tx; nudge only larger counter
+            if rrx >= rtx:
+                new_rx = rrx * (1.0 - alpha)
+                new_conf = min(rc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['rx_rate'] = (orx, new_rx, clamp(new_conf))
+            else:
+                new_tx = rtx * (1.0 + alpha)
+                new_conf = min(tc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['tx_rate'] = (otx, new_tx, clamp(new_conf))
+=======
+    # Apply safer, benefit-checked micro-adjustments only on dominating, non-trivial unpaired interfaces
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        imbalance = sum_tx - sum_rx
+        abs_imb = abs(imbalance)
+        if abs_imb <= 0.0:
+            continue
+        denom = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs_imb / denom
+        # Require sufficient residual to attempt micro-adjustments
+        if resid_frac < 0.03:
+            continue
+
+        # Identify unpaired, up interfaces with non-trivial traffic
+        candidates = []
+        for if_id in if_list:
+            if if_id not in result:
+                continue
+            connected_to = result[if_id].get('connected_to')
+            is_unpaired = not connected_to or connected_to not in telemetry
+            status = result[if_id]['interface_status'][1]
+            if is_unpaired and status == 'up':
+                txv = float(result[if_id]['tx_rate'][1])
+                rxv = float(result[if_id]['rx_rate'][1])
+                if max(txv, rxv) < LOW_RATE_CUTOFF:
+                    continue  # avoid nudging tiny flows
+                contrib = abs(txv - rxv)
+                candidates.append((contrib, if_id, txv, rxv))
+
+        if not candidates:
+            continue
+
+        candidates.sort(reverse=True)
+        top_contrib, top_if, txv, rxv = candidates[0]
+        if top_contrib < 0.5 * abs_imb:
+            continue  # not dominating enough
+
+        alpha = min(0.02, 0.5 * resid_frac)
+        if alpha <= 0.0:
+            continue
+
+        # Helper to compute router residual for a single router from current result snapshot
+        def compute_router_resid_local(router_id: str) -> float:
+            stx, srx = 0.0, 0.0
+            for iid in router_ifaces.get(router_id, []):
+                if iid in result:
+                    stx += float(result[iid]['tx_rate'][1])
+                    srx += float(result[iid]['rx_rate'][1])
+            return abs(stx - srx) / max(1.0, stx, srx)
+
+        # Adjust only the larger counter toward reducing router imbalance, tentatively
+        orx, rrx, rc = result[top_if]['rx_rate']
+        otx, rtx, tc = result[top_if]['tx_rate']
+        pre_internal = abs(rtx - rrx) / max(1.0, max(rtx, rrx))
+
+        if imbalance > 0.0:
+            # sum_tx > sum_rx: decrease tx or increase rx
+            if rtx >= rrx:
+                new_tx = rtx * (1.0 - alpha)
+                new_rx = rrx
+                adjust_kind = 'tx'
+            else:
+                new_rx = rrx * (1.0 + alpha)
+                new_tx = rtx
+                adjust_kind = 'rx'
+        else:
+            # sum_tx < sum_rx: decrease rx or increase tx
+            if rrx >= rtx:
+                new_rx = rrx * (1.0 - alpha)
+                new_tx = rtx
+                adjust_kind = 'rx'
+            else:
+                new_tx = rtx * (1.0 + alpha)
+                new_rx = rrx
+                adjust_kind = 'tx'
+
+        # Apply tentatively
+        if adjust_kind == 'tx':
+            result[top_if]['tx_rate'] = (otx, new_tx, tc)
+        else:
+            result[top_if]['rx_rate'] = (orx, new_rx, rc)
+
+        resid_after = compute_router_resid_local(r)
+        post_internal = abs(new_tx - new_rx) / max(1.0, max(new_tx, new_rx))
+
+        # Commit only if improves residual >=8% and internal imbalance doesn't worsen by >3% relative
+        if resid_after <= (1.0 - 0.08) * resid_frac and post_internal <= pre_internal + 0.03:
+            # Reduce confidence modestly to reflect heuristic adjustment
+            if adjust_kind == 'tx':
+                new_conf = min(tc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['tx_rate'] = (otx, new_tx, clamp(new_conf))
+            else:
+                new_conf = min(rc, 0.6 + 0.2 * (alpha / 0.02))
+                result[top_if]['rx_rate'] = (orx, new_rx, clamp(new_conf))
+        else:
+            # Revert
+            result[top_if]['tx_rate'] = (otx, rtx, tc)
+            result[top_if]['rx_rate'] = (orx, rrx, rc)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Recompute residuals after micro-adjustments
+    router_resid: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_resid[r] = abs(sum_tx - sum_rx) / denom
+
+    # Apply tri-axis confidence composition:
+    # - direction-aware router penalties
+    # - link symmetry fit after repair
+    # - correction magnitude (original vs repaired)
+    # with magnitude-aware floors and asymmetric traffic-evidence shaping.
+    for if_id, d in telemetry.items():
+        if if_id not in result:
+            continue
+
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        resid_local = router_resid.get(lr, 0.0)
+        resid_remote = router_resid.get(rr, 0.0)
+        pen_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.0, 1.0)
+        pen_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.0, 1.0)
+
+        orx, rrx, rc = result[if_id]['rx_rate']
+        otx, rtx, tc = result[if_id]['tx_rate']
+        ost, rst, sc = result[if_id]['interface_status']
+
+        # If repaired status is down, keep zeros and current confidence (handled earlier)
+        if rst == 'down':
+            status_scale = 0.85 + 0.15 * min(pen_tx, pen_rx)
+            result[if_id]['interface_status'] = (ost, rst, clamp(sc * status_scale))
+            result[if_id]['tx_rate'] = (otx, 0.0, tc)
+            result[if_id]['rx_rate'] = (orx, 0.0, rc)
+            continue
+=======
+    # Recompute residuals after micro-adjustments and collect per-router sums
+    router_resid: Dict[str, float] = {}
+    router_sum_tx: Dict[str, float] = {}
+    router_sum_rx: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_resid[r] = abs(sum_tx - sum_rx) / denom
+        router_sum_tx[r] = sum_tx
+        router_sum_rx[r] = sum_rx
+
+    # Apply tri-axis confidence composition:
+    # - share-aware, direction-aware router penalties
+    # - link symmetry fit after repair
+    # - correction magnitude (original vs repaired)
+    # with magnitude-aware floors and asymmetric traffic-evidence shaping.
+    for if_id, d in telemetry.items():
+        if if_id not in result:
+            continue
+
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        resid_local = router_resid.get(lr, 0.0)
+        resid_remote = router_resid.get(rr, 0.0)
+
+        orx, rrx, rc = result[if_id]['rx_rate']
+        otx, rtx, tc = result[if_id]['tx_rate']
+        ost, rst, sc = result[if_id]['interface_status']
+
+        # Share-aware penalties using interface directional shares on local router
+        sum_tx_local = router_sum_tx.get(lr, 0.0)
+        sum_rx_local = router_sum_rx.get(lr, 0.0)
+        tx_share = rtx / max(1.0, sum_tx_local)
+        rx_share = rrx / max(1.0, sum_rx_local)
+        pen_tx = clamp(1.0 - ((0.6 + 0.2 * tx_share) * resid_local + (0.4 - 0.2 * tx_share) * resid_remote), 0.5, 1.0)
+        pen_rx = clamp(1.0 - ((0.6 + 0.2 * rx_share) * resid_local + (0.4 - 0.2 * rx_share) * resid_remote), 0.5, 1.0)
+
+        # If repaired status is down, keep zeros and scale confidences by penalties
+        if rst == 'down':
+            result[if_id]['rx_rate'] = (orx, 0.0, clamp(rc * pen_rx))
+            result[if_id]['tx_rate'] = (otx, 0.0, clamp(tc * pen_tx))
+            status_scale = 0.85 + 0.15 * min(pen_tx, pen_rx)
+            result[if_id]['interface_status'] = (ost, rst, clamp(sc * status_scale))
+            continue
+>>>>>>> REPLACE
+</DIFF>

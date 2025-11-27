@@ -1,0 +1,468 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+from collections import defaultdict, deque
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Tournament-guided merge construction + targeted LNS with memoized costs.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of multistart variants (used as an intensity parameter)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+
+    N = workload.num_txns
+    start_time = time.time()
+    # Overall per-workload budget; tuned for combined score (quality+speed)
+    base_budget = 0.62
+    time_budget_sec = base_budget
+
+    def time_left():
+        return (time.time() - start_time) < time_budget_sec
+
+    # Memoized cost oracles
+    cost_cache = {}
+    ext_cache = {}
+
+    def eval_seq_cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is None:
+            c = workload.get_opt_seq_cost(seq)
+            cost_cache[key] = c
+        return c
+
+    def eval_ext_cost(prefix_tuple, cand):
+        key = (prefix_tuple, cand)
+        c = ext_cache.get(key)
+        if c is None:
+            c = eval_seq_cost(list(prefix_tuple) + [cand])
+            ext_cache[key] = c
+        return c
+
+    all_txns = list(range(N))
+
+    # -----------------------------
+    # 1) Sparse pairwise tournament
+    # -----------------------------
+    # For sampled pairs (i, j), compute margin m[i][j] = cost([i,j]) - cost([j,i]).
+    # Negative => prefer i before j. Positive => prefer j before i.
+    margin = defaultdict(dict)
+    wins = defaultdict(int)
+    losses = defaultdict(int)
+    strength = defaultdict(float)  # accumulate advantage magnitude
+
+    # Sampling plan: for each i, sample K others; adapt K to N
+    if N <= 30:
+        sample_per_txn = min(max(12, N - 1), 20)
+    elif N <= 60:
+        sample_per_txn = 16
+    else:
+        sample_per_txn = 14
+
+    # Also sample a small set of strong candidates by singleton cost
+    singleton_cost = {}
+    for t in all_txns:
+        if not time_left():
+            break
+        singleton_cost[t] = eval_seq_cost([t])
+    singles_sorted = sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf')))
+
+    pair_cost_cache = {}
+
+    def pair_ext_cost(a, b):
+        # Cost of [a, b]
+        key = (a, b)
+        c = pair_cost_cache.get(key)
+        if c is not None:
+            return c
+        base = eval_seq_cost([a])  # cached
+        ec = eval_ext_cost((a,), b)
+        pair_cost_cache[key] = ec
+        return ec
+
+    # Build margins under time budget
+    rng = random
+    for i in all_txns:
+        if not time_left():
+            break
+        # Compose candidate pool: mix of top by singleton and random
+        others = [x for x in all_txns if x != i]
+        k_top = min(len(others), max(6, N // 10))
+        top_pool = [t for t in singles_sorted[:k_top] if t != i]
+        extra_need = max(0, sample_per_txn - len(top_pool))
+        rand_pool = rng.sample([x for x in others if x not in top_pool], min(extra_need, len(others) - len(top_pool))) if extra_need > 0 else []
+        cand_pool = top_pool + rand_pool
+        # If still small (e.g., very small N), just use others
+        if len(cand_pool) == 0:
+            cand_pool = others
+
+        for j in cand_pool:
+            if not time_left():
+                break
+            if j in margin[i] or i in margin[j]:
+                continue
+            cij = pair_ext_cost(i, j)
+            cji = pair_ext_cost(j, i)
+            m = cij - cji
+            margin[i][j] = m
+            margin[j][i] = -m
+            if m < 0:
+                wins[i] += 1
+                losses[j] += 1
+                strength[i] += (-m)
+            elif m > 0:
+                wins[j] += 1
+                losses[i] += 1
+                strength[j] += m
+            # ties: no updates
+
+    # Aggregate score for ranking
+    # Combine Copeland (wins - losses) with total margin strength
+    agg_score = {}
+    for t in all_txns:
+        copeland = wins.get(t, 0) - losses.get(t, 0)
+        agg_score[t] = 1.0 * copeland + 0.02 * strength.get(t, 0.0)
+
+    # ----------------------------------------
+    # 2) Merge construction guided by ext cost
+    # ----------------------------------------
+    # Start from an initial ranking and merge small blocks using true costs
+    def merge_two_blocks(left, right):
+        """Merge two sequences by repeatedly choosing head that minimizes extension cost."""
+        out = []
+        i = 0
+        j = 0
+        prefix_tuple = tuple(out)
+        # We must keep updating prefix_tuple as out grows; reuse extension cache heavily
+        while i < len(left) and j < len(right) and time_left():
+            a = left[i]
+            b = right[j]
+            # Evaluate ext cost of appending a vs b
+            # For correctness we need current prefix cost; eval_ext_cost handles it by calling get_opt_seq_cost(prefix+[cand])
+            # Because prefix_tuple changes, recompute it every few steps
+            prefix_tuple = tuple(out)
+            ca = eval_ext_cost(prefix_tuple, a)
+            cb = eval_ext_cost(prefix_tuple, b)
+            if ca <= cb:
+                out.append(a)
+                i += 1
+            else:
+                out.append(b)
+                j += 1
+        # append leftovers
+        if i < len(left):
+            out.extend(left[i:])
+        if j < len(right):
+            out.extend(right[j:])
+        return out
+
+    def merge_blocks(blocks):
+        """Repeatedly merge blocks pairwise until single sequence remains."""
+        cur = [list(b) for b in blocks]
+        while len(cur) > 1 and time_left():
+            nxt = []
+            for k in range(0, len(cur), 2):
+                if k + 1 < len(cur):
+                    merged = merge_two_blocks(cur[k], cur[k + 1])
+                    nxt.append(merged)
+                else:
+                    nxt.append(cur[k])
+            cur = nxt
+        return cur[0] if cur else []
+
+    def build_by_merge(order):
+        # Chunk the order into small blocks (size 7–10) and merge
+        B = min(10, max(7, N // 12)) if N >= 14 else max(3, N // 5)
+        blocks = [order[i:i+B] for i in range(0, len(order), B)]
+        merged = merge_blocks(blocks)
+        # Ensure all transactions appear exactly once; repair if necessary
+        seen = set()
+        repaired = []
+        for t in merged:
+            if t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        return repaired[:N]
+
+    # ----------------------------------------
+    # 3) Local improvement: swaps and LNS RnR
+    # ----------------------------------------
+    def adjacent_swap_pass(seq, current_cost, max_passes=2):
+        best_seq = seq[:]
+        best_cost = current_cost
+        for _ in range(max_passes):
+            improved = False
+            for i in range(len(best_seq) - 1):
+                if not time_left():
+                    break
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_seq_cost(cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand
+                    improved = True
+            if not improved or not time_left():
+                break
+        return best_cost, best_seq
+
+    def limited_two_opt(seq, current_cost, trials=30):
+        best_seq = seq[:]
+        best_cost = current_cost
+        n = len(best_seq)
+        t = trials
+        while t > 0 and time_left():
+            t -= 1
+            i = random.randrange(n)
+            j = random.randrange(n)
+            if abs(i - j) <= 1:
+                continue
+            if i > j:
+                i, j = j, i
+            cand = best_seq[:]
+            cand[i:j+1] = reversed(cand[i:j+1])
+            c = eval_seq_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+        return best_cost, best_seq
+
+    def most_violated_edges(seq, k=3):
+        # Use learned margins to score adjacent violations
+        viols = []
+        for i in range(len(seq) - 1):
+            a = seq[i]
+            b = seq[i + 1]
+            m = margin.get(a, {}).get(b, 0.0)
+            # If m > 0, we prefer b before a; adjacency a->b violates preference
+            viols.append((m, i))
+        viols.sort(key=lambda x: -x[0])
+        return viols[:k]
+
+    def reinsertion_positions(n, center, radius=6, extra=10):
+        pos = set()
+        # positions around center window
+        for d in range(-radius, radius + 1):
+            p = center + d
+            if 0 <= p <= n:
+                pos.add(p)
+        # random extras for diversity
+        while len(pos) < min(n + 1, len(pos) + extra):
+            pos.add(random.randrange(0, n + 1))
+        return list(pos)
+
+    def ruin_and_recreate(seq, current_cost, rounds=2):
+        best_seq = seq[:]
+        best_cost = current_cost
+        n = len(best_seq)
+        for _ in range(rounds):
+            if not time_left():
+                break
+            # pick worst adjacency index
+            viols = most_violated_edges(best_seq, k=1)
+            if not viols or viols[0][0] <= 0:
+                # fallback: random center
+                worst_idx = random.randrange(max(1, n - 1))
+            else:
+                worst_idx = viols[0][1]
+            # choose block around worst
+            block_size = min(6, max(3, n // 30))
+            start = max(0, min(worst_idx - block_size // 2, n - block_size))
+            block = best_seq[start:start + block_size]
+            remaining = best_seq[:start] + best_seq[start + block_size:]
+
+            # Reinsert greedily with limited positions
+            seq_build = remaining[:]
+            for x in block:
+                if not time_left():
+                    break
+                candidates = reinsertion_positions(len(seq_build), start, radius=5, extra=8)
+                local_best_c = float('inf')
+                local_best_p = None
+                for p in candidates:
+                    cand = seq_build[:]
+                    cand.insert(p, x)
+                    c = eval_seq_cost(cand)
+                    if c < local_best_c:
+                        local_best_c = c
+                        local_best_p = p
+                if local_best_p is None:
+                    # fallback to end
+                    seq_build.append(x)
+                else:
+                    seq_build.insert(local_best_p, x)
+            if len(seq_build) == n:
+                c_try = eval_seq_cost(seq_build)
+                if c_try < best_cost:
+                    best_cost = c_try
+                    best_seq = seq_build
+        return best_cost, best_seq
+
+    # ----------------------------------------
+    # 4) Multi-start portfolio
+    # ----------------------------------------
+    # Build several initial orders:
+    #  - by aggregated tournament score
+    #  - reverse (to diversify)
+    #  - singleton-cost sorted
+    #  - random
+    base_rank = sorted(all_txns, key=lambda t: (-agg_score.get(t, 0.0), t))
+    seeds_orders = []
+    if base_rank:
+        seeds_orders.append(base_rank)
+        seeds_orders.append(list(reversed(base_rank)))
+    seeds_orders.append(sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf'))))
+    # Add a couple of random orders
+    if N > 0:
+        rnd = all_txns[:]
+        random.shuffle(rnd)
+        seeds_orders.append(rnd)
+        rnd2 = all_txns[:]
+        random.shuffle(rnd2)
+        seeds_orders.append(rnd2)
+
+    # Limit restarts by num_seqs but ensure coverage
+    max_starts = max(3, min(len(seeds_orders), int(num_seqs) + 2))
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    for r in range(max_starts):
+        if not time_left():
+            break
+        order = seeds_orders[r % len(seeds_orders)]
+        # Merge-based construction
+        seq0 = build_by_merge(order)
+        c0 = eval_seq_cost(seq0)
+
+        # Quick adjacent swap polish
+        c1, s1 = adjacent_swap_pass(seq0, c0, max_passes=1)
+
+        # Ruin-and-recreate around worst edges
+        c2, s2 = ruin_and_recreate(s1, c1, rounds=2)
+
+        # Limited 2-opt
+        c3, s3 = limited_two_opt(s2, c2, trials=28)
+
+        # Final adjacent swap pass
+        c4, s4 = adjacent_swap_pass(s3, c3, max_passes=1)
+
+        if c4 < global_best_cost:
+            global_best_cost, global_best_seq = c4, s4
+
+    # Safety: ensure a valid permutation of all transactions
+    if global_best_seq is None:
+        global_best_seq = list(range(N))
+        random.shuffle(global_best_seq)
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    if len(global_best_seq) != N or len(set(global_best_seq)) != N:
+        seen = set()
+        repaired = []
+        for t in global_best_seq:
+            if 0 <= t < N and t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        global_best_seq = repaired[:N]
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

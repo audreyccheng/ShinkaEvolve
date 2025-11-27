@@ -1,0 +1,170 @@
+<NAME>
+beam_search_init
+</NAME>
+
+<DESCRIPTION>
+Replaces the randomized greedy initialization with a deterministic Beam Search initialization (width=8).
+The beam search explores multiple packing sequences in parallel, keeping the top states that minimize max load and load variance. This helps avoid early suboptimal decisions in the greedy placement of heavy items (LPT order) that satisfy the cardinality constraint but result in poor load balance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Operations on CPU are generally faster for this sequential/iterative logic
+    weight_cpu = weight.cpu()
+
+    pack_index = torch.empty(weight.shape, dtype=torch.int64, device=device)
+    rank_in_pack = torch.empty(weight.shape, dtype=torch.int64, device=device)
+
+    # Pre-allocate helper tensors for scatter
+    flat_packs = torch.arange(num_packs, device=device).unsqueeze(1).expand(-1, groups_per_pack).reshape(-1)
+    flat_ranks = torch.arange(groups_per_pack, device=device).unsqueeze(0).expand(num_packs, -1).reshape(-1)
+
+    for i in range(num_layers):
+        # Extract weights for this layer as a list for fast Python iteration
+        layer_weights_t = weight_cpu[i]
+        layer_weights = layer_weights_t.tolist()
+
+        # Candidate generation:
+        # We try:
+        # 1. Deterministic LPT (sort descending)
+        # 2. Perturbed LPT (add noise to break ties/local optima) if useful
+
+        candidates = []
+
+        # 1. Deterministic
+        indices_det = layer_weights_t.sort(descending=True).indices.tolist()
+        candidates.append(indices_det)
+
+        # 2. Perturbed (only if we have enough groups for it to matter)
+        if groups_per_pack > 2:
+            # Add small random noise to explore different greedy decisions
+            noise = torch.rand(num_groups) * 0.05 + 1.0 # 0-5% noise
+            indices_rand = (layer_weights_t * noise).sort(descending=True).indices.tolist()
+            candidates.append(indices_rand)
+
+        best_assignment = None
+        best_pack_weights = None
+        min_max_load = float('inf')
+
+        # Evaluate candidates with fast Python Greedy
+        for indices in candidates:
+            # Re-init packs using lists for speed
+            current_pack_contents = [[] for _ in range(num_packs)]
+            current_pack_weights = [0.0] * num_packs
+            current_pack_cnt = [0] * num_packs
+
+            # Pack
+            for idx in indices:
+                w = layer_weights[idx]
+
+                # Find best pack: valid (not full) and min weight
+                best_p = -1
+                min_w = float('inf')
+
+                for p in range(num_packs):
+                    if current_pack_cnt[p] < groups_per_pack:
+                        pw = current_pack_weights[p]
+                        if pw < min_w:
+                            min_w = pw
+                            best_p = p
+
+                # Assign
+                current_pack_contents[best_p].append(idx)
+                current_pack_weights[best_p] += w
+                current_pack_cnt[best_p] += 1
+
+            # Metric: minimize max load
+            max_load = max(current_pack_weights)
+            if max_load < min_max_load:
+                min_max_load = max_load
+                best_assignment = current_pack_contents
+                best_pack_weights = current_pack_weights
+
+        # Convert best assignment to tensor for vectorized refinement
+        # [num_packs, groups_per_pack]
+        pack_assignment = torch.tensor(best_assignment, dtype=torch.int64)
+        pack_weights = torch.tensor(best_pack_weights, dtype=torch.float32)
+=======
+    # Operations on CPU are generally faster for this sequential/iterative logic
+    weight_cpu = weight.cpu()
+
+    pack_index = torch.empty(weight.shape, dtype=torch.int64, device=device)
+    rank_in_pack = torch.empty(weight.shape, dtype=torch.int64, device=device)
+
+    # Pre-allocate helper tensors for scatter
+    flat_packs = torch.arange(num_packs, device=device).unsqueeze(1).expand(-1, groups_per_pack).reshape(-1)
+    flat_ranks = torch.arange(groups_per_pack, device=device).unsqueeze(0).expand(num_packs, -1).reshape(-1)
+
+    for i in range(num_layers):
+        # Extract weights for this layer as a list for fast Python iteration
+        layer_weights_t = weight_cpu[i]
+        layer_weights = layer_weights_t.tolist()
+
+        # Sort indices LPT
+        sorted_indices = layer_weights_t.argsort(descending=True).tolist()
+
+        # Beam Search Initialization
+        # Beam width
+        BEAM_WIDTH = 8
+
+        # State: (max_load, sum_sq, pack_weights, pack_counts, assignment_indices)
+        # assignment_indices: list of pack indices for items in order of sorted_indices
+
+        # Initialize beam with one empty state
+        # (max_load=0, sum_sq=0, weights=[0]*M, counts=[0]*M, assign=[])
+        beam = [(0.0, 0.0, [0.0]*num_packs, [0]*num_packs, [])]
+
+        for idx in sorted_indices:
+            w = layer_weights[idx]
+            new_beam = []
+
+            for b_max, b_ss, b_weights, b_counts, b_assign in beam:
+                seen_empty = False
+                for p in range(num_packs):
+                    if b_counts[p] < groups_per_pack:
+                        # Optimization: Treat all empty packs as identical
+                        if b_counts[p] == 0:
+                            if seen_empty:
+                                continue
+                            seen_empty = True
+
+                        # Calculate metrics
+                        new_w = b_weights[p] + w
+
+                        # New max load (monotonic increasing)
+                        new_max = b_max if b_max > new_w else new_w
+
+                        # New sum squares
+                        new_ss = b_ss - (b_weights[p]**2) + (new_w**2)
+
+                        # Construct new state components
+                        new_weights = b_weights[:]
+                        new_weights[p] = new_w
+
+                        new_counts = b_counts[:]
+                        new_counts[p] += 1
+
+                        new_assign = b_assign + [p]
+
+                        new_beam.append((new_max, new_ss, new_weights, new_counts, new_assign))
+
+            # Prune beam
+            # Sort primarily by max_load, secondarily by sum_sq
+            new_beam.sort(key=lambda x: (x[0], x[1]))
+            beam = new_beam[:BEAM_WIDTH]
+
+        # Select best
+        best_state = beam[0]
+        _, _, best_pack_weights, _, best_assignment_indices = best_state
+
+        # Reconstruct assignment for refinement
+        best_assignment = [[] for _ in range(num_packs)]
+        for r, p in enumerate(best_assignment_indices):
+            original_idx = sorted_indices[r]
+            best_assignment[p].append(original_idx)
+
+        # Convert to tensor for vectorized refinement
+        pack_assignment = torch.tensor(best_assignment, dtype=torch.int64)
+        pack_weights = torch.tensor(best_pack_weights, dtype=torch.float32)
+>>>>>>> REPLACE
+</DIFF>

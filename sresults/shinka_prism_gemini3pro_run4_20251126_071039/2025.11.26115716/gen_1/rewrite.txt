@@ -1,0 +1,122 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+    
+    # Pre-process models to extract relevant metrics: weight (req/slo) and size
+    items = []
+    for m in models:
+        items.append({
+            'model': m,
+            'w': m.req_rate / m.slo,
+            's': m.model_size
+        })
+
+    def check_placement(k_target):
+        """
+        Determines if it is possible to place all models such that for every GPU:
+        KVPR <= k_target.
+        
+        Uses First-Fit-Decreasing heuristic with a dynamic sorting key:
+        Sort Key = Weight + k_target * Size
+        
+        This key is derived from the linearized constraint:
+        Sum(Weight) <= k_target * (Capacity - Sum(Size))
+        Sum(Weight) + k_target * Sum(Size) <= k_target * Capacity
+        """
+        # Sort items based on the "cost" at this specific pressure level K
+        # High K (memory bound) -> Size dominates sorting
+        # Low K (load bound) -> Weight dominates sorting
+        sorted_items = sorted(items, key=lambda x: x['w'] + k_target * x['s'], reverse=True)
+        
+        placement = {i: [] for i in range(gpu_num)}
+        gpu_load = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+        
+        for item in sorted_items:
+            placed = False
+            for i in range(gpu_num):
+                # Proposed new state
+                new_s = gpu_load[i]['s'] + item['s']
+                new_w = gpu_load[i]['w'] + item['w']
+                
+                # Check hard memory constraint (with slight tolerance)
+                if new_s > GPU_MEM_SIZE:
+                    continue
+                    
+                # Check KVPR constraint: new_w / (M - new_s) <= k_target
+                # Transform to multiplication to handle denominator approaching zero safely
+                rem_mem = GPU_MEM_SIZE - new_s
+                
+                # If remaining memory is near zero, KVPR blows up unless load is 0
+                if rem_mem <= 1e-9:
+                    # If K is extremely large (initialization), we allow tight packing
+                    if k_target > 1e12:
+                        pass 
+                    elif new_w > 1e-9: 
+                        continue
+                elif new_w > k_target * rem_mem:
+                    continue
+                
+                # Assign to this GPU
+                placement[i].append(item['model'])
+                gpu_load[i]['s'] = new_s
+                gpu_load[i]['w'] = new_w
+                placed = True
+                break
+            
+            if not placed:
+                return None
+                
+        return placement
+
+    # Binary Search for the Minimum Maximum KVPR (K)
+    
+    # 1. Initialization
+    # Try a very loose constraint (High K) to check feasibility and get a baseline.
+    # K=1e9 makes the sort key dominated by Size, effectively "First Fit Decreasing by Size".
+    high = 1e9
+    best_placement = check_placement(high)
+    
+    if best_placement is None:
+        # If we cannot pack even with relaxed constraints, the models physically don't fit.
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+        
+    # Refine 'high' to the actual KVPR of the feasible solution found
+    current_max = 0.0
+    for gpu_p in best_placement.values():
+        w_sum = sum(m.req_rate / m.slo for m in gpu_p)
+        s_sum = sum(m.model_size for m in gpu_p)
+        rem = GPU_MEM_SIZE - s_sum
+        if rem > 1e-9:
+            current_max = max(current_max, w_sum / rem)
+        elif w_sum > 0:
+            current_max = high 
+            
+    high = current_max
+    low = 0.0
+    
+    # 2. Binary Search Loop
+    # 25 iterations gives sufficient precision for this scale
+    for _ in range(25):
+        mid = (low + high) / 2
+        result = check_placement(mid)
+        if result is not None:
+            best_placement = result
+            high = mid
+        else:
+            low = mid
+            
+    return best_placement
+# EVOLVE-BLOCK-END

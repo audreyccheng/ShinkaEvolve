@@ -1,0 +1,247 @@
+<NAME>
+lns_regret_repair_integration
+</NAME>
+
+<DESCRIPTION>
+I add a regret-guided Large Neighborhood Search (LNS) phase that removes a mixed set of transactions (one contiguous block plus scattered items) and repairs the sequence via regret-driven best-two insertion with a small per-repair cache and stratified position sampling. This directly targets conflict hotspots by temporarily freeing problematic transactions and reinserting them where they increase makespan the least, while protecting placements with high regret. I integrate this LNS after the existing local refinements and apply a quick polish. This should yield better schedules with lower makespan by escaping local minima that standard Or-opt and swaps may miss, aligning with known gains from ruin-and-recreate methods on sequencing problems with dependency conflicts.
+
+Key additions:
+- lns_ruin_and_recreate: regret-guided reinsertion with best-two insertions and anchor-based position sampling, using a small cache.
+- Integration in the restart loop after local search, with acceptance on improvement and quick polishing (reinsert + adjacent).
+
+This edit is targeted and maintains the current architecture while adding a powerful improvement step without heavy overhead.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def local_segment_reversals_sampled(seq, curr_cost, tries=80):
+        """
+        Sampled 2-opt-like segment reversals; accept improving reversals and reset on improvement.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        n_local = len(best_seq)
+        if n_local <= 4:
+            return best_cost, best_seq
+        attempts = 0
+        while attempts < tries:
+            i = random.randint(0, n_local - 2)
+            j = random.randint(i + 1, min(n_local - 1, i + 10))  # cap reversal length
+            if j - i < 2:
+                attempts += 1
+                continue
+            cand = best_seq[:]
+            cand[i:j + 1] = reversed(cand[i:j + 1])
+            c = eval_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+                attempts = 0
+            else:
+                attempts += 1
+        return best_cost, best_seq
+=======
+    def local_segment_reversals_sampled(seq, curr_cost, tries=80):
+        """
+        Sampled 2-opt-like segment reversals; accept improving reversals and reset on improvement.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        n_local = len(best_seq)
+        if n_local <= 4:
+            return best_cost, best_seq
+        attempts = 0
+        while attempts < tries:
+            i = random.randint(0, n_local - 2)
+            j = random.randint(i + 1, min(n_local - 1, i + 10))  # cap reversal length
+            if j - i < 2:
+                attempts += 1
+                continue
+            cand = best_seq[:]
+            cand[i:j + 1] = reversed(cand[i:j + 1])
+            c = eval_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+                attempts = 0
+            else:
+                attempts += 1
+        return best_cost, best_seq
+
+    def lns_ruin_and_recreate(seq, curr_cost, rounds=2):
+        """
+        Ruin-and-recreate using regret-guided best-two insertion repair.
+        - Remove a contiguous block plus scattered items (sized ~12% of sequence, capped).
+        - Reinsert removed transactions using best-two insertion and a small per-repair cache.
+        - Accept if improved; repeat for given rounds.
+        Returns (best_cost, best_seq).
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        if len(best_seq) <= 6:
+            return best_cost, best_seq
+
+        for _ in range(max(1, rounds)):
+            L = len(best_seq)
+            # Determine number to remove: 12% of L, within [6, 16], keep at least two elements
+            k_remove = max(6, min(16, int(0.12 * L)))
+            k_remove = min(k_remove, L - 2)
+
+            # Select indices: one contiguous block plus scattered extras
+            remove_idx = set()
+            if L > k_remove:
+                contig_len = max(2, min(k_remove - 2, max(2, L // 15)))
+                start = random.randint(0, L - contig_len)
+                for j in range(start, start + contig_len):
+                    if len(remove_idx) < k_remove:
+                        remove_idx.add(j)
+            while len(remove_idx) < k_remove:
+                remove_idx.add(random.randint(0, L - 1))
+            remove_idx = sorted(remove_idx)
+
+            removed = [best_seq[i] for i in remove_idx]
+            base = [best_seq[i] for i in range(L) if i not in remove_idx]
+
+            # Per-repair cache for best-two insertion evaluations
+            bt_cache = {}
+
+            def sample_positions_repair(m):
+                """Anchor-based position sampling with random interiors; all positions if small."""
+                if m + 1 <= 20:
+                    return list(range(m + 1))
+                anchors = {0, m, m // 2, m // 4, (3 * m) // 4}
+                anchors = {p for p in anchors if 0 <= p <= m}
+                interior = [p for p in range(1, m) if p not in anchors]
+                R = min(10, len(interior))
+                if R > 0:
+                    anchors.update(random.sample(interior, R))
+                return sorted(anchors)
+
+            def best_two_for(seq_partial, t):
+                """Return ((best_cost, best_pos), (second_cost, second_pos)) for inserting t."""
+                key = (tuple(seq_partial), t)
+                v = bt_cache.get(key)
+                if v is not None:
+                    return v
+                positions = sample_positions_repair(len(seq_partial))
+                best = (float('inf'), None)
+                second = (float('inf'), None)
+                for pos in positions:
+                    cand = seq_partial[:]
+                    cand.insert(pos, t)
+                    c = eval_cost(cand)
+                    if c < best[0]:
+                        second = best
+                        best = (c, pos)
+                    elif c < second[0]:
+                        second = (c, pos)
+                bt_cache[key] = (best, second)
+                return best, second
+
+            # Regret-guided reinsertion
+            seq_partial = list(base)
+            remaining = list(removed)
+            random.shuffle(remaining)
+            while remaining:
+                # Evaluate a small candidate subset, or all if small remaining
+                k_t = len(remaining) if len(remaining) <= 8 else 8
+                cand_txns = random.sample(remaining, k_t)
+                scored = []
+                for t in cand_txns:
+                    (c1, p1), (c2, p2) = best_two_for(seq_partial, t)
+                    regret = (c2 - c1) if c2 < float('inf') else 0.0
+                    scored.append((c1, regret, t, p1))
+                # Build RCL pool by cost and regret
+                scored.sort(key=lambda x: x[0])
+                rcl_cost = scored[:min(3, len(scored))]
+                scored.sort(key=lambda x: (-x[1], x[0]))
+                rcl_regret = scored[:min(2, len(scored))]
+                pool = list({(c, r, t, p) for (c, r, t, p) in (rcl_cost + rcl_regret)})
+
+                # Choose: 60% lowest best-cost, else highest regret
+                if random.random() < 0.6:
+                    pool.sort(key=lambda x: x[0])
+                    chosen_c, chosen_r, chosen_t, chosen_p = pool[0]
+                else:
+                    pool.sort(key=lambda x: (-x[1], x[0]))
+                    chosen_c, chosen_r, chosen_t, chosen_p = pool[0]
+
+                seq_partial.insert(chosen_p, chosen_t)
+                remaining.remove(chosen_t)
+
+            c_new = eval_cost(seq_partial)
+            if c_new < best_cost:
+                best_cost = c_new
+                best_seq = seq_partial
+
+        return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for r in range(restarts):
+        random.seed((n * 131 + num_seqs * 17 + r * 911 + random.randint(0, 1_000_000)) % (2**32 - 1))
+
+        c, seq = beam_search(beam_width=beam_width, cand_per_state=cand_per_state, lookahead_k=5, alpha=0.7)
+
+        # Strong local refinements: reinsertion -> adjacent swaps -> sampled pair swaps -> segment reversals
+        c1, s1 = local_reinsert_refine(seq, max_passes=2, pos_sample_limit=25)
+        c2, s2 = local_adjacent_refine(s1, max_passes=2)
+        c3, s3 = local_pair_swaps_sampled(s2, c2, tries=max(60, n // 2))
+        c4, s4 = local_segment_reversals_sampled(s3, c3, tries=max(50, n // 2))
+        # Quick polish
+        c5, s5 = local_reinsert_refine(s4, max_passes=1, pos_sample_limit=20)
+        c6, s6 = local_adjacent_refine(s5, max_passes=1)
+
+        # Adopt best among refined variants
+        best_local_cost = c
+        best_local_seq = seq
+        for cand_cost, cand_seq in [(c1, s1), (c2, s2), (c3, s3), (c4, s4), (c5, s5), (c6, s6)]:
+            if cand_cost < best_local_cost:
+                best_local_cost, best_local_seq = cand_cost, cand_seq
+        c, seq = best_local_cost, best_local_seq
+
+        if c < best_overall_cost:
+            best_overall_cost, best_overall_seq = c, seq
+=======
+    for r in range(restarts):
+        random.seed((n * 131 + num_seqs * 17 + r * 911 + random.randint(0, 1_000_000)) % (2**32 - 1))
+
+        c, seq = beam_search(beam_width=beam_width, cand_per_state=cand_per_state, lookahead_k=5, alpha=0.7)
+
+        # Strong local refinements: reinsertion -> adjacent swaps -> sampled pair swaps -> segment reversals
+        c1, s1 = local_reinsert_refine(seq, max_passes=2, pos_sample_limit=25)
+        c2, s2 = local_adjacent_refine(s1, max_passes=2)
+        c3, s3 = local_pair_swaps_sampled(s2, c2, tries=max(60, n // 2))
+        c4, s4 = local_segment_reversals_sampled(s3, c3, tries=max(50, n // 2))
+        # Quick polish
+        c5, s5 = local_reinsert_refine(s4, max_passes=1, pos_sample_limit=20)
+        c6, s6 = local_adjacent_refine(s5, max_passes=1)
+
+        # Adopt best among refined variants
+        best_local_cost = c
+        best_local_seq = seq
+        for cand_cost, cand_seq in [(c1, s1), (c2, s2), (c3, s3), (c4, s4), (c5, s5), (c6, s6)]:
+            if cand_cost < best_local_cost:
+                best_local_cost, best_local_seq = cand_cost, cand_seq
+
+        # Regret-guided LNS to escape local minima, then quick polish
+        lns_rounds = 3 if n <= 60 else 2
+        c_lns, s_lns = lns_ruin_and_recreate(best_local_seq, best_local_cost, rounds=lns_rounds)
+        if c_lns < best_local_cost:
+            # Quick polish after reconstruction
+            c_pol1, s_pol1 = local_reinsert_refine(s_lns, max_passes=1, pos_sample_limit=20)
+            c_pol2, s_pol2 = local_adjacent_refine(s_pol1, max_passes=1)
+            # Choose best among reconstructed and polished
+            c, seq = c_lns, s_lns
+            for cand_cost, cand_seq in [(c_pol1, s_pol1), (c_pol2, s_pol2)]:
+                if cand_cost < c:
+                    c, seq = cand_cost, cand_seq
+        else:
+            c, seq = best_local_cost, best_local_seq
+
+        if c < best_overall_cost:
+            best_overall_cost, best_overall_seq = c, seq
+>>>>>>> REPLACE
+</DIFF>

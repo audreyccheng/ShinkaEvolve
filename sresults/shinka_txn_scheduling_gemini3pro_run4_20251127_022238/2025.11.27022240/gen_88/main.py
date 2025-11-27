@@ -1,0 +1,365 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import re
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Scheduler using Decaying-Alpha Greedy construction and Multi-Scale LAHC refinement.
+    
+    Key Improvements:
+    1.  **Decaying Alpha Heuristic**: During greedy construction, the weight of transaction length 
+        starts high (packing "Big Rocks") and decays linearly. This ensures large items are placed 
+        when the schedule is empty, while smaller items fill gaps later.
+    2.  **Stochastic Parameters**: Greedy parameters (alpha start, decay rate, pool threshold) 
+        are randomized per candidate to explore different structural packings.
+    3.  **Multi-Scale Mutation**: Explicit separation of 'Micro' (local adjustment) and 'Macro' 
+        (structural move) block shifts to navigate the search space effectively.
+    4.  **Cooling & Kicking**: The LAHC process includes a final strict hill-climbing phase 
+        (cooling) and a stagnation breaking mechanism (kick) to escape local optima.
+    """
+
+    # --- Pre-computation ---
+    txn_lens = {}
+    try:
+        for i in range(workload.num_txns):
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            ops = len(re.findall(r'[rw]-\d+', txn_str))
+            txn_lens[i] = ops
+    except Exception:
+        for i in range(workload.num_txns):
+            txn_lens[i] = 1
+
+    # --- Advanced LAHC Engine ---
+    def run_lahc(start_seq, start_cost, iterations, history_len=50, enable_kick=False):
+        curr_s = list(start_seq)
+        curr_c = start_cost
+        best_s = list(start_seq)
+        best_c = start_cost
+
+        history = [curr_c] * history_len
+        last_imp_iter = 0
+
+        # Constants for mutation probabilities
+        PROB_SAMPLED = 0.04
+        PROB_MICRO = 0.30  # Frequent small adjustments
+        PROB_MACRO = 0.06  # Rare large structural moves
+        PROB_SHIFT = 0.45  # Standard shifts
+        # Remaining ~15% is Swap
+
+        for i in range(iterations):
+            # 1. Cooling Phase: Last 20% is strict Hill Climbing
+            is_cooling = i > (iterations * 0.8)
+
+            # 2. Stagnation Kick
+            # Trigger if no improvement for significant time, but not during cooling
+            if enable_kick and not is_cooling and (i - last_imp_iter > 500):
+                slen = len(curr_s)
+                if slen > 15:
+                    # Shuffle a medium-sized segment to break deadlock
+                    seg_len = random.randint(8, 15)
+                    idx = random.randint(0, slen - seg_len)
+                    segment = curr_s[idx:idx+seg_len]
+                    random.shuffle(segment)
+                    curr_s[idx:idx+seg_len] = segment
+                    
+                    # Recalculate cost and reset history
+                    curr_c = workload.get_opt_seq_cost(curr_s)
+                    history = [curr_c] * history_len
+                    last_imp_iter = i
+                    continue
+
+            # 3. Mutation Selection
+            op = random.random()
+            neigh_s = list(curr_s)
+            neigh_c = -1
+            slen = len(neigh_s)
+
+            if op < PROB_SAMPLED:
+                # Sampled Best-Fit Insert (Expensive but effective)
+                if slen < 5: continue
+                idx = random.randint(0, slen-1)
+                item = neigh_s.pop(idx)
+                
+                best_local_c = float('inf')
+                best_local_s = None
+                
+                # Try 3 random positions
+                targets = [random.randint(0, len(neigh_s)) for _ in range(3)]
+                
+                for t_idx in targets:
+                    tmp = list(neigh_s)
+                    tmp.insert(t_idx, item)
+                    c = workload.get_opt_seq_cost(tmp)
+                    if c < best_local_c:
+                        best_local_c = c
+                        best_local_s = tmp
+                
+                neigh_s = best_local_s
+                neigh_c = best_local_c
+
+            elif op < PROB_SAMPLED + PROB_MICRO:
+                # Micro-Block Shift (Size 2-4)
+                if slen < 6: continue
+                bsize = random.randint(2, 4)
+                f = random.randint(0, slen - bsize)
+                block = neigh_s[f : f+bsize]
+                del neigh_s[f : f+bsize]
+                t = random.randint(0, len(neigh_s))
+                neigh_s[t:t] = block
+
+            elif op < PROB_SAMPLED + PROB_MICRO + PROB_MACRO:
+                # Macro-Block Shift (Size 6-12)
+                if slen < 15: continue
+                bsize = random.randint(6, 12)
+                f = random.randint(0, slen - bsize)
+                block = neigh_s[f : f+bsize]
+                del neigh_s[f : f+bsize]
+                t = random.randint(0, len(neigh_s))
+                neigh_s[t:t] = block
+
+            elif op < PROB_SAMPLED + PROB_MICRO + PROB_MACRO + PROB_SHIFT:
+                # Single Shift
+                if slen < 2: continue
+                f = random.randint(0, slen-1)
+                t = random.randint(0, slen-1)
+                if f != t:
+                    item = neigh_s.pop(f)
+                    neigh_s.insert(t, item)
+            
+            else:
+                # Swap
+                if slen < 2: continue
+                idx = random.randint(0, slen - 2)
+                neigh_s[idx], neigh_s[idx+1] = neigh_s[idx+1], neigh_s[idx]
+
+            # Calculate cost if not done by Sampled Best-Fit
+            if neigh_c == -1:
+                neigh_c = workload.get_opt_seq_cost(neigh_s)
+
+            # 4. Acceptance Logic
+            accept = False
+            if is_cooling:
+                # Strict Hill Climbing
+                if neigh_c < curr_c:
+                    accept = True
+            else:
+                # Late Acceptance
+                h_idx = i % history_len
+                if neigh_c <= curr_c or neigh_c <= history[h_idx]:
+                    accept = True
+            
+            if accept:
+                curr_s = neigh_s
+                curr_c = neigh_c
+                if curr_c < best_c:
+                    best_c = curr_c
+                    best_s = list(curr_s)
+                    last_imp_iter = i
+            
+            if not is_cooling:
+                history[i % history_len] = curr_c
+
+        return best_c, best_s
+
+    # Configuration
+    candidates = []
+    
+    # --- Phase 1: Diverse Decaying-Greedy Construction ---
+    # We generate candidates with varying strategies for "Big Rock" placement
+    for i in range(num_seqs):
+        # Parameters
+        # Alpha: How much we reward transaction length. 
+        # Decay: How fast that reward drops off.
+        # Threshold: What defines a "Big Rock" (relative to max remaining).
+        
+        if i == 0:
+            # Baseline: Conservative values
+            start_alpha = 0.4
+            decay_rate = 0.8
+            threshold_ratio = 0.9
+        else:
+            # Random exploration
+            start_alpha = random.uniform(0.3, 0.7)
+            decay_rate = random.uniform(0.7, 1.0)
+            threshold_ratio = random.uniform(0.85, 0.98)
+
+        remaining = set(range(workload.num_txns))
+        total_txns = workload.num_txns
+        
+        # Start with a random transaction to seed diversity
+        start_txn = random.choice(list(remaining))
+        curr_seq = [start_txn]
+        remaining.remove(start_txn)
+        
+        # Sample Size for pool
+        POOL_SIZE = 12
+
+        while remaining:
+            # Calculate current alpha based on progress
+            progress = len(curr_seq) / total_txns
+            eff_alpha = start_alpha * (1.0 - (decay_rate * progress))
+            
+            # Identify Big Rocks
+            rem_lens = [txn_lens[t] for t in remaining]
+            max_len = max(rem_lens) if rem_lens else 0
+            limit = max_len * threshold_ratio
+            
+            big_rocks = [t for t in remaining if txn_lens[t] >= limit]
+            
+            # Form Pool: Big Rocks + Random Fill
+            pool = list(big_rocks)
+            needed = POOL_SIZE - len(pool)
+            if needed > 0:
+                others = [t for t in remaining if t not in big_rocks]
+                if len(others) <= needed:
+                    pool.extend(others)
+                else:
+                    pool.extend(random.sample(others, needed))
+            
+            pool = list(set(pool))
+            
+            # Select Best
+            best_cand = -1
+            best_score = float('inf')
+            
+            for t in pool:
+                c = workload.get_opt_seq_cost(curr_seq + [t])
+                # Objective: Minimize Cost, Maximize Length (weighted)
+                score = c - (eff_alpha * txn_lens[t])
+                if score < best_score:
+                    best_score = score
+                    best_cand = t
+            
+            curr_seq.append(best_cand)
+            remaining.remove(best_cand)
+        
+        # Warmup: Short LAHC to settle local arrangements
+        base_cost = workload.get_opt_seq_cost(curr_seq)
+        warmup_cost, warmup_seq = run_lahc(curr_seq, base_cost, 150, history_len=20)
+        candidates.append((warmup_cost, warmup_seq))
+
+    # --- Phase 2: Sprint (Selection & Initial Refinement) ---
+    candidates.sort(key=lambda x: x[0])
+    
+    # Select top 3 distinct schedules
+    unique_candidates = []
+    seen_costs = set()
+    for c, s in candidates:
+        if c not in seen_costs:
+            unique_candidates.append((c, list(s)))
+            seen_costs.add(c)
+        if len(unique_candidates) >= 3:
+            break
+            
+    if not unique_candidates:
+        unique_candidates = [candidates[0]]
+        
+    sprint_results = []
+    SPRINT_ITERS = 400
+    
+    for c, s in unique_candidates:
+        res = run_lahc(s, c, SPRINT_ITERS, history_len=30)
+        sprint_results.append(res)
+        
+    # --- Phase 3: Marathon (Deep Refinement) ---
+    sprint_results.sort(key=lambda x: x[0])
+    champion_cost, champion_seq = sprint_results[0]
+    
+    MARATHON_ITERS = 3500
+    # Enable kicks and a larger history buffer for the long run
+    final_cost, final_seq = run_lahc(champion_seq, champion_cost, MARATHON_ITERS, history_len=150, enable_kick=True)
+
+    return final_cost, final_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    # NUM_SEQS = 10 provides a good balance between exploration (multiple starts)
+    # and exploitation (Simulated Annealing on the best candidate).
+    NUM_SEQS = 10
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, NUM_SEQS)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, NUM_SEQS)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, NUM_SEQS)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

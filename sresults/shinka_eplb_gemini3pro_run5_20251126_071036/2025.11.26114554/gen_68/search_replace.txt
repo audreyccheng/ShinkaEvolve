@@ -1,0 +1,205 @@
+<NAME>
+refine_l2_allpairs
+</NAME>
+
+<DESCRIPTION>
+1. Replace the local greedy max-load refinement with an all-pairs L2-norm (variance) minimization refinement. This allows the algorithm to reduce the overall load imbalance even when a direct swap from the max pack isn't immediately available or beneficial, helping to escape local optima.
+2. Increase the number of attempts in `balanced_packing` from 5 to 10 to better utilize the iterative re-weighting mechanism, leveraging the high speed of the algorithm to find better solutions.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 20) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refines packing by swapping items from the heaviest pack to any other pack
+    to minimize the max load. Vectorized over the batch dimension (num_layers).
+    """
+    num_layers = weights.shape[0]
+    batch_idx = torch.arange(num_layers, device=weights.device)
+
+    for _ in range(max_iters):
+        # 1. Identify the max load pack
+        max_load, max_pid = torch.max(pack_weights, dim=1)
+
+        # 2. Gather weights
+        # Items in max pack: [L, G]
+        max_pack_items = pack_indices[batch_idx, max_pid]
+        w_max_items = weights.gather(1, max_pack_items)
+
+        # Items in all packs: [L, M, G]
+        w_all_items = weights.gather(1, pack_indices.view(num_layers, -1)).view(num_layers, num_packs, groups_per_pack)
+
+        # 3. Calculate Deltas: w_u (from max) - w_v (from other)
+        # target shape: [L, M, G_other, G_max]
+        deltas = w_max_items.view(num_layers, 1, 1, groups_per_pack) - w_all_items.view(num_layers, num_packs, groups_per_pack, 1)
+
+        # 4. Prospective loads
+        # New Max = Max - delta, New Other = Other + delta
+        cur_max = max_load.view(num_layers, 1, 1, 1)
+        cur_other = pack_weights.view(num_layers, num_packs, 1, 1)
+
+        new_max_load = cur_max - deltas
+        new_other_load = cur_other + deltas
+
+        # Objective: minimize max(new_max, new_other)
+        metrics = torch.max(new_max_load, new_other_load)
+
+        # Mask self-swaps (pack k == max_pid)
+        mask = (torch.arange(num_packs, device=weights.device).unsqueeze(0) == max_pid.unsqueeze(1))
+        mask = mask.view(num_layers, num_packs, 1, 1)
+        metrics.masked_fill_(mask, float('inf'))
+
+        # 5. Best swap
+        flat_metrics = metrics.view(num_layers, -1)
+        best_metric, best_idx = torch.min(flat_metrics, dim=1)
+
+        # 6. Check for improvement
+        improve_mask = best_metric < (max_load - 1e-5)
+        if not improve_mask.any():
+            break
+
+        active_indices = batch_idx[improve_mask]
+        if len(active_indices) == 0:
+            break
+
+        # 7. Execute swap for active layers
+        idx_flat = best_idx[improve_mask]
+        G = groups_per_pack
+        G2 = G * G
+
+        p_other = idx_flat // G2
+        rem = idx_flat % G2
+        g_other = rem // G
+        g_max = rem % G
+
+        p_max_active = max_pid[active_indices]
+
+        item_max = pack_indices[active_indices, p_max_active, g_max]
+        item_other = pack_indices[active_indices, p_other, g_other]
+
+        pack_indices[active_indices, p_max_active, g_max] = item_other
+        pack_indices[active_indices, p_other, g_other] = item_max
+
+        w_max_val = weights[active_indices, item_max]
+        w_other_val = weights[active_indices, item_other]
+        d_val = w_max_val - w_other_val
+
+        pack_weights[active_indices, p_max_active] -= d_val
+        pack_weights[active_indices, p_other] += d_val
+
+    return pack_indices, pack_weights
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_attempts: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using Vectorized Iterated Greedy.
+    Combines Greedy LPT with iterative re-weighting and local search refinement.
+    """
+    num_layers, num_groups = weight.shape
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 50) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refines packing by swapping items between any two packs to minimize the L2 norm
+    (variance) of the pack loads. Vectorized over the batch dimension (num_layers).
+    """
+    num_layers = weights.shape[0]
+    batch_idx = torch.arange(num_layers, device=weights.device)
+
+    # Pre-compute mask for diagonal (self-swaps)
+    # [1, M, M, 1, 1]
+    diag_mask = torch.eye(num_packs, device=weights.device).view(
+        1, num_packs, num_packs, 1, 1).bool()
+
+    for _ in range(max_iters):
+        # 1. Gather item weights currently in packs
+        # w_items: [L, M, G]
+        w_items = weights.gather(
+            1, pack_indices.view(num_layers, -1)).view(num_layers, num_packs,
+                                                       groups_per_pack)
+
+        # 2. Prepare tensors for broadcasting
+        # W: [L, M, 1, 1, 1]
+        W = pack_weights.view(num_layers, num_packs, 1, 1, 1)
+        # w_u: [L, M, 1, G, 1] (Item i in Pack u)
+        w_u = w_items.view(num_layers, num_packs, 1, groups_per_pack, 1)
+        # w_v: [L, 1, M, 1, G] (Item j in Pack v)
+        w_v = w_items.view(num_layers, 1, num_packs, 1, groups_per_pack)
+
+        # 3. Compute Delta and L2 Change
+        # delta = w_u - w_v. Weight moved from u to v.
+        # [L, M, M, G, G]
+        delta = w_u - w_v
+
+        # W_v - W_u. [L, M, M, 1, 1]
+        W_diff = W.permute(0, 2, 1, 3, 4) - W
+
+        # Change in L2 = 2 * delta * (W_v - W_u + delta)
+        change = 2 * delta * (W_diff + delta)
+
+        # Mask invalid swaps (self-swaps)
+        change.masked_fill_(diag_mask, float('inf'))
+
+        # 4. Find best swap per layer
+        flat_change = change.view(num_layers, -1)
+        min_change, flat_idx = torch.min(flat_change, dim=1)
+
+        # 5. Check convergence
+        active_mask = min_change < -1e-5
+        if not active_mask.any():
+            break
+
+        active_indices = batch_idx[active_mask]
+
+        # 6. Execute Swaps
+        best_idx = flat_idx[active_mask]
+
+        G = groups_per_pack
+        G2 = G * G
+        MG2 = num_packs * G2
+
+        # idx = u * (M*G*G) + v * (G*G) + i * G + j
+        u = best_idx // MG2
+        rem = best_idx % MG2
+        v = rem // G2
+        rem = rem % G2
+        i = rem // G
+        j = rem % G
+
+        # Swap indices
+        val_u = pack_indices[active_indices, u, i]
+        val_v = pack_indices[active_indices, v, j]
+
+        pack_indices[active_indices, u, i] = val_v
+        pack_indices[active_indices, v, j] = val_u
+
+        # Update Weights
+        d_val = delta[active_mask, u, v, i, j]
+        pack_weights[active_indices, u] -= d_val
+        pack_weights[active_indices, v] += d_val
+
+    return pack_indices, pack_weights
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_attempts: int = 10) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using Vectorized Iterated Greedy.
+    Combines Greedy LPT with iterative re-weighting and all-pairs L2 refinement.
+    """
+    num_layers, num_groups = weight.shape
+>>>>>>> REPLACE
+
+</DIFF>

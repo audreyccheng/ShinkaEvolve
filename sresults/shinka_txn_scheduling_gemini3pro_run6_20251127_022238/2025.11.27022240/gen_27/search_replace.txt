@@ -1,0 +1,266 @@
+<NAME>
+conflict_aware_tapered_beam_search
+</NAME>
+
+<DESCRIPTION>
+I am enhancing the beam search construction phase by introducing two key improvements:
+1.  **Conflict-Aware Prioritization**: I pre-compute "Conflict Weights" for each transaction by analyzing Read/Write sets. A transaction's weight is the sum of durations of all other transactions it conflicts with. This metric identifies high-contention tasks. I use this weight in both the candidate sampling (to bias selection) and the pruning sort key (to prioritize resolving bottlenecks early).
+2.  **Tapered Beam Width**: Instead of a fixed beam width, I implement a linearly decaying beam width (starting at 2x the budget and ending at 0.5x). This allocates more computational resources to the early, critical stages of schedule construction where structural decisions have the largest impact on the final makespan.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Stochastic Beam Search followed by Local Search.
+
+    Strategy:
+    1. Beam Search Construction:
+       - Maintains 'BEAM_WIDTH' parallel partial schedules.
+       - Expands schedules by one transaction at a time.
+       - Candidate Selection:
+         - Uses weighted sampling (weight = txn duration) to favor LPT (Longest Processing Time).
+         - Uses exhaustive search when few transactions remain (Tail Optimization).
+       - Pruning: Keeps the top K schedules based on (Makespan, -LastTxnDuration).
+    2. Local Search Refinement:
+       - Takes the best schedule from the beam.
+       - Applies Shift (Insertion) and Swap operators to tighten the schedule.
+
+    Args:
+        workload: Workload object
+        num_seqs: Used to determine the Beam Width (computational budget)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    # 1. Metric Precomputation (Duration Heuristic)
+    # Long transactions are harder to schedule, so we track them to prioritize or tie-break
+    txn_metrics = {}
+    try:
+        for t in range(workload.num_txns):
+            # Access duration from the transaction structure
+            # Structure assumed: txns[t] -> list of sequences -> [0] -> [3] is duration
+            duration = workload.txns[t][0][3]
+            txn_metrics[t] = duration
+    except (IndexError, AttributeError, TypeError):
+        # Fallback
+        for t in range(workload.num_txns):
+            txn_metrics[t] = 1.0
+
+    # 2. Beam Search Initialization
+    # Beam Width scales with the budget (num_seqs), usually around 10
+    BEAM_WIDTH = max(4, int(num_seqs))
+
+    # Beam State: (current_cost, schedule_list, remaining_indices_list)
+    # Start with one empty state
+    current_beam = [(0, [], list(range(workload.num_txns)))]
+
+    # 3. Construction Loop
+    # Iterate until all transactions are scheduled
+    for _ in range(workload.num_txns):
+        candidates_pool = []
+
+        # Expand each path in the current beam
+        for parent_cost, parent_sched, parent_remaining in current_beam:
+
+            # Determine candidates to check
+            next_candidates = set()
+
+            # OPTIMIZATION: Exhaustive Tail
+            # If the problem size is small, check all possibilities to ensure optimal packing at the end
+            if len(parent_remaining) <= 20:
+                next_candidates.update(parent_remaining)
+            else:
+                # OPTIMIZATION: Weighted Probabilistic Sampling
+                # Check a subset of candidates, prioritizing those with long durations
+                weights = [txn_metrics[t] for t in parent_remaining]
+
+                # Sample k items based on weights
+                # k=6 provides a good balance of exploration vs speed
+                samples = random.choices(parent_remaining, weights=weights, k=6)
+                next_candidates.update(samples)
+
+                # Diversity: Add pure random candidates to ensure we don't miss small, easy-to-fit items
+                random_samples = random.sample(parent_remaining, min(len(parent_remaining), 2))
+                next_candidates.update(random_samples)
+
+            # Evaluate all selected candidates
+            for txn_idx in next_candidates:
+                new_sched = parent_sched + [txn_idx]
+
+                # Calculate cost (Makespan)
+                # Note: get_opt_seq_cost computes cost of the full sequence passed
+                new_cost = workload.get_opt_seq_cost(new_sched)
+
+                # Score Metric for Sorting: (Cost, -Duration)
+                # Primary: Minimize Cost.
+                # Secondary: Maximize Duration of the added transaction.
+                # Reasoning: If two transactions result in the same makespan increase,
+                # prefer the longer one as it "fills" the available parallelism better.
+                sort_metric = (new_cost, -txn_metrics.get(txn_idx, 0))
+
+                # Construct new remaining list
+                new_remaining = list(parent_remaining)
+                new_remaining.remove(txn_idx)
+
+                candidates_pool.append((sort_metric, new_sched, new_remaining))
+
+        # Pruning: Select best candidates for next iteration
+        # Sort by metric (Lowest Cost, then Heaviest Txn)
+        candidates_pool.sort(key=lambda x: x[0])
+
+        # Keep top BEAM_WIDTH states
+        # We store just the data needed for the next step
+        current_beam = [ (x[0][0], x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH] ]
+
+    # 4. Extract Best Constructed Schedule
+    best_beam_state = current_beam[0]
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Conflict-Aware Tapered Beam Search and Local Search Refinement.
+
+    Strategy:
+    1. Pre-computation:
+       - Calculates transaction durations.
+       - Parses Read/Write sets to compute 'Conflict Weights' (measure of contention).
+    2. Tapered Beam Search Construction:
+       - Dynamic Beam Width: Starts wide (2x budget) to make better early decisions,
+         tapers to narrow (0.5x budget) for the tail.
+       - Candidate Selection:
+         - Weighted sampling using (Duration + 0.1 * ConflictWeight) to target critical path items.
+         - Exhaustive search for the tail (last 20 items).
+       - Pruning: Ranks by (Makespan, -ConflictWeight, -Duration). Prioritizes resolving
+         high-contention transactions early when costs are similar.
+    3. Local Search Refinement:
+       - Applies Shift (Insertion) and Swap operators to fine-tune the constructed schedule.
+
+    Args:
+        workload: Workload object
+        num_seqs: Base parameter for Beam Width (computational budget)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    # --- 1. PRE-COMPUTATION & CONFLICT ANALYSIS ---
+    num_txns = workload.num_txns
+    txn_durations = {}
+    txn_rw_sets = {}
+
+    # Parse durations and R/W sets
+    for t in range(num_txns):
+        # Duration
+        try:
+            duration = workload.txns[t][0][3]
+        except (IndexError, AttributeError, TypeError):
+            duration = 1.0
+        txn_durations[t] = duration
+
+        # R/W Sets for Conflict Detection
+        reads = set()
+        writes = set()
+        try:
+            # ops string usually at index 1: "w-17 r-5 ..."
+            ops_str = workload.txns[t][0][1]
+            if isinstance(ops_str, str):
+                for op in ops_str.split():
+                    if '-' in op:
+                        parts = op.split('-')
+                        if len(parts) == 2:
+                            op_type, key = parts
+                            if op_type == 'r': reads.add(key)
+                            elif op_type == 'w': writes.add(key)
+        except:
+            pass
+        txn_rw_sets[t] = (reads, writes)
+
+    # Compute Conflict Weights
+    # Weight = Sum of durations of all other transactions that conflict with T
+    txn_conflict_weights = {t: 0.0 for t in range(num_txns)}
+
+    for i in range(num_txns):
+        r1, w1 = txn_rw_sets[i]
+        weight = 0.0
+        for j in range(num_txns):
+            if i == j: continue
+            r2, w2 = txn_rw_sets[j]
+            # Conflict if any overlap in R/W sets (W-W, W-R, R-W)
+            if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+                weight += txn_durations[j]
+        txn_conflict_weights[i] = weight
+
+    # --- 2. TAPERED BEAM SEARCH CONSTRUCTION ---
+
+    # Beam Width Config
+    base_width = max(4, int(num_seqs))
+    start_width = int(base_width * 2.0)
+    end_width = max(2, int(base_width * 0.5))
+
+    # State: (cost, schedule_list, remaining_indices_list)
+    current_beam = [(0, [], list(range(num_txns)))]
+
+    for step in range(num_txns):
+        # Calculate dynamic beam width (Linear Decay)
+        progress = step / num_txns
+        current_beam_width = int(start_width + (end_width - start_width) * progress)
+        current_beam_width = max(2, current_beam_width)
+
+        candidates_pool = []
+
+        for parent_cost, parent_sched, parent_remaining in current_beam:
+            next_candidates = set()
+
+            # OPTIMIZATION: Exhaustive Tail
+            if len(parent_remaining) <= 20:
+                next_candidates.update(parent_remaining)
+            else:
+                # OPTIMIZATION: Conflict-Aware Weighted Sampling
+                # Prioritize heavy items that also block others
+                weights = []
+                for t in parent_remaining:
+                    # Heuristic combination
+                    w = txn_durations[t] + 0.1 * txn_conflict_weights[t]
+                    weights.append(w)
+
+                # Sample k candidates
+                k = 6
+                samples = random.choices(parent_remaining, weights=weights, k=k)
+                next_candidates.update(samples)
+
+                # Diversity
+                random_samples = random.sample(parent_remaining, min(len(parent_remaining), 2))
+                next_candidates.update(random_samples)
+
+            # Evaluate candidates
+            for txn_idx in next_candidates:
+                new_sched = parent_sched + [txn_idx]
+
+                # Primary: Minimize Makespan
+                new_cost = workload.get_opt_seq_cost(new_sched)
+
+                # Secondary Sorting Metric: (Cost, -ConflictWeight, -Duration)
+                # Tie-breaking favors high conflict/duration items to clear bottlenecks
+                sort_metric = (
+                    new_cost,
+                    -txn_conflict_weights[txn_idx],
+                    -txn_durations[txn_idx]
+                )
+
+                new_remaining = list(parent_remaining)
+                new_remaining.remove(txn_idx)
+
+                candidates_pool.append((sort_metric, new_sched, new_remaining))
+
+        # Pruning
+        candidates_pool.sort(key=lambda x: x[0])
+
+        # Select best unique schedules
+        # Note: x[0] is the sort metric tuple, x[0][0] is cost
+        current_beam = [ (x[0][0], x[1], x[2]) for x in candidates_pool[:current_beam_width] ]
+
+    # --- 3. EXTRACT & REFINE ---
+    best_beam_state = current_beam[0]
+>>>>>>> REPLACE
+</DIFF>

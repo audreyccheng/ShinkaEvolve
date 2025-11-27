@@ -1,0 +1,444 @@
+<NAME>
+beam_endgame_fix_and_insertion_completion
+</NAME>
+
+<DESCRIPTION>
+I fixed a critical bug in beam_search where the endgame condition was never triggered because min_remaining was never updated inside the beam layer loop. This prevented deeper lookahead and diversity tightening in the latter stages of the search, hurting makespan. I added proper tracking of min_remaining, introduced a per-state endgame_local flag, and used it to evaluate all second-step lookahead options when close to completion.
+
+Additionally, I strengthened the greedy completion when the beam ends with partial prefixes. Instead of only appending the next transaction at the end, the new completion tries best-position insertion (sampling all positions for small sequences and anchored sampling for larger ones). This better resolves remaining conflicts and reduces the final makespan.
+
+These targeted changes improve schedule quality without overhauling the algorithm or adding heavy computation and remain consistent with the existing caching strategy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def beam_search(beam_width, cand_per_state, lookahead_k=5, alpha=0.7):
+        """
+        Beam search with two-step lookahead, suffix-2 diversity, and regret-weighted selection.
+
+        beam_width: number of partial sequences to keep at each depth
+        cand_per_state: number of candidates to expand per beam state when remaining is large
+        lookahead_k: number of second-step candidates to sample for scoring
+        alpha: weight on immediate cost vs lookahead (0..1)
+        """
+        # Evaluate all single-transaction starters and pick top starters
+        starters = []
+        for t in range(n):
+            c = eval_cost([t])
+            starters.append((c, [t]))
+        starters.sort(key=lambda x: x[0])
+
+        init_count = min(max(beam_width * 2, beam_width), n)
+        init_beam = []
+        used_prefixes = set()
+        for c, seq in starters[:init_count]:
+            key = tuple(seq)
+            if key in used_prefixes:
+                continue
+            used_prefixes.add(key)
+            rem = tuple(x for x in range(n) if x != seq[0])
+            init_beam.append((c, seq, rem))
+
+        # Add a GRASP-style seed to diversify
+        grasp_c, grasp_seq = construct_grasp_seed()
+        rem = tuple(x for x in range(n) if x not in set(grasp_seq))
+        if len(grasp_seq) == n:
+            init_beam.append((grasp_c, grasp_seq, ()))
+        else:
+            init_beam.append((grasp_c, grasp_seq, rem))
+
+        best_complete = (float('inf'), [])
+        beam = init_beam
+
+        # Helper for suffix-2 signature
+        def suffix_sig(seq):
+            if not seq:
+                return ()
+            if len(seq) == 1:
+                return (seq[-1],)
+            return (seq[-2], seq[-1])
+
+        # Progressively grow prefixes
+        for depth in range(1, n + 1):
+            next_candidates = []  # entries: (score, regret, c1, seq, rem, sig)
+            min_remaining = n
+            for cost_so_far, prefix, remaining in beam:
+                rem_list = list(remaining)
+                if not rem_list:
+                    # Completed
+                    if cost_so_far < best_complete[0]:
+                        best_complete = (cost_so_far, prefix)
+                    # Keep as candidate (no further expansion)
+                    next_candidates.append((cost_so_far, 0.0, cost_so_far, prefix, remaining, suffix_sig(prefix)))
+                    continue
+
+                # Decide candidate set size (endgame widening)
+                if len(rem_list) <= min(cand_per_state, 16):
+                    expand_list = rem_list
+                else:
+                    k = min(cand_per_state, len(rem_list))
+                    expand_list = random.sample(rem_list, k)
+
+                # Expand and score by immediate + adaptive lookahead
+                local = []
+                # Collect raw expansion stats first to compute regret span-driven alpha
+                raw_moves = []  # (c1, best_c2, span, new_prefix, rem_after)
+                for t in expand_list:
+                    new_prefix = prefix + [t]
+                    c1 = eval_cost(new_prefix)
+                    rem_after = [x for x in rem_list if x != t]
+
+                    best_c2 = c1
+                    span = 0.0
+                    if rem_after:
+                        # Sample second-step candidates; in endgame, evaluate all
+                        k2 = len(rem_after) if len(rem_after) <= 6 else min(lookahead_k, len(rem_after))
+                        second = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        second_costs = []
+                        best_c2 = float('inf')
+                        for u in second:
+                            c2 = eval_cost(new_prefix + [u])
+                            second_costs.append(c2)
+                            if c2 < best_c2:
+                                best_c2 = c2
+                        if second_costs:
+                            span = max(second_costs) - min(second_costs)
+
+                    if len(new_prefix) == n and c1 < best_complete[0]:
+                        best_complete = (c1, new_prefix)
+                    raw_moves.append((c1, best_c2, span, new_prefix, tuple(rem_after)))
+
+                # Compute median span to adapt alpha within this state
+                if raw_moves:
+                    spans = sorted([s for _, _, s, _, _ in raw_moves])
+                    mid = len(spans) // 2
+                    median_span = spans[mid] if spans else 0.0
+                    # Build local scored list with adaptive mixing
+                    for c1, best_c2, span, new_prefix, rem_after in raw_moves:
+                        # If high dispersion among second-step costs, rely more on lookahead
+                        if span > median_span:
+                            a = 0.5
+                        else:
+                            a = 0.8
+                        score = a * c1 + (1.0 - a) * best_c2
+                        local.append((score, c1, new_prefix, rem_after))
+
+                if not local:
+                    continue
+                local.sort(key=lambda x: x[0])
+                # compute regret for the best local choice
+                best_score = local[0][0]
+                second_score = local[1][0] if len(local) > 1 else best_score
+                regret = max(0.0, second_score - best_score)
+                # Keep a few of the best local moves for global selection
+                # Widen retention in endgame for this state
+                keep_k = 6 if len(rem_list) <= 2 * beam_width else 4
+                keep_local = local[:min(keep_k, len(local))]
+                for idx, (score, c1, seq_cand, rem_cand) in enumerate(keep_local):
+                    reg = regret if idx == 0 else 0.0
+                    next_candidates.append((score, reg, c1, seq_cand, rem_cand, suffix_sig(seq_cand)))
+
+            if not next_candidates:
+                break
+
+            # Primary selection by score with suffix-2 diversity
+            next_candidates.sort(key=lambda x: x[0])
+            pruned = []
+            used_seq = set()
+            seen_suffix = set()
+            endgame = (min_remaining <= 2 * beam_width)
+            primary_target = max(1, int((0.6 if endgame else 0.7) * beam_width))
+            for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                key = tuple(seq_cand)
+                if sig in seen_suffix or key in used_seq:
+                    continue
+                pruned.append((c1, seq_cand, rem_cand))
+                used_seq.add(key)
+                seen_suffix.add(sig)
+                if len(pruned) >= primary_target:
+                    break
+
+            # Regret-boosted fill with diversity
+            if len(pruned) < beam_width:
+                remaining = [x for x in next_candidates if tuple(x[3]) not in used_seq]
+                remaining.sort(key=lambda x: (-x[1], x[0]))  # high regret first, then better score
+                for score, reg, c1, seq_cand, rem_cand, sig in remaining:
+                    key = tuple(seq_cand)
+                    if key in used_seq or sig in seen_suffix:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    seen_suffix.add(sig)
+                    if len(pruned) >= beam_width:
+                        break
+
+            # If still short, fill by best score regardless of suffix
+            if len(pruned) < beam_width:
+                for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                    key = tuple(seq_cand)
+                    if key in used_seq:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    if len(pruned) >= beam_width:
+                        break
+
+            beam = pruned
+
+        # If we didn't complete during loop, finalize from beam candidates greedily
+        for c, seq, rem in beam:
+            if len(seq) == n and c < best_complete[0]:
+                best_complete = (c, seq)
+
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_ext = None
+                best_ext_cost = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur_seq + [t])
+                    if c2 < best_ext_cost:
+                        best_ext_cost = c2
+                        best_ext = t
+                cur_seq.append(best_ext)
+                rem_list.remove(best_ext)
+            final_cost = eval_cost(cur_seq)
+            return final_cost, cur_seq
+
+        # Absolute fallback: identity sequence
+        identity = list(range(n))
+        return eval_cost(identity), identity
+=======
+    def beam_search(beam_width, cand_per_state, lookahead_k=5, alpha=0.7):
+        """
+        Beam search with two-step lookahead, suffix-2 diversity, and regret-weighted selection.
+
+        beam_width: number of partial sequences to keep at each depth
+        cand_per_state: number of candidates to expand per beam state when remaining is large
+        lookahead_k: number of second-step candidates to sample for scoring
+        alpha: weight on immediate cost vs lookahead (0..1)
+        """
+        # Evaluate all single-transaction starters and pick top starters
+        starters = []
+        for t in range(n):
+            c = eval_cost([t])
+            starters.append((c, [t]))
+        starters.sort(key=lambda x: x[0])
+
+        init_count = min(max(beam_width * 2, beam_width), n)
+        init_beam = []
+        used_prefixes = set()
+        for c, seq in starters[:init_count]:
+            key = tuple(seq)
+            if key in used_prefixes:
+                continue
+            used_prefixes.add(key)
+            rem = tuple(x for x in range(n) if x != seq[0])
+            init_beam.append((c, seq, rem))
+
+        # Add a GRASP-style seed to diversify
+        grasp_c, grasp_seq = construct_grasp_seed()
+        rem = tuple(x for x in range(n) if x not in set(grasp_seq))
+        if len(grasp_seq) == n:
+            init_beam.append((grasp_c, grasp_seq, ()))
+        else:
+            init_beam.append((grasp_c, grasp_seq, rem))
+
+        best_complete = (float('inf'), [])
+        beam = init_beam
+
+        # Helper for suffix-2 signature
+        def suffix_sig(seq):
+            if not seq:
+                return ()
+            if len(seq) == 1:
+                return (seq[-1],)
+            return (seq[-2], seq[-1])
+
+        # Progressively grow prefixes
+        for depth in range(1, n + 1):
+            next_candidates = []  # entries: (score, regret, c1, seq, rem, sig)
+            min_remaining = n
+            for cost_so_far, prefix, remaining in beam:
+                rem_list = list(remaining)
+                # track minimum remaining across this layer for endgame decision
+                if len(rem_list) < min_remaining:
+                    min_remaining = len(rem_list)
+
+                if not rem_list:
+                    # Completed
+                    if cost_so_far < best_complete[0]:
+                        best_complete = (cost_so_far, prefix)
+                    # Keep as candidate (no further expansion)
+                    next_candidates.append((cost_so_far, 0.0, cost_so_far, prefix, remaining, suffix_sig(prefix)))
+                    continue
+
+                # Decide candidate set size (endgame widening)
+                if len(rem_list) <= min(cand_per_state, 16):
+                    expand_list = rem_list
+                else:
+                    k = min(cand_per_state, len(rem_list))
+                    expand_list = random.sample(rem_list, k)
+
+                # Expand and score by immediate + adaptive lookahead
+                local = []
+                # Collect raw expansion stats first to compute regret span-driven alpha
+                raw_moves = []  # (c1, best_c2, span, new_prefix, rem_after)
+                for t in expand_list:
+                    new_prefix = prefix + [t]
+                    c1 = eval_cost(new_prefix)
+                    rem_after = [x for x in rem_list if x != t]
+
+                    best_c2 = c1
+                    span = 0.0
+                    if rem_after:
+                        # Sample second-step candidates; in local endgame, evaluate all
+                        endgame_local = (len(rem_list) <= 2 * beam_width)
+                        k2 = len(rem_after) if endgame_local or len(rem_after) <= 6 else min(lookahead_k, len(rem_after))
+                        second = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        second_costs = []
+                        best_c2 = float('inf')
+                        for u in second:
+                            c2 = eval_cost(new_prefix + [u])
+                            second_costs.append(c2)
+                            if c2 < best_c2:
+                                best_c2 = c2
+                        if second_costs:
+                            span = max(second_costs) - min(second_costs)
+
+                    if len(new_prefix) == n and c1 < best_complete[0]:
+                        best_complete = (c1, new_prefix)
+                    raw_moves.append((c1, best_c2, span, new_prefix, tuple(rem_after)))
+
+                # Compute median span to adapt alpha within this state
+                if raw_moves:
+                    spans = sorted([s for _, _, s, _, _ in raw_moves])
+                    mid = len(spans) // 2
+                    median_span = spans[mid] if spans else 0.0
+                    # Build local scored list with adaptive mixing
+                    for c1, best_c2, span, new_prefix, rem_after in raw_moves:
+                        # If high dispersion among second-step costs, rely more on lookahead
+                        if span > median_span:
+                            a = 0.5
+                        else:
+                            a = 0.8
+                        score = a * c1 + (1.0 - a) * best_c2
+                        local.append((score, c1, new_prefix, rem_after))
+
+                if not local:
+                    continue
+                local.sort(key=lambda x: x[0])
+                # compute regret for the best local choice
+                best_score = local[0][0]
+                second_score = local[1][0] if len(local) > 1 else best_score
+                regret = max(0.0, second_score - best_score)
+                # Keep a few of the best local moves for global selection
+                # Widen retention in endgame for this state
+                keep_k = 6 if len(rem_list) <= 2 * beam_width else 4
+                keep_local = local[:min(keep_k, len(local))]
+                for idx, (score, c1, seq_cand, rem_cand) in enumerate(keep_local):
+                    reg = regret if idx == 0 else 0.0
+                    next_candidates.append((score, reg, c1, seq_cand, rem_cand, suffix_sig(seq_cand)))
+
+            if not next_candidates:
+                break
+
+            # Primary selection by score with suffix-2 diversity
+            next_candidates.sort(key=lambda x: x[0])
+            pruned = []
+            used_seq = set()
+            seen_suffix = set()
+            endgame = (min_remaining <= 2 * beam_width)
+            primary_target = max(1, int((0.6 if endgame else 0.7) * beam_width))
+            for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                key = tuple(seq_cand)
+                if sig in seen_suffix or key in used_seq:
+                    continue
+                pruned.append((c1, seq_cand, rem_cand))
+                used_seq.add(key)
+                seen_suffix.add(sig)
+                if len(pruned) >= primary_target:
+                    break
+
+            # Regret-boosted fill with diversity
+            if len(pruned) < beam_width:
+                remaining = [x for x in next_candidates if tuple(x[3]) not in used_seq]
+                remaining.sort(key=lambda x: (-x[1], x[0]))  # high regret first, then better score
+                for score, reg, c1, seq_cand, rem_cand, sig in remaining:
+                    key = tuple(seq_cand)
+                    if key in used_seq or sig in seen_suffix:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    seen_suffix.add(sig)
+                    if len(pruned) >= beam_width:
+                        break
+
+            # If still short, fill by best score regardless of suffix
+            if len(pruned) < beam_width:
+                for score, reg, c1, seq_cand, rem_cand, sig in next_candidates:
+                    key = tuple(seq_cand)
+                    if key in used_seq:
+                        continue
+                    pruned.append((c1, seq_cand, rem_cand))
+                    used_seq.add(key)
+                    if len(pruned) >= beam_width:
+                        break
+
+            beam = pruned
+
+        # If we didn't complete during loop, finalize from beam candidates greedily
+        for c, seq, rem in beam:
+            if len(seq) == n and c < best_complete[0]:
+                best_complete = (c, seq)
+
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        if beam:
+            # Greedy completion with best-position insertion (not only append)
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_t = None
+                best_pos = 0
+                best_ext_cost = float('inf')
+                m = len(cur_seq)
+                # position candidates: all for small m, anchored sampling otherwise
+                def completion_positions(m):
+                    if m + 1 <= 30:
+                        return list(range(m + 1))
+                    anchors = {0, m, m // 2, m // 4, (3 * m) // 4}
+                    anchors = {p for p in anchors if 0 <= p <= m}
+                    interior = [p for p in range(1, m) if p not in anchors]
+                    k = min(20, len(interior))
+                    if k > 0:
+                        anchors.update(random.sample(interior, k))
+                    return sorted(anchors)
+                pos_list = completion_positions(m)
+                for t in rem_list:
+                    for pos in pos_list:
+                        cand = cur_seq[:]
+                        cand.insert(pos, t)
+                        c2 = eval_cost(cand)
+                        if c2 < best_ext_cost:
+                            best_ext_cost = c2
+                            best_t = t
+                            best_pos = pos
+                # apply best insertion
+                cur_seq.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+            final_cost = eval_cost(cur_seq)
+            return final_cost, cur_seq
+
+        # Absolute fallback: identity sequence
+        identity = list(range(n))
+        return eval_cost(identity), identity
+>>>>>>> REPLACE
+</DIFF>

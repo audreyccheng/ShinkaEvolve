@@ -1,0 +1,496 @@
+<NAME>
+vnd_ils_model_placement
+</NAME>
+
+<DESCRIPTION>
+Optimizes the model placement logic by replacing the Steepest Descent ILS with a Variable Neighborhood Descent (VND) ILS using First Improvement strategy.
+
+1.  **Simplifies Initialization**: Reduces the binary search loop complexity and the number of randomized restarts to save computational budget for local search.
+2.  **VND Local Search**:
+    -   Uses "First Improvement" instead of "Best Improvement" for faster iteration.
+    -   Sorts potential target GPUs by their current KVPR (ascending). This heuristics prioritizes moving load to the least loaded GPUs, drastically increasing the hit rate of valid moves.
+    -   Systematically explores neighborhoods: Move, Swap(1-1), Swap(2-1).
+3.  **Perturbation**: Instead of complex reconstruction, it performs a simple random ejection from a bottleneck to a random feasible GPU to escape local optima.
+
+This strategy aims to quickly reduce the max KVPR by exploiting the structure of the problem (moving from highest load to lowest load) and efficiently traversing the solution space.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 1. Deterministic Binary Search for Baseline K
+    low, high = 0.0, 1.0
+    # Find Upper Bound
+    for _ in range(20):
+        if solve_packing(high) is not None: break
+        low = high
+        high *= 2.0
+    else: high = 1e9
+
+    # Refine
+    for _ in range(25):
+        mid = (low + high) / 2
+        if solve_packing(mid) is not None: high = mid
+        else: low = mid
+    base_k = high
+
+    # 2. Multi-Start Initialization
+    best_init_plc = None
+    best_init_max_kvpr = float('inf')
+
+    # Attempt deterministic + multiple randomized starts slightly above base_k
+    # Randomized packing works better if constraint is not tight to the limit
+    search_k = base_k * 1.001
+
+    seeds = [None] + list(range(19)) # 20 total starts
+    for seed in seeds:
+        if time.time() - start_time > 0.3: break # Cap initialization budget
+
+        res = solve_packing(search_k, random_seed=seed)
+        if res:
+            current_max = 0.0
+            for g in range(gpu_num):
+                l = sum(x['l'] for x in res[g])
+                s = sum(x['s'] for x in res[g])
+                k_val = get_kvpr(l, s)
+                if k_val > current_max: current_max = k_val
+
+            if current_max < best_init_max_kvpr:
+                best_init_max_kvpr = current_max
+                best_init_plc = res
+
+    # Fallback
+    if best_init_plc is None:
+        best_init_plc = solve_packing(base_k)
+        if best_init_plc is None:
+            best_init_plc = solve_packing(1e9)
+            if best_init_plc is None:
+                # Should be unreachable if problem is feasible
+                # Return empty placement (or simplistic bin packing) to allow evaluator to fail gracefully
+                best_init_plc = [[] for _ in range(gpu_num)]
+
+    # --- Phase 2: Iterated Local Search (ILS) ---
+
+    # Convert to mutable structures
+    plc = [list(best_init_plc[g]) for g in range(gpu_num)]
+
+    # Tracking stats
+    gpu_stats = []
+    for g in range(gpu_num):
+        l = sum(x['l'] for x in plc[g])
+        s = sum(x['s'] for x in plc[g])
+        gpu_stats.append({'l': l, 's': s})
+
+    best_global_plc = [list(p) for p in plc]
+    best_global_score = best_init_max_kvpr
+
+    def evaluate(stats):
+        max_k = -1.0
+        bottlenecks = []
+        for g in range(gpu_num):
+            k = get_kvpr(stats[g]['l'], stats[g]['s'])
+            if k > max_k:
+                max_k = k
+                bottlenecks = [g]
+            elif abs(k - max_k) < 1e-9:
+                bottlenecks.append(g)
+        return max_k, bottlenecks
+
+    # Run ILS
+    while time.time() - start_time < 0.9:
+
+        # Steepest Descent Local Search
+        while True:
+            cur_max, bottlenecks = evaluate(gpu_stats)
+            if cur_max < 1e-9: break
+
+            best_move = None
+            best_imp = 0.0
+
+            # Check bottlenecks (prioritize worst)
+            candidates = bottlenecks[:2]
+
+            targets = []
+            for t in range(gpu_num):
+                if t not in bottlenecks:
+                    targets.append(t)
+
+            if not targets:
+                # If all GPUs are bottlenecks (perfect balance), break
+                break
+
+            for b_idx in candidates:
+                b_l = gpu_stats[b_idx]['l']
+                b_s = gpu_stats[b_idx]['s']
+                src_items = plc[b_idx]
+
+                # Pre-filter targets that can actually accept items without becoming new worst bottleneck
+                valid_targets = [t for t in targets if get_kvpr(gpu_stats[t]['l'], gpu_stats[t]['s']) < cur_max]
+
+                # 1. Move
+                for i, item in enumerate(src_items):
+                    for t in valid_targets:
+                        if gpu_stats[t]['s'] + item['s'] >= GPU_MEM_SIZE: continue
+
+                        nk_src = get_kvpr(b_l - item['l'], b_s - item['s'])
+                        nk_tgt = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+
+                        new_global = max(nk_src, nk_tgt)
+                        if new_global < cur_max - 1e-7:
+                            imp = cur_max - new_global
+                            if imp > best_imp:
+                                best_imp = imp
+                                best_move = ('move', b_idx, i, t)
+
+                # 2. Swap 1-1
+                for i, s_item in enumerate(src_items):
+                    for t in valid_targets:
+                        tgt_items = plc[t]
+                        for j, t_item in enumerate(tgt_items):
+                            # Capacity check
+                            if b_s - s_item['s'] + t_item['s'] >= GPU_MEM_SIZE: continue
+                            if gpu_stats[t]['s'] - t_item['s'] + s_item['s'] >= GPU_MEM_SIZE: continue
+
+                            nk_src = get_kvpr(b_l - s_item['l'] + t_item['l'], b_s - s_item['s'] + t_item['s'])
+                            nk_tgt = get_kvpr(gpu_stats[t]['l'] - t_item['l'] + s_item['l'], gpu_stats[t]['s'] - t_item['s'] + s_item['s'])
+
+                            new_global = max(nk_src, nk_tgt)
+                            if new_global < cur_max - 1e-7:
+                                imp = cur_max - new_global
+                                if imp > best_imp:
+                                    best_imp = imp
+                                    best_move = ('swap11', b_idx, i, t, j)
+
+                # 3. Swap 2-1 (2 from bottleneck)
+                if len(src_items) >= 2:
+                    # Heuristic limits to avoid O(N^2 * M)
+                    limit_checks = 100
+                    checks = 0
+                    for i1 in range(len(src_items)):
+                        if checks > limit_checks: break
+                        for i2 in range(i1 + 1, len(src_items)):
+                            m1 = src_items[i1]
+                            m2 = src_items[i2]
+                            pair_l = m1['l'] + m2['l']
+                            pair_s = m1['s'] + m2['s']
+
+                            for t in valid_targets:
+                                tgt_items = plc[t]
+                                for j, m3 in enumerate(tgt_items):
+                                    if b_s - pair_s + m3['s'] >= GPU_MEM_SIZE: continue
+                                    if gpu_stats[t]['s'] - m3['s'] + pair_s >= GPU_MEM_SIZE: continue
+
+                                    nk_src = get_kvpr(b_l - pair_l + m3['l'], b_s - pair_s + m3['s'])
+                                    nk_tgt = get_kvpr(gpu_stats[t]['l'] - m3['l'] + pair_l, gpu_stats[t]['s'] - m3['s'] + pair_s)
+
+                                    new_global = max(nk_src, nk_tgt)
+                                    if new_global < cur_max - 1e-7:
+                                        imp = cur_max - new_global
+                                        if imp > best_imp:
+                                            best_imp = imp
+                                            best_move = ('swap21', b_idx, i1, i2, t, j)
+                                    checks += 1
+
+            # Apply Best Move
+            if best_move:
+                mtype = best_move[0]
+                if mtype == 'move':
+                    _, b, i, t = best_move
+                    item = plc[b].pop(i)
+                    plc[t].append(item)
+                    gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+                    gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+                elif mtype == 'swap11':
+                    _, b, i, t, j = best_move
+                    it1 = plc[b][i]
+                    it2 = plc[t][j]
+                    plc[b][i] = it2
+                    plc[t][j] = it1
+                    dl = it2['l'] - it1['l']; ds = it2['s'] - it1['s']
+                    gpu_stats[b]['l'] += dl; gpu_stats[b]['s'] += ds
+                    gpu_stats[t]['l'] -= dl; gpu_stats[t]['s'] -= ds
+                elif mtype == 'swap21':
+                    _, b, i1, i2, t, j = best_move
+                    it2 = plc[b].pop(i2)
+                    it1 = plc[b].pop(i1)
+                    it3 = plc[t].pop(j)
+                    plc[b].append(it3)
+                    plc[t].extend([it1, it2])
+                    pl = it1['l'] + it2['l']; ps = it1['s'] + it2['s']
+                    gpu_stats[b]['l'] += it3['l'] - pl; gpu_stats[b]['s'] += it3['s'] - ps
+                    gpu_stats[t]['l'] += pl - it3['l']; gpu_stats[t]['s'] += ps - it3['s']
+            else:
+                break # Local Optima Reached
+
+        # Update Global Best
+        cur_max, bottlenecks = evaluate(gpu_stats)
+        if cur_max < best_global_score:
+            best_global_score = cur_max
+            best_global_plc = [list(p) for p in plc]
+
+        # --- Perturbation (Ruins & Recreate) ---
+        if not bottlenecks: break
+
+        b_idx = random.choice(bottlenecks)
+        if not plc[b_idx]: break
+
+        # Remove items
+        # Try to remove largest items to significantly change state
+        candidates_to_remove = sorted(enumerate(plc[b_idx]), key=lambda x: x[1]['s'], reverse=True)
+        # Take top 1 or 2
+        num_remove = min(len(candidates_to_remove), random.randint(1, 2))
+
+        removed_items = []
+        # We need to pop by index, so we must be careful about index shifting.
+        # Simplest way: just pick random indices if sort is complex, or use the indices found.
+        # Let's use random for speed and diversity.
+        for _ in range(num_remove):
+            if not plc[b_idx]: break
+            idx = random.randrange(len(plc[b_idx]))
+            item = plc[b_idx].pop(idx)
+            removed_items.append(item)
+            gpu_stats[b_idx]['l'] -= item['l']
+            gpu_stats[b_idx]['s'] -= item['s']
+
+        # Recreate: Best Fit
+        for item in removed_items:
+            best_t = -1
+            best_k = float('inf')
+
+            # Randomize order of GPUs to break symmetry
+            targets = list(range(gpu_num))
+            random.shuffle(targets)
+
+            for t in targets:
+                if t == b_idx: continue
+                if gpu_stats[t]['s'] + item['s'] < GPU_MEM_SIZE:
+                    k = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+                    if k < best_k:
+                        best_k = k
+                        best_t = t
+
+            if best_t != -1:
+                plc[best_t].append(item)
+                gpu_stats[best_t]['l'] += item['l']
+                gpu_stats[best_t]['s'] += item['s']
+            else:
+                # Forced to put back in bottleneck if no fit (unlikely unless full)
+                plc[b_idx].append(item)
+                gpu_stats[b_idx]['l'] += item['l']
+                gpu_stats[b_idx]['s'] += item['s']
+
+    # Final result
+    result = {}
+    for i in range(gpu_num):
+        result[i] = [x['model'] for x in best_global_plc[i]]
+    return result
+=======
+    # 1. Deterministic Binary Search for Baseline K
+    low, high = 0.0, 1.0
+    for _ in range(30):
+        mid = (low + high) / 2
+        if solve_packing(mid) is not None: high = mid
+        else: low = mid
+    base_k = high
+
+    # 2. Multi-Start Initialization
+    best_init_plc = None
+    best_init_max_kvpr = float('inf')
+
+    # Run multiple randomized initializations
+    # Relax K slightly for randomized packing
+    search_k = base_k * 1.001
+
+    seeds = [None] + list(range(10))
+    for seed in seeds:
+        if time.time() - start_time > 0.3: break
+
+        res = solve_packing(search_k, random_seed=seed)
+        if res:
+            max_k = max(get_kvpr(sum(x['l'] for x in res[g]), sum(x['s'] for x in res[g])) for g in range(gpu_num))
+            if max_k < best_init_max_kvpr:
+                best_init_max_kvpr = max_k
+                best_init_plc = res
+
+    if best_init_plc is None:
+        best_init_plc = solve_packing(1e9)
+        if best_init_plc is None: best_init_plc = [[] for _ in range(gpu_num)]
+        best_init_max_kvpr = 1e9
+
+    # --- Phase 2: Iterated Local Search (VND) ---
+    plc = [list(best_init_plc[g]) for g in range(gpu_num)]
+
+    gpu_stats = []
+    for g in range(gpu_num):
+        gpu_stats.append({
+            'l': sum(m['l'] for m in plc[g]),
+            's': sum(m['s'] for m in plc[g])
+        })
+
+    best_global_plc = [list(p) for p in plc]
+    best_global_score = best_init_max_kvpr
+
+    def evaluate_max_k():
+        max_k = -1.0
+        bottlenecks = []
+        for g in range(gpu_num):
+            k = get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s'])
+            if k > max_k:
+                max_k = k
+                bottlenecks = [g]
+            elif abs(k - max_k) < 1e-9:
+                bottlenecks.append(g)
+        return max_k, bottlenecks
+
+    while time.time() - start_time < 0.95:
+        # Variable Neighborhood Descent
+        # Priorities: Move > Swap11 > Swap21
+        # Uses First Improvement with Target Sorting
+
+        improved = True
+        while improved:
+            improved = False
+            cur_max, bottlenecks = evaluate_max_k()
+            if cur_max < 1e-9: break
+
+            # Identify valid targets (KVPR < cur_max) sorted by KVPR asc
+            targets = []
+            for g in range(gpu_num):
+                if g not in bottlenecks:
+                    k = get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s'])
+                    if k < cur_max - 1e-7:
+                        targets.append((k, g))
+            targets.sort(key=lambda x: x[0])
+            target_indices = [x[1] for x in targets]
+
+            if not target_indices: break
+
+            # Process primary bottleneck
+            b = bottlenecks[0]
+            b_l, b_s = gpu_stats[b]['l'], gpu_stats[b]['s']
+            b_items = plc[b]
+
+            # Helper to update stats
+            def update_stats(g, dl, ds):
+                gpu_stats[g]['l'] += dl
+                gpu_stats[g]['s'] += ds
+
+            # 1. MOVE
+            for i, item in enumerate(b_items):
+                for t in target_indices:
+                    t_l, t_s = gpu_stats[t]['l'], gpu_stats[t]['s']
+                    if t_s + item['s'] >= GPU_MEM_SIZE: continue
+
+                    nk_src = get_kvpr(b_l - item['l'], b_s - item['s'])
+                    nk_tgt = get_kvpr(t_l + item['l'], t_s + item['s'])
+
+                    if max(nk_src, nk_tgt) < cur_max - 1e-7:
+                        # Apply Move
+                        item = plc[b].pop(i)
+                        plc[t].append(item)
+                        update_stats(b, -item['l'], -item['s'])
+                        update_stats(t, item['l'], item['s'])
+                        improved = True
+                        break
+                if improved: break
+            if improved: continue
+
+            # 2. SWAP 1-1
+            for i, item1 in enumerate(b_items):
+                for t in target_indices:
+                    t_items = plc[t]
+                    t_l, t_s = gpu_stats[t]['l'], gpu_stats[t]['s']
+                    for j, item2 in enumerate(t_items):
+                        if b_s - item1['s'] + item2['s'] >= GPU_MEM_SIZE: continue
+                        if t_s - item2['s'] + item1['s'] >= GPU_MEM_SIZE: continue
+
+                        nk_src = get_kvpr(b_l - item1['l'] + item2['l'], b_s - item1['s'] + item2['s'])
+                        nk_tgt = get_kvpr(t_l - item2['l'] + item1['l'], t_s - item2['s'] + item1['s'])
+
+                        if max(nk_src, nk_tgt) < cur_max - 1e-7:
+                            # Apply Swap
+                            plc[b][i] = item2
+                            plc[t][j] = item1
+                            dl = item2['l'] - item1['l']
+                            ds = item2['s'] - item1['s']
+                            update_stats(b, dl, ds)
+                            update_stats(t, -dl, -ds)
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+            if improved: continue
+
+            # 3. SWAP 2-1
+            if len(b_items) >= 2:
+                for i1 in range(len(b_items)):
+                    for i2 in range(i1 + 1, len(b_items)):
+                        m1 = b_items[i1]
+                        m2 = b_items[i2]
+                        pair_l = m1['l'] + m2['l']
+                        pair_s = m1['s'] + m2['s']
+
+                        for t in target_indices:
+                            t_items = plc[t]
+                            t_l, t_s = gpu_stats[t]['l'], gpu_stats[t]['s']
+                            for j, m3 in enumerate(t_items):
+                                if b_s - pair_s + m3['s'] >= GPU_MEM_SIZE: continue
+                                if t_s - m3['s'] + pair_s >= GPU_MEM_SIZE: continue
+
+                                nk_src = get_kvpr(b_l - pair_l + m3['l'], b_s - pair_s + m3['s'])
+                                nk_tgt = get_kvpr(t_l - m3['l'] + pair_l, t_s - m3['s'] + pair_s)
+
+                                if max(nk_src, nk_tgt) < cur_max - 1e-7:
+                                    # Apply Swap 2-1
+                                    it2 = plc[b].pop(i2)
+                                    it1 = plc[b].pop(i1)
+                                    it3 = plc[t].pop(j)
+                                    plc[b].append(it3)
+                                    plc[t].extend([it1, it2])
+
+                                    pl = it1['l'] + it2['l']
+                                    ps = it1['s'] + it2['s']
+                                    update_stats(b, it3['l'] - pl, it3['s'] - ps)
+                                    update_stats(t, pl - it3['l'], ps - it3['s'])
+                                    improved = True
+                                    break
+                            if improved: break
+                        if improved: break
+                    if improved: break
+
+        # Check Global Best
+        cur_max, bottlenecks = evaluate_max_k()
+        if cur_max < best_global_score:
+            best_global_score = cur_max
+            best_global_plc = [list(p) for p in plc]
+
+        # Perturbation
+        if not bottlenecks: break
+
+        b = random.choice(bottlenecks)
+        if not plc[b]: break
+
+        # Eject 1 item to random feasible GPU
+        idx = random.randrange(len(plc[b]))
+        item = plc[b][idx]
+
+        candidates = []
+        for g in range(gpu_num):
+            if g != b and gpu_stats[g]['s'] + item['s'] < GPU_MEM_SIZE:
+                candidates.append(g)
+
+        if candidates:
+            t = random.choice(candidates)
+            plc[b].pop(idx)
+            plc[t].append(item)
+            gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+            gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+        else:
+            break
+
+    # Final result
+    result = {}
+    for i in range(gpu_num):
+        result[i] = [x['model'] for x in best_global_plc[i]]
+    return result
+>>>>>>> REPLACE
+</DIFF>

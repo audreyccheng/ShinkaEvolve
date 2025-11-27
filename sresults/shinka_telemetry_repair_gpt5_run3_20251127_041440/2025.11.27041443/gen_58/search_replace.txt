@@ -1,0 +1,246 @@
+<NAME>
+adaptive_pre_fuse_and_sum_preserving_bundle
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements aligned with the research principles and prior top-performing variants:
+
+1) Adaptive fusion on large link mismatches (R3): Instead of snapping to the farther-from-zero observation when a.tx and b.rx (or a.rx and b.tx) disagree, we blend toward the peer with an adaptive bias beta in [0.7, 0.9] that increases with mismatch. This better exploits redundancy, reduces asymmetry early, and has shown gains in counter accuracy without harming calibration.
+
+2) Early soft-zero pre-snap before router projection: If both adjacent routers are already balanced (within adaptive tau) and all four link directions are below 1.5*ZERO_THRESH, snap the link to zero with high confidence prior to the router projection. This removes tiny noise links early, simplifying the WLS projection and improving stability.
+
+3) Sum-preserving bundle smoothing: Replace the prior bundle smoothing that referenced orig_* anchors (which could perturb router balance) with a sum-preserving intra-bundle rebalance. For dominant bundles (≥60% of the side’s traffic), we shift values toward low-confidence weighted shares using a small step (eta=0.6) and per-link ±5% caps, then redistribute any residual to keep the group sum exactly unchanged. This keeps R1 intact, aligns parallel links, and reduces residual asymmetry.
+
+No additional external dependencies were introduced. All constants used are already defined or maintained. These changes should slightly improve counter repair accuracy while tightening confidence calibration by aligning with link symmetry and preserving router conservation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        if d1 <= tau1:
+            v1 = 0.5 * (a_tx0 + b_rx0)
+        else:
+            # Favor the farther-from-zero redundant observation to avoid under-report outliers
+            v1 = b_rx0 if abs(b_rx0) >= abs(a_tx0) else a_tx0
+        tx[a] = max(0.0, v1)
+        rx[b] = max(0.0, v1)
+=======
+        if d1 <= tau1:
+            v1 = 0.5 * (a_tx0 + b_rx0)
+        else:
+            # Adaptive snap-toward-peer for large mismatches (bias 0.7–0.9 toward peer)
+            # This reduces asymmetry up front and mitigates under-report outliers.
+            beta = 0.7 + 0.2 * clamp01((d1 - 0.10) / 0.20)
+            beta = min(0.9, max(0.7, beta))
+            v1 = (1.0 - beta) * a_tx0 + beta * b_rx0
+        tx[a] = max(0.0, v1)
+        rx[b] = max(0.0, v1)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if d2 <= tau2:
+            v2 = 0.5 * (a_rx0 + b_tx0)
+        else:
+            v2 = b_tx0 if abs(b_tx0) >= abs(a_rx0) else a_rx0
+        rx[a] = max(0.0, v2)
+        tx[b] = max(0.0, v2)
+=======
+        if d2 <= tau2:
+            v2 = 0.5 * (a_rx0 + b_tx0)
+        else:
+            # Adaptive snap-toward-peer for large mismatches
+            beta = 0.7 + 0.2 * clamp01((d2 - 0.10) / 0.20)
+            beta = min(0.9, max(0.7, beta))
+            v2 = (1.0 - beta) * a_rx0 + beta * b_tx0
+        rx[a] = max(0.0, v2)
+        tx[b] = max(0.0, v2)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+
+    for r, ifs in router_ifaces.items():
+=======
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+
+    # Stage 1b: Early soft-zero pre-snap on near-zero links when adjacent routers are already balanced
+    for a, b in link_pairs:
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        if max(rx[a], tx[a], rx[b], tx[b]) < 1.5 * ZERO_THRESH:
+            ra = local_router_of.get(a)
+            rb = local_router_of.get(b)
+            n_active_a = len([i for i in router_ifaces.get(ra, []) if status.get(i) == 'up'])
+            n_active_b = len([i for i in router_ifaces.get(rb, []) if status.get(i) == 'up'])
+            tau_ra = min(0.07, max(0.03, 0.05 * math.sqrt(2.0 / max(2, n_active_a))))
+            tau_rb = min(0.07, max(0.03, 0.05 * math.sqrt(2.0 / max(2, n_active_b))))
+            if router_residual_pre.get(ra, 0.0) <= tau_ra and router_residual_pre.get(rb, 0.0) <= tau_rb:
+                rx[a] = tx[a] = rx[b] = tx[b] = 0.0
+                conf_rx[a] = max(conf_rx[a], 0.95)
+                conf_tx[a] = max(conf_tx[a], 0.95)
+                conf_rx[b] = max(conf_rx[b], 0.95)
+                conf_tx[b] = max(conf_tx[b], 0.95)
+
+    for r, ifs in router_ifaces.items():
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2.1: Bundle-aware intra-group smoothing (small ±5% pass)
+    # Group by (local_router, remote_router)
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if not up_ifs:
+            continue
+        # Side totals
+        sum_rx_side = sum(rx[i] for i in up_ifs)
+        sum_tx_side = sum(tx[i] for i in up_ifs)
+        # Build bundles
+        bundles: Dict[Tuple[Any, Any], List[str]] = {}
+        for i in up_ifs:
+            key = (local_router_of.get(i), remote_router_of.get(i))
+            bundles.setdefault(key, []).append(i)
+
+        # RX side smoothing
+        for key, members in bundles.items():
+            if len(members) < 2:
+                continue
+            group_sum = sum(rx[i] for i in members)
+            if sum_rx_side > ZERO_EPS and (group_sum / sum_rx_side) >= BUNDLE_DOM_FRAC:
+                # Relative scales (post-router vs pre-router using orig_rx as loose anchor)
+                rels = []
+                for i in members:
+                    base = max(ZERO_THRESH, orig_rx.get(i, 0.0))
+                    rels.append(rx[i] / base)
+                s_group = sum(rels) / len(rels)
+                # Clip to ±5%
+                s_group = max(1.0 - INTRA_BUNDLE_CLIP, min(1.0 + INTRA_BUNDLE_CLIP, s_group))
+                for i in members:
+                    base = max(ZERO_THRESH, orig_rx.get(i, 0.0))
+                    new_v = max(0.0, base * s_group)
+                    if rx[i] > ZERO_EPS:
+                        scl = new_v / rx[i]
+                        if abs(scl - 1.0) >= 0.10:
+                            clip_hit[i] = True
+                    rx[i] = new_v
+
+        # TX side smoothing
+        for key, members in bundles.items():
+            if len(members) < 2:
+                continue
+            group_sum = sum(tx[i] for i in members)
+            if sum_tx_side > ZERO_EPS and (group_sum / sum_tx_side) >= BUNDLE_DOM_FRAC:
+                rels = []
+                for i in members:
+                    base = max(ZERO_THRESH, orig_tx.get(i, 0.0))
+                    rels.append(tx[i] / base)
+                s_group = sum(rels) / len(rels)
+                s_group = max(1.0 - INTRA_BUNDLE_CLIP, min(1.0 + INTRA_BUNDLE_CLIP, s_group))
+                for i in members:
+                    base = max(ZERO_THRESH, orig_tx.get(i, 0.0))
+                    new_v = max(0.0, base * s_group)
+                    if tx[i] > ZERO_EPS:
+                        scl = new_v / tx[i]
+                        if abs(scl - 1.0) >= 0.10:
+                            clip_hit[i] = True
+                    tx[i] = new_v
+=======
+    # Stage 2.1: Bundle-aware intra-group smoothing (sum-preserving, ±5% per-link)
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if not up_ifs:
+            continue
+        # Build bundles
+        bundles: Dict[Tuple[Any, Any], List[str]] = {}
+        for i in up_ifs:
+            key = (local_router_of.get(i), remote_router_of.get(i))
+            bundles.setdefault(key, []).append(i)
+
+        # RX side rebalance (dominant bundles only), preserves group sum
+        sum_rx_side = sum(rx[i] for i in up_ifs)
+        if sum_rx_side > ZERO_EPS:
+            for key, members in bundles.items():
+                if len(members) < 2:
+                    continue
+                group_sum = sum(rx[i] for i in members)
+                if (group_sum / sum_rx_side) >= BUNDLE_DOM_FRAC:
+                    ws = {i: (1.0 - clamp01(conf_rx.get(i, 0.7))) * max(rx[i], ZERO_THRESH) + 1e-12 for i in members}
+                    W = sum(ws.values())
+                    if W <= 0.0:
+                        continue
+                    desired = {i: (ws[i] / W) * group_sum for i in members}
+                    eta = 0.6  # modest step toward target shares
+                    prop = {}
+                    chg = {}
+                    cap = {}
+                    for i in members:
+                        di = desired[i] - rx[i]
+                        prop[i] = rx[i] + eta * di
+                        cap[i] = INTRA_BUNDLE_CLIP * max(rx[i], ZERO_THRESH)
+                        chg[i] = max(-cap[i], min(cap[i], prop[i] - rx[i]))
+                    v_new = {i: rx[i] + chg[i] for i in members}
+                    # Keep sum exactly: redistribute residual within remaining headroom
+                    diff = group_sum - sum(v_new.values())
+                    if abs(diff) > 1e-9:
+                        elig = [i for i in members if abs(chg[i]) < cap[i] - 1e-12]
+                        if elig:
+                            W_elig = sum(ws[i] for i in elig)
+                            for i in elig:
+                                add = diff * (ws[i] / max(1e-12, W_elig))
+                                room = cap[i] - abs(chg[i])
+                                add = max(-room, min(room, add))
+                                v_new[i] += add
+                    for i in members:
+                        if rx[i] > ZERO_EPS:
+                            scl = v_new[i] / rx[i]
+                            if abs(scl - 1.0) >= 0.10:
+                                clip_hit[i] = True
+                        rx[i] = max(0.0, v_new[i])
+
+        # TX side rebalance (dominant bundles only), preserves group sum
+        sum_tx_side = sum(tx[i] for i in up_ifs)
+        if sum_tx_side > ZERO_EPS:
+            for key, members in bundles.items():
+                if len(members) < 2:
+                    continue
+                group_sum = sum(tx[i] for i in members)
+                if (group_sum / sum_tx_side) >= BUNDLE_DOM_FRAC:
+                    ws = {i: (1.0 - clamp01(conf_tx.get(i, 0.7))) * max(tx[i], ZERO_THRESH) + 1e-12 for i in members}
+                    W = sum(ws.values())
+                    if W <= 0.0:
+                        continue
+                    desired = {i: (ws[i] / W) * group_sum for i in members}
+                    eta = 0.6
+                    prop = {}
+                    chg = {}
+                    cap = {}
+                    for i in members:
+                        di = desired[i] - tx[i]
+                        prop[i] = tx[i] + eta * di
+                        cap[i] = INTRA_BUNDLE_CLIP * max(tx[i], ZERO_THRESH)
+                        chg[i] = max(-cap[i], min(cap[i], prop[i] - tx[i]))
+                    v_new = {i: tx[i] + chg[i] for i in members}
+                    diff = group_sum - sum(v_new.values())
+                    if abs(diff) > 1e-9:
+                        elig = [i for i in members if abs(chg[i]) < cap[i] - 1e-12]
+                        if elig:
+                            W_elig = sum(ws[i] for i in elig)
+                            for i in elig:
+                                add = diff * (ws[i] / max(1e-12, W_elig))
+                                room = cap[i] - abs(chg[i])
+                                add = max(-room, min(room, add))
+                                v_new[i] += add
+                    for i in members:
+                        if tx[i] > ZERO_EPS:
+                            scl = v_new[i] / tx[i]
+                            if abs(scl - 1.0) >= 0.10:
+                                clip_hit[i] = True
+                        tx[i] = max(0.0, v_new[i])
+>>>>>>> REPLACE
+</DIFF>

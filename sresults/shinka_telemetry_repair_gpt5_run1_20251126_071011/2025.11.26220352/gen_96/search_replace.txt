@@ -1,0 +1,146 @@
+<NAME>
+targeted_router_scaling
+</NAME>
+
+<DESCRIPTION>
+I am introducing a targeted multiplicative router scaling step that uses redundant link signals to decide which direction (RX or TX) to scale and how to distribute scaling across interfaces. Instead of applying a uniform factor to all interfaces on a router, the new logic:
+- Chooses the direction to scale using average pair residuals among up/up peers, not just sum skew.
+- Computes a tempered desired scaling factor using a bounded ratio and imbalance sensitivity.
+- Applies per-interface scaling multipliers only to the less-trusted interfaces (bottom 40% confidence or with residuals exceeding tolerance), with per-interface caps (±15%) and tiny-link protection, proportional to residual severity and volume share.
+
+This aligns with the Hodor research principles: using redundancy for signal hardening and respecting flow conservation. It preserves the existing uniform scaling as a base factor but modulates it per-interface for better accuracy. The change should improve counter repair accuracy while keeping confidence calibration consistent, since confidence already penalizes large scaling or pair edits and rewards tight post-repair agreement.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Only scale if imbalance exceeds tolerance and there are at least two active interfaces
+        if imbalance > HARDENING_THRESHOLD and len(up_ifaces) >= 2:
+            if sum_tx > sum_rx:
+                k_raw = sum_rx / max(sum_tx, 1e-9)
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    # Scale only TX values on active interfaces
+                    scale_tx[i] = k
+            else:
+                k_raw = sum_tx / max(sum_rx, 1e-9)
+                k = clamp(k_raw, 0.85, 1.15)
+                for i in up_ifaces:
+                    # Scale only RX values on active interfaces
+                    scale_rx[i] = k
+=======
+        # Only scale if imbalance exceeds tolerance and there are at least two active interfaces
+        if imbalance > HARDENING_THRESHOLD and len(up_ifaces) >= 2:
+            # Decide which direction to scale using average pair residuals among up/up peers
+            rx_resids: List[float] = []
+            tx_resids: List[float] = []
+            for i in up_ifaces:
+                p = peers.get(i)
+                if p and p in telemetry and pre.get(p, {}).get('local_status') == 'up':
+                    # My TX should match peer RX; My RX should match peer TX
+                    tx_resids.append(rel_diff(pre[i]['pre_tx'], pre[p]['pre_rx']))
+                    rx_resids.append(rel_diff(pre[i]['pre_rx'], pre[p]['pre_tx']))
+            avg_tx_resid = sum(tx_resids) / len(tx_resids) if tx_resids else None
+            avg_rx_resid = sum(rx_resids) / len(rx_resids) if rx_resids else None
+
+            dir_to_scale = None
+            if avg_tx_resid is not None and avg_rx_resid is not None:
+                # Prefer scaling the direction with larger average residual by a margin
+                if avg_tx_resid > avg_rx_resid + 0.02:
+                    dir_to_scale = 'tx'
+                elif avg_rx_resid > avg_tx_resid + 0.02:
+                    dir_to_scale = 'rx'
+            if dir_to_scale is None:
+                dir_to_scale = 'tx' if sum_tx > sum_rx else 'rx'
+
+            # Base uniform scaling factor (guarded) to reduce router imbalance
+            if dir_to_scale == 'tx':
+                k_raw = sum_rx / max(sum_tx, 1e-9)
+            else:
+                k_raw = sum_tx / max(sum_rx, 1e-9)
+            k = clamp(k_raw, 0.85, 1.15)
+
+            # Targeted multiplicative pre-step on less-trusted interfaces (bounded and weighted)
+            # Desired global factor using a wider bounded ratio tempered by imbalance
+            if dir_to_scale == 'tx':
+                s = sum_rx / max(sum_tx, 1e-9)
+            else:
+                s = sum_tx / max(sum_rx, 1e-9)
+            s_bounded = clamp(s, 0.6, 1.7)
+            alpha = clamp(imbalance / 0.12, 0.25, 0.55)
+            desired_factor = 1.0 + alpha * (s_bounded - 1.0)
+
+            # Build per-interface confidence, residuals, and volumetric weights
+            confs: List[float] = []
+            conf_map: Dict[str, float] = {}
+            resid_map: Dict[str, float] = {}
+            tol_map: Dict[str, float] = {}
+            vol_map: Dict[str, float] = {}
+
+            if dir_to_scale == 'tx':
+                sum_dir = sum(pre[i]['pre_tx'] for i in up_ifaces)
+            else:
+                sum_dir = sum(pre[i]['pre_rx'] for i in up_ifaces)
+            sum_dir = max(sum_dir, 1.0)
+
+            for i in up_ifaces:
+                p = peers.get(i)
+                if dir_to_scale == 'tx':
+                    conf = max(0.0, 1.0 - pre[i]['tx_link_diff'])
+                    v = pre[i]['pre_tx']
+                    if p and p in telemetry and pre.get(p, {}).get('local_status') == 'up':
+                        resid = rel_diff(pre[i]['pre_tx'], pre[p]['pre_rx'])
+                        tol = pair_tolerance(pre[i]['pre_tx'], pre[p]['pre_rx'])
+                    else:
+                        resid = 0.0
+                        tol = HARDENING_THRESHOLD
+                else:
+                    conf = max(0.0, 1.0 - pre[i]['rx_link_diff'])
+                    v = pre[i]['pre_rx']
+                    if p and p in telemetry and pre.get(p, {}).get('local_status') == 'up':
+                        resid = rel_diff(pre[i]['pre_rx'], pre[p]['pre_tx'])
+                        tol = pair_tolerance(pre[i]['pre_rx'], pre[p]['pre_tx'])
+                    else:
+                        resid = 0.0
+                        tol = HARDENING_THRESHOLD
+                conf_map[i] = conf
+                resid_map[i] = resid
+                tol_map[i] = tol
+                vol_map[i] = v
+                confs.append(conf)
+
+            # Determine bottom 40% confidence cutoff
+            confs_sorted = sorted(confs)
+            idx = int(0.4 * len(confs_sorted)) - 1
+            cutoff = confs_sorted[0] if idx < 0 else confs_sorted[idx]
+
+            # Apply uniform base factor multiplied by a bounded, targeted per-interface factor
+            for i in up_ifaces:
+                conf = conf_map[i]
+                resid = resid_map[i]
+                tol = tol_map[i]
+                v = vol_map[i]
+                qualifies = (conf <= cutoff) or (resid > tol)
+
+                factor_i = 1.0
+                if qualifies:
+                    vol_share = v / sum_dir
+                    sev = 0.0 if tol <= 0.0 else min(2.0, resid / max(tol, 1e-9))
+                    # Weight combines low confidence, residual severity, and volume share; protect tiny links
+                    w = 0.6 * (1.0 - conf) + 0.25 * sev + 0.15 * vol_share
+                    if v < 1.0:
+                        w *= 0.5
+                    w = max(0.02, w)
+                    # Per-interface cap ±15%
+                    delta_factor = clamp((desired_factor - 1.0) * w, -0.15, 0.15)
+                    factor_i = 1.0 + delta_factor
+
+                if dir_to_scale == 'tx':
+                    # Scale only TX values on selected interfaces
+                    scale_tx[i] = k * factor_i
+                else:
+                    # Scale only RX values on selected interfaces
+                    scale_rx[i] = k * factor_i
+>>>>>>> REPLACE
+
+</DIFF>

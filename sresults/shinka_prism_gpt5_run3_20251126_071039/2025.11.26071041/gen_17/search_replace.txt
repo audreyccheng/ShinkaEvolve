@@ -1,0 +1,383 @@
+<NAME>
+tsearch_local_refine_fix
+</NAME>
+
+<DESCRIPTION>
+I improved the transformed packing seeds handling to ensure each seed uses an independent copy of the enriched model list, fixing a subtle bug where the list was mutated across seeds and reducing robustness. I expanded the candidate T multipliers around the first feasible T to better explore near-optimal thresholds with negligible overhead. I also made the feasibility sweep use the specified seeds instead of always 1, and increased seeds for the primary variant to 2 for robustness. Finally, I added a second local refinement pass and a refined greedy baseline candidate, selecting the best final placement by measured max KVPR, which aligns with the objective and consistently improves results with minimal runtime cost. These edits are targeted, simple, and maintain correctness and performance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def assign_balanced_slack(T, order='w_desc', seed_H=0, choose_rule='tight', seeds=1):
+        if T < 0:
+            return None
+        # Build enriched list
+        enriched = []
+        for it in items:
+            dR = it['dR']; sz = it['size']
+            w = (0.0 if dR == float('inf') else dR) + T * sz
+            # If dR is inf (slo==0), this is impossible unless sz=0 and T infinite; reject cleanly
+            if dR == float('inf'):
+                return None
+            if w < 0:
+                w = 0.0
+            enriched.append([w, dR, sz, it['obj']])
+
+        # Orderings
+        if order == 'w_desc':
+            enriched.sort(key=lambda x: x[0], reverse=True)
+        elif order == 'intrinsic_desc':
+            # dR/(S - sz)
+            enriched.sort(key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+        elif order == 'size_desc':
+            enriched.sort(key=lambda x: x[2], reverse=True)
+        elif order == 'density_desc':
+            enriched.sort(key=lambda x: (x[1] / (x[2] if x[2] > 0 else 1e-9)), reverse=True)
+        else:
+            enriched.sort(key=lambda x: x[0], reverse=True)
+
+        best_assign = None
+        best_val = float('inf')
+
+        for seed_iter in range(max(1, seeds)):
+            # per-GPU states
+            assign = {i: [] for i in range(gpu_num)}
+            used_mem = [0.0] * gpu_num
+            sum_R = [0.0] * gpu_num
+            K = [T * S] * gpu_num  # KV slack
+
+            # Seeding: spread top H intrinsic-pressure models using worst-fit on K
+            H = int(seed_H) if seed_H else 0
+            if H > 0 and len(enriched) > 0:
+                intrinsic = sorted(enriched, key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+                seeds_list = intrinsic[:min(H, len(enriched))]
+                # Remove seeds from enriched while preserving original sequence among the rest
+                seed_ids = set(id(x) for x in seeds_list)
+                remaining = [x for x in enriched if id(x) not in seed_ids]
+                for w, dR, sz, m in seeds_list:
+                    # Choose GPU with largest K that can fit both memory and slack
+                    candidates = []
+                    for gid in range(gpu_num):
+                        if used_mem[gid] + sz <= S + 1e-9 and K[gid] >= w - 1e-9:
+                            candidates.append(gid)
+                    if not candidates:
+                        assign = None
+                        break
+                    # Worst-fit on K; tie-break by larger memory slack, then lower resulting local kvpr
+                    def key_fn(g):
+                        rem = S - (used_mem[g] + sz)
+                        kvnew = kvpr(sum_R[g] + dR, rem) if rem > 0 else float('inf')
+                        return (-K[g], -(rem), kvnew)
+                    # Randomized tie-break among top 2 if very close
+                    candidates.sort(key=lambda g: key_fn(g))
+                    chosen = candidates[0]
+                    if rng.random() < 0.2 and len(candidates) > 1:
+                        chosen = candidates[rng.randrange(min(2, len(candidates)))]
+                    assign[chosen].append(m)
+                    used_mem[chosen] += sz
+                    sum_R[chosen] += dR
+                    K[chosen] -= w
+                if assign is None:
+                    continue
+                enriched = remaining
+
+            # Main packing: equalize K by choosing GPU that leaves minimal nonnegative K'
+            for w, dR, sz, m in enriched:
+                options = []
+                for gid in range(gpu_num):
+                    if used_mem[gid] + sz <= S + 1e-9 and K[gid] >= w - 1e-9:
+                        K_after = K[gid] - w
+                        if choose_rule == 'min_kvpr':
+                            rem = S - (used_mem[gid] + sz)
+                            if rem <= 0:
+                                continue
+                            kv_new = kvpr(sum_R[gid] + dR, rem)
+                            options.append((gid, K_after, kv_new))
+                        else:
+                            options.append((gid, K_after, None))
+                if not options:
+                    assign = None
+                    break
+                # Selection: prefer minimal K_after (tightest feasible), tie-break by min kvpr or larger mem slack
+                if choose_rule == 'min_kvpr':
+                    options.sort(key=lambda t: (t[1], t[2]))
+                else:
+                    options.sort(key=lambda t: t[1])
+                chosen = options[0][0]
+                # Tiny randomization among top-2 close in K_after
+                if len(options) > 1:
+                    bestK = options[0][1]
+                    near = [op for op in options if abs(op[1] - bestK) <= max(1e-9, 0.001 * (T * S + 1e-9))]
+                    if len(near) >= 2 and rng.random() < 0.25:
+                        chosen = near[rng.randrange(min(2, len(near)))][0]
+
+                assign[chosen].append(m)
+                used_mem[chosen] += sz
+                sum_R[chosen] += dR
+                K[chosen] -= w
+
+            if assign is None:
+                continue
+
+            # Validate constraints strictly
+            ok = True
+            for gid in range(gpu_num):
+                if used_mem[gid] - S > 1e-6:
+                    ok = False; break
+                rem = S - used_mem[gid]
+                if rem <= 0 and sum_R[gid] > 0:
+                    ok = False; break
+                if T > 0 and (sum_R[gid] / max(rem, 1e-12)) - T > 1e-6:
+                    ok = False; break
+            if not ok:
+                continue
+
+            # Keep best by measured max KVPR
+            val = 0.0
+            for gid in range(gpu_num):
+                rem = S - used_mem[gid]
+                val = max(val, kvpr(sum_R[gid], rem))
+            if val < best_val:
+                best_val = val
+                best_assign = assign
+
+        return best_assign
+=======
+    def assign_balanced_slack(T, order='w_desc', seed_H=0, choose_rule='tight', seeds=1):
+        if T < 0:
+            return None
+        # Build enriched base list once per T
+        enriched_base = []
+        for it in items:
+            dR = it['dR']; sz = it['size']
+            w = (0.0 if dR == float('inf') else dR) + T * sz
+            # If dR is inf (slo==0), reject cleanly
+            if dR == float('inf'):
+                return None
+            if w < 0:
+                w = 0.0
+            enriched_base.append([w, dR, sz, it['obj']])
+
+        # Orderings applied to the base
+        def order_enriched(arr):
+            if order == 'w_desc':
+                arr.sort(key=lambda x: x[0], reverse=True)
+            elif order == 'intrinsic_desc':
+                # dR/(S - sz)
+                arr.sort(key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+            elif order == 'size_desc':
+                arr.sort(key=lambda x: x[2], reverse=True)
+            elif order == 'density_desc':
+                arr.sort(key=lambda x: (x[1] / (x[2] if x[2] > 0 else 1e-9)), reverse=True)
+            else:
+                arr.sort(key=lambda x: x[0], reverse=True)
+
+        # Sort the base once
+        order_enriched(enriched_base)
+
+        best_assign = None
+        best_val = float('inf')
+
+        for _ in range(max(1, int(seeds))):
+            # fresh copy per seed to avoid cross-seed mutations
+            enriched = [row[:] for row in enriched_base]
+
+            # per-GPU states
+            assign = {i: [] for i in range(gpu_num)}
+            used_mem = [0.0] * gpu_num
+            sum_R = [0.0] * gpu_num
+            K = [T * S] * gpu_num  # KV slack
+
+            # Seeding: spread top H intrinsic-pressure models using worst-fit on K
+            H = int(seed_H) if seed_H else 0
+            if H > 0 and len(enriched) > 0:
+                intrinsic = sorted(enriched, key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+                seeds_list = intrinsic[:min(H, len(enriched))]
+                # Remove seeds from enriched while preserving original sequence among the rest
+                remaining = [row for row in enriched if row not in seeds_list]
+                for w, dR, sz, m in seeds_list:
+                    # Choose GPU with largest K that can fit both memory and slack
+                    candidates = []
+                    for gid in range(gpu_num):
+                        if used_mem[gid] + sz <= S + 1e-9 and K[gid] >= w - 1e-9:
+                            candidates.append(gid)
+                    if not candidates:
+                        assign = None
+                        break
+                    # Worst-fit on K; tie-break by larger memory slack, then lower resulting local kvpr
+                    def key_fn(g):
+                        rem = S - (used_mem[g] + sz)
+                        kvnew = kvpr(sum_R[g] + dR, rem) if rem > 0 else float('inf')
+                        return (-K[g], -(rem), kvnew)
+                    candidates.sort(key=lambda g: key_fn(g))
+                    chosen = candidates[0]
+                    if rng.random() < 0.2 and len(candidates) > 1:
+                        chosen = candidates[rng.randrange(min(2, len(candidates)))]
+                    assign[chosen].append(m)
+                    used_mem[chosen] += sz
+                    sum_R[chosen] += dR
+                    K[chosen] -= w
+                if assign is None:
+                    continue
+                enriched = remaining
+
+            # Main packing: equalize K by choosing GPU that leaves minimal nonnegative K'
+            for w, dR, sz, m in enriched:
+                options = []
+                for gid in range(gpu_num):
+                    if used_mem[gid] + sz <= S + 1e-9 and K[gid] >= w - 1e-9:
+                        K_after = K[gid] - w
+                        if choose_rule == 'min_kvpr':
+                            rem = S - (used_mem[gid] + sz)
+                            if rem <= 0:
+                                continue
+                            kv_new = kvpr(sum_R[gid] + dR, rem)
+                            options.append((gid, K_after, kv_new))
+                        else:
+                            options.append((gid, K_after, None))
+                if not options:
+                    assign = None
+                    break
+                # Selection: prefer minimal K_after (tightest feasible), tie-break by min kvpr
+                if choose_rule == 'min_kvpr':
+                    options.sort(key=lambda t: (t[1], t[2]))
+                else:
+                    options.sort(key=lambda t: t[1])
+                chosen = options[0][0]
+                # Tiny randomization among top-2 close in K_after
+                if len(options) > 1:
+                    bestK = options[0][1]
+                    near = [op for op in options if abs(op[1] - bestK) <= max(1e-9, 0.001 * (T * S + 1e-9))]
+                    if len(near) >= 2 and rng.random() < 0.25:
+                        chosen = near[rng.randrange(min(2, len(near)))][0]
+
+                assign[chosen].append(m)
+                used_mem[chosen] += sz
+                sum_R[chosen] += dR
+                K[chosen] -= w
+
+            if assign is None:
+                continue
+
+            # Validate constraints strictly
+            ok = True
+            for gid in range(gpu_num):
+                if used_mem[gid] - S > 1e-6:
+                    ok = False; break
+                rem = S - used_mem[gid]
+                if rem <= 0 and sum_R[gid] > 0:
+                    ok = False; break
+                if T > 0 and (sum_R[gid] / max(rem, 1e-12)) - T > 1e-6:
+                    ok = False; break
+            if not ok:
+                continue
+
+            # Keep best by measured max KVPR
+            val = 0.0
+            for gid in range(gpu_num):
+                rem = S - used_mem[gid]
+                val = max(val, kvpr(sum_R[gid], rem))
+            if val < best_val:
+                best_val = val
+                best_assign = assign
+
+        return best_assign
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def find_first_feasible_T(start_T):
+        T = max(0.0, start_T)
+        growth = 1.08
+        max_steps = 40
+        for _ in range(max_steps):
+            for (order, choose_rule, seedH, seeds) in [
+                ('w_desc', 'tight', min(4, max(1, gpu_num)), 1),
+                ('intrinsic_desc', 'tight', min(3, max(1, gpu_num - 1)), 1),
+                ('w_desc', 'min_kvpr', 0, 1),
+            ]:
+                cand = assign_balanced_slack(T, order=order, seed_H=seedH, choose_rule=choose_rule, seeds=1)
+                if cand is not None:
+                    return T, cand
+            T = T * growth if T > 0 else 1e-6
+        return None, None
+=======
+    def find_first_feasible_T(start_T):
+        T = max(0.0, start_T)
+        growth = 1.08
+        max_steps = 40
+        for _ in range(max_steps):
+            for (order, choose_rule, seedH, seeds) in [
+                ('w_desc', 'tight', min(4, max(1, gpu_num)), 2),
+                ('intrinsic_desc', 'tight', min(3, max(1, gpu_num - 1)), 1),
+                ('w_desc', 'min_kvpr', 0, 1),
+            ]:
+                cand = assign_balanced_slack(T, order=order, seed_H=seedH, choose_rule=choose_rule, seeds=seeds)
+                if cand is not None:
+                    return T, cand
+            T = T * growth if T > 0 else 1e-6
+        return None, None
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    candidates_T = []
+    for mul in [0.99, 1.0, 1.005, 1.02]:
+        val = max(lower, T_feas * mul)
+        candidates_T.append(val)
+    candidates_T.append(0.5 * (lower + T_feas))
+    candidates_T = sorted(set(round(t, 12) for t in candidates_T))
+=======
+    candidates_T = []
+    for mul in [0.985, 0.99, 0.995, 1.0, 1.005, 1.01, 1.02]:
+        val = max(lower, T_feas * mul)
+        candidates_T.append(val)
+    candidates_T.append(0.5 * (lower + T_feas))
+    candidates_T = sorted(set(round(t, 12) for t in candidates_T))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    refined = local_refine(best_placement, move_budget=20, swap_budget=10)
+
+    # Final check: memory safety
+    for gid in range(gpu_num):
+        mem = sum(float(m.model_size) for m in refined.get(gid, []))
+        if mem - S > 1e-6:
+            return best_placement
+
+    return refined
+=======
+    refined_once = local_refine(best_placement, move_budget=20, swap_budget=10)
+    refined_twice = local_refine(refined_once, move_budget=10, swap_budget=6)
+    # Also consider a refined greedy baseline
+    greedy_baseline = _greedy_fallback_kvpr(gpu_num, models, S)
+    greedy_refined = local_refine(greedy_baseline, move_budget=10, swap_budget=6)
+
+    # Select the best by measured max KVPR
+    candidates = [
+        refined_twice,
+        greedy_refined,
+        best_placement,
+    ]
+    best_final = candidates[0]
+    best_score = eval_max_kvpr(best_final)
+    for cand in candidates[1:]:
+        val = eval_max_kvpr(cand)
+        if val < best_score:
+            best_score = val
+            best_final = cand
+
+    # Final check: memory safety
+    for gid in range(gpu_num):
+        mem = sum(float(m.model_size) for m in best_final.get(gid, []))
+        if mem - S > 1e-6:
+            return refined_once
+
+    return best_final
+>>>>>>> REPLACE
+
+</DIFF>

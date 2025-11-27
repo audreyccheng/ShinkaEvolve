@@ -1,0 +1,281 @@
+# EVOLVE-BLOCK-START
+"""
+hybrid_constraint_synthesis
+Network Telemetry Repair using Synthetic Residual Candidates.
+
+This algorithm improves on iterative consensus by introducing "Synthetic Candidates" 
+derived from Flow Conservation residuals. This allows the system to reconstruct 
+traffic flows even when both ends of a link report erroneous zero values ("double dead"),
+provided the surrounding network context (neighbors) is verifiable.
+
+Key innovations:
+- Synthetic Candidates: Calculates the exact rate required to balance a router and proposes it as a solution.
+- Residual-Weighted Voting: Scores candidates based on how well they satisfy the 'demand' of verifiable routers.
+- Adaptive Confidence: Downgrades confidence if the router remains unbalanced after repair.
+"""
+from typing import Dict, Any, Tuple, List
+import collections
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    # --- Constants ---
+    TOLERANCE = 0.02          # 2% symmetry tolerance
+    FLOW_TOLERANCE = 0.05     # 5% flow conservation tolerance
+    MIN_ACTIVITY = 0.05       # Threshold for active traffic (Mbps)
+    
+    # --- 1. Initialization ---
+    state = {}
+    router_map = collections.defaultdict(list)
+    verifiable_routers = set()
+    
+    # Identify verifiable routers (complete telemetry)
+    for rid, if_list in topology.items():
+        router_map[rid] = if_list
+        if all(if_id in telemetry for if_id in if_list):
+            verifiable_routers.add(rid)
+            
+    # Initial State Load
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'down'),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'down'),
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router')
+        }
+
+    # --- 2. Status Repair ---
+    status_conf_map = {}
+    
+    for if_id, s in state.items():
+        orig = s['orig_status']
+        peer_id = s['connected_to']
+        
+        # Determine activity
+        local_traffic = (s['orig_rx'] > MIN_ACTIVITY) or (s['orig_tx'] > MIN_ACTIVITY)
+        peer_traffic = False
+        peer_status = 'unknown'
+        
+        if peer_id and peer_id in state:
+            p = state[peer_id]
+            peer_traffic = (p['orig_rx'] > MIN_ACTIVITY) or (p['orig_tx'] > MIN_ACTIVITY)
+            peer_status = p['orig_status']
+            
+        # Repair Logic
+        final_status = orig
+        conf = 1.0
+        
+        if local_traffic or peer_traffic:
+            final_status = 'up'
+            if orig == 'down':
+                conf = 0.95 # Fixing false negative
+        elif orig == 'up' and peer_status == 'down':
+            final_status = 'down'
+            conf = 0.8  # Peer disagreement
+        elif orig != peer_status:
+            final_status = 'down' # Conservative default
+            conf = 0.7
+            
+        state[if_id]['status'] = final_status
+        status_conf_map[if_id] = conf
+        
+        # Enforce Zero on DOWN
+        if final_status == 'down':
+            state[if_id]['rx'] = 0.0
+            state[if_id]['tx'] = 0.0
+
+    # --- 3. Rate Repair with Synthetic Candidates ---
+    
+    # Helper: Calculate Residual Demand
+    # Returns (residual_value, router_total_throughput)
+    def get_residual_demand(rid, exclude_if, field):
+        if rid not in verifiable_routers:
+            return None, 1.0
+        
+        sum_in = 0.0
+        sum_out = 0.0
+        # Sum traffic excluding current interface
+        for iface in router_map[rid]:
+            if iface == exclude_if: continue
+            sum_in += state[iface]['rx']
+            sum_out += state[iface]['tx']
+            
+        # If solving for TX: Input = Output + TX -> TX = Input - Output
+        if field == 'tx':
+            resid = sum_in - sum_out
+        else: # solving for RX: Input + RX = Output -> RX = Output - Input
+            resid = sum_out - sum_in
+            
+        throughput = max(sum_in, sum_out, 1.0)
+        return max(0.0, resid), throughput
+
+    # Iterative Consensus
+    for _ in range(4): # 4 passes for convergence
+        sorted_interfaces = sorted(list(state.keys()))
+        
+        for if_id in sorted_interfaces:
+            s = state[if_id]
+            if s['status'] == 'down': continue
+            
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+            
+            # Target Link: Local TX -> Remote RX
+            rid_loc = s['local_router']
+            rid_rem = s['remote_router']
+            
+            # 1. Gather Candidates
+            candidates = set()
+            candidates.add(s['tx'])                 # Local measurement
+            candidates.add(state[peer_id]['rx'])    # Remote measurement
+            
+            # Synthetic Candidates from Flow Conservation
+            res_loc, tp_loc = get_residual_demand(rid_loc, if_id, 'tx')
+            res_rem, tp_rem = get_residual_demand(rid_rem, peer_id, 'rx')
+            
+            if res_loc is not None: candidates.add(res_loc)
+            if res_rem is not None: candidates.add(res_rem)
+            
+            # Average candidate (Smoothing)
+            avg_val = (s['tx'] + state[peer_id]['rx']) / 2.0
+            candidates.add(avg_val)
+            
+            # Filter Candidates
+            valid_candidates = [c for c in candidates if c >= 0.0]
+            if not valid_candidates: valid_candidates = [0.0]
+            
+            # 2. Score Candidates (Penalty Function)
+            best_val = s['tx']
+            min_score = float('inf')
+            
+            for c in valid_candidates:
+                score = 0.0
+                
+                # Flow Constraint Penalty (Local)
+                if res_loc is not None:
+                    # Error = |Candidate - Ideal_Residual|
+                    # Normalized by router throughput
+                    err = abs(c - res_loc)
+                    rel_err = err / tp_loc
+                    score += min(rel_err * 10.0, 5.0) # Weight 10, Clamp 5
+                else:
+                    score += 0.1 # Small penalty for lack of verification
+                    
+                # Flow Constraint Penalty (Remote)
+                if res_rem is not None:
+                    err = abs(c - res_rem)
+                    rel_err = err / tp_rem
+                    score += min(rel_err * 10.0, 5.0)
+                else:
+                    score += 0.1
+                
+                # Measurement Deviation Penalty (Tie-Breaker)
+                # Helps stick to measurements when flow is ambiguous or consistent with multiple values
+                # E.g. if both routers unverifiable, stick to average/measured
+                orig_tx = s['tx']
+                orig_rx = state[peer_id]['rx']
+                
+                dev_tx = abs(c - orig_tx) / (orig_tx + 1.0)
+                dev_rx = abs(c - orig_rx) / (orig_rx + 1.0)
+                score += 0.05 * (dev_tx + dev_rx)
+                
+                if score < min_score:
+                    min_score = score
+                    best_val = c
+            
+            # 3. Update State
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+
+    # --- 4. Confidence Calibration ---
+    result = {}
+    
+    # Calculate final router health
+    router_health = {}
+    for rid in verifiable_routers:
+        sum_in = sum(state[iface]['rx'] for iface in router_map[rid])
+        sum_out = sum(state[iface]['tx'] for iface in router_map[rid])
+        diff = abs(sum_in - sum_out)
+        mag = max(sum_in, sum_out, 1.0)
+        router_health[rid] = (diff / mag) < FLOW_TOLERANCE
+
+    for if_id, s in state.items():
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+        status_conf = status_conf_map.get(if_id, 1.0)
+        
+        peer_id = s['connected_to']
+        rid_loc = s['local_router']
+        rid_rem = s['remote_router']
+        
+        def calibrate(orig, final, field):
+            # 1. Verification Context
+            loc_ok = router_health.get(rid_loc, False)
+            
+            rem_ok = False
+            if rid_rem in router_health:
+                rem_ok = router_health[rid_rem]
+            
+            # Peer Consistency
+            peer_consistent = True
+            if peer_id and peer_id in state:
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+
+            # Change Detection
+            changed = abs(orig - final) > max(orig * 0.01, 0.001)
+            smoothed = changed and (abs(orig - final) < max(orig * 0.10, 0.1)) # <10% change
+
+            # --- Bucket Logic ---
+            
+            # Case A: Unchanged
+            if not changed:
+                if loc_ok and rem_ok: return 1.0
+                if loc_ok: return 0.98
+                if not peer_consistent: return 0.7
+                return 0.9
+            
+            # Case B: Smoothed (Minor adjustments)
+            if smoothed:
+                return 0.95
+            
+            # Case C: Significant Repair
+            # Verified by "Math" (Flow Conservation)
+            if loc_ok and rem_ok: return 0.99
+            if loc_ok: return 0.96
+            if rem_ok: return 0.92
+            
+            # Case D: Heuristic Repairs
+            # Repairing a dead counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85
+            
+            # Case E: Unverified / Guess
+            return 0.6
+
+        rx_conf = calibrate(orig_rx, final_rx, 'rx')
+        tx_conf = calibrate(orig_tx, final_tx, 'tx')
+        
+        # Down-Status Override
+        if s['status'] == 'down':
+             if final_rx > 1.0 or final_tx > 1.0:
+                 rx_conf = 0.0
+                 tx_conf = 0.0
+        
+        result[if_id] = {
+            'rx_rate': (orig_rx, final_rx, rx_conf),
+            'tx_rate': (orig_tx, final_tx, tx_conf),
+            'interface_status': (s['orig_status'], s['status'], status_conf),
+            'connected_to': s['connected_to'],
+            'local_router': s['local_router'],
+            'remote_router': s['remote_router']
+        }
+        
+    return result
+# EVOLVE-BLOCK-END

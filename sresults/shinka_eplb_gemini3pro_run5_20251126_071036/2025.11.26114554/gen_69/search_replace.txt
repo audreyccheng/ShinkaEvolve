@@ -1,0 +1,169 @@
+<NAME>
+two_item_swap_refinement
+</NAME>
+
+<DESCRIPTION>
+Introduces a high-order refinement step (2-for-2 item swaps) applied to the best candidate solution found after the randomized LPT phase.
+By selecting the best configuration from the 256 restarts and performing computationally more expensive 2-for-2 swaps only on this optimal candidate, the algorithm can escape local optima where 1-for-1 swaps fail (e.g., swapping two medium items for one large and one small item), without incurring the cost of running this refinement on all 256 restarts.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 4. Select Best Restart
+    # Calculate final imbalance for each restart
+    final_weights = pack_contents.sum(dim=2)
+    imbalance = final_weights.max(dim=1).values - final_weights.min(dim=1).values
+
+    # Reshape to [Layers, Restarts]
+    imbalance = imbalance.view(num_layers, num_restarts)
+
+    # Select best restart index for each layer
+    best_restart_idx = imbalance.argmin(dim=1)
+
+    # Gather best results
+    # Index in B is (layer * num_restarts + best_restart_idx)
+    select_batch_idx = torch.arange(num_layers, device=device) * num_restarts + best_restart_idx
+
+    # [L, P, G]
+    best_ids = pack_orig_ids[select_batch_idx]
+
+    # 5. Reconstruct Output Format
+    # Map back to [L, N] -> Pack Index, Rank Index
+    pack_index = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+    rank_in_pack = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+
+    flat_best_ids = best_ids.view(num_layers, -1)
+
+    # Generate grids of pack indices and ranks
+    grid_packs = torch.arange(num_packs, device=device).view(1, -1, 1).expand(num_layers, -1, groups_per_pack).reshape(num_layers, -1)
+    grid_ranks = torch.arange(groups_per_pack, device=device).view(1, 1, -1).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+
+    # Scatter based on the original item IDs
+    # best_ids contains the original item index at each position (pack, rank)
+    # We want: pack_index[layer, item_id] = pack_id
+    pack_index.scatter_(1, flat_best_ids, grid_packs)
+    rank_in_pack.scatter_(1, flat_best_ids, grid_ranks)
+
+    return pack_index, rank_in_pack
+=======
+    # 4. Select Best Restart
+    # Calculate final imbalance for each restart
+    final_weights = pack_contents.sum(dim=2)
+    imbalance = final_weights.max(dim=1).values - final_weights.min(dim=1).values
+
+    # Reshape to [Layers, Restarts]
+    imbalance = imbalance.view(num_layers, num_restarts)
+
+    # Select best restart index for each layer
+    best_restart_idx = imbalance.argmin(dim=1)
+
+    # Gather best results
+    # Index in B is (layer * num_restarts + best_restart_idx)
+    select_batch_idx = torch.arange(num_layers, device=device) * num_restarts + best_restart_idx
+
+    # [L, P, G]
+    best_contents = pack_contents[select_batch_idx]
+    best_ids = pack_orig_ids[select_batch_idx]
+
+    # 5. Advanced Refinement (2-for-2 Swaps) on Selected Candidates
+    # This runs only on the best restart configuration per layer
+    if groups_per_pack >= 2:
+        # Precompute pair indices
+        r_idx, c_idx = torch.triu_indices(groups_per_pack, groups_per_pack, offset=1, device=device)
+        num_pairs = r_idx.size(0)
+
+        # Run a few iterations of 2-item swaps
+        for _ in range(20):
+            p_weights = best_contents.sum(dim=2)
+            val_max, idx_max = p_weights.max(dim=1)
+            val_min, idx_min = p_weights.min(dim=1)
+            diff = val_max - val_min
+
+            active_mask = diff > 1e-4
+            if not active_mask.any():
+                break
+
+            # Gather items from max and min packs
+            # [L, G]
+            items_max = best_contents[torch.arange(num_layers, device=device), idx_max]
+            items_min = best_contents[torch.arange(num_layers, device=device), idx_min]
+
+            # Compute pair sums [L, NumPairs]
+            pair_sum_max = items_max[:, r_idx] + items_max[:, c_idx]
+            pair_sum_min = items_min[:, r_idx] + items_min[:, c_idx]
+
+            # Delta [L, NumPairs, NumPairs]
+            delta = pair_sum_max.unsqueeze(2) - pair_sum_min.unsqueeze(1)
+
+            # Maximize improvement
+            target = diff.view(-1, 1, 1)
+            improvement = target - (target - 2 * delta).abs()
+
+            # Filter valid swaps (delta > 0 means moving weight from max to min)
+            valid = (improvement > 1e-6) & (delta > 0)
+
+            # Find best swap
+            imp_flat = improvement.view(num_layers, -1)
+            best_imp, best_idx_flat = imp_flat.max(dim=1)
+
+            do_swap = (best_imp > 1e-6) & active_mask
+            if not do_swap.any():
+                break
+
+            # Perform swaps
+            l_ids = torch.where(do_swap)[0]
+            flat_indices = best_idx_flat[l_ids]
+
+            pair_max_idx = flat_indices // num_pairs
+            pair_min_idx = flat_indices % num_pairs
+
+            # Indices within the pack (0..G-1)
+            u1 = r_idx[pair_max_idx]
+            u2 = c_idx[pair_max_idx]
+            v1 = r_idx[pair_min_idx]
+            v2 = c_idx[pair_min_idx]
+
+            # Pack indices
+            p_mx = idx_max[l_ids]
+            p_mn = idx_min[l_ids]
+
+            # Swap values
+            val_u1 = best_contents[l_ids, p_mx, u1]
+            val_u2 = best_contents[l_ids, p_mx, u2]
+            val_v1 = best_contents[l_ids, p_mn, v1]
+            val_v2 = best_contents[l_ids, p_mn, v2]
+
+            best_contents[l_ids, p_mx, u1] = val_v1
+            best_contents[l_ids, p_mx, u2] = val_v2
+            best_contents[l_ids, p_mn, v1] = val_u1
+            best_contents[l_ids, p_mn, v2] = val_u2
+
+            # Swap IDs
+            id_u1 = best_ids[l_ids, p_mx, u1]
+            id_u2 = best_ids[l_ids, p_mx, u2]
+            id_v1 = best_ids[l_ids, p_mn, v1]
+            id_v2 = best_ids[l_ids, p_mn, v2]
+
+            best_ids[l_ids, p_mx, u1] = id_v1
+            best_ids[l_ids, p_mx, u2] = id_v2
+            best_ids[l_ids, p_mn, v1] = id_u1
+            best_ids[l_ids, p_mn, v2] = id_u2
+
+    # 6. Reconstruct Output Format
+    # Map back to [L, N] -> Pack Index, Rank Index
+    pack_index = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+    rank_in_pack = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+
+    flat_best_ids = best_ids.view(num_layers, -1)
+
+    # Generate grids of pack indices and ranks
+    grid_packs = torch.arange(num_packs, device=device).view(1, -1, 1).expand(num_layers, -1, groups_per_pack).reshape(num_layers, -1)
+    grid_ranks = torch.arange(groups_per_pack, device=device).view(1, 1, -1).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+
+    # Scatter based on the original item IDs
+    pack_index.scatter_(1, flat_best_ids, grid_packs)
+    rank_in_pack.scatter_(1, flat_best_ids, grid_ranks)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

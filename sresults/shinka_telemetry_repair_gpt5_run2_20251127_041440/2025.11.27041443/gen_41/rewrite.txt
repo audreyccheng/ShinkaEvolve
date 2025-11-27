@@ -1,0 +1,330 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair using POCS with affine router balancing.
+
+Core ideas:
+- Alternating projections onto tolerance-banded link-direction symmetry
+- Closed-form least-squares router flow conservation projection
+- Minimal-change principle with non-negativity and mirrored peer updates
+- Confidence from symmetry fit, router residuals (direction-aware), and change magnitude
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Tolerances and guards (Hodor-aligned with magnitude awareness)
+    HARDENING_THRESHOLD = 0.02   # 2% for normal flows
+    LOW_RATE_CUTOFF = 10.0       # Mbps; for small flows use 5%
+    LOW_RATE_THRESHOLD = 0.05    # 5% for small flows
+    ABS_GUARD = 0.5              # Mbps absolute guard
+    QUIET_EPS = 0.1              # Mbps silent threshold
+    ITERATIONS = 4               # POCS iterations
+    ROUTER_EPS = 1e-9            # small epsilon
+
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(1.0, a, b)
+
+    def dir_threshold(a: float, b: float) -> float:
+        return LOW_RATE_THRESHOLD if max(a, b) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+
+    # Build peer mapping
+    peers: Dict[str, str] = {}
+    for if_id, d in telemetry.items():
+        p = d.get('connected_to')
+        peers[if_id] = p if p in telemetry else None
+
+    # Initialize working values from originals
+    vals: Dict[str, Dict[str, float]] = {}
+    orig: Dict[str, Dict[str, float]] = {}
+    status_orig: Dict[str, str] = {}
+    for if_id, d in telemetry.items():
+        tx = float(d.get('tx_rate', 0.0))
+        rx = float(d.get('rx_rate', 0.0))
+        vals[if_id] = {'tx': tx, 'rx': rx}
+        orig[if_id] = {'tx': tx, 'rx': rx}
+        status_orig[if_id] = d.get('interface_status', 'unknown')
+
+    # Determine pinned interfaces (forced down consistency)
+    pinned: Dict[str, bool] = {}
+    for if_id in telemetry:
+        peer_id = peers.get(if_id)
+        st = status_orig.get(if_id, 'unknown')
+        pst = status_orig.get(peer_id, 'unknown') if peer_id else None
+        force_down = (st == 'down') or (peer_id is not None and pst == 'down')
+        pinned[if_id] = force_down
+
+    # Build router->interfaces mapping (use topology and telemetry hints)
+    router_ifaces: Dict[str, List[str]] = {r: list(if_list) for r, if_list in topology.items()}
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        if lr:
+            router_ifaces.setdefault(lr, [])
+            if if_id not in router_ifaces[lr]:
+                router_ifaces[lr].append(if_id)
+        rr = d.get('remote_router')
+        if rr and rr not in router_ifaces:
+            router_ifaces[rr] = []
+
+    # Helper: enforce non-negativity
+    def nonneg():
+        for iid in vals:
+            vals[iid]['tx'] = max(0.0, float(vals[iid]['tx']))
+            vals[iid]['rx'] = max(0.0, float(vals[iid]['rx']))
+
+    # Link-direction projection (onto tolerance-banded equality)
+    def project_links():
+        visited = set()
+        for a_id, _ in telemetry.items():
+            b_id = peers.get(a_id)
+            if not b_id:
+                continue
+            key = tuple(sorted((a_id, b_id)))
+            if key in visited:
+                continue
+            visited.add(key)
+
+            # Skip if either side pinned (forced down handled separately)
+            if pinned.get(a_id, False) or pinned.get(b_id, False):
+                continue
+
+            a_tx, a_rx = vals[a_id]['tx'], vals[a_id]['rx']
+            b_tx, b_rx = vals[b_id]['tx'], vals[b_id]['rx']
+
+            # a->b: a_tx vs b_rx
+            abs_ab = abs(a_tx - b_rx)
+            tol_ab = dir_threshold(a_tx, b_rx)
+            max_ab = max(1.0, a_tx, b_rx)
+            if abs_ab > max(ABS_GUARD, tol_ab * max_ab):
+                # Minimal-change projection to equality: average both endpoints
+                cons = 0.5 * (a_tx + b_rx)
+                vals[a_id]['tx'] = cons
+                vals[b_id]['rx'] = cons
+
+            # b->a: b_tx vs a_rx
+            abs_ba = abs(b_tx - a_rx)
+            tol_ba = dir_threshold(b_tx, a_rx)
+            max_ba = max(1.0, b_tx, a_rx)
+            if abs_ba > max(ABS_GUARD, tol_ba * max_ba):
+                cons = 0.5 * (b_tx + a_rx)
+                vals[b_id]['tx'] = cons
+                vals[a_id]['rx'] = cons
+
+    # Router flow conservation projection (closed-form LS)
+    def project_routers():
+        for r, if_list in router_ifaces.items():
+            # Consider only non-pinned locals for adjustment mass
+            tx_indices = [iid for iid in if_list if iid in vals and not pinned.get(iid, False)]
+            rx_indices = [iid for iid in if_list if iid in vals and not pinned.get(iid, False)]
+
+            if not tx_indices and not rx_indices:
+                continue
+
+            sum_tx = sum(vals[iid]['tx'] for iid in if_list if iid in vals)
+            sum_rx = sum(vals[iid]['rx'] for iid in if_list if iid in vals)
+            delta = sum_tx - sum_rx
+            n = len(tx_indices) + len(rx_indices)
+            if n == 0:
+                continue
+
+            # Project only if residual exceeds tolerance band
+            denom = max(1.0, sum_tx, sum_rx)
+            if abs(delta) <= HARDENING_THRESHOLD * denom:
+                continue
+
+            c = delta / n  # equal shift minimizing squared change
+            # Apply to local tx/rx and mirror to peers to accelerate convergence
+            for iid in tx_indices:
+                old = vals[iid]['tx']
+                new = max(0.0, old - c)
+                d_change = new - old
+                vals[iid]['tx'] = new
+                pid = peers.get(iid)
+                if pid and not pinned.get(pid, False):
+                    vals[pid]['rx'] = max(0.0, vals[pid]['rx'] + d_change)  # mirror
+
+            for iid in rx_indices:
+                old = vals[iid]['rx']
+                new = max(0.0, old + c)
+                d_change = new - old
+                vals[iid]['rx'] = new
+                pid = peers.get(iid)
+                if pid and not pinned.get(pid, False):
+                    vals[pid]['tx'] = max(0.0, vals[pid]['tx'] - d_change)  # mirror
+
+    # Run POCS iterations
+    for _ in range(ITERATIONS):
+        project_links()
+        nonneg()
+        project_routers()
+        nonneg()
+
+    # Enforce final pinned zeros and status
+    for iid, is_pinned in pinned.items():
+        if is_pinned:
+            vals[iid]['tx'] = 0.0
+            vals[iid]['rx'] = 0.0
+
+    # Compute per-router residuals after repair (for confidence)
+    router_resid: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        s_tx = 0.0
+        s_rx = 0.0
+        for iid in if_list:
+            if iid in vals:
+                s_tx += float(vals[iid]['tx'])
+                s_rx += float(vals[iid]['rx'])
+        denom = max(1.0, s_tx, s_rx)
+        router_resid[r] = abs(s_tx - s_rx) / denom
+
+    # Assemble output with calibrated confidences
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        peer_id = peers.get(if_id)
+        peer_exists = peer_id is not None
+
+        orig_tx = orig[if_id]['tx']
+        orig_rx = orig[if_id]['rx']
+        rep_tx = vals[if_id]['tx']
+        rep_rx = vals[if_id]['rx']
+
+        status = status_orig.get(if_id, 'unknown')
+        peer_status = status_orig.get(peer_id, 'unknown') if peer_exists else None
+
+        # Interface consistency: if either side is down -> down and zero rates
+        force_down = (status == 'down') or (peer_exists and peer_status == 'down')
+        if force_down:
+            repaired_status = 'down'
+            both_report_down = (status == 'down' and (peer_exists and peer_status == 'down'))
+            status_conf = 0.95 if both_report_down else 0.7
+            rep_tx = 0.0
+            rep_rx = 0.0
+            tx_conf = status_conf
+            rx_conf = status_conf
+        else:
+            repaired_status = status
+
+            # Symmetry fit after repair
+            if peer_exists:
+                peer_rep_tx = vals[peer_id]['tx']
+                peer_rep_rx = vals[peer_id]['rx']
+                diff_tx = rel_diff(rep_tx, peer_rep_rx)  # my_tx vs their_rx
+                diff_rx = rel_diff(rep_rx, peer_rep_tx)  # my_rx vs their_tx
+                c_sym_tx = clamp(1.0 - diff_tx)
+                c_sym_rx = clamp(1.0 - diff_rx)
+                # Floors for strong agreements
+                floor_tx = 0.0
+                floor_rx = 0.0
+                if max(rep_tx, peer_rep_rx) >= 10.0 and diff_tx <= 0.005:
+                    floor_tx = 0.99
+                elif diff_tx <= dir_threshold(rep_tx, peer_rep_rx):
+                    floor_tx = 0.98 if max(rep_tx, peer_rep_rx) >= 10.0 else 0.97
+
+                if max(rep_rx, peer_rep_tx) >= 10.0 and diff_rx <= 0.005:
+                    floor_rx = 0.99
+                elif diff_rx <= dir_threshold(rep_rx, peer_rep_tx):
+                    floor_rx = 0.98 if max(rep_rx, peer_rep_tx) >= 10.0 else 0.97
+            else:
+                peer_rep_tx = None
+                peer_rep_rx = None
+                c_sym_tx = 0.9
+                c_sym_rx = 0.9
+                floor_tx = 0.0
+                floor_rx = 0.0
+
+            # Router residual penalties (direction-aware)
+            resid_local = router_resid.get(lr, 0.0)
+            resid_remote = router_resid.get(rr, 0.0)
+            pen_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.7, 1.0)
+            pen_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.7, 1.0)
+
+            # Correction magnitude penalty
+            m_tx = abs(rep_tx - orig_tx) / max(1.0, rep_tx, orig_tx)
+            m_rx = abs(rep_rx - orig_rx) / max(1.0, rep_rx, orig_rx)
+            c_delta_tx = clamp(1.0 - min(1.0, 1.5 * m_tx))
+            c_delta_rx = clamp(1.0 - min(1.0, 1.5 * m_rx))
+
+            # Compose confidences (weighted blend + floors)
+            tx_conf = clamp(0.45 * pen_tx + 0.35 * c_sym_tx + 0.20 * c_delta_tx)
+            rx_conf = clamp(0.45 * pen_rx + 0.35 * c_sym_rx + 0.20 * c_delta_rx)
+            tx_conf = max(tx_conf, floor_tx)
+            rx_conf = max(rx_conf, floor_rx)
+
+            # Asymmetric shaping: penalize the silent side only
+            if peer_exists:
+                if rep_tx <= QUIET_EPS and peer_rep_rx is not None and peer_rep_rx > QUIET_EPS:
+                    tx_conf = clamp(tx_conf * 0.88)
+                if rep_rx <= QUIET_EPS and peer_rep_tx is not None and peer_rep_tx > QUIET_EPS:
+                    rx_conf = clamp(rx_conf * 0.88)
+
+            # Status confidence
+            status_conf = 0.95
+            if peer_exists and repaired_status != peer_status and peer_status != 'down':
+                status_conf = min(status_conf, 0.6)
+            # Boost when both directions are strongly consistent
+            if peer_exists:
+                if (max(rep_tx, peer_rep_rx) >= 10.0 and rel_diff(rep_tx, peer_rep_rx) <= 0.005 and
+                        max(rep_rx, peer_rep_tx) >= 10.0 and rel_diff(rep_rx, peer_rep_tx) <= 0.005):
+                    status_conf = max(status_conf, 0.99)
+                elif (rel_diff(rep_tx, peer_rep_rx) <= dir_threshold(rep_tx, peer_rep_rx) and
+                      rel_diff(rep_rx, peer_rep_tx) <= dir_threshold(rep_rx, peer_rep_tx)):
+                    status_conf = max(status_conf, 0.97)
+            status_conf = clamp(status_conf * (0.85 + 0.15 * min(tx_conf, rx_conf)))
+
+        # Assemble output structure
+        out: Dict[str, Tuple] = {}
+        out['rx_rate'] = (orig_rx, rep_rx, clamp(rx_conf))
+        out['tx_rate'] = (orig_tx, rep_tx, clamp(tx_conf))
+        out['interface_status'] = (status_orig[if_id], repaired_status, clamp(status_conf))
+        out['connected_to'] = d.get('connected_to')
+        out['local_router'] = d.get('local_router')
+        out['remote_router'] = d.get('remote_router')
+        result[if_id] = out
+
+    # Safety: enforce zero rates if repaired status is down
+    for if_id, d in result.items():
+        if d['interface_status'][1] == 'down':
+            orx, _, rc = d['rx_rate']
+            otx, _, tc = d['tx_rate']
+            d['rx_rate'] = (orx, 0.0, rc)
+            d['tx_rate'] = (otx, 0.0, tc)
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple sanity test
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'r1',
+            'remote_router': 'r2',
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,
+            'tx_rate': 100.0,
+            'connected_to': 'if1_to_if2',
+            'local_router': 'r2',
+            'remote_router': 'r1',
+        }
+    }
+    test_topology = {'r1': ['if1_to_if2'], 'r2': ['if2_to_if1']}
+    res = run_repair(test_telemetry, test_topology)
+    for k, v in res.items():
+        print(k, v)

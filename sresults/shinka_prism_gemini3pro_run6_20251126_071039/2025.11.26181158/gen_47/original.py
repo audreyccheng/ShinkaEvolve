@@ -1,0 +1,162 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Uses a Binary Search approach on the target KVPR value.
+    The check for a feasible KVPR 'K' is transformed into a Bin Packing problem
+    where item weights are linear combinations of load and size: w = load + K * size.
+    """
+    
+    # Precompute model characteristics for speed
+    # L = req_rate / slo, S = model_size
+    model_data = []
+    for m in models:
+        model_data.append({
+            'model': m,
+            'l': m.req_rate / m.slo,
+            's': m.model_size
+        })
+
+    # Helper function to check if a max_kvpr K is feasible
+    def can_pack(target_k):
+        # We need to pack models such that for each GPU:
+        # sum(L) / (M - sum(S)) <= K
+        # => sum(L) <= K * M - K * sum(S)
+        # => sum(L) + K * sum(S) <= K * M
+        # Let weight_i = L_i + K * S_i
+        # We need to pack items with weight_i into bins of capacity K * M
+        # Additionally, strict memory constraint: sum(S) < M
+        
+        # Heuristic: First Fit Decreasing on the linearized weights
+        # This dynamic sorting helps:
+        # - For large K (tight memory), size S dominates weight, packing acts like S-based FFD.
+        # - For small K (loose memory), load L dominates, packing acts like L-based FFD.
+        items = sorted(model_data, key=lambda x: x['l'] + target_k * x['s'], reverse=True)
+        
+        # GPU states
+        # We track accumulated L and S directly to check exact constraints
+        bins_l = [0.0] * gpu_num
+        bins_s = [0.0] * gpu_num
+        bins_models = [[] for _ in range(gpu_num)]
+        
+        capacity_limit = target_k * GPU_MEM_SIZE
+        
+        for item in items:
+            placed = False
+            # Try to place in the first valid bin (First Fit)
+            for i in range(gpu_num):
+                # Check hard memory constraint
+                if bins_s[i] + item['s'] >= GPU_MEM_SIZE - 1e-6:
+                    continue
+                
+                # Check KVPR constraint (linearized form for stability)
+                # sum(L) + K*sum(S) <= K*M
+                current_weight = (bins_l[i] + item['l']) + target_k * (bins_s[i] + item['s'])
+                if current_weight <= capacity_limit + 1e-9:
+                    # Place here
+                    bins_l[i] += item['l']
+                    bins_s[i] += item['s']
+                    bins_models[i].append(item['model'])
+                    placed = True
+                    break
+            
+            if not placed:
+                return None
+                
+        return bins_models
+
+    # Binary Search for the optimal K
+    # 1. Find a valid upper bound (High)
+    low = 0.0
+    high = 1.0
+    best_placement = None
+    
+    # Exponential search to find a feasible upper bound
+    # If high=1.0 works, we search [0, 1]. If not, we double until we find one.
+    found_high = False
+    for _ in range(20): # Max out at K ~ 10^6
+        res = can_pack(high)
+        if res is not None:
+            best_placement = res
+            found_high = True
+            break
+        low = high
+        high *= 2.0
+        
+    if not found_high:
+        # If we can't place even with very high K, memory constraints are likely the bottleneck.
+        # Try one last desperate packing with purely size-based logic (effectively infinite K)
+        high = 1e9
+        best_placement = can_pack(high)
+        if best_placement is None:
+             raise ValueError("Unable to fit models into GPU memory.")
+
+    # 2. Refine K using Binary Search
+    # We maintain the invariant that 'high' is always feasible (best_placement is valid)
+    for _ in range(20): # 20 iterations gives good precision
+        mid = (low + high) / 2
+        res = can_pack(mid)
+        if res is not None:
+            best_placement = res
+            high = mid
+        else:
+            low = mid
+            
+    return {i: best_placement[i] for i in range(gpu_num)}
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+    
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+    
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+    
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+    
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+

@@ -1,0 +1,274 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Diversity-Aware Exhaustive Beam Search followed by 
+    Simulated Annealing with Block Moves.
+    
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Parameter affecting the computational budget (unused in this fixed-strategy logic)
+        
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # --- Hyperparameters ---
+    BEAM_WIDTH = 4
+    # Diversity: Don't let a single parent dominate the next generation of the beam
+    MAX_EXTENSIONS_PER_PARENT = 2 
+    
+    SA_ITERATIONS = 4500
+    SA_START_TEMP_RATIO = 0.05
+    SA_COOLING_RATE = 0.9985
+    
+    # --- Cost Cache ---
+    # Critical for performance since we re-evaluate similar sequences
+    cost_cache = {}
+
+    def get_cost(seq):
+        t_seq = tuple(seq)
+        if t_seq in cost_cache:
+            return cost_cache[t_seq]
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[t_seq] = c
+        return c
+
+    # --- Phase 1: Exhaustive Beam Search Construction with Diversity ---
+    
+    # Step 1: Initialize beam with all single transactions
+    initial_candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        # We track 'root' here essentially as parent_id for the first step
+        initial_candidates.append({
+            'cost': cost, 
+            'seq': seq, 
+            'rem': [x for x in range(workload.num_txns) if x != t]
+        })
+    
+    # Sort and take top beam width
+    initial_candidates.sort(key=lambda x: x['cost'])
+    beam = initial_candidates[:BEAM_WIDTH]
+    
+    # Iteratively build the schedule
+    # We need to add (num_txns - 1) more transactions
+    for _ in range(workload.num_txns - 1):
+        candidates = []
+        
+        # Enumerate all valid extensions for every beam node
+        for parent_idx, node in enumerate(beam):
+            parent_seq = node['seq']
+            parent_rem = node['rem']
+            
+            # Exhaustive check of all remaining transactions for this path
+            for next_txn in parent_rem:
+                new_seq = parent_seq + [next_txn]
+                new_cost = get_cost(new_seq)
+                
+                candidates.append({
+                    'cost': new_cost,
+                    'seq': new_seq,
+                    'added': next_txn,
+                    'parent_idx': parent_idx, # Track lineage for diversity
+                    'parent_rem': parent_rem
+                })
+        
+        # Sort all candidates by cost
+        candidates.sort(key=lambda x: x['cost'])
+        
+        # Select best candidates while enforcing diversity
+        new_beam = []
+        parent_counts = {i: 0 for i in range(len(beam))}
+        
+        for cand in candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+                
+            p_idx = cand['parent_idx']
+            # Only accept if this parent hasn't contributed too many children already
+            if parent_counts[p_idx] < MAX_EXTENSIONS_PER_PARENT:
+                new_rem = list(cand['parent_rem'])
+                new_rem.remove(cand['added'])
+                
+                new_beam.append({
+                    'cost': cand['cost'],
+                    'seq': cand['seq'],
+                    'rem': new_rem
+                })
+                parent_counts[p_idx] += 1
+        
+        # Fallback: If strict diversity resulted in fewer than BEAM_WIDTH candidates, 
+        # fill the remaining spots with the best available skipped candidates.
+        if len(new_beam) < BEAM_WIDTH and len(candidates) > len(new_beam):
+            for cand in candidates:
+                if len(new_beam) >= BEAM_WIDTH: break
+                
+                # Check if we skipped this one based on parent counts
+                p_idx = cand['parent_idx']
+                if parent_counts[p_idx] >= MAX_EXTENSIONS_PER_PARENT:
+                    # Construct and add
+                    new_rem = list(cand['parent_rem'])
+                    new_rem.remove(cand['added'])
+                    new_beam.append({
+                        'cost': cand['cost'], 
+                        'seq': cand['seq'], 
+                        'rem': new_rem
+                    })
+        
+        beam = new_beam
+
+    # Best result from Beam Search
+    if not beam:
+        return float('inf'), []
+    
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+    
+    # --- Phase 2: Simulated Annealing with Block Moves ---
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+    
+    # Temperature initialization
+    T = current_cost * SA_START_TEMP_RATIO
+    T_min = 0.05
+    
+    for k in range(SA_ITERATIONS):
+        # Create neighbor
+        neighbor = list(current_schedule)
+        n = len(neighbor)
+        
+        # Probabilistic Operator Selection
+        # 40% Swap, 40% Insert, 20% Block Move
+        op_rand = random.random()
+        
+        if op_rand < 0.4:
+            # Swap Operator
+            i, j = random.sample(range(n), 2)
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+            
+        elif op_rand < 0.8:
+            # Insert Operator (Single item move)
+            i = random.randint(0, n - 1)
+            val = neighbor.pop(i)
+            j = random.randint(0, n - 1)
+            neighbor.insert(j, val)
+            
+        else:
+            # Block Move Operator
+            # Move a contiguous sequence of transactions
+            b_size = random.randint(2, 5) # Block size 2 to 5
+            if n > b_size:
+                # Pick start index
+                i = random.randint(0, n - b_size)
+                # Extract block
+                block = neighbor[i : i+b_size]
+                # Remove block
+                del neighbor[i : i+b_size]
+                # Insert block at new random position
+                # New length is n - b_size
+                j = random.randint(0, len(neighbor))
+                neighbor[j:j] = block
+        
+        new_cost = get_cost(neighbor)
+        delta = new_cost - current_cost
+        
+        # Metropolis Acceptance Criterion
+        accept = False
+        if delta < 0:
+            accept = True
+        elif T > 1e-9:
+            p = math.exp(-delta / T)
+            if random.random() < p:
+                accept = True
+        
+        if accept:
+            current_schedule = neighbor
+            current_cost = new_cost
+            if current_cost < best_cost:
+                best_cost = current_cost
+                best_schedule = list(current_schedule)
+        
+        # Cooling
+        T *= SA_COOLING_RATE
+        if T < T_min: T = T_min
+
+    return best_cost, best_schedule
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END

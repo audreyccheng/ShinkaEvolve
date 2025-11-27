@@ -1,0 +1,204 @@
+<NAME>
+tilt_asym_fix_disable_pair_reconcile
+</NAME>
+
+<DESCRIPTION>
+Goal: Improve counter_repair_accuracy (currently below prior best) without harming status or confidence calibration.
+
+Observation: The current version introduced a new Stage 2 “paired proportional reconciliation” that nudges many paired interfaces to reduce router residuals. While it can reduce residuals, it also tends to distort otherwise-correct counters, hurting counter accuracy. Prior high-performing versions relied instead on small, benefit-checked adjustments focused on unpaired, dominating interfaces (Stage 2b).
+
+Edits:
+1) Disable the paired proportional reconciliation pass (Stage 2) while preserving its surrounding sum/residual calculations so later stages still function. We add a feature flag PAIR_RECONCILE_ENABLED=False and gate the Stage 2 loop. This reverts behavior closer to the previously strong counter repair while keeping the safer Stage 2b adjustments.
+
+2) Replace the asymmetric partial averaging kernel with a directionally sound implementation per the “Asymmetric partial averaging” recommendation. It moves the louder endpoint more using a controllable ramp and protects low-rate cases via the existing exponent. This should converge faster and more accurately toward consensus when one side dominates, improving counter repair without overreach.
+
+3) Slightly reduce the pair-bias pre-scaling strength (BETA_BIAS: 0.6 → 0.5) to lower the risk of over-scaling an endpoint when multiplicative bias is inferred, improving stability.
+
+These changes are consistent with the Hodor principles: they harden signals using redundancy, correct outliers conservatively, and avoid overconfident/coarse router-wide redistributions that can reduce accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Pair-bias stage moderation
+    BETA_BIAS = 0.6                  # partial application strength for pair-bias scaling
+=======
+    # Pair-bias stage moderation
+    BETA_BIAS = 0.5                  # partial application strength for pair-bias scaling (slightly reduced for stability)
+
+    # Feature flag: paired proportional reconciliation (Stage 2)
+    # Disable by default to avoid widespread counter distortion; rely on safer Stage 2b micro-adjustments.
+    PAIR_RECONCILE_ENABLED = False
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        def asym_partial(a_val: float, b_val: float, consensus: float, diff: float, tol: float, exp: float = 1.0) -> Tuple[float, float]:
+            k_base_raw = (diff - tol) / max(tol, 1e-9)
+            k_base = k_base_raw ** exp
+            # compute loudness share
+            s = max(1e-9, a_val + b_val)
+            a_share = a_val / s
+            b_share = b_val / s
+            # louder moves more
+            k_a = clamp(k_base * (1.0 + 0.5 * a_share), 0.0, 1.0)
+            k_b = clamp(k_base * (1.0 + 0.5 * b_share), 0.0, 1.0)
+            # but bias to move louder more: the quieter uses reduced factor
+            if a_val >= b_val:
+                k_b = clamp(k_base * (1.0 - 0.5 * b_share), 0.0, 1.0)
+            else:
+                k_a = clamp(k_base * (1.0 - 0.5 * a_share), 0.0, 1.0)
+            new_a = a_val * (1.0 - k_a) + consensus * k_a
+            new_b = b_val * (1.0 - k_b) + consensus * k_b
+            return new_a, new_b
+=======
+        def asym_partial(a_val: float, b_val: float, consensus: float, diff: float, tol: float, exp: float = 1.0) -> Tuple[float, float]:
+            # Base ramp proportional to excess over tolerance, magnitude-aware
+            k_base_raw = (diff - tol) / max(tol, 1e-9)
+            k_base = clamp(k_base_raw, 0.0, 1.0) ** exp
+            # Move the louder side more toward consensus; quieter side less
+            loud_is_a = a_val >= b_val
+            loud = a_val if loud_is_a else b_val
+            quiet = b_val if loud_is_a else a_val
+            r = (loud - quiet) / max(1.0, loud)  # directional dominance in [0,1]
+            k_loud = clamp(k_base * (1.0 + 0.5 * r), 0.0, 1.0)
+            k_quiet = clamp(k_base * (1.0 - 0.5 * r), 0.0, 1.0)
+            new_loud = loud * (1.0 - k_loud) + consensus * k_loud
+            new_quiet = quiet * (1.0 - k_quiet) + consensus * k_quiet
+            if loud_is_a:
+                return new_loud, new_quiet
+            else:
+                return new_quiet, new_loud
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        delta = sum_tx - sum_rx
+        denom_r = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs(delta) / denom_r
+        if resid_frac < ROUTER_RESID_TRIGGER or not if_list:
+            continue
+
+        reduce_tx = delta > 0.0
+        reduce_rx = delta < 0.0
+
+        # Collect paired, up interfaces for proportional distribution
+        if reduce_tx:
+            dirs = [(iid, float(vals[iid]['tx'])) for iid in if_list
+                    if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+        else:
+            dirs = [(iid, float(vals[iid]['rx'])) for iid in if_list
+                    if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+        total_mass = sum(m for _, m in dirs)
+        if total_mass <= 0.0:
+            continue
+
+        budget = min(abs(delta), 0.008 * denom_r)  # small 0.8% cap to protect counters
+
+        # Apply tentatively
+        changes: List[Tuple[str, str, float]] = []
+        for iid, mass in dirs:
+            share = mass / total_mass if total_mass > 0 else 0.0
+            d_i = budget * share
+            if d_i <= 0.0:
+                continue
+            if reduce_tx:
+                old_tx = vals[iid]['tx']
+                vals[iid]['tx'] = max(0.0, old_tx - d_i)
+                changes.append(('tx', iid, old_tx))
+                pid = peers.get(iid)
+                if pid and status_orig.get(pid, 'unknown') != 'down':
+                    old_prx = vals[pid]['rx']
+                    vals[pid]['rx'] = max(0.0, old_prx - d_i)
+                    changes.append(('rx', pid, old_prx))
+            else:
+                old_rx = vals[iid]['rx']
+                vals[iid]['rx'] = max(0.0, old_rx - d_i)
+                changes.append(('rx', iid, old_rx))
+                pid = peers.get(iid)
+                if pid and status_orig.get(pid, 'unknown') != 'down':
+                    old_ptx = vals[pid]['tx']
+                    vals[pid]['tx'] = max(0.0, old_ptx - d_i)
+                    changes.append(('tx', pid, old_ptx))
+
+        resid_after = compute_router_resid_if(vals, r)
+        resid_before = resid_frac
+        # Commit only if improves by at least 8%
+        if resid_after > (1.0 - 0.10) * resid_before:
+            # Revert all tentative changes
+            for kind, iid, old_val in changes:
+                vals[iid][kind] = old_val
+        else:
+            # Update router_sums for this router after commit
+            router_sums[r] = compute_router_sums(vals).get(r, (0.0, 0.0))
+=======
+    if PAIR_RECONCILE_ENABLED:
+        for r, if_list in router_ifaces.items():
+            sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+            delta = sum_tx - sum_rx
+            denom_r = max(1.0, sum_tx, sum_rx)
+            resid_frac = abs(delta) / denom_r
+            if resid_frac < ROUTER_RESID_TRIGGER or not if_list:
+                continue
+
+            reduce_tx = delta > 0.0
+            reduce_rx = delta < 0.0
+
+            # Collect paired, up interfaces for proportional distribution
+            if reduce_tx:
+                dirs = [(iid, float(vals[iid]['tx'])) for iid in if_list
+                        if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+            else:
+                dirs = [(iid, float(vals[iid]['rx'])) for iid in if_list
+                        if iid in vals and status_orig.get(iid, 'unknown') != 'down' and peers.get(iid)]
+            total_mass = sum(m for _, m in dirs)
+            if total_mass <= 0.0:
+                continue
+
+            budget = min(abs(delta), 0.008 * denom_r)  # small 0.8% cap to protect counters
+
+            # Apply tentatively
+            changes: List[Tuple[str, str, float]] = []
+            for iid, mass in dirs:
+                share = mass / total_mass if total_mass > 0 else 0.0
+                d_i = budget * share
+                if d_i <= 0.0:
+                    continue
+                if reduce_tx:
+                    old_tx = vals[iid]['tx']
+                    vals[iid]['tx'] = max(0.0, old_tx - d_i)
+                    changes.append(('tx', iid, old_tx))
+                    pid = peers.get(iid)
+                    if pid and status_orig.get(pid, 'unknown') != 'down':
+                        old_prx = vals[pid]['rx']
+                        vals[pid]['rx'] = max(0.0, old_prx - d_i)
+                        changes.append(('rx', pid, old_prx))
+                else:
+                    old_rx = vals[iid]['rx']
+                    vals[iid]['rx'] = max(0.0, old_rx - d_i)
+                    changes.append(('rx', iid, old_rx))
+                    pid = peers.get(iid)
+                    if pid and status_orig.get(pid, 'unknown') != 'down':
+                        old_ptx = vals[pid]['tx']
+                        vals[pid]['tx'] = max(0.0, old_ptx - d_i)
+                        changes.append(('tx', pid, old_ptx))
+
+            resid_after = compute_router_resid_if(vals, r)
+            resid_before = resid_frac
+            # Commit only if improves by at least 8%
+            if resid_after > (1.0 - 0.10) * resid_before:
+                # Revert all tentative changes
+                for kind, iid, old_val in changes:
+                    vals[iid][kind] = old_val
+            else:
+                # Update router_sums for this router after commit
+                router_sums[r] = compute_router_sums(vals).get(r, (0.0, 0.0))
+    else:
+        # No paired reconciliation; rely on safer unpaired micro-adjustments (Stage 2b).
+        pass
+>>>>>>> REPLACE
+
+</DIFF>

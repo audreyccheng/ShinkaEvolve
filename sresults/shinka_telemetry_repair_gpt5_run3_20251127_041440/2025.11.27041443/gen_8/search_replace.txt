@@ -1,0 +1,157 @@
+<NAME>
+router_aware_pair_choice
+</NAME>
+
+<DESCRIPTION>
+I introduce a router-aware tie-breaker during the pairwise hardening stage. When a link-direction’s bilateral counters disagree beyond the 2% hardening threshold, instead of blindly trusting the peer’s counter, the algorithm now chooses between the local and peer measurement by evaluating which choice better satisfies router-level flow conservation (R1) across both routers connected by the link. This leverages topology to reduce per-router imbalance early, improving rate repair accuracy without disrupting the existing confidence calibration. The rest of the pipeline (router-level adjustments and final symmetry touch-up) remains intact, so we preserve the previous strong calibration and status behavior while increasing counter accuracy.
+
+The change adds:
+- A mapping from interface to router using topology (fallback to local_router).
+- Baseline per-router rx/tx sums computed from original telemetry.
+- In the pairwise hardening, when the symmetry deviation exceeds the threshold, a router-aware choice for the repaired value is made by picking the candidate (local or peer) that yields lower combined imbalance over the two routers.
+
+This is a targeted enhancement that uses the topology and R1 to make more informed repairs in the early stage, increasing the accuracy of repaired counters while maintaining existing confidence semantics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Precompute originals
+    orig_rx: Dict[str, float] = {}
+    orig_tx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+        status[if_id] = data.get('interface_status', 'unknown')
+        peer_of[if_id] = data.get('connected_to')
+
+    # Pair hardening: use bilateral agreement to estimate direction rates
+=======
+    # Precompute originals
+    orig_rx: Dict[str, float] = {}
+    orig_tx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+        status[if_id] = data.get('interface_status', 'unknown')
+        peer_of[if_id] = data.get('connected_to')
+
+    # Build interface->router mapping using topology when available (fallback to local_router)
+    router_of: Dict[str, str] = {}
+    if topology:
+        for r, ifs in topology.items():
+            for iid in ifs:
+                if iid in telemetry:
+                    router_of[iid] = r
+    # Fallback/populate missing from local_router field
+    for iid, data in telemetry.items():
+        if iid not in router_of:
+            router_of[iid] = data.get('local_router')
+
+    # Baseline per-router sums from original measurements (used as router-level tie-breaker)
+    base_sum_rx: Dict[str, float] = {}
+    base_sum_tx: Dict[str, float] = {}
+    for iid in telemetry:
+        r = router_of.get(iid)
+        if not r:
+            # If router is unknown, skip from baseline
+            continue
+        base_sum_rx[r] = base_sum_rx.get(r, 0.0) + orig_rx.get(iid, 0.0)
+        base_sum_tx[r] = base_sum_tx.get(r, 0.0) + orig_tx.get(iid, 0.0)
+
+    # Pair hardening: use bilateral agreement to estimate direction rates
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Base hardened values
+        if my_up and peer_up and peer_data:
+            # Directional hardening with tolerance:
+            # - If within tolerance, average to reduce noise.
+            # - If beyond tolerance, trust the peer's redundant counter for that direction.
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                hardened_tx_val = 0.5 * (my_tx + peer_rx)
+            else:
+                hardened_tx_val = peer_rx
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                hardened_rx_val = 0.5 * (my_rx + peer_tx)
+            else:
+                hardened_rx_val = peer_tx
+
+            # Confidence primarily from agreement; boost when within tolerance
+            base_tx_conf = clamp01(1.0 - tx_to_peer_rx_diff)
+            base_rx_conf = clamp01(1.0 - rx_from_peer_tx_diff)
+            # Slight bump when within tolerance to reflect redundancy agreement
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                base_tx_conf = clamp01(0.92 + 0.08 * (1.0 - tx_to_peer_rx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                base_rx_conf = clamp01(0.92 + 0.08 * (1.0 - rx_from_peer_tx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+=======
+        # Base hardened values
+        if my_up and peer_up and peer_data:
+            # Directional hardening with tolerance:
+            # - If within tolerance, average to reduce noise.
+            # - If beyond tolerance, choose the value (local vs peer) that best improves router R1 across both routers.
+            ra = router_of.get(if_id)
+            rb = router_of.get(peer_id)
+            # Helper to compute per-router imbalance given a candidate substitution
+            def router_imbalance(sum_rx: float, sum_tx: float) -> float:
+                denom = max(1.0, abs(sum_rx), abs(sum_tx))
+                return abs(sum_rx - sum_tx) / denom
+
+            # Direction 1: a.tx vs b.rx
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                hardened_tx_val = 0.5 * (my_tx + peer_rx)
+            else:
+                if ra and rb and (ra in base_sum_rx) and (rb in base_sum_rx):
+                    srx_ra = base_sum_rx.get(ra, 0.0)
+                    stx_ra = base_sum_tx.get(ra, 0.0)
+                    srx_rb = base_sum_rx.get(rb, 0.0)
+                    stx_rb = base_sum_tx.get(rb, 0.0)
+                    # Option 1: keep local my_tx
+                    ra_tx_local = stx_ra - my_tx + my_tx
+                    rb_rx_local = srx_rb - peer_rx + my_tx
+                    imb_local = router_imbalance(srx_ra, ra_tx_local) + router_imbalance(rb_rx_local, stx_rb)
+                    # Option 2: use peer_rx
+                    ra_tx_peer = stx_ra - my_tx + peer_rx
+                    rb_rx_peer = srx_rb - peer_rx + peer_rx
+                    imb_peer = router_imbalance(srx_ra, ra_tx_peer) + router_imbalance(rb_rx_peer, stx_rb)
+                    hardened_tx_val = peer_rx if imb_peer <= imb_local else my_tx
+                else:
+                    hardened_tx_val = peer_rx
+
+            # Direction 2: a.rx vs b.tx
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                hardened_rx_val = 0.5 * (my_rx + peer_tx)
+            else:
+                if ra and rb and (ra in base_sum_rx) and (rb in base_sum_rx):
+                    srx_ra = base_sum_rx.get(ra, 0.0)
+                    stx_ra = base_sum_tx.get(ra, 0.0)
+                    srx_rb = base_sum_rx.get(rb, 0.0)
+                    stx_rb = base_sum_tx.get(rb, 0.0)
+                    # Option 1: keep local my_rx
+                    ra_rx_local = srx_ra - my_rx + my_rx
+                    rb_tx_local = stx_rb - peer_tx + my_rx
+                    imb_local = router_imbalance(ra_rx_local, stx_ra) + router_imbalance(srx_rb, rb_tx_local)
+                    # Option 2: use peer_tx
+                    ra_rx_peer = srx_ra - my_rx + peer_tx
+                    rb_tx_peer = stx_rb - peer_tx + peer_tx
+                    imb_peer = router_imbalance(ra_rx_peer, stx_ra) + router_imbalance(srx_rb, rb_tx_peer)
+                    hardened_rx_val = peer_tx if imb_peer <= imb_local else my_rx
+                else:
+                    hardened_rx_val = peer_tx
+
+            # Confidence primarily from agreement; boost when within tolerance
+            base_tx_conf = clamp01(1.0 - tx_to_peer_rx_diff)
+            base_rx_conf = clamp01(1.0 - rx_from_peer_tx_diff)
+            # Slight bump when within tolerance to reflect redundancy agreement
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                base_tx_conf = clamp01(0.92 + 0.08 * (1.0 - tx_to_peer_rx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                base_rx_conf = clamp01(0.92 + 0.08 * (1.0 - rx_from_peer_tx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+>>>>>>> REPLACE
+</DIFF>

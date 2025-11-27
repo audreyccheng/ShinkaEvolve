@@ -1,0 +1,195 @@
+<NAME>
+candidate_imputation_and_refined_scoring
+</NAME>
+
+<DESCRIPTION>
+Introduces a "Candidate Synthesis" mechanism in the rate repair loop (Imputation). Instead of just choosing between the local TX and remote RX values, the algorithm now calculates hypothetical values that would satisfy flow conservation at the local and remote routers ("synthesized candidates").
+
+This allows the algorithm to:
+1. Reconstruct data for links where both ends are corrupted or dead (double-dead links), provided the routers are otherwise balanced.
+2. Resolve conflicts by checking which candidate (measured or synthesized) minimizes global flow error.
+
+Also refines the confidence calibration by removing the continuous penalty for small, valid errors (under 5%), preventing underconfidence in good repairs.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = avg
+            else:
+                # Disagreement: Resolve conflict using Continuous Error Scoring
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                def get_candidate_cost(candidate_val):
+                    # Cost from Local Router (TX side)
+                    err_loc = get_flow_error(rid_local, if_id, 'tx', candidate_val)
+                    if err_loc is None:
+                        # Unverifiable: Small fixed cost to represent uncertainty
+                        cost_loc = 0.02
+                    elif err_loc < FLOW_TOLERANCE:
+                        # Verifiable and Valid: Cost is the actual error magnitude
+                        cost_loc = err_loc
+                    else:
+                        # Verifiable and Invalid: High penalty + error
+                        cost_loc = 0.5 + err_loc
+
+                    # Cost from Remote Router (RX side)
+                    err_rem = get_flow_error(rid_remote, peer_id, 'rx', candidate_val)
+                    if err_rem is None:
+                        cost_rem = 0.02
+                    elif err_rem < FLOW_TOLERANCE:
+                        cost_rem = err_rem
+                    else:
+                        cost_rem = 0.5 + err_rem
+
+                    return cost_loc + cost_rem
+
+                score_tx = get_candidate_cost(val_tx)
+                score_rx = get_candidate_cost(val_rx)
+
+                # Heuristic: Penalize Dead counters (0) if the other side is active
+                # This helps select the active value when one side is incorrectly zero
+                if val_tx < MIN_ACTIVITY and val_rx > MIN_ACTIVITY: score_tx += 0.5
+                if val_rx < MIN_ACTIVITY and val_tx > MIN_ACTIVITY: score_rx += 0.5
+
+                # Selection
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = avg # Tie -> Average
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+=======
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            val_tx = s['tx']
+            val_rx = state[peer_id]['rx']
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                new_val = avg
+            else:
+                # Disagreement: Use Candidate Generation & Continuous Scoring
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # 1. Generate Candidates
+                candidates = {val_tx, val_rx, avg}
+
+                # Synthesize candidates from flow conservation (Imputation)
+                # Local Synthesis (Target TX = In - Other_Out)
+                if rid_local in verifiable_routers:
+                     sum_rx = sum(state[i]['rx'] for i in router_map[rid_local])
+                     sum_tx = sum(state[i]['tx'] for i in router_map[rid_local])
+                     # Current balance = sum_rx - sum_tx
+                     # We want new_tx such that sum_rx - (sum_tx - val_tx + new_tx) = 0
+                     # new_tx = sum_rx - sum_tx + val_tx
+                     synth_tx = sum_rx - sum_tx + val_tx
+                     if synth_tx >= 0: candidates.add(synth_tx)
+
+                # Remote Synthesis (Target RX = Out - Other_In)
+                if rid_remote in verifiable_routers:
+                     sum_rx = sum(state[i]['rx'] for i in router_map[rid_remote])
+                     sum_tx = sum(state[i]['tx'] for i in router_map[rid_remote])
+                     # We want new_rx such that (sum_rx - val_rx + new_rx) - sum_tx = 0
+                     # new_rx = sum_tx - sum_rx + val_rx
+                     synth_rx = sum_tx - sum_rx + val_rx
+                     if synth_rx >= 0: candidates.add(synth_rx)
+
+                # 2. Score Candidates
+                best_val = avg
+                best_score = float('inf')
+
+                for cand in candidates:
+                    # Cost from Local
+                    err_loc = get_flow_error(rid_local, if_id, 'tx', cand)
+                    cost_loc = 0.05 if err_loc is None else (err_loc if err_loc < FLOW_TOLERANCE else 1.0 + err_loc)
+
+                    # Cost from Remote
+                    err_rem = get_flow_error(rid_remote, peer_id, 'rx', cand)
+                    cost_rem = 0.05 if err_rem is None else (err_rem if err_rem < FLOW_TOLERANCE else 1.0 + err_rem)
+
+                    score = cost_loc + cost_rem
+
+                    # Heuristic: Penalize Zero/Low values if significant traffic exists elsewhere
+                    # This prevents "dragging down" valid traffic to 0
+                    if cand < MIN_ACTIVITY and max(val_tx, val_rx) > MIN_ACTIVITY:
+                        score += 1.0
+
+                    if score < best_score:
+                        best_score = score
+                        best_val = cand
+
+                new_val = best_val
+
+            # Update state
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # 4. Continuous Penalties
+
+            # Local Router Residual Penalty
+            # Even if verified (<5%), a 4% error is worse than 0%.
+            # If unverifiable (None), no penalty applied here.
+            # If >5%, heavily penalized via penalty cap.
+            if loc_err is not None:
+                 penalty = min(0.5, loc_err)
+                 conf *= (1.0 - penalty)
+
+            # Peer Inconsistency Penalty
+            if not peer_consistent:
+                conf *= 0.9
+
+            return float(conf)
+=======
+            # 4. Penalties
+
+            # Penalty for residual error (only if significant)
+            if loc_err is not None and loc_err > FLOW_TOLERANCE:
+                 penalty = min(0.5, loc_err)
+                 conf *= (1.0 - penalty)
+
+            # Peer Inconsistency Penalty
+            if not peer_consistent:
+                conf *= 0.8
+
+            return float(conf)
+>>>>>>> REPLACE
+</DIFF>

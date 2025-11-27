@@ -1,0 +1,351 @@
+<NAME>
+robust_init_and_ruin
+</NAME>
+
+<DESCRIPTION>
+1. Enhance Initialization: Improve the binary search linearization by scanning a range of K values around the optimal found K. This varies the balance between packing efficiency (Size) and load balancing (Load), generating more diverse initial solutions.
+2. Robust Fallback: Replace the simple fallback with a multi-strategy fallback (Size, Load, Density, Random Shuffle) to maximize success rate and avoid "Models do not fit" errors.
+3. Multi-GPU Ruin & Recreate: Modify perturbation to ruin the top 2 bottleneck GPUs instead of just moving one model. This allows larger rearrangements and escaping local optima where swapping between bottlenecks is necessary.
+4. Increase Iterations: Increase max_iter to 250 to allow more time for the ILS to converge given the fast execution time.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 1. Initialization
+    # -------------------------------------------------------------------------
+    candidates = []
+
+    # Strategy A: Binary Search Linearization (with Randomization)
+    def solve_linearized_bp(target_k, noise=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            base_w = (m.req_rate / m.slo) + target_k * m.model_size
+            w = base_w * random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_usage = bins[i].load + target_k * bins[i].used_mem
+                if lin_usage + base_w <= bin_cap:
+                    rem = bin_cap - (lin_usage + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    bs_res = None
+    best_k = high
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            bs_res = res
+            best_k = mid
+            high = mid
+        else:
+            low = mid
+    if bs_res:
+        candidates.append(bs_res)
+        # Randomized Refinement around best_k
+        for _ in range(10):
+            res_noise = solve_linearized_bp(best_k, noise=0.05)
+            if res_noise: candidates.append(res_noise)
+
+    # Strategy B, C, D: Greedy
+    strategies = [
+        ('size', lambda m: m.model_size),
+        ('load', lambda m: m.req_rate / m.slo),
+        ('density', lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 1e-7 else 0)
+    ]
+
+    for _, key_fn in strategies:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        valid = True
+        sorted_m = sorted(models, key=key_fn, reverse=True)
+        for m in sorted_m:
+            best_idx = -1
+            best_val = float('inf')
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    rem = GPU_MEM_SIZE - (gpus[i].used_mem + m.model_size)
+                    val = (gpus[i].load + m.req_rate/m.slo) / rem if rem > 1e-7 else float('inf')
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+            if best_idx != -1:
+                gpus[best_idx].add(m)
+            else:
+                valid = False
+                break
+        if valid: candidates.append(gpus)
+
+    # Strategy E: Randomized Greedy (Robustness)
+    for _ in range(5):
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        shuffled_m = list(models)
+        random.shuffle(shuffled_m)
+        valid = True
+        for m in shuffled_m:
+            best_idx = -1
+            best_val = float('inf')
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    rem = GPU_MEM_SIZE - (gpus[i].used_mem + m.model_size)
+                    val = (gpus[i].load + m.req_rate/m.slo) / rem if rem > 1e-7 else float('inf')
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+            if best_idx != -1:
+                gpus[best_idx].add(m)
+            else:
+                valid = False
+                break
+        if valid: candidates.append(gpus)
+
+    # Fallback
+    if not candidates:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        for m in sorted(models, key=lambda x: x.model_size, reverse=True):
+            placed = False
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    gpus[i].add(m)
+                    placed = True
+                    break
+            if not placed: raise ValueError("Models do not fit in GPU memory.")
+        candidates.append(gpus)
+=======
+    # -------------------------------------------------------------------------
+    # 1. Initialization
+    # -------------------------------------------------------------------------
+    candidates = []
+
+    # Strategy A: Binary Search Linearization (with Randomization)
+    def solve_linearized_bp(target_k, noise=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            base_w = (m.req_rate / m.slo) + target_k * m.model_size
+            w = base_w
+            if noise > 0:
+                w *= random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_usage = bins[i].load + target_k * bins[i].used_mem
+                # Linearized constraint check: load + K*used <= K*Total
+                if lin_usage + base_w <= bin_cap:
+                    rem = bin_cap - (lin_usage + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    bs_res = None
+    best_k = high
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            bs_res = res
+            best_k = mid
+            high = mid
+        else:
+            low = mid
+    if bs_res:
+        candidates.append(bs_res)
+        # Refinement: Scan range of K values to vary load/size bias
+        for mult in [1.0, 1.05, 1.1, 1.2, 1.5]:
+            for _ in range(2):
+                res_noise = solve_linearized_bp(best_k * mult, noise=0.05)
+                if res_noise: candidates.append(res_noise)
+
+    # Strategy B, C, D: Deterministic Greedy
+    strategies = [
+        ('size', lambda m: m.model_size),
+        ('load', lambda m: m.req_rate / m.slo),
+        ('density', lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 1e-7 else 0)
+    ]
+
+    for _, key_fn in strategies:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        valid = True
+        sorted_m = sorted(models, key=key_fn, reverse=True)
+        for m in sorted_m:
+            best_idx = -1
+            best_val = float('inf')
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    rem = GPU_MEM_SIZE - (gpus[i].used_mem + m.model_size)
+                    val = (gpus[i].load + m.req_rate/m.slo) / rem if rem > 1e-7 else float('inf')
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+            if best_idx != -1:
+                gpus[best_idx].add(m)
+            else:
+                valid = False
+                break
+        if valid: candidates.append(gpus)
+
+    # Strategy E: Randomized Greedy
+    for _ in range(5):
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        shuffled_m = list(models)
+        random.shuffle(shuffled_m)
+        valid = True
+        for m in shuffled_m:
+            best_idx = -1
+            best_val = float('inf')
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    rem = GPU_MEM_SIZE - (gpus[i].used_mem + m.model_size)
+                    val = (gpus[i].load + m.req_rate/m.slo) / rem if rem > 1e-7 else float('inf')
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+            if best_idx != -1:
+                gpus[best_idx].add(m)
+            else:
+                valid = False
+                break
+        if valid: candidates.append(gpus)
+
+    # Robust Fallback to guarantee solution
+    if not candidates:
+        # Try multiple fallback strategies
+        fallback_strategies = [
+            lambda m: m.model_size,
+            lambda m: m.req_rate / m.slo,
+            lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 0 else 0
+        ]
+        placed_all = False
+        for key_fn in fallback_strategies:
+            try:
+                gpus = [GPUState(i) for i in range(gpu_num)]
+                for m in sorted(models, key=key_fn, reverse=True):
+                    placed = False
+                    for i in range(gpu_num):
+                        if gpus[i].can_fit(m.model_size):
+                            gpus[i].add(m)
+                            placed = True
+                            break
+                    if not placed: raise ValueError
+                candidates.append(gpus)
+                placed_all = True
+                break
+            except ValueError:
+                continue
+
+        # Last resort: Randomized attempts
+        if not placed_all:
+            for _ in range(10):
+                try:
+                    gpus = [GPUState(i) for i in range(gpu_num)]
+                    shuffled = list(models)
+                    random.shuffle(shuffled)
+                    for m in shuffled:
+                        placed = False
+                        for i in range(gpu_num):
+                            if gpus[i].can_fit(m.model_size):
+                                gpus[i].add(m)
+                                placed = True
+                                break
+                        if not placed: raise ValueError
+                    candidates.append(gpus)
+                    placed_all = True
+                    break
+                except ValueError:
+                    continue
+
+        if not candidates:
+             raise ValueError("Models do not fit in GPU memory after exhaustive search.")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 2. Iterated Local Search
+    # -------------------------------------------------------------------------
+    iter_cnt = 0
+    max_iter = 150
+
+    while iter_cnt < max_iter:
+=======
+    # -------------------------------------------------------------------------
+    # 2. Iterated Local Search
+    # -------------------------------------------------------------------------
+    iter_cnt = 0
+    max_iter = 250
+
+    while iter_cnt < max_iter:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- Perturbation ---
+        iter_cnt += 1
+        if iter_cnt > max_iter - 10: break
+
+        worst_gpu = sorted_gpus[0]
+        if not worst_gpu.models: break
+
+        # Select model to move: Prefer high load models
+        # Sort models by load descending
+        sorted_models_idx = sorted(range(len(worst_gpu.models)),
+                                   key=lambda k: worst_gpu.models[k].req_rate/worst_gpu.models[k].slo,
+                                   reverse=True)
+        # Pick from top 50%
+        n_candidates = max(1, len(sorted_models_idx) // 2)
+        m_idx_idx = random.randint(0, n_candidates - 1)
+        m_idx = sorted_models_idx[m_idx_idx]
+
+        model_to_move = worst_gpu.models[m_idx]
+
+        feasible_dests = [g for g in current_gpus if g.id != worst_gpu.id and g.can_fit(model_to_move.model_size)]
+
+        if feasible_dests:
+            # Guided: Prefer good GPUs to avoid moving to another bottleneck
+            feasible_dests.sort(key=lambda g: g.kvpr())
+            target_candidates = feasible_dests[:4]
+            dest = random.choice(target_candidates)
+
+            worst_gpu.remove(m_idx)
+            dest.add(model_to_move)
+            current_vector = get_vector(current_gpus)
+        else:
+            break
+=======
+        # --- Perturbation (Multi-GPU Ruin & Recreate) ---
+        iter_cnt += 1
+        if iter_cnt > max_iter - 10: break
+
+        # Ruin top 2 bottlenecks to allow swapping items between them and others
+        n_ruin = min(2, len(sorted_gpus))
+        ruined_gpus = sorted_gpus[:n_ruin]
+
+        displaced_models = []
+        for g in ruined_gpus:

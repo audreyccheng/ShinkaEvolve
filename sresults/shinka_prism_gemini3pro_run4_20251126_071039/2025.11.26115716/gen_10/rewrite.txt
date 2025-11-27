@@ -1,0 +1,218 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+
+    # Pre-process models
+    items = []
+    for m in models:
+        items.append({
+            'model': m,
+            'w': m.req_rate / m.slo,
+            's': m.model_size
+        })
+
+    def get_max_kvpr(placement):
+        """Calculate the actual maximum KVPR of a given placement."""
+        current_max = 0.0
+        for p in placement.values():
+            w_sum = sum(m.req_rate / m.slo for m in p)
+            s_sum = sum(m.model_size for m in p)
+            rem = GPU_MEM_SIZE - s_sum
+            if rem <= 1e-9:
+                if w_sum > 1e-9: return float('inf')
+                val = 0.0
+            else:
+                val = w_sum / rem
+            if val > current_max:
+                current_max = val
+        return current_max
+
+    def check_placement(k_target):
+        """
+        Check if models can be placed with KVPR <= k_target using multiple heuristics.
+        """
+        # Strategies: (key_lambda, reverse, use_best_fit)
+        # 1. Linearized cost: w + k*s. Adapts to K.
+        # 2. Size: s. Good for memory bound.
+        # 3. Weight: w. Good for load bound.
+        # 4. Density: w/s.
+        strategies = [
+            (lambda x: x['w'] + k_target * x['s'], True, True),   # Best Fit
+            (lambda x: x['w'] + k_target * x['s'], True, False),  # First Fit
+            (lambda x: x['s'], True, True),                       # Size Desc, Best Fit
+            (lambda x: x['w'], True, True),                       # Weight Desc, Best Fit
+            (lambda x: x['w'] / (x['s'] + 1e-5), True, True)      # Density Desc, Best Fit
+        ]
+
+        for key_func, reverse, use_best_fit in strategies:
+            sorted_items = sorted(items, key=key_func, reverse=reverse)
+            placement = {i: [] for i in range(gpu_num)}
+            gpu_state = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+            
+            possible = True
+            for item in sorted_items:
+                best_idx = -1
+                best_score = -1.0 # For Best Fit (maximize filled "volume")
+                
+                # Check all GPUs
+                for i in range(gpu_num):
+                    new_s = gpu_state[i]['s'] + item['s']
+                    if new_s > GPU_MEM_SIZE: continue
+                    
+                    new_w = gpu_state[i]['w'] + item['w']
+                    rem = GPU_MEM_SIZE - new_s
+                    
+                    # KVPR constraint: w <= k * rem
+                    # Use multiplication to avoid division by zero/small numbers
+                    limit = k_target * rem
+                    if new_w > limit + 1e-7: 
+                        continue
+                        
+                    if not use_best_fit:
+                        # First Fit
+                        best_idx = i
+                        break
+                    
+                    # Best Fit criteria: Maximize current usage (Leave least space)
+                    # Usage metric: new_w + k * new_s
+                    # This corresponds to filling the "linearized bin" as much as possible
+                    score = new_w + k_target * new_s
+                    if score > best_score:
+                        best_score = score
+                        best_idx = i
+                
+                if best_idx != -1:
+                    placement[best_idx].append(item['model'])
+                    gpu_state[best_idx]['w'] += item['w']
+                    gpu_state[best_idx]['s'] += item['s']
+                else:
+                    possible = False
+                    break
+            
+            if possible:
+                return placement
+        return None
+
+    # 1. Binary Search for K
+    high = 1e9
+    # Initial feasibility check
+    best_placement = check_placement(high)
+    if best_placement is None:
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+    
+    # Tighten initial high bound
+    high = get_max_kvpr(best_placement)
+    low = 0.0
+    
+    # 20 iterations is sufficient for high precision
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = check_placement(mid)
+        if res is not None:
+            best_placement = res
+            # Aggressive bound tightening: the actual max is <= mid
+            actual_max = get_max_kvpr(res)
+            high = min(mid, actual_max)
+        else:
+            low = mid
+
+    # 2. Local Search Optimization (Hill Climbing / Descent)
+    # Attempt to reduce the peak load by moving models from the bottleneck GPU
+    
+    # Initialize state for fast updates
+    gpu_states = []
+    for i in range(gpu_num):
+        w = sum(m.req_rate / m.slo for m in best_placement[i])
+        s = sum(m.model_size for m in best_placement[i])
+        gpu_states.append({'w': w, 's': s, 'models': list(best_placement[i])})
+
+    for _ in range(100): # Max iterations
+        # Calculate costs and identify max
+        max_cost = -1.0
+        max_idx = -1
+        
+        for i in range(gpu_num):
+            rem = GPU_MEM_SIZE - gpu_states[i]['s']
+            if rem <= 1e-9:
+                c = float('inf') if gpu_states[i]['w'] > 1e-9 else 0.0
+            else:
+                c = gpu_states[i]['w'] / rem
+            
+            if c > max_cost:
+                max_cost = c
+                max_idx = i
+        
+        if max_cost == 0: break
+        
+        improved = False
+        src = gpu_states[max_idx]
+        
+        # Try to move a model from src to dst
+        for m_idx, m in enumerate(src['models']):
+            m_w = m.req_rate / m.slo
+            m_s = m.model_size
+            
+            # Predict source cost after removal
+            ns_s = src['s'] - m_s
+            ns_w = src['w'] - m_w
+            ns_rem = GPU_MEM_SIZE - ns_s
+            if ns_rem <= 1e-9:
+                 ns_cost = float('inf') if ns_w > 1e-9 else 0.0
+            else:
+                 ns_cost = ns_w / ns_rem
+            
+            # Optimization: if src doesn't improve much, still valid, but we want global improvement
+            if ns_cost >= max_cost: continue 
+
+            for dst_idx in range(gpu_num):
+                if dst_idx == max_idx: continue
+                dst = gpu_states[dst_idx]
+                
+                # Check mem
+                nd_s = dst['s'] + m_s
+                if nd_s > GPU_MEM_SIZE: continue
+                
+                # Predict dest cost
+                nd_w = dst['w'] + m_w
+                nd_rem = GPU_MEM_SIZE - nd_s
+                if nd_rem <= 1e-9:
+                    nd_cost = float('inf') if nd_w > 1e-9 else 0.0
+                else:
+                    nd_cost = nd_w / nd_rem
+                
+                # Check if this move improves the local bottleneck situation
+                # We require that both the new source and new dest are strictly better than the OLD max
+                if max(ns_cost, nd_cost) < max_cost - 1e-9:
+                    # Apply move
+                    model = src['models'].pop(m_idx)
+                    src['s'] = ns_s
+                    src['w'] = ns_w
+                    
+                    dst['models'].append(model)
+                    dst['s'] = nd_s
+                    dst['w'] = nd_w
+                    
+                    improved = True
+                    break
+            if improved: break
+        
+        if not improved:
+            break
+
+    # Reconstruct result
+    final_placement = {i: gpu_states[i]['models'] for i in range(gpu_num)}
+    return final_placement
+# EVOLVE-BLOCK-END

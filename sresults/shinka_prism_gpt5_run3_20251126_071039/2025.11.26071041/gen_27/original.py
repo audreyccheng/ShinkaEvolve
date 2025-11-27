@@ -1,0 +1,550 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+    # Helper to compute KVPR for a GPU safely
+    def kvpr(R, rem_mem):
+        if rem_mem <= 0:
+            return float('inf')
+        return R / rem_mem
+
+    # Early return for trivial cases
+    empty = {gpu_id: [] for gpu_id in range(gpu_num)}
+    if not models or gpu_num <= 0:
+        return empty
+
+    # Greedy min-max assignment using lookahead of resultant max KVPR for a given ordering
+    def greedy_assign(sorted_models):
+        placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+        rem_mem = [GPU_MEM_SIZE for _ in range(gpu_num)]   # remaining memory per GPU
+        sum_r_over_s = [0.0 for _ in range(gpu_num)]       # sum of r_j / s_j per GPU
+
+        for model in sorted_models:
+            dR = model.req_rate / model.slo
+            current_kvprs = [kvpr(sum_r_over_s[i], rem_mem[i]) for i in range(gpu_num)]
+
+            best_gpu = None
+            best_resulting_max = float('inf')
+            best_new_gpu_kvpr = float('inf')
+            best_new_rem = -1
+
+            for gid in range(gpu_num):
+                if model.model_size <= rem_mem[gid]:
+                    new_R = sum_r_over_s[gid] + dR
+                    new_mem = rem_mem[gid] - model.model_size
+                    new_gpu_kvpr = kvpr(new_R, new_mem)
+
+                    # Compute resulting global max KVPR after placing on gid
+                    resulting_max = new_gpu_kvpr
+                    for j in range(gpu_num):
+                        if j == gid:
+                            continue
+                        if current_kvprs[j] > resulting_max:
+                            resulting_max = current_kvprs[j]
+
+                    # Tie-breaking: minimize resulting max; then minimize this GPU's KVPR; then prefer more remaining memory.
+                    if (resulting_max < best_resulting_max or
+                        (resulting_max == best_resulting_max and new_gpu_kvpr < best_new_gpu_kvpr) or
+                        (resulting_max == best_resulting_max and new_gpu_kvpr == best_new_gpu_kvpr and new_mem > best_new_rem)):
+                        best_resulting_max = resulting_max
+                        best_new_gpu_kvpr = new_gpu_kvpr
+                        best_new_rem = new_mem
+                        best_gpu = gid
+
+            if best_gpu is None:
+                # No GPU can fit this model without exceeding memory
+                raise ValueError(
+                    f"Unable to place model of size {model.model_size} GB on any GPU. "
+                    f"Remaining per-GPU memory: {rem_mem}"
+                )
+
+            # Commit placement
+            placement[best_gpu].append(model)
+            sum_r_over_s[best_gpu] += dR
+            rem_mem[best_gpu] -= model.model_size
+
+        return placement, rem_mem, sum_r_over_s
+
+    # Local improvement: try moving or swapping models to reduce max KVPR
+    def improve(placement, rem_mem, sum_r_over_s):
+        def compute_all_kvprs():
+            return [kvpr(sum_r_over_s[i], rem_mem[i]) for i in range(gpu_num)]
+
+        eps = 1e-12
+        # Limit the number of improvement iterations to keep it simple and fast
+        max_iters = max(1, min(len(models), 6 * gpu_num))
+        for _ in range(max_iters):
+            kvprs = compute_all_kvprs()
+            if not kvprs:
+                break
+            current_max = max(kvprs)
+            max_gid = max(range(gpu_num), key=lambda i: kvprs[i])
+
+            improved = False
+            best_move = None  # (src, dst, model, resulting_max, dst_new_kvpr, dst_new_mem)
+
+            # Try moving a single model from the max-pressure GPU to another GPU
+            for mdl in list(placement[max_gid]):
+                dR = mdl.req_rate / mdl.slo
+                size = mdl.model_size
+
+                # State after removing from source
+                src_new_R = sum_r_over_s[max_gid] - dR
+                src_new_mem = rem_mem[max_gid] + size
+                src_new_kvpr = kvpr(src_new_R, src_new_mem)
+
+                for dst in range(gpu_num):
+                    if dst == max_gid:
+                        continue
+                    if size <= rem_mem[dst]:
+                        dst_new_R = sum_r_over_s[dst] + dR
+                        dst_new_mem = rem_mem[dst] - size
+                        dst_new_kvpr = kvpr(dst_new_R, dst_new_mem)
+
+                        # Compute resulting global max after move
+                        resulting_max = dst_new_kvpr
+                        if src_new_kvpr > resulting_max:
+                            resulting_max = src_new_kvpr
+                        for j in range(gpu_num):
+                            if j == max_gid or j == dst:
+                                continue
+                            if kvprs[j] > resulting_max:
+                                resulting_max = kvprs[j]
+
+                        if resulting_max + eps < current_max:
+                            # Tie-breakers: minimize resulting_max, then minimize dst kvpr, then maximize dst remaining mem
+                            move_better = False
+                            if best_move is None:
+                                move_better = True
+                            else:
+                                _, _, _, best_res_max, best_dst_kvpr, best_dst_rem = best_move
+                                if (resulting_max < best_res_max or
+                                    (resulting_max == best_res_max and dst_new_kvpr < best_dst_kvpr) or
+                                    (resulting_max == best_res_max and dst_new_kvpr == best_dst_kvpr and dst_new_mem > best_dst_rem)):
+                                    move_better = True
+                            if move_better:
+                                best_move = (max_gid, dst, mdl, resulting_max, dst_new_kvpr, dst_new_mem)
+
+            if best_move is not None:
+                # Apply the best move
+                src, dst, mdl, _, _, _ = best_move
+                placement[src].remove(mdl)
+                placement[dst].append(mdl)
+                dR = mdl.req_rate / mdl.slo
+                size = mdl.model_size
+                sum_r_over_s[src] -= dR
+                rem_mem[src] += size
+                sum_r_over_s[dst] += dR
+                rem_mem[dst] -= size
+                improved = True
+            else:
+                # Try one pairwise swap between the most pressured GPU and others
+                best_swap = None  # (src, dst, a, b, resulting_max)
+                src = max_gid
+                # Cap the search to keep it fast
+                cap_a = max(3, min(10, len(placement[src])))
+                for ai, a in enumerate(list(placement[src])[:cap_a]):
+                    aR = a.req_rate / a.slo
+                    aS = a.model_size
+                    for dst in range(gpu_num):
+                        if dst == src or not placement[dst]:
+                            continue
+                        cap_b = max(3, min(10, len(placement[dst])))
+                        for bi, b in enumerate(list(placement[dst])[:cap_b]):
+                            bR = b.req_rate / b.slo
+                            bS = b.model_size
+
+                            # New states after swap
+                            src_new_R = sum_r_over_s[src] - aR + bR
+                            dst_new_R = sum_r_over_s[dst] - bR + aR
+                            src_new_mem = rem_mem[src] + aS - bS
+                            dst_new_mem = rem_mem[dst] + bS - aS
+
+                            if src_new_mem < 0 or dst_new_mem < 0:
+                                continue
+
+                            src_new_kvpr = kvpr(src_new_R, src_new_mem)
+                            dst_new_kvpr = kvpr(dst_new_R, dst_new_mem)
+
+                            # Compute resulting max across all GPUs
+                            resulting_max = src_new_kvpr if src_new_kvpr > dst_new_kvpr else dst_new_kvpr
+                            for j in range(gpu_num):
+                                if j == src or j == dst:
+                                    continue
+                                if kvprs[j] > resulting_max:
+                                    resulting_max = kvprs[j]
+
+                            if resulting_max + eps < current_max:
+                                if best_swap is None or resulting_max < best_swap[4]:
+                                    best_swap = (src, dst, a, b, resulting_max)
+
+                if best_swap is not None:
+                    src, dst, a, b, _ = best_swap
+                    # Apply swap
+                    placement[src].remove(a)
+                    placement[dst].append(a)
+                    placement[dst].remove(b)
+                    placement[src].append(b)
+
+                    aR = a.req_rate / a.slo
+                    bR = b.req_rate / b.slo
+                    aS = a.model_size
+                    bS = b.model_size
+
+                    sum_r_over_s[src] = sum_r_over_s[src] - aR + bR
+                    sum_r_over_s[dst] = sum_r_over_s[dst] - bR + aR
+                    rem_mem[src] = rem_mem[src] + aS - bS
+                    rem_mem[dst] = rem_mem[dst] + bS - aS
+                    improved = True
+
+            if not improved:
+                break  # no improving move/swap found
+
+        return placement, rem_mem, sum_r_over_s
+
+    # Build multiple candidate orderings and choose the best after improvements
+    def pressure_weight(m):
+        denom = GPU_MEM_SIZE - m.model_size
+        if denom <= 0:
+            return float('inf')
+        return (m.req_rate / m.slo) / denom
+
+    def r_over_s(m):
+        return (m.req_rate / m.slo)
+
+    def density(m):
+        # Prefer higher r/s per memory footprint
+        sz = m.model_size if m.model_size > 0 else 1e-9
+        return (m.req_rate / m.slo) / sz
+
+    # Candidate orderings (descending where appropriate)
+    orderings = [
+        lambda ms: sorted(ms, key=pressure_weight, reverse=True),
+        lambda ms: sorted(ms, key=r_over_s, reverse=True),
+        lambda ms: sorted(ms, key=lambda m: m.model_size, reverse=True),  # size-desc
+        lambda ms: sorted(ms, key=lambda m: m.model_size),                # size-asc
+        lambda ms: sorted(ms, key=density, reverse=True),
+        lambda ms: sorted(ms, key=lambda m: (r_over_s(m), -m.model_size), reverse=True),
+    ]
+
+    best_placement = None
+    best_max_kvpr = float('inf')
+
+    for make_order in orderings:
+        try:
+            ordered = make_order(models)
+            placement, rem_mem, sum_r_over_s = greedy_assign(ordered)
+            # Refine with local improvements
+            placement, rem_mem, sum_r_over_s = improve(placement, rem_mem, sum_r_over_s)
+            # Evaluate
+            kvprs = [kvpr(sum_r_over_s[i], rem_mem[i]) for i in range(gpu_num)]
+            cand_max = max(kvprs) if kvprs else 0.0
+            if cand_max < best_max_kvpr:
+                best_max_kvpr = cand_max
+                best_placement = placement
+        except ValueError:
+            # This ordering couldn't place all models due to per-GPU memory constraints
+            continue
+
+    if best_placement is None:
+        # Fall back to an error consistent with greedy behavior
+        # Try a final simple size-desc heuristic to produce a clearer error state
+        ordered = sorted(models, key=lambda m: m.model_size, reverse=True)
+        # This will raise ValueError if infeasible
+        best_placement, _, _ = greedy_assign(ordered)
+
+    # Parametric search to further minimize the max KVPR using the transformed capacity model:
+    # For a target T, each item weight is w = dR + T * size, each GPU capacity is C = T * GPU_MEM_SIZE.
+    # Feasibility under these weights implies KVPR <= T and memory <= GPU_MEM_SIZE on each GPU.
+    def max_kvpr_of(placement_dict):
+        max_v = 0.0
+        for gid in range(gpu_num):
+            bucket = placement_dict.get(gid, [])
+            R = 0.0
+            used = 0.0
+            for m in bucket:
+                R += (m.req_rate / m.slo)
+                used += m.model_size
+            v = kvpr(R, GPU_MEM_SIZE - used)
+            if v > max_v:
+                max_v = v
+        return max_v
+
+    def bfd_assign_for_T(T):
+        # Hybrid best-fit that respects both transformed capacity and memory,
+        # choosing the destination that minimizes the resulting global max KVPR.
+        eps = 1e-12
+        S = GPU_MEM_SIZE
+        capacity = T * S
+        if capacity < -eps:
+            return None
+
+        # Build items with transformed weights w = dR + T * size
+        items = []
+        for idx, m in enumerate(models):
+            dR = m.req_rate / m.slo
+            w = dR + T * m.model_size
+            if w < 0:
+                w = 0.0
+            items.append((w, dR, m.model_size, idx, m))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        used_w = [0.0 for _ in range(gpu_num)]
+        bins_R = [0.0 for _ in range(gpu_num)]
+        bins_used_mem = [0.0 for _ in range(gpu_num)]
+        assign = {i: [] for i in range(gpu_num)}
+
+        for w, dR, sz, _, m in items:
+            # Precompute current per-GPU KVPRs and top-2 to quickly get "max other"
+            top1_val = -1.0
+            top2_val = -1.0
+            top1_id = -1
+            for gid in range(gpu_num):
+                rem = S - bins_used_mem[gid]
+                v = kvpr(bins_R[gid], rem)
+                if v > top1_val:
+                    top2_val = top1_val
+                    top1_val = v
+                    top1_id = gid
+                elif v > top2_val:
+                    top2_val = v
+
+            best_bin = None
+            best_score = float('inf')   # resulting global max KVPR
+            best_new_k = float('inf')   # new GPU's KVPR after placement
+            best_nw = float('inf')      # transformed weight used after placement
+            best_rem = -1.0             # remaining memory after placement
+
+            for gid in range(gpu_num):
+                nw = used_w[gid] + w
+                mem_after = bins_used_mem[gid] + sz
+                if nw <= capacity + 1e-9 and mem_after <= S + 1e-9:
+                    rem_after = S - mem_after
+                    if rem_after <= 0:
+                        continue
+                    new_k = (bins_R[gid] + dR) / rem_after
+                    max_other = top2_val if gid == top1_id else top1_val
+                    resulting = new_k if new_k > max_other else max_other
+
+                    # Tie-break: minimize resulting, then new_k, then nw, then prefer larger rem_after
+                    if (resulting < best_score or
+                        (resulting == best_score and new_k < best_new_k) or
+                        (resulting == best_score and new_k == best_new_k and nw < best_nw) or
+                        (resulting == best_score and new_k == best_new_k and nw == best_nw and rem_after > best_rem)):
+                        best_score = resulting
+                        best_new_k = new_k
+                        best_nw = nw
+                        best_rem = rem_after
+                        best_bin = gid
+
+            if best_bin is None:
+                return None
+
+            used_w[best_bin] += w
+            bins_R[best_bin] += dR
+            bins_used_mem[best_bin] += sz
+            assign[best_bin].append(m)
+
+        # Final validation (defensive)
+        for gid in range(gpu_num):
+            if bins_used_mem[gid] - S > 1e-6:
+                return None
+            rem = S - bins_used_mem[gid]
+            if rem <= 0:
+                return None
+            if (bins_R[gid] / rem) - T > 1e-6:
+                return None
+        return assign
+
+    # Compute bounds for binary search
+    S = GPU_MEM_SIZE
+    total_R = sum((m.req_rate / m.slo) for m in models)
+    total_size = sum(m.model_size for m in models)
+
+    # Lower bound 1: any single model placed alone implies T >= dR / (S - size)
+    lb1 = 0.0
+    infeasible_single = False
+    for m in models:
+        dR = m.req_rate / m.slo
+        denom = S - m.model_size
+        if denom <= 0:
+            if dR > 0:
+                infeasible_single = True
+            continue
+        if dR > 0:
+            cand = dR / denom
+            if cand > lb1:
+                lb1 = cand
+
+    # Lower bound 2: global bound from totals
+    denom2 = gpu_num * S - total_size
+    if denom2 <= 0 and total_R > 0:
+        # Not enough aggregate memory to leave any KV space
+        return best_placement
+    lb2 = 0.0 if denom2 <= 0 else (total_R / denom2 if total_R > 0 else 0.0)
+
+    # Lower bound 3: pair bound for pairs that cannot co-reside (si + sj > S)
+    lb_pair = 0.0
+    P = min(len(models), 200)
+    by_size = sorted(models, key=lambda m: m.model_size, reverse=True)[:P]
+    for i in range(len(by_size)):
+        mi = by_size[i]; si = mi.model_size; ri = mi.req_rate / mi.slo
+        for j in range(i + 1, len(by_size)):
+            mj = by_size[j]; sj = mj.model_size; rj = mj.req_rate / mj.slo
+            if si + sj > S:
+                denom = 2 * S - (si + sj)
+                if denom > 0:
+                    cand = (ri + rj) / denom
+                    if cand > lb_pair:
+                        lb_pair = cand
+
+    # Lower bound 4: k-prefix bound for k in {1..min(gpu_num,5)}
+    lb_k = 0.0
+    sorted_by_size = sorted(models, key=lambda m: m.model_size, reverse=True)
+    prefix_sizes = []
+    prefix_rates = []
+    cs = 0.0
+    cr = 0.0
+    for m in sorted_by_size:
+        cs += m.model_size
+        cr += (m.req_rate / m.slo)
+        prefix_sizes.append(cs)
+        prefix_rates.append(cr)
+    for k in range(1, min(gpu_num, 5) + 1):
+        threshold = (k - 1) * S
+        idx = -1
+        for t in range(len(prefix_sizes)):
+            if prefix_sizes[t] > threshold:
+                idx = t
+                break
+        if idx >= 0:
+            numer = prefix_rates[idx]
+            denom = k * S - prefix_sizes[idx]
+            if denom > 0 and numer > 0:
+                cand = numer / denom
+                if cand > lb_k:
+                    lb_k = cand
+
+    lower = max(0.0, lb1, lb2, lb_pair, lb_k)
+    if infeasible_single:
+        # No finite T can bound KVPR if a model fully occupies a GPU with positive demand
+        return best_placement
+
+    # Upper bound from the best heuristic placement we already computed
+    hi = max_kvpr_of(best_placement)
+    if not (hi < float('inf')):
+        # If heuristic produced infinite KVPR, skip parametric refinement
+        return best_placement
+
+    # Binary search to tighten T
+    best_bsearch_placement = best_placement
+    best_bsearch_T = hi
+    lo = max(0.0, lower)
+    # Ensure lo <= hi
+    if lo > hi:
+        lo = hi
+
+    for _ in range(32):  # sufficient precision
+        mid = (lo + hi) / 2.0
+        cand_place = bfd_assign_for_T(mid)
+        if cand_place is not None:
+            # Feasible: try lower T
+            hi = mid
+            best_bsearch_placement = cand_place
+            best_bsearch_T = mid
+        else:
+            lo = mid
+
+    # Optional local refinement on the binary-search placement
+    def _build_state(pl):
+        rem = [S for _ in range(gpu_num)]
+        sums = [0.0 for _ in range(gpu_num)]
+        for gid in range(gpu_num):
+            for m in pl.get(gid, []):
+                rem[gid] -= m.model_size
+                sums[gid] += (m.req_rate / m.slo)
+        return rem, sums
+
+    if best_bsearch_placement is not None:
+        try:
+            rem_b, sum_b = _build_state(best_bsearch_placement)
+            imp_place, imp_rem, imp_sum = improve({i: list(best_bsearch_placement.get(i, [])) for i in range(gpu_num)},
+                                                  rem_b[:], sum_b[:])
+            improved_T = 0.0
+            for i in range(gpu_num):
+                improved_T = max(improved_T, kvpr(imp_sum[i], imp_rem[i]))
+            if improved_T + 1e-12 < max_kvpr_of(best_bsearch_placement):
+                best_bsearch_placement = imp_place
+                best_bsearch_T = improved_T
+        except Exception:
+            pass
+
+    # Verify and adopt if better
+    final_T = max_kvpr_of(best_bsearch_placement)
+    if final_T + 1e-12 < best_max_kvpr:
+        return best_bsearch_placement
+
+    return best_placement
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

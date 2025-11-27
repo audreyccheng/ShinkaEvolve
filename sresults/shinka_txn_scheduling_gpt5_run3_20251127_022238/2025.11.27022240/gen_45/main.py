@@ -1,0 +1,565 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Surrogate-guided greedy construction + ΔW-gated LNS refinement.
+    - Memoized true cost for prefixes and extensions
+    - On-demand pairwise marginal deltas as a surrogate model
+    - Buddy-biased greedy build for fast, conflict-aware seeding
+    - Local neighborhoods (worst-pair fixes, adjacent swaps, block reinsert, random insertion)
+      filtered by surrogate improvements and validated with true cost
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of restarts (used to vary seeds)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    N = workload.num_txns
+    # Balanced budget: maintain strong combined performance
+    time_budget_sec = 0.60
+    start_time = time.time()
+
+    def time_left():
+        return (time.time() - start_time) < time_budget_sec
+
+    # Caches
+    cost_cache = {}
+    ext_cache = {}
+    singleton_cost = {}
+
+    def eval_seq_cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is not None:
+            return c
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[key] = c
+        return c
+
+    def eval_ext_cost(prefix_tuple, cand):
+        key = (prefix_tuple, cand)
+        c = ext_cache.get(key)
+        if c is not None:
+            return c
+        c = eval_seq_cost(list(prefix_tuple) + [cand])
+        ext_cache[key] = c
+        return c
+
+    # Precompute singleton costs
+    for t in range(N):
+        if not time_left():
+            break
+        singleton_cost[t] = eval_seq_cost([t])
+
+    # On-demand pairwise marginal delta Δ(a->b) = cost([a,b]) - cost([a])
+    pair_delta_cache = {}
+    def pair_delta(a, b):
+        key = (a, b)
+        v = pair_delta_cache.get(key)
+        if v is not None:
+            return v
+        base = singleton_cost.get(a)
+        if base is None:
+            base = eval_seq_cost([a])
+            singleton_cost[a] = base
+        ec = eval_ext_cost((a,), b)
+        d = ec - base
+        pair_delta_cache[key] = d
+        return d
+
+    # Build small buddy list per txn by sampling minimal pair_delta
+    def build_buddies(max_buddies=6, sample_per_t=12):
+        buds = {t: [] for t in range(N)}
+        all_txns = list(range(N))
+        # order by singleton to bias candidate pools
+        singles_sorted = sorted(all_txns, key=lambda x: singleton_cost.get(x, float('inf')))
+        for t in all_txns:
+            if not time_left():
+                break
+            # pool: top by singleton and random sample
+            pool = [u for u in singles_sorted[:min(18, max(6, N // 7))] if u != t]
+            others = [u for u in all_txns if u != t and u not in pool]
+            if others:
+                pool.extend(random.sample(others, min(sample_per_t, len(others))))
+            # dedup
+            seen = set()
+            cands = []
+            for u in pool:
+                if u == t or u in seen:
+                    continue
+                seen.add(u)
+                cands.append(u)
+            scored = []
+            for u in cands:
+                if not time_left():
+                    break
+                scored.append((pair_delta(t, u), u))
+            scored.sort(key=lambda x: x[0])
+            buds[t] = [u for _d, u in scored[:max_buddies]]
+        return buds
+
+    buddies = build_buddies(max_buddies=6, sample_per_t=min(12, max(8, N // 12)))
+
+    # Greedy constructor with buddy guidance and small candidate pools
+    def greedy_build(start_txn=None, branch_k=None):
+        all_txns = list(range(N))
+        rem = set(all_txns)
+        seq = []
+        if start_txn is None:
+            # choose a good starter among top few singletons
+            topk = min(10, N)
+            start_txn = min(random.sample(all_txns, topk), key=lambda t: singleton_cost.get(t, float('inf')))
+        if start_txn in rem:
+            seq.append(start_txn)
+            rem.remove(start_txn)
+        cur_cost = eval_seq_cost(seq)
+        if branch_k is None:
+            branch_k = min(14, max(8, N // 9))
+
+        while rem and time_left():
+            last = seq[-1] if seq else None
+            cand_pool = []
+            # prioritize buddies
+            if last is not None and last in buddies:
+                for u in buddies[last]:
+                    if u in rem:
+                        cand_pool.append(u)
+            # fill with random
+            if len(cand_pool) < branch_k:
+                others = [x for x in rem if x not in cand_pool]
+                add = min(branch_k - len(cand_pool), len(others))
+                if add > 0:
+                    cand_pool.extend(random.sample(others, add))
+            prefix_tuple = tuple(seq)
+            best_c = float('inf')
+            best_t = None
+            for t in cand_pool if cand_pool else list(rem):
+                c = eval_ext_cost(prefix_tuple, t)
+                if c < best_c:
+                    best_c = c
+                    best_t = t
+            if best_t is None:
+                # fallback append random remaining
+                best_t = random.choice(tuple(rem))
+                best_c = eval_ext_cost(prefix_tuple, best_t)
+            seq.append(best_t)
+            if best_t in rem:
+                rem.remove(best_t)
+            cur_cost = best_c
+
+        if rem:
+            # in case time was exhausted
+            seq.extend(list(rem))
+            cur_cost = eval_seq_cost(seq)
+        return cur_cost, seq
+
+    # Surrogate helpers for local moves (ΔW-based gating)
+    def worst_adjacency(seq):
+        """Return (worst_val, idx) for pair (seq[idx], seq[idx+1]) with largest delta."""
+        n = len(seq)
+        worst_v = -float('inf')
+        worst_i = -1
+        for i in range(n - 1):
+            v = pair_delta(seq[i], seq[i + 1])
+            if v > worst_v:
+                worst_v = v
+                worst_i = i
+        return worst_v, worst_i
+
+    def surrogate_swap_delta(seq, i, j):
+        """Surrogate change if swap positions i and j (i<j) using local adjacency deltas."""
+        if i == j:
+            return 0.0
+        n = len(seq)
+        if i > j:
+            i, j = j, i
+        a, b = seq[i], seq[j]
+        # collect affected positions
+        def pd(x, y):
+            return pair_delta(x, y)
+        old = 0.0
+        new = 0.0
+        # positions around i
+        if i - 1 >= 0:
+            old += pd(seq[i - 1], a)
+            new += pd(seq[i - 1], b)
+        if i + 1 < n:
+            # if i+1 == j, handle adjacency carefully
+            if i + 1 == j:
+                old += pd(a, b)
+                new += pd(b, a)
+            else:
+                old += pd(a, seq[i + 1])
+                new += pd(b, seq[i + 1])
+        # positions around j
+        if j - 1 >= 0 and j - 1 != i:
+            old += pd(seq[j - 1], b)
+            new += pd(seq[j - 1], a)
+        if j + 1 < n:
+            old += pd(b, seq[j + 1])
+            new += pd(a, seq[j + 1])
+        return new - old  # negative is good
+
+    def surrogate_insertion_delta(seq, i, j):
+        """Move element at index i to position j (before current j)."""
+        if i == j:
+            return 0.0
+        n = len(seq)
+        a = seq[i]
+        def pd(x, y):
+            return pair_delta(x, y)
+        old = 0.0
+        new = 0.0
+        # Removal effects around i
+        if i - 1 >= 0:
+            old += pd(seq[i - 1], a)
+            if i + 1 < n:
+                old += pd(a, seq[i + 1])
+                new += pd(seq[i - 1], seq[i + 1])
+        else:
+            if i + 1 < n:
+                old += pd(a, seq[i + 1])
+        # Insertion effects around new position (adjust j if passing over)
+        if j > i:
+            j_eff = j - 1
+        else:
+            j_eff = j
+        if j_eff - 1 >= 0:
+            new += pd(seq[j_eff - 1], a)
+        if j_eff < n:
+            # note: at this point, a is removed so seq[j_eff] is the element currently at j (or next)
+            new += pd(a, seq[j_eff])
+        return new - old  # negative is good
+
+    # Local refinement with ΔW-gated neighborhoods
+    def local_refine(seq, current_cost):
+        best_seq = list(seq)
+        best_cost = current_cost
+
+        # Pass 1: Fix worst adjacencies by reinserting the second element near better spots
+        if time_left():
+            worst_v, worst_i = worst_adjacency(best_seq)
+            if worst_i >= 0:
+                # Attempt moving the second element of the worst pair
+                j_elem_idx = worst_i + 1
+                n = len(best_seq)
+                # Try a set of promising positions around the vicinity and random
+                positions = list(range(max(0, worst_i - 4), min(n, worst_i + 6)))
+                # Add a few random positions
+                extra = set()
+                limit = min(8, n)
+                while len(extra) < limit and time_left():
+                    extra.add(random.randrange(n))
+                for p in extra:
+                    if p not in positions:
+                        positions.append(p)
+                # Rank by surrogate insertion delta
+                scored = []
+                for p in positions:
+                    if p == j_elem_idx:
+                        continue
+                    d = surrogate_insertion_delta(best_seq, j_elem_idx, p)
+                    scored.append((d, p))
+                scored.sort(key=lambda x: x[0])  # more negative first
+                # Validate top-3 by true cost
+                for k in range(min(3, len(scored))):
+                    d, p = scored[k]
+                    if d >= 0:
+                        break
+                    cand = best_seq[:]
+                    val = cand.pop(j_elem_idx)
+                    cand.insert(p, val)
+                    c = eval_seq_cost(cand)
+                    if c < best_cost:
+                        best_seq, best_cost = cand, c
+                        # Update worst index if time permits
+                        if not time_left():
+                            break
+
+        # Pass 2: Adjacent swap hill climbing guided by surrogate
+        if time_left():
+            improved = True
+            n = len(best_seq)
+            while improved and time_left():
+                improved = False
+                # sample subset of indices to keep it fast
+                indices = list(range(n - 1))
+                # deterministic order helps convergence
+                for i in indices:
+                    if not time_left():
+                        break
+                    d = surrogate_swap_delta(best_seq, i, i + 1)
+                    if d < 0:  # promising
+                        cand = best_seq[:]
+                        cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                        c = eval_seq_cost(cand)
+                        if c < best_cost:
+                            best_seq, best_cost = cand, c
+                            improved = True
+
+        # Pass 3: Block ruin-and-reinsert around worst adjacency
+        if time_left():
+            worst_v, worst_i = worst_adjacency(best_seq)
+            if worst_i >= 0 and len(best_seq) >= 6:
+                n = len(best_seq)
+                block_size = min(5, max(3, n // 30))
+                start = max(0, min(worst_i - block_size // 2, n - block_size))
+                block = best_seq[start:start + block_size]
+                remaining = best_seq[:start] + best_seq[start + block_size:]
+                # Candidate positions
+                positions = list(range(max(0, start - 4), min(len(remaining) + 1, start + 5)))
+                # Add random positions
+                extra = set()
+                limit = min(10, len(remaining) + 1)
+                while len(extra) < limit and time_left():
+                    extra.add(random.randrange(len(remaining) + 1))
+                for p in extra:
+                    if p not in positions:
+                        positions.append(p)
+                # Surrogate rank by boundary deltas (only boundaries matter)
+                def block_surrogate_insert(rem_seq, blk, pos):
+                    # compute surrogate boundary effect
+                    # left neighbor -> blk[0], blk[-1] -> right neighbor
+                    def pd(x, y):
+                        return pair_delta(x, y)
+                    s_old = 0.0
+                    s_new = 0.0
+                    # old boundaries: at removal points (already removed in rem_seq, so ignore)
+                    # new boundaries at insertion
+                    if pos - 1 >= 0:
+                        s_new += pd(rem_seq[pos - 1], blk[0])
+                    if pos < len(rem_seq):
+                        s_new += pd(blk[-1], rem_seq[pos])
+                    # inner block boundaries are fixed, but we can estimate within-block sum once
+                    inner = 0.0
+                    for i in range(len(blk) - 1):
+                        inner += pd(blk[i], blk[i + 1])
+                    return s_new + inner - s_old
+                scored = []
+                for p in positions:
+                    d = block_surrogate_insert(remaining, block, p)
+                    scored.append((d, p))
+                scored.sort(key=lambda x: x[0])  # smaller is better
+                # Validate top-3
+                for k in range(min(3, len(scored))):
+                    d, p = scored[k]
+                    cand = remaining[:]
+                    for i, x in enumerate(block):
+                        cand.insert(p + i, x)
+                    c = eval_seq_cost(cand)
+                    if c < best_cost:
+                        best_seq, best_cost = cand, c
+
+        # Pass 4: Random insertion moves with surrogate gating
+        trials = 60
+        n = len(best_seq)
+        while trials > 0 and time_left():
+            trials -= 1
+            i, j = random.sample(range(n), 2)
+            d = surrogate_insertion_delta(best_seq, i, j)
+            if d < -1e-9:  # promising
+                cand = best_seq[:]
+                val = cand.pop(i)
+                cand.insert(j, val)
+                c = eval_seq_cost(cand)
+                if c < best_cost:
+                    best_seq, best_cost = cand, c
+
+        return best_cost, best_seq
+
+    # Multi-restart portfolio with different starts
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    # Derive some good starting seeds
+    all_txns = list(range(N))
+    singles_sorted = sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf')))
+    top_single_starts = singles_sorted[:min(6, N)]
+    # also best pair-based starts
+    best_pair_starts = []
+    for t in top_single_starts:
+        if buddies.get(t):
+            best_pair_starts.append([t, buddies[t][0]])
+
+    # number of attempts constrained by num_seqs and time
+    attempts = max(2, min(6, int(num_seqs)))
+    seeds = []
+
+    # seed from top singletons
+    for t in top_single_starts:
+        seeds.append([t])
+        if len(seeds) >= attempts:
+            break
+    # supplement with pairs
+    for p in best_pair_starts:
+        if len(seeds) >= attempts:
+            break
+        seeds.append(p)
+    # supplement with random starts if needed
+    while len(seeds) < attempts:
+        seeds.append([random.randrange(N)])
+
+    # Build and refine for each seed while time permits
+    for s in seeds:
+        if not time_left():
+            break
+        # Greedy build
+        if len(s) == 1:
+            c0, seq0 = greedy_build(start_txn=s[0], branch_k=min(14, max(8, N // 9)))
+        else:
+            # start with two elements; finish greedily
+            start_seq = s[:]
+            rem = set(all_txns)
+            for x in start_seq:
+                if x in rem:
+                    rem.remove(x)
+            # finish from the given prefix using greedy steps
+            seq = start_seq[:]
+            while rem and time_left():
+                prefix_tuple = tuple(seq)
+                cand_pool = []
+                last = seq[-1]
+                if last in buddies:
+                    for u in buddies[last]:
+                        if u in rem:
+                            cand_pool.append(u)
+                if len(cand_pool) < 12:
+                    others = [x for x in rem if x not in cand_pool]
+                    add = min(12 - len(cand_pool), len(others))
+                    if add > 0:
+                        cand_pool.extend(random.sample(others, add))
+                best_c = float('inf')
+                best_t = None
+                for t in cand_pool if cand_pool else list(rem):
+                    c = eval_ext_cost(prefix_tuple, t)
+                    if c < best_c:
+                        best_c = c
+                        best_t = t
+                if best_t is None:
+                    best_t = random.choice(tuple(rem))
+                    best_c = eval_ext_cost(prefix_tuple, best_t)
+                seq.append(best_t)
+                rem.remove(best_t)
+            c0 = eval_seq_cost(seq)
+            seq0 = seq
+
+        # Local refinement
+        if time_left():
+            c1, s1 = local_refine(seq0, c0)
+        else:
+            c1, s1 = c0, seq0
+
+        if c1 < global_best_cost:
+            global_best_cost, global_best_seq = c1, s1
+
+    # Safety: ensure a valid permutation
+    if global_best_seq is None or len(global_best_seq) != N or len(set(global_best_seq)) != N:
+        if global_best_seq is None:
+            seq = list(range(N))
+            random.shuffle(seq)
+            global_best_seq = seq
+        seen = set()
+        repaired = []
+        for t in global_best_seq:
+            if 0 <= t < N and t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in range(N):
+            if t not in seen:
+                repaired.append(t)
+        global_best_seq = repaired[:N]
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

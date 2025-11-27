@@ -1,0 +1,599 @@
+--- a/original.py
++++ b/original.py
+@@ -1,332 +1,364 @@
+ # EVOLVE-BLOCK-START
+ from typing import Dict, Any, Tuple, List
+ import math
+ 
+ def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                              topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+-    Repairs network telemetry using a consensus mechanism between Link Symmetry
+-    and Router Flow Conservation invariants.
++    Repairs network telemetry using an Iterative Bayesian Consensus algorithm.
++    It systematically fuses Link Symmetry and Router Flow Conservation evidence.
+ 
+     Algorithm:
+-    1. Identify 'clean' (consistent) and 'suspect' (inconsistent) links.
+-    2. For suspect links, generate hypotheses: True Value = Local Measurement vs Peer Measurement.
+-    3. Validate hypotheses using Router Flow Conservation (Input Flux == Output Flux).
+-    4. Select the hypothesis that minimizes global network violation.
+-    5. Calibrate confidence based on the agreement strength of invariants.
++    1.  **Symmetry Analysis**: Identify consistent links and harden them.
++    2.  **Iterative Optimization**: For suspect links, test hypotheses (Local, Peer, Zero)
++        against router flow balance constraints.
++    3.  **Bayesian Confidence**: Calculate confidence based on hypothesis likelihood and
++        absolute goodness-of-fit.
+     """
+ 
+-    # Configuration
+-    TOLERANCE = 0.02  # 2% hardening threshold
+-    MIN_FLOW_SIGNIFICANCE = 0.1  # Ignore micro-flows for status logic
+-
+-    # Data Structures for repair
+-    # Structure: {if_id: {'rx': (val, conf), 'tx': (val, conf), 'status': (val, conf)}}
+-    repairs = {}
+-
+-    # Helper: Build Interface->Router map from topology
++    # --- Configuration ---
++    SYMMETRY_TOLERANCE = 0.02
++    CONSERVATION_TOLERANCE_PCT = 0.03
++    MIN_SIGNIFICANT_FLOW = 0.5
++    ITERATIONS = 5
++
++    # --- Helper Structures ---
+     if_to_router = {}
+     for r_id, if_list in topology.items():
+         for i_id in if_list:
+             if_to_router[i_id] = r_id
+ 
+-    # --- PHASE 1: Link Symmetry Analysis & Hypothesis Generation ---
+-    # We gather candidate values for every interface's RX and TX.
+-    # Candidates = [Local_Measurement, Peer_Measurement]
+-
+-    link_analysis = {}
++    # Group interfaces into Links for unique processing
++    links = {}
++    processed_ifs = set()
+ 
+     for if_id, data in telemetry.items():
+-        # Get Local Data
+-        local_rx = data.get('rx_rate', 0.0)
+-        local_tx = data.get('tx_rate', 0.0)
+-
+-        # Get Peer Data
++        if if_id in processed_ifs: continue
++
+         peer_id = data.get('connected_to')
+-        peer_data = telemetry.get(peer_id, {}) if peer_id else {}
+-
+-        peer_tx = peer_data.get('tx_rate', None) # Peer's TX corresponds to My RX
+-        peer_rx = peer_data.get('rx_rate', None) # Peer's RX corresponds to My TX
+-
+-        # Analyze RX Symmetry
+-        rx_candidates = {'local': local_rx}
+-        rx_symmetry_score = 0.0 # 0=Bad, 1=Good
+-
+-        if peer_tx is not None:
+-            rx_candidates['peer'] = peer_tx
+-            # Calculate symmetry error
+-            denom = max(local_rx, peer_tx, 1.0)
+-            diff = abs(local_rx - peer_tx)
+-            if diff / denom < TOLERANCE:
+-                rx_symmetry_score = 1.0
+-                # If they agree, average them for higher precision
+-                rx_candidates['consensus'] = (local_rx + peer_tx) / 2.0
++        if peer_id and peer_id in telemetry:
++            link_key = tuple(sorted([if_id, peer_id]))
++            links[link_key] = {'type': 'internal', 'if1': if_id, 'if2': peer_id}
++            processed_ifs.add(if_id)
++            processed_ifs.add(peer_id)
++        else:
++            links[(if_id,)] = {'type': 'external', 'if1': if_id, 'if2': None}
++            processed_ifs.add(if_id)
++
++    # --- Step 1: Initialization & Link Symmetry ---
++
++    # Current best estimates: {if_id: {'rx': val, 'tx': val}}
++    current_estimates = {}
++    # Confidence scores: {if_id: {'rx': conf, 'tx': conf}}
++    estimate_confidence = {}
++
++    # List of suspect flows (link + direction) to solve
++    suspect_flows = []
++
++    for link_key, info in links.items():
++        if1 = info['if1']
++        if2 = info['if2']
++        d1 = telemetry[if1]
++
++        # Initialize default estimates (will be overwritten if consistent)
++        current_estimates[if1] = {'rx': d1.get('rx_rate', 0.0), 'tx': d1.get('tx_rate', 0.0)}
++        estimate_confidence[if1] = {'rx': 0.5, 'tx': 0.5} # Low default
++
++        if if2:
++            d2 = telemetry[if2]
++            current_estimates[if2] = {'rx': d2.get('rx_rate', 0.0), 'tx': d2.get('tx_rate', 0.0)}
++            estimate_confidence[if2] = {'rx': 0.5, 'tx': 0.5}
++
++            # Check Forward: if1 TX -> if2 RX
++            val_tx = d1.get('tx_rate', 0.0)
++            val_rx = d2.get('rx_rate', 0.0)
++            denom = max(val_tx, val_rx, 1.0)
++            if abs(val_tx - val_rx) / denom < SYMMETRY_TOLERANCE:
++                avg = (val_tx + val_rx) / 2.0
++                current_estimates[if1]['tx'] = avg
++                current_estimates[if2]['rx'] = avg
++                estimate_confidence[if1]['tx'] = 0.95
++                estimate_confidence[if2]['rx'] = 0.95
+             else:
+-                # Disagreement
+-                rx_symmetry_score = max(0.0, 1.0 - (diff / denom))
++                # Suspect: Add to solver
++                suspect_flows.append({
++                    'src': if1, 'dst': if2,
++                    'val_src': val_tx, 'val_dst': val_rx,
++                    'type': 'internal'
++                })
++
++            # Check Backward: if2 TX -> if1 RX
++            val_tx = d2.get('tx_rate', 0.0)
++            val_rx = d1.get('rx_rate', 0.0)
++            denom = max(val_tx, val_rx, 1.0)
++            if abs(val_tx - val_rx) / denom < SYMMETRY_TOLERANCE:
++                avg = (val_tx + val_rx) / 2.0
++                current_estimates[if2]['tx'] = avg
++                current_estimates[if1]['rx'] = avg
++                estimate_confidence[if2]['tx'] = 0.95
++                estimate_confidence[if1]['rx'] = 0.95
++            else:
++                suspect_flows.append({
++                    'src': if2, 'dst': if1,
++                    'val_src': val_tx, 'val_dst': val_rx,
++                    'type': 'internal'
++                })
+         else:
+-            # No peer data, trust local but with lower confidence baseline?
+-            # Actually, without peer, symmetry is unknown. Assume 1.0 for processing but track missing.
+-            rx_symmetry_score = 0.5
+-
+-        # Analyze TX Symmetry
+-        tx_candidates = {'local': local_tx}
+-        tx_symmetry_score = 0.0
+-
+-        if peer_rx is not None:
+-            tx_candidates['peer'] = peer_rx
+-            denom = max(local_tx, peer_rx, 1.0)
+-            diff = abs(local_tx - peer_rx)
+-            if diff / denom < TOLERANCE:
+-                tx_symmetry_score = 1.0
+-                tx_candidates['consensus'] = (local_tx + peer_rx) / 2.0
+-            else:
+-                tx_symmetry_score = max(0.0, 1.0 - (diff / denom))
+-        else:
+-            tx_symmetry_score = 0.5
+-
+-        link_analysis[if_id] = {
+-            'rx': {'candidates': rx_candidates, 'symmetry': rx_symmetry_score},
+-            'tx': {'candidates': tx_candidates, 'symmetry': tx_symmetry_score}
+-        }
+-
+-    # --- PHASE 2: Router Conservation Voting ---
+-    # We iterate over routers to resolve conflicts using Flow Conservation.
+-
+-    final_decisions = {} # if_id -> {'rx': (val, conf), ...}
+-
+-    for router_id, if_list in topology.items():
+-
+-        # 2a. Identify Reliable vs Unreliable flows on this router
+-        reliable_inputs = 0.0
+-        reliable_outputs = 0.0
+-
+-        unreliable_ifs = [] # List of (if_id, type 'rx'|'tx')
+-
+-        # Preliminary pass: calculate "Trusted" flow mass
+-        for if_id in if_list:
+-            if if_id not in link_analysis: continue
+-
+-            # RX Check
+-            rx_info = link_analysis[if_id]['rx']
+-            if rx_info['symmetry'] > 0.95:
+-                # High symmetry, assume correct
+-                val = rx_info['candidates'].get('consensus', rx_info['candidates']['local'])
+-                reliable_inputs += val
+-            else:
+-                unreliable_ifs.append((if_id, 'rx'))
+-
+-            # TX Check
+-            tx_info = link_analysis[if_id]['tx']
+-            if tx_info['symmetry'] > 0.95:
+-                val = tx_info['candidates'].get('consensus', tx_info['candidates']['local'])
+-                reliable_outputs += val
+-            else:
+-                unreliable_ifs.append((if_id, 'tx'))
+-
+-        # 2b. Resolve Unreliable Interfaces
+-        # We try to pick candidates (Local vs Peer) for unreliable flows that balance the router.
+-        # Imbalance equation: Reliable_In + Sum(Unreliable_In) ≈ Reliable_Out + Sum(Unreliable_Out)
+-
+-        # Baseline: Assume "Peer" measurements are correct for unreliable links (External Observer Principle)
+-        # This is our H0 hypothesis.
+-        h0_inputs = reliable_inputs
+-        h0_outputs = reliable_outputs
+-
+-        decisions = {} # (if_id, type) -> val
+-
+-        for if_id, metric in unreliable_ifs:
+-            candidates = link_analysis[if_id][metric]['candidates']
+-            # Default to peer if available, else local
+-            val = candidates.get('peer', candidates['local'])
+-            decisions[(if_id, metric)] = val
+-            if metric == 'rx': h0_inputs += val
+-            else: h0_outputs += val
+-
+-        baseline_imbalance = abs(h0_inputs - h0_outputs)
+-
+-        # 2c. Optimization / Correction
+-        # Check if swapping any decision from Peer -> Local improves balance significantly
+-
+-        for if_id, metric in unreliable_ifs:
+-            candidates = link_analysis[if_id][metric]['candidates']
+-            if 'peer' not in candidates: continue # Can't swap if only local exists
+-
+-            local_val = candidates['local']
+-            peer_val = candidates['peer']
+-
+-            # If we switch this specific interface to Local, how does balance change?
+-            current_diff = local_val - peer_val
+-
+-            # If metric is RX, it adds to Inputs. Change = +diff
+-            # If metric is TX, it adds to Outputs. Change = +diff (on the output side) -> effectively -diff to Net Flow
+-
+-            if metric == 'rx':
+-                # New imbalance = |(In + diff) - Out| = |(In - Out) + diff|
+-                # Current Net = h0_inputs - h0_outputs
+-                new_imbalance = abs((h0_inputs - h0_outputs) + current_diff)
+-            else:
+-                # New imbalance = |In - (Out + diff)| = |(In - Out) - diff|
+-                new_imbalance = abs((h0_inputs - h0_outputs) - current_diff)
+-
+-            # Decision Rule: If Local reduces imbalance significantly compared to Peer, pick Local.
+-            # "Significantly" means better balance and the imbalance is < 5% of total flow
+-            total_flow = max(h0_inputs, h0_outputs, 1.0)
+-
+-            # We prefer Local if it fixes the conservation problem
+-            if new_imbalance < baseline_imbalance and new_imbalance < (total_flow * 0.05):
+-                decisions[(if_id, metric)] = local_val
+-                # Update running sums to reflect the swap (greedy approach)
+-                if metric == 'rx': h0_inputs += current_diff
+-                else: h0_outputs += current_diff
+-                baseline_imbalance = new_imbalance
+-
+-        # 2d. Calculate Final Conservation Score for Confidence
+-        final_imbalance = abs(h0_inputs - h0_outputs)
+-        max_flow = max(h0_inputs, h0_outputs, 1.0)
+-        conservation_score = max(0.0, 1.0 - (final_imbalance / max_flow))
+-
+-        # 2e. Store Decisions and compute Confidence
+-        for if_id in if_list:
+-            if if_id not in final_decisions: final_decisions[if_id] = {}
+-
+-            # Process RX
+-            if (if_id, 'rx') in decisions:
+-                # It was unreliable
+-                val = decisions[(if_id, 'rx')]
+-                # Confidence is combination of how well it matches peer (0 by def if unreliable) + conservation
+-                # If we picked Peer (usually means Link Symmetry error is ignored/fixed), Conf relies on Conservation
+-                # If we picked Local (means Peer was wrong), Conf relies on Conservation
+-                final_decisions[if_id]['rx'] = (val, 0.5 + 0.5 * conservation_score)
+-            else:
+-                # It was reliable (Symmetry > 0.95)
+-                # Confidence is high, modulated slightly by conservation
+-                val = link_analysis[if_id]['rx']['candidates'].get('consensus', link_analysis[if_id]['rx']['candidates']['local'])
+-                final_decisions[if_id]['rx'] = (val, 0.9 + 0.1 * conservation_score)
+-
+-            # Process TX
+-            if (if_id, 'tx') in decisions:
+-                val = decisions[(if_id, 'tx')]
+-                final_decisions[if_id]['tx'] = (val, 0.5 + 0.5 * conservation_score)
+-            else:
+-                val = link_analysis[if_id]['tx']['candidates'].get('consensus', link_analysis[if_id]['tx']['candidates']['local'])
+-                final_decisions[if_id]['tx'] = (val, 0.9 + 0.1 * conservation_score)
+-
+-    # --- PHASE 3: Status Inference & Final Assembly ---
++            # External Link - Mark as suspect to allow validation against router balance
++            # even though we only have one measurement source.
++            suspect_flows.append({
++                'src': if1, 'dst': None,
++                'val_src': d1.get('tx_rate', 0.0), 'val_dst': None,
++                'type': 'external_tx'
++            })
++            # External RX is effectively an input to the router
++            suspect_flows.append({
++                'src': None, 'dst': if1,
++                'val_src': None, 'val_dst': d1.get('rx_rate', 0.0),
++                'type': 'external_rx'
++            })
++
++            # Set tentative high confidence for external, will be lowered if conservation fails
++            estimate_confidence[if1]['tx'] = 0.8
++            estimate_confidence[if1]['rx'] = 0.8
++
++    # --- Step 2: Iterative Bayesian Resolution ---
++
++    def get_router_imbalance(rid):
++        if not rid: return 0.0, 1.0
++        if_list = topology.get(rid, [])
++        total_in = 0.0
++        total_out = 0.0
++        for iid in if_list:
++            total_in += current_estimates[iid]['rx']
++            total_out += current_estimates[iid]['tx']
++        return (total_in - total_out), max(total_in, total_out, 1.0)
++
++    for _ in range(ITERATIONS):
++        updates = []
++
++        for flow in suspect_flows:
++            src = flow['src']
++            dst = flow['dst']
++
++            # Setup Hypotheses
++            hypotheses = []
++
++            if flow['type'] == 'internal':
++                # Hypotheses: Source Meas, Dest Meas, Zero (Phantom/Down)
++                hypotheses.append(flow['val_src'])
++                hypotheses.append(flow['val_dst'])
++                hypotheses.append(0.0)
++                # Remove duplicates to avoid split probability
++                hypotheses = sorted(list(set(hypotheses)))
++
++                rid_src = if_to_router.get(src)
++                rid_dst = if_to_router.get(dst)
++
++                saved_src_tx = current_estimates[src]['tx']
++                saved_dst_rx = current_estimates[dst]['rx']
++
++                scores = []
++                for h in hypotheses:
++                    # Apply
++                    current_estimates[src]['tx'] = h
++                    current_estimates[dst]['rx'] = h
++
++                    # Eval
++                    imb_src, f_src = get_router_imbalance(rid_src)
++                    imb_dst, f_dst = get_router_imbalance(rid_dst)
++
++                    sig_src = max(f_src * CONSERVATION_TOLERANCE_PCT, 1.0)
++                    sig_dst = max(f_dst * CONSERVATION_TOLERANCE_PCT, 1.0)
++
++                    p_src = math.exp(-abs(imb_src) / sig_src)
++                    p_dst = math.exp(-abs(imb_dst) / sig_dst)
++
++                    scores.append(p_src * p_dst)
++
++                # Restore
++                current_estimates[src]['tx'] = saved_src_tx
++                current_estimates[dst]['rx'] = saved_dst_rx
++
++                # Pick Winner
++                total_score = sum(scores) + 1e-20
++                probs = [s / total_score for s in scores]
++                best_idx = probs.index(max(probs))
++                winner = hypotheses[best_idx]
++
++                # Confidence: Relative Certainty * Absolute Fit Quality
++                # Fit Quality is sqrt of likelihoods (geometric mean)
++                fit_quality = math.sqrt(scores[best_idx])
++                conf = probs[best_idx] * fit_quality
++
++                updates.append((src, 'tx', winner, conf))
++                updates.append((dst, 'rx', winner, conf))
++
++            elif flow['type'] == 'external_tx':
++                # Src is local interface, Dst is None.
++                # Hypotheses: Local Meas, Zero
++                val = flow['val_src']
++                rid = if_to_router.get(src)
++                saved = current_estimates[src]['tx']
++
++                # Test Local Val
++                current_estimates[src]['tx'] = val
++                imb, f = get_router_imbalance(rid)
++                sig = max(f * CONSERVATION_TOLERANCE_PCT, 1.0)
++                score_val = math.exp(-abs(imb) / sig)
++
++                # Test Zero (optional, but good if external link is dead)
++                current_estimates[src]['tx'] = 0.0
++                imb_z, f_z = get_router_imbalance(rid)
++                sig_z = max(f_z * CONSERVATION_TOLERANCE_PCT, 1.0)
++                score_zero = math.exp(-abs(imb_z) / sig_z)
++
++                current_estimates[src]['tx'] = saved
++
++                if score_val >= score_zero:
++                    winner = val
++                    conf = score_val # No peer, so just absolute fit
++                else:
++                    winner = 0.0
++                    conf = score_zero
++
++                updates.append((src, 'tx', winner, conf))
++
++            elif flow['type'] == 'external_rx':
++                # Dst is local interface, Src is None
++                val = flow['val_dst']
++                rid = if_to_router.get(dst)
++                saved = current_estimates[dst]['rx']
++
++                current_estimates[dst]['rx'] = val
++                imb, f = get_router_imbalance(rid)
++                sig = max(f * CONSERVATION_TOLERANCE_PCT, 1.0)
++                score_val = math.exp(-abs(imb) / sig)
++
++                current_estimates[dst]['rx'] = 0.0
++                imb_z, f_z = get_router_imbalance(rid)
++                sig_z = max(f_z * CONSERVATION_TOLERANCE_PCT, 1.0)
++                score_zero = math.exp(-abs(imb_z) / sig_z)
++
++                current_estimates[dst]['rx'] = saved
++
++                if score_val >= score_zero:
++                    winner = val
++                    conf = score_val
++                else:
++                    winner = 0.0
++                    conf = score_zero
++
++                updates.append((dst, 'rx', winner, conf))
++
++        # Apply Updates
++        for if_id, metric, val, conf in updates:
++            current_estimates[if_id][metric] = val
++            estimate_confidence[if_id][metric] = conf
++
++    # --- Step 3: Status Inference ---
+ 
+     result = {}
+ 
+     for if_id, data in telemetry.items():
+         orig_rx = data.get('rx_rate', 0.0)
+         orig_tx = data.get('tx_rate', 0.0)
+         orig_status = data.get('interface_status', 'unknown')
+ 
+-        # Get Repaired Rates
+-        dec = final_decisions.get(if_id, {})
+-        rep_rx, conf_rx = dec.get('rx', (orig_rx, 0.0))
+-        rep_tx, conf_tx = dec.get('tx', (orig_tx, 0.0))
+-
+-        # Get Peer Status for consistency
++        est_rx = current_estimates[if_id]['rx']
++        conf_rx = estimate_confidence[if_id]['rx']
++        est_tx = current_estimates[if_id]['tx']
++        conf_tx = estimate_confidence[if_id]['tx']
++
+         peer_id = data.get('connected_to')
+         peer_status = 'unknown'
+         if peer_id and peer_id in telemetry:
+             peer_status = telemetry[peer_id].get('interface_status', 'unknown')
+ 
+-        # Status Logic
+-        # Rule 1: Significant Traffic -> UP
+-        has_traffic = rep_rx > MIN_FLOW_SIGNIFICANCE or rep_tx > MIN_FLOW_SIGNIFICANCE
++        has_traffic = (est_rx > MIN_SIGNIFICANT_FLOW) or (est_tx > MIN_SIGNIFICANT_FLOW)
+ 
+         rep_status = orig_status
+         conf_status = 1.0
+ 
+         if has_traffic:
+             rep_status = 'up'
+-            # If we contradicted original status, confidence depends on rate confidence
+             if orig_status != 'up':
+                 conf_status = (conf_rx + conf_tx) / 2.0
+         elif peer_status == 'down':
+-            # Rule 2: Peer is down and no traffic -> DOWN
+             rep_status = 'down'
+             if orig_status != 'down':
+-                conf_status = 0.9
+-        else:
+-            # Rule 3: No traffic, peer UP. Ambiguous.
+-            # If original says DOWN, trust it. If UP, trust it (idle).
+-            # Lower confidence if mismatch with peer
+-            rep_status = orig_status
+-            if orig_status == 'up' and peer_status == 'down':
+-                rep_status = 'down' # Safe default
+-                conf_status = 0.7
+-
+-        # Consistency enforcement: If DOWN, rates must be 0
++                conf_status = 0.95
++        elif orig_status == 'up':
++            # Traffic is 0, Peer is UP (or unknown).
++            # Could be idle. Keep UP.
++            rep_status = 'up'
++
++        # Post-process: If status is DOWN, force rates to 0
+         if rep_status == 'down':
+-            rep_rx = 0.0
+-            rep_tx = 0.0
+-            conf_rx = max(conf_rx, 0.9) # High confidence in 0 if down
+-            conf_tx = max(conf_tx, 0.9)
+-
+-        # Structure Output
+-        repaired_entry = {}
+-        repaired_entry['rx_rate'] = (orig_rx, rep_rx, conf_rx)
+-        repaired_entry['tx_rate'] = (orig_tx, rep_tx, conf_tx)
+-        repaired_entry['interface_status'] = (orig_status, rep_status, conf_status)
+-
+-        # Metadata pass-through
++            est_rx = 0.0
++            est_tx = 0.0
++            conf_rx = max(conf_rx, 0.95)
++            conf_tx = max(conf_tx, 0.95)
++
++        entry = {}
++        entry['rx_rate'] = (orig_rx, est_rx, conf_rx)
++        entry['tx_rate'] = (orig_tx, est_tx, conf_tx)
++        entry['interface_status'] = (orig_status, rep_status, conf_status)
++
+         for k in ['connected_to', 'local_router', 'remote_router']:
+-            if k in data:
+-                repaired_entry[k] = data[k]
+-
+-        result[if_id] = repaired_entry
++            if k in data: entry[k] = data[k]
++
++        result[if_id] = entry
+ 
+     return result
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+     Main entry point that will be called by the evaluator.
+ 
+     Args:
+         telemetry: Network interface telemetry data
+         topology: Dictionary where key is router_id and value contains a list of interface_ids
+ 
+     Returns:
+         Dictionary containing repaired results with confidence scores
+     """
+     return repair_network_telemetry(telemetry, topology)
+ 
+ 
+ if __name__ == "__main__":
+     # Simple test case
+     test_telemetry = {
+         'if1_to_if2': {
+             'interface_status': 'up',
+             'rx_rate': 100.0,
+             'tx_rate': 95.0,
+             'connected_to': 'if2_to_if1',
+             'local_router': 'router1',
+             'remote_router': 'router2'
+         },
+         'if2_to_if1': {
+             'interface_status': 'up',
+             'rx_rate': 95.0,  # Should match if1's TX
+             'tx_rate': 100.0,  # Should match if1's RX
+             'connected_to': 'if1_to_if2',
+             'local_router': 'router2',
+             'remote_router': 'router1'
+         }
+     }
+ 
+     test_topology = {
+         'router1': ['if1_to_if2'],
+         'router2': ['if2_to_if1']
+     }
+ 
+     result = run_repair(test_telemetry, test_topology)
+ 
+     print("Repair results:")
+     for if_id, data in result.items():
+         print(f"\n{if_id}:")
+         print(f"  RX: {data['rx_rate']}")
+         print(f"  TX: {data['tx_rate']}")
+         print(f"  Status: {data['interface_status']}")

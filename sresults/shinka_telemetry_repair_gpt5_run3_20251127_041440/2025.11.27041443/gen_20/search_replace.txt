@@ -1,0 +1,306 @@
+<NAME>
+targeted_router_and_confidence_resync
+</NAME>
+
+<DESCRIPTION>
+I propose three coordinated improvements that target both counter accuracy and confidence calibration without rewriting the core algorithm:
+
+1) Targeted router correction on outliers instead of uniform scaling:
+   - Replace the router-level uniform scaling (which zeroed confidence on 10% adjustments) with a damped, per-interface additive adjustment. We adjust only the lower-confidence side and distribute the correction proportionally to (1 - confidence) * rate, clipping each interface change to +/-10% of its current value. This preserves router-level flow conservation while avoiding unnecessary changes on high-confidence links and drastically improves confidence calibration.
+
+2) Confidence-gap-proportional one-sided link re-sync:
+   - Replace the final symmetry step that averaged both ends with a one-sided, confidence-gap-proportional nudge toward the pair’s mean. Only the lower-confidence direction is nudged, with fraction f = min(0.4, max(0.0, conf_high - conf_low)). We also guard against double-adjustment by skipping the nudge on a direction that just received a strong router scaling (|alpha - 1| > 0.08). This reduces overcorrection and maintains alignment with link symmetry.
+
+3) Peer confidence smoothing:
+   - After re-sync, softly harmonize confidence across peers with a 10% blend between opposite directions (a.tx with b.rx and a.rx with b.tx) when both ends are up. This further aligns confidences with actual redundancy strength and improves calibration.
+
+Together, these changes aim to maintain or improve counter repair accuracy and significantly improve confidence calibration, which should raise the combined score. The modifications are localized and consistent with the Hodor-inspired design.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build router membership using provided topology (preferred)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        for r, ifs in topology.items():
+            router_ifaces[r] = [i for i in ifs if i in telemetry]
+    else:
+        # Fallback to local_router if topology not supplied (still useful for R1)
+        for iid, d in telemetry.items():
+            r = d.get('local_router')
+            router_ifaces.setdefault(r, []).append(iid)
+=======
+    # Track per-direction scaled factors from router adjustments (for later guards)
+    scaled_rx_factor = {i: 1.0 for i in telemetry}
+    scaled_tx_factor = {i: 1.0 for i in telemetry}
+
+    # Build router membership using provided topology (preferred)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        for r, ifs in topology.items():
+            router_ifaces[r] = [i for i in ifs if i in telemetry]
+    else:
+        # Fallback to local_router if topology not supplied (still useful for R1)
+        for iid, d in telemetry.items():
+            r = d.get('local_router')
+            router_ifaces.setdefault(r, []).append(iid)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Guarded router-level flow conservation (R1)
+    # Apply only when router has >= 3 interfaces and imbalance > threshold.
+    for r, ifs in router_ifaces.items():
+        if len(ifs) < 3:
+            continue
+        # Consider only interfaces that are up to avoid double-penalizing down links
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        imbalance = abs(sum_rx - sum_tx) / denom
+        if imbalance <= HARDENING_THRESHOLD:
+            continue
+
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+
+        # Decide which side to adjust based on lower confidence
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        # Required scaling to close gap fully
+        ratio = (sum_rx + 1e-9) / (sum_tx + 1e-9)
+        if adjust_side == 'rx':
+            s_req = 1.0 / max(1e-9, ratio)  # scale rx by s_req
+        else:
+            s_req = max(1e-9, ratio)        # scale tx by s_req
+
+        # Cap the magnitude of change to be gentle (<=10%)
+        s_cap = 0.10
+        s = max(1.0 - s_cap, min(1.0 + s_cap, s_req))
+
+        # Apply scaling and penalize confidence by relative change
+        rel_change = abs(s - 1.0)
+        for i in up_ifs:
+            if adjust_side == 'rx':
+                old = hardened_rx[i]
+                hardened_rx[i] = max(0.0, old * s)
+                # Penalize proportional to change (10% => ~0 confidence multiplier 0.0)
+                conf_rx[i] = clamp01(conf_rx[i] * (1.0 - rel_change / s_cap))
+            else:
+                old = hardened_tx[i]
+                hardened_tx[i] = max(0.0, old * s)
+                conf_tx[i] = clamp01(conf_tx[i] * (1.0 - rel_change / s_cap))
+=======
+    # Guarded router-level flow conservation (R1)
+    # Targeted adjustment: adjust only the lower-confidence side, distribute by weights,
+    # clip per-interface relative change to +/-10%, and damp the total correction by 60%.
+    for r, ifs in router_ifaces.items():
+        # Consider only interfaces that are up to avoid double-penalizing down links
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        imbalance = abs(sum_rx - sum_tx) / denom
+
+        # Adaptive router tolerance depending on number of active links
+        n_active = len(up_ifs)
+        tau_router = min(0.07, max(0.03, 0.05 * (2.0 / max(2, n_active)) ** 0.5))
+        if imbalance <= tau_router:
+            continue
+
+        # Aggregate confidences per side
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+
+        # Choose side with lower aggregate confidence to adjust
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        delta = sum_rx - sum_tx  # positive: rx larger than tx
+        # We aim to reduce the gap; compute total additive adjustment with damping
+        total_adjust = (-delta) if adjust_side == 'rx' else (delta)
+        total_adjust *= 0.6  # damping to avoid over-correction
+
+        # Build weights: favor larger links and lower-confidence signals
+        vals = []
+        confs = []
+        if adjust_side == 'rx':
+            vals = [hardened_rx[i] for i in up_ifs]
+            confs = [conf_rx[i] for i in up_ifs]
+        else:
+            vals = [hardened_tx[i] for i in up_ifs]
+            confs = [conf_tx[i] for i in up_ifs]
+
+        weights = []
+        for v, c in zip(vals, confs):
+            w = (max(v, 0.0) + 1e-6) * (1.0 - clamp01(c)) + 1e-6
+            weights.append(w)
+        total_w = sum(weights)
+        if total_w <= 0:
+            continue
+
+        # Apply distributed adjustments with per-interface clipping (+/-10%)
+        for idx, i in enumerate(up_ifs):
+            v_old = vals[idx]
+            w_i = weights[idx] / total_w
+            adj = total_adjust * w_i
+            # Clip per-interface relative change to +/-10%
+            cap = 0.10 * v_old
+            adj_clipped = min(max(adj, -cap), cap)
+            v_new = max(0.0, v_old + adj_clipped)
+
+            # Update hardened values and track effective scale factor for re-sync guard
+            if adjust_side == 'rx':
+                prev = hardened_rx[i]
+                hardened_rx[i] = v_new
+                if prev > ZERO_EPS:
+                    scaled_rx_factor[i] *= (v_new / prev)
+                # Moderate confidence penalty proportional to applied change
+                rel = abs(adj_clipped) / max(1.0, abs(prev))
+                conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * rel))
+            else:
+                prev = hardened_tx[i]
+                hardened_tx[i] = v_new
+                if prev > ZERO_EPS:
+                    scaled_tx_factor[i] *= (v_new / prev)
+                rel = abs(adj_clipped) / max(1.0, abs(prev))
+                conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * rel))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Final symmetry touch-up to keep links consistent (R3)
+    for a, b in list(processed_pairs):
+        if a not in telemetry or b not in telemetry:
+            continue
+        v1 = 0.5 * (hardened_tx[a] + hardened_rx[b])
+        v2 = 0.5 * (hardened_rx[a] + hardened_tx[b])
+        hardened_tx[a] = max(0.0, v1)
+        hardened_rx[b] = max(0.0, v1)
+        hardened_rx[a] = max(0.0, v2)
+        hardened_tx[b] = max(0.0, v2)
+        # Slight confidence reduction due to final adjustment
+        conf_rx[a] = clamp01(conf_rx[a] * 0.95)
+        conf_tx[a] = clamp01(conf_tx[a] * 0.95)
+        conf_rx[b] = clamp01(conf_rx[b] * 0.95)
+        conf_tx[b] = clamp01(conf_tx[b] * 0.95)
+=======
+    # Final symmetry touch-up (R3) with one-sided, confidence-gap-proportional nudge
+    for a, b in list(processed_pairs):
+        if a not in telemetry or b not in telemetry:
+            continue
+        # Skip if either side is down (already zeroed)
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+
+        # Helper to perform one-sided nudge toward mean
+        def nudge_one_side(val_lo: float, val_hi: float, f: float) -> float:
+            target = 0.5 * (val_lo + val_hi)
+            return val_lo + f * (target - val_lo)
+
+        # Direction 1: a.tx vs b.rx
+        a_tx = hardened_tx.get(a, 0.0)
+        b_rx = hardened_rx.get(b, 0.0)
+        if max(a_tx, b_rx) > ZERO_EPS:
+            d1 = rel_diff(a_tx, b_rx)
+            if d1 > HARDENING_THRESHOLD:
+                conf_a_tx = conf_tx.get(a, 0.6)
+                conf_b_rx = conf_rx.get(b, 0.6)
+                if conf_a_tx >= conf_b_rx:
+                    # Nudge lower-confidence side (b.rx) unless it had strong router scaling
+                    if abs(scaled_rx_factor.get(b, 1.0) - 1.0) <= 0.08:
+                        f = min(0.4, max(0.0, conf_a_tx - conf_b_rx))
+                        if f > 0.0:
+                            old = b_rx
+                            new = nudge_one_side(old, a_tx, f)
+                            hardened_rx[b] = max(0.0, new)
+                            relc = abs(new - old) / max(1.0, abs(old), abs(new))
+                            conf_rx[b] = clamp01(conf_rx.get(b, 0.6) * (1.0 - 0.3 * relc))
+                else:
+                    # Nudge lower-confidence side (a.tx) unless it had strong router scaling
+                    if abs(scaled_tx_factor.get(a, 1.0) - 1.0) <= 0.08:
+                        f = min(0.4, max(0.0, conf_b_rx - conf_a_tx))
+                        if f > 0.0:
+                            old = a_tx
+                            new = nudge_one_side(old, b_rx, f)
+                            hardened_tx[a] = max(0.0, new)
+                            relc = abs(new - old) / max(1.0, abs(old), abs(new))
+                            conf_tx[a] = clamp01(conf_tx.get(a, 0.6) * (1.0 - 0.3 * relc))
+
+        # Direction 2: a.rx vs b.tx
+        a_rx = hardened_rx.get(a, 0.0)
+        b_tx = hardened_tx.get(b, 0.0)
+        if max(a_rx, b_tx) > ZERO_EPS:
+            d2 = rel_diff(a_rx, b_tx)
+            if d2 > HARDENING_THRESHOLD:
+                conf_a_rx = conf_rx.get(a, 0.6)
+                conf_b_tx = conf_tx.get(b, 0.6)
+                if conf_a_rx >= conf_b_tx:
+                    # Nudge lower-confidence side (b.tx) unless it had strong router scaling
+                    if abs(scaled_tx_factor.get(b, 1.0) - 1.0) <= 0.08:
+                        f = min(0.4, max(0.0, conf_a_rx - conf_b_tx))
+                        if f > 0.0:
+                            old = b_tx
+                            new = nudge_one_side(old, a_rx, f)
+                            hardened_tx[b] = max(0.0, new)
+                            relc = abs(new - old) / max(1.0, abs(old), abs(new))
+                            conf_tx[b] = clamp01(conf_tx.get(b, 0.6) * (1.0 - 0.3 * relc))
+                else:
+                    # Nudge lower-confidence side (a.rx) unless it had strong router scaling
+                    if abs(scaled_rx_factor.get(a, 1.0) - 1.0) <= 0.08:
+                        f = min(0.4, max(0.0, conf_b_tx - conf_a_rx))
+                        if f > 0.0:
+                            old = a_rx
+                            new = nudge_one_side(old, b_tx, f)
+                            hardened_rx[a] = max(0.0, new)
+                            relc = abs(new - old) / max(1.0, abs(old), abs(new))
+                            conf_rx[a] = clamp01(conf_rx.get(a, 0.6) * (1.0 - 0.3 * relc))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Enforce interface down => zero traffic (final safeguard)
+    for i in telemetry:
+        if status.get(i) == 'down':
+            hardened_rx[i] = 0.0
+            hardened_tx[i] = 0.0
+            conf_rx[i] = max(conf_rx[i], 0.85)
+            conf_tx[i] = max(conf_tx[i], 0.85)
+=======
+    # Confidence peer smoothing: softly harmonize per-direction confidences across peers
+    # Apply only when both ends are up
+    new_conf_rx = dict(conf_rx)
+    new_conf_tx = dict(conf_tx)
+    for a, b in list(processed_pairs):
+        if a not in telemetry or b not in telemetry:
+            continue
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        # Blend 10% from peer opposite direction
+        new_conf_tx[a] = clamp01(0.9 * conf_tx.get(a, 0.6) + 0.1 * conf_rx.get(b, 0.6))
+        new_conf_rx[b] = clamp01(0.9 * conf_rx.get(b, 0.6) + 0.1 * conf_tx.get(a, 0.6))
+        new_conf_rx[a] = clamp01(0.9 * conf_rx.get(a, 0.6) + 0.1 * conf_tx.get(b, 0.6))
+        new_conf_tx[b] = clamp01(0.9 * conf_tx.get(b, 0.6) + 0.1 * conf_rx.get(a, 0.6))
+    conf_rx = new_conf_rx
+    conf_tx = new_conf_tx
+
+    # Enforce interface down => zero traffic (final safeguard)
+    for i in telemetry:
+        if status.get(i) == 'down':
+            hardened_rx[i] = 0.0
+            hardened_tx[i] = 0.0
+            conf_rx[i] = max(conf_rx[i], 0.85)
+            conf_tx[i] = max(conf_tx[i], 0.85)
+>>>>>>> REPLACE
+
+</DIFF>

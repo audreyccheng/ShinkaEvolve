@@ -1,0 +1,217 @@
+<NAME>
+uncertainty_weighted_additive_router_pass
+</NAME>
+
+<DESCRIPTION>
+I propose adding an uncertainty-weighted additive redistribution pass at the router level after the existing multiplicative scaling, and refining confidence calibration accordingly. This aligns with flow conservation (R1) and improves counter repair accuracy while maintaining calibrated confidence.
+
+Key changes:
+- Add a per-interface cap-usage tracker to record how much of each interface’s correction budget is consumed across passes.
+- After the multiplicative router pre-step, run an additive redistribution on the less-trusted direction, allocating the remaining aggregate imbalance proportionally to:
+  - lower per-direction confidence (from link residuals),
+  - pair residuals vs tolerance,
+  - volume share.
+  Each interface is bounded by a per-interface additive cap (≤25% of current value), and per-router total delta is guarded. This focuses edits where they are most justified and avoids overshooting.
+- Track additive deltas in router_delta_rel so pair reconciliation triggers only on touched links, and incorporate cap usage into confidence penalties for better calibration.
+- Taper the change penalty weight for small edits (delta_rel < 0.15) to avoid underconfidence for modest, justified corrections, improving confidence calibration.
+
+This directly implements the research-driven strategy: pre-scale multiplicatively to reduce large imbalances, then distribute residuals additively using uncertainty signals, followed by pair reconciliation. Confidence is penalized when large fractions of correction caps are consumed and gently reduced for larger changes, while untouched directions get a small bonus.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    router_imbalance_pre: Dict[str, float] = {}
+    router_scale_dir: Dict[str, str] = {}  # 'rx' or 'tx' for diagnostics
+    # Track per-interface relative delta from router scaling, used for confidence calibration
+    router_delta_rel: Dict[str, Dict[str, float]] = {i: {'rx': 0.0, 'tx': 0.0} for i in telemetry}
+=======
+    router_imbalance_pre: Dict[str, float] = {}
+    router_scale_dir: Dict[str, str] = {}  # 'rx' or 'tx' for diagnostics
+    # Track per-interface relative delta from router scaling, used for confidence calibration
+    router_delta_rel: Dict[str, Dict[str, float]] = {i: {'rx': 0.0, 'tx': 0.0} for i in telemetry}
+    # Track how much of per-direction caps are consumed across passes for confidence calibration
+    cap_used_frac: Dict[str, Dict[str, float]] = {i: {'rx': 0.0, 'tx': 0.0} for i in telemetry}
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if dir_to_scale == 'tx':
+                old = post_router[i]['tx']
+                new = old * k
+                # Cap per-interface multiplicative delta to ±15%
+                new_capped = clamp(new, old * 0.85, old * 1.15)
+                post_router[i]['tx'] = max(0.0, new_capped)
+                router_delta_rel[i]['tx'] = abs(post_router[i]['tx'] - old) / max(old, 1.0)
+            else:
+                old = post_router[i]['rx']
+                new = old * k
+                new_capped = clamp(new, old * 0.85, old * 1.15)
+                post_router[i]['rx'] = max(0.0, new_capped)
+                router_delta_rel[i]['rx'] = abs(post_router[i]['rx'] - old) / max(old, 1.0)
+=======
+            if dir_to_scale == 'tx':
+                old = post_router[i]['tx']
+                new = old * k
+                # Cap per-interface multiplicative delta to ±15%
+                new_capped = clamp(new, old * 0.85, old * 1.15)
+                post_router[i]['tx'] = max(0.0, new_capped)
+                router_delta_rel[i]['tx'] = abs(post_router[i]['tx'] - old) / max(old, 1.0)
+                # Track fraction of cap used by this multiplicative move
+                cap = 0.15 * max(old, 1.0)
+                applied = abs(post_router[i]['tx'] - old)
+                if cap > 0:
+                    cap_used_frac[i]['tx'] = max(cap_used_frac[i]['tx'], applied / cap)
+            else:
+                old = post_router[i]['rx']
+                new = old * k
+                new_capped = clamp(new, old * 0.85, old * 1.15)
+                post_router[i]['rx'] = max(0.0, new_capped)
+                router_delta_rel[i]['rx'] = abs(post_router[i]['rx'] - old) / max(old, 1.0)
+                cap = 0.15 * max(old, 1.0)
+                applied = abs(post_router[i]['rx'] - old)
+                if cap > 0:
+                    cap_used_frac[i]['rx'] = max(cap_used_frac[i]['rx'], applied / cap)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Build values after router pass
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+=======
+    # Additive router redistribution to close remaining flow imbalance with uncertainty-weighted allocation
+    for router_id, iface_list in topology.items():
+        up_ifaces = [i for i in iface_list if i in telemetry and pre[i]['local_status'] == 'up']
+        if len(up_ifaces) < 2:
+            continue
+
+        sum_rx2 = sum(post_router[i]['rx'] for i in up_ifaces)
+        sum_tx2 = sum(post_router[i]['tx'] for i in up_ifaces)
+
+        # Choose direction consistent with multiplicative pass; fallback to larger aggregate
+        need_dir = router_scale_dir.get(router_id)
+        if not need_dir:
+            need_dir = 'tx' if sum_tx2 > sum_rx2 else 'rx'
+
+        # We need to adjust the chosen direction so that its sum matches the other
+        need = (sum_rx2 - sum_tx2) if need_dir == 'tx' else (sum_tx2 - sum_rx2)
+        denom2 = max(sum_rx2, sum_tx2, 1.0)
+        # Skip negligible residuals
+        if abs(need) / denom2 <= HARDENING_THRESHOLD:
+            continue
+
+        # Per-router total delta guard (≤ 25% of average traffic)
+        guard = 0.25 * ((sum_rx2 + sum_tx2) / 2.0)
+        need = clamp(need, -guard, guard)
+
+        # Build weights emphasizing low-confidence, high-residual, and material-volume links
+        sum_v = sum(max(0.0, post_router[i][need_dir]) for i in up_ifaces)
+        weights: Dict[str, float] = {}
+        for i in up_ifaces:
+            v = max(0.0, post_router[i][need_dir])
+            peer_id = peers.get(i)
+            resid = 0.0
+            tol = HARDENING_THRESHOLD
+            if peer_id and peer_id in telemetry and pre[peer_id]['local_status'] == 'up':
+                if need_dir == 'tx':
+                    resid = rel_diff(post_router[i]['tx'], post_router[peer_id]['rx'])
+                    tol = pair_tolerance(post_router[i]['tx'], post_router[peer_id]['rx'])
+                    conf_dir_i = max(0.0, 1.0 - pre[i]['tx_link_diff'])
+                else:
+                    resid = rel_diff(post_router[i]['rx'], post_router[peer_id]['tx'])
+                    tol = pair_tolerance(post_router[i]['rx'], post_router[peer_id]['tx'])
+                    conf_dir_i = max(0.0, 1.0 - pre[i]['rx_link_diff'])
+            else:
+                conf_dir_i = 0.6
+                resid = 0.0
+                tol = HARDENING_THRESHOLD
+
+            w = 0.6 * (1.0 - conf_dir_i) + 0.25 * min(2.0, resid / max(tol, 1e-9)) + 0.15 * (v / max(sum_v, 1.0))
+            if v < 1.0:
+                w *= 0.5
+            weights[i] = w
+
+        sum_w = sum(weights.values())
+        if sum_w <= 1e-12:
+            # Fallback to equal weights
+            for i in up_ifaces:
+                weights[i] = 1.0
+            sum_w = float(len(up_ifaces))
+
+        # Apply additive allocation with per-interface caps (≤ 25% of current value)
+        for i in up_ifaces:
+            v = max(0.0, post_router[i][need_dir])
+            cap_i = 0.25 * max(v, 1.0)
+            delta = need * (weights[i] / sum_w)
+            delta = clamp(delta, -cap_i, cap_i)
+            if need_dir == 'tx':
+                old = post_router[i]['tx']
+                new = max(0.0, old + delta)
+                if new < 0.0:
+                    new = 0.0
+                    delta = -old
+                post_router[i]['tx'] = new
+                router_delta_rel[i]['tx'] += abs(delta) / max(old, 1.0)
+                if cap_i > 0.0:
+                    cap_used_frac[i]['tx'] = max(cap_used_frac[i]['tx'], abs(delta) / cap_i)
+            else:
+                old = post_router[i]['rx']
+                new = max(0.0, old + delta)
+                if new < 0.0:
+                    new = 0.0
+                    delta = -old
+                post_router[i]['rx'] = new
+                router_delta_rel[i]['rx'] += abs(delta) / max(old, 1.0)
+                if cap_i > 0.0:
+                    cap_used_frac[i]['rx'] = max(cap_used_frac[i]['rx'], abs(delta) / cap_i)
+
+    # Build values after router passes
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        rx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, tx_change))
+=======
+        # Taper change-penalty weight for small edits to avoid underconfidence
+        rx_weight = 0.4 if rx_change < 0.15 else 0.5
+        tx_weight = 0.4 if tx_change < 0.15 else 0.5
+        rx_change_factor = max(0.2, 1.0 - rx_weight * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - tx_weight * min(1.0, tx_change))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        padj_rx = pair_adj_rel[iface]['rx']
+        padj_tx = pair_adj_rel[iface]['tx']
+        rx_conf -= min(0.05, 0.25 * padj_rx)
+        tx_conf -= min(0.05, 0.25 * padj_tx)
+
+        # Bonus for untouched directions across all passes
+=======
+        padj_rx = pair_adj_rel[iface]['rx']
+        padj_tx = pair_adj_rel[iface]['tx']
+        rx_conf -= min(0.05, 0.25 * padj_rx)
+        tx_conf -= min(0.05, 0.25 * padj_tx)
+
+        # Penalty when an interface consumed a large portion of its per-pass cap (stresses calibration)
+        capf_rx = cap_used_frac[iface]['rx']
+        capf_tx = cap_used_frac[iface]['tx']
+        if capf_rx > 0.9:
+            rx_conf -= 0.08
+        elif capf_rx > 0.7:
+            rx_conf -= 0.05
+        if capf_tx > 0.9:
+            tx_conf -= 0.08
+        elif capf_tx > 0.7:
+            tx_conf -= 0.05
+
+        # Bonus for untouched directions across all passes
+>>>>>>> REPLACE
+
+</DIFF>

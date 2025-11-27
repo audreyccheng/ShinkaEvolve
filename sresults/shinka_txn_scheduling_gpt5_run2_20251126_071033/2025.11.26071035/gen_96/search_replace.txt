@@ -1,0 +1,280 @@
+<NAME>
+bnb_greedy_insert_relink_block_and_cache_bump
+</NAME>
+
+<DESCRIPTION>
+I propose five targeted improvements to reduce makespan by aligning expansions and completions more closely with the true simulated cost while strengthening exact endgame and improving reuse:
+
+1) Greedy completions use best-insertion instead of naive append:
+   - In both beam-search fallback and BnB fallback, we now complete partial schedules by inserting each remaining txn at its best position via cached best-two evaluation. This directly optimizes against the simulator and often yields large gains over append-based greedy.
+
+2) Strengthen endgame BnB:
+   - Warm-start with a best-insertion greedy completion to set a tight incumbent bound before DFS.
+   - Use a transposition-like memo keyed by (frozenset(remaining), suffix of current prefix) instead of the full prefix; this prunes more duplicates across different partials with the same remaining set and suffix.
+   - Opportunistically refine the bound within DFS when the remaining set is small (<=6) by performing a quick best-insertion greedy completion.
+
+3) Better path relinking moves:
+   - When moving a block toward the target, choose its best insertion position within the base sequence (guided by focus) instead of forcing it exactly at the target index. This uses the same deterministic position sampling and the simulator cost to pick the best landing spot, improving the quality of each step.
+
+4) Final exact suffix optimization:
+   - After the main search, perform an exact BnB reorder of the last ≤BNB_K transactions of the incumbent to capture endgame improvements missed during local search.
+
+5) More memo reuse:
+   - Increase LRU capacities for insertion and block reinsertion to reduce recomputation across beam/LNS/VND phases.
+
+These changes maintain determinism of position sampling and reuse the existing caches, improving search quality without heavy rewrites. They are consistent with the current architecture and should lower the makespan reliably.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Best-two LRU for single insertions and block insertions
+            self.best_two_lru = LRU(20000)
+            self.best_block_lru = LRU(10000)
+=======
+            # Best-two LRU for single insertions and block insertions (larger caps for reuse)
+            self.best_two_lru = LRU(60000)
+            self.best_block_lru = LRU(30000)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    def bnb_complete(prefix, remaining, best_bound):
+        start_time = time.time()
+        best_cost = best_bound[0]
+        best_seq = None
+
+        rem_list = list(remaining)
+        # Precompute immediate extension costs for ordering
+        order = []
+        for t in rem_list:
+            c = eng.eval_cost(prefix + [t])
+            order.append((c, t))
+        order.sort(key=lambda x: x[0])
+
+        memo = {}
+
+        def dfs(cur, rem):
+            nonlocal best_cost, best_seq
+            # prune by time
+            if time.time() - start_time > BNB_TIME_BUDGET:
+                return
+            if not rem:
+                c = eng.eval_cost(cur)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = list(cur)
+                return
+            key = (tuple(cur), tuple(sorted(rem)))
+            if key in memo and memo[key] >= best_cost:
+                return
+            # Lower bound is current prefix cost since cost is non-decreasing
+            c_pref = eng.eval_cost(cur)
+            if c_pref >= best_cost:
+                memo[key] = c_pref
+                return
+            # Order remaining by immediate extension cost to prune faster
+            local = []
+            for t in rem:
+                c1 = eng.eval_cost(cur + [t])
+                local.append((c1, t))
+            local.sort(key=lambda x: x[0])
+            for c1, t in local:
+                if c1 >= best_cost:
+                    continue
+                nxt = list(cur)
+                nxt.append(t)
+                rem_next = [x for x in rem if x != t]
+                dfs(nxt, rem_next)
+                if time.time() - start_time > BNB_TIME_BUDGET:
+                    break
+            memo[key] = min(memo.get(key, float('inf')), c_pref)
+
+        dfs(list(prefix), rem_list)
+        if best_seq is None:
+            # Fallback greedy completion if time pruned everything
+            cur = list(prefix)
+            rem = list(remaining)
+            while rem:
+                best_t, best_c = None, float('inf')
+                for t in rem:
+                    c = eng.eval_cost(cur + [t])
+                    if c < best_c:
+                        best_c, best_t = c, t
+                cur.append(best_t)
+                rem.remove(best_t)
+            return eng.eval_cost(cur), cur
+        return best_cost, best_seq
+=======
+    def bnb_complete(prefix, remaining, best_bound):
+        start_time = time.time()
+        best_cost = best_bound[0]
+        best_seq = None
+
+        # Best-insertion greedy completion used for warm start and opportunistic tightening
+        def greedy_complete_insertion(pref, rem):
+            cur = list(pref)
+            left = list(rem)
+            while left:
+                best_t, best_p, best_c = None, 0, float('inf')
+                for t in left:
+                    c2, p2, _ = eng.best_two_insertions(cur, t, focus_idx=None, exhaustive=(len(cur) <= exhaustive_threshold))
+                    if c2 < best_c:
+                        best_c, best_t, best_p = c2, t, p2
+                cur.insert(best_p, best_t)
+                left.remove(best_t)
+            return eng.eval_cost(cur), cur
+
+        # Warm-start incumbent with greedy best-insertion completion
+        if remaining:
+            gc, gs = greedy_complete_insertion(prefix, list(remaining))
+            if gc < best_cost:
+                best_cost, best_seq = gc, gs
+
+        rem_list = list(remaining)
+
+        memo = {}
+
+        def dfs(cur, rem):
+            nonlocal best_cost, best_seq
+            # prune by time
+            if time.time() - start_time > BNB_TIME_BUDGET:
+                return
+            if not rem:
+                c = eng.eval_cost(cur)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = list(cur)
+                return
+            # Transposition-style key: remaining set + suffix of prefix
+            key = (frozenset(rem), tuple(cur[-3:]) if len(cur) >= 3 else tuple(cur))
+            c_pref = eng.eval_cost(cur)
+            prev = memo.get(key)
+            if prev is not None and c_pref >= prev - 1e-12:
+                return
+            memo[key] = c_pref
+            # Non-decreasing cost bound
+            if c_pref >= best_cost:
+                return
+
+            # Opportunistic greedy tightening near leaves
+            if len(rem) <= 6:
+                gc, gs = greedy_complete_insertion(cur, rem)
+                if gc < best_cost:
+                    best_cost, best_seq = gc, gs
+
+            # Order remaining by immediate extension cost to prune faster
+            local = []
+            for t in rem:
+                c1 = eng.eval_cost(cur + [t])
+                local.append((c1, t))
+            local.sort(key=lambda x: x[0])
+            for c1, t in local:
+                if c1 >= best_cost:
+                    continue
+                nxt = list(cur)
+                nxt.append(t)
+                rem_next = [x for x in rem if x != t]
+                dfs(nxt, rem_next)
+                if time.time() - start_time > BNB_TIME_BUDGET:
+                    break
+
+        dfs(list(prefix), rem_list)
+        if best_seq is None:
+            # Fallback: complete via best-insertion greedy
+            return greedy_complete_insertion(prefix, list(remaining))
+        return best_cost, best_seq
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            if len(rem) <= BNB_K:
+                return bnb_complete(seq, list(rem), (float('inf'),))
+            # greedy completion
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_c = None, float('inf')
+                for t in rem_list:
+                    c2 = eng.eval_cost(cur + [t])
+                    if c2 < best_c:
+                        best_c, best_t = c2, t
+                cur.append(best_t)
+                rem_list.remove(best_t)
+            return eng.eval_cost(cur), cur
+=======
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            if len(rem) <= BNB_K:
+                return bnb_complete(seq, list(rem), (float('inf'),))
+            # Greedy completion via best-insertion (uses best-two memo)
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_p, best_c = None, 0, float('inf')
+                for t in rem_list:
+                    c2, p2, _ = eng.best_two_insertions(cur, t, focus_idx=None, exhaustive=(len(cur) <= exhaustive_threshold))
+                    if c2 < best_c:
+                        best_c, best_t, best_p = c2, t, p2
+                cur.insert(best_p, best_t)
+                rem_list.remove(best_t)
+            return eng.eval_cost(cur), cur
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+                block = cur[j:j + k]
+                base = cur[:j] + cur[j + k:]
+                new_seq = base[:i] + block + base[i:]
+                c = eng.eval_cost(new_seq)
+                cur = new_seq
+=======
+                block = cur[j:j + k]
+                base = cur[:j] + cur[j + k:]
+                # Choose best insertion position for the block (focus near i)
+                positions, _ = eng.positions_for_insertion(len(base), exhaustive=(len(base) <= exhaustive_threshold), focus_idx=i)
+                best_seq_move = None
+                best_c_move = float('inf')
+                best_pos_move = i
+                for p in positions:
+                    cand = base[:]
+                    cand[p:p] = block
+                    c_try = eng.eval_cost(cand)
+                    if c_try < best_c_move:
+                        best_c_move = c_try
+                        best_pos_move = p
+                        best_seq_move = cand
+                if best_seq_move is None:
+                    new_seq = base[:i] + block + base[i:]
+                    c = eng.eval_cost(new_seq)
+                else:
+                    new_seq = best_seq_move
+                    c = best_c_move
+                cur = new_seq
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    best_cost, best_seq = incumbent_cost, incumbent_seq
+
+    # Safety check
+    assert len(best_seq) == n and len(set(best_seq)) == n, "Schedule must include each transaction exactly once"
+
+    return best_cost, best_seq
+=======
+    best_cost, best_seq = incumbent_cost, incumbent_seq
+
+    # Final exact optimization of the suffix via BnB to capture endgame improvements
+    if n > 3:
+        k = min(BNB_K, n)
+        prefix = best_seq[:-k]
+        suffix = best_seq[-k:]
+        c_b, s_b = bnb_complete(prefix, list(suffix), (best_cost,))
+        if s_b and c_b < best_cost:
+            best_cost, best_seq = c_b, s_b
+
+    # Safety check
+    assert len(best_seq) == n and len(set(best_seq)) == n, "Schedule must include each transaction exactly once"
+
+    return best_cost, best_seq
+>>>>>>> REPLACE
+
+</DIFF>

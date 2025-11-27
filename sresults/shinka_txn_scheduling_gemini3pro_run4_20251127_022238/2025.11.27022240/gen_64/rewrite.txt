@@ -1,0 +1,325 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Stochastic Weighted Greedy Construction and Two-Stage LAHC.
+    
+    Strategies:
+    1. Stochastic Greedy: Diversifies initial population by varying scoring weights and 
+       occasionally picking sub-optimal local moves.
+    2. Extended LAHC: Uses Block Swap and Reversal operators to handle complex dependencies.
+    3. Two-Stage Funnel: Sprint (Top 5) -> Marathon (Winner).
+    """
+    # 1. Pre-calculation
+    # Compute transaction durations for heuristic guidance
+    txn_durations = {t: workload.get_opt_seq_cost([t]) for t in range(workload.num_txns)}
+    # Sort transactions by duration (descending) for Big Rocks lookup
+    sorted_txns_by_len = sorted(range(workload.num_txns), key=lambda t: txn_durations[t], reverse=True)
+
+    candidates_pool = []
+
+    # 2. Greedy Construction Phase
+    for i in range(num_seqs):
+        # Diversity: Randomize parameters per candidate
+        if i == 0:
+            # Baseline parameters
+            alpha = 0.4
+            rock_limit = 5
+            threshold_ratio = 0.90
+            sample_size = 15
+            stochasticity = 0.0
+        else:
+            # Randomized exploration parameters
+            alpha = random.uniform(0.1, 0.7)
+            rock_limit = random.randint(3, 10)
+            threshold_ratio = random.uniform(0.80, 0.98)
+            sample_size = random.randint(10, 25)
+            # Probability of not picking the absolute best local move
+            stochasticity = random.uniform(0.05, 0.25)
+
+        start_txn = random.randint(0, workload.num_txns - 1)
+        schedule = [start_txn]
+        remaining = set(range(workload.num_txns))
+        remaining.remove(start_txn)
+
+        while remaining:
+            candidates = set()
+
+            # A. Big Rocks Strategy
+            # Identify max duration in remaining set for dynamic threshold
+            max_dur = 0
+            # Optimization: check top few sorted instead of full iteration if possible
+            for t in sorted_txns_by_len:
+                if t in remaining:
+                    max_dur = txn_durations[t]
+                    break
+            
+            threshold = max_dur * threshold_ratio
+            
+            rocks_added = 0
+            for t in sorted_txns_by_len:
+                if t in remaining:
+                    if txn_durations[t] >= threshold:
+                        candidates.add(t)
+                        rocks_added += 1
+                        if rocks_added >= rock_limit:
+                            break
+                    else:
+                        break # Since sorted, rest are smaller
+
+            # B. Random Sampling
+            remaining_list = list(remaining)
+            if len(remaining_list) > sample_size:
+                candidates.update(random.sample(remaining_list, sample_size))
+            else:
+                candidates.update(remaining)
+
+            # C. Weighted Scoring with Stochastic Selection
+            scored_candidates = []
+            for t in candidates:
+                cost = workload.get_opt_seq_cost(schedule + [t])
+                # Score: lower is better. 
+                # Combine makespan increase with duration (longer txns preferred early)
+                score = cost - (alpha * txn_durations[t])
+                # Tie-break: Prefer longer duration (so negative duration)
+                scored_candidates.append((score, -txn_durations[t], t))
+
+            # Sort by score
+            scored_candidates.sort()
+
+            # Select transaction
+            best_t = scored_candidates[0][2]
+            
+            # Stochasticity: occasionally pick 2nd or 3rd best to diversify structure
+            if stochasticity > 0 and len(scored_candidates) > 1:
+                if random.random() < stochasticity:
+                    pick_idx = random.randint(0, min(len(scored_candidates)-1, 2))
+                    best_t = scored_candidates[pick_idx][2]
+
+            schedule.append(best_t)
+            remaining.remove(best_t)
+
+        initial_cost = workload.get_opt_seq_cost(schedule)
+        candidates_pool.append((initial_cost, schedule))
+
+    # 3. LAHC Optimization Helper
+    def run_lahc(schedule, start_cost, budget, enable_kick=False):
+        current_seq = list(schedule)
+        current_cost = start_cost
+        best_seq = list(schedule)
+        best_cost = start_cost
+
+        history_len = 50
+        history = [start_cost] * history_len
+        last_imp_idx = 0
+
+        for k in range(budget):
+            # Kick Mechanism for Stagnation (Marathon only)
+            if enable_kick and (k - last_imp_idx > 500):
+                # Major Perturbation: Shuffle a large random segment
+                seg_len = random.randint(15, 30)
+                if len(current_seq) > seg_len:
+                    start_k = random.randint(0, len(current_seq) - seg_len)
+                    segment = current_seq[start_k : start_k + seg_len]
+                    random.shuffle(segment)
+                    current_seq[start_k : start_k + seg_len] = segment
+
+                    current_cost = workload.get_opt_seq_cost(current_seq)
+                    history = [current_cost] * history_len
+                    last_imp_idx = k
+                    continue
+
+            neighbor = list(current_seq)
+            op_rand = random.random()
+            n = len(neighbor)
+
+            # Extended Operator Set
+            if op_rand < 0.40:
+                # Single Insert (Move 1 item)
+                idx1 = random.randint(0, n - 1)
+                idx2 = random.randint(0, n - 1)
+                if idx1 != idx2:
+                    item = neighbor.pop(idx1)
+                    neighbor.insert(idx2, item)
+
+            elif op_rand < 0.70:
+                # Block Insert (Move 2-8 items)
+                bsize = random.randint(2, 8)
+                if n > bsize:
+                    start = random.randint(0, n - bsize)
+                    block = neighbor[start : start + bsize]
+                    del neighbor[start : start + bsize]
+                    dest = random.randint(0, len(neighbor))
+                    neighbor[dest : dest] = block
+                else:
+                    continue
+
+            elif op_rand < 0.80:
+                # Swap (Single items)
+                idx1, idx2 = random.sample(range(n), 2)
+                neighbor[idx1], neighbor[idx2] = neighbor[idx2], neighbor[idx1]
+
+            elif op_rand < 0.90:
+                # Block Swap (Swap two disjoint blocks)
+                # Create two blocks of size 2-5
+                bsize1 = random.randint(2, 5)
+                bsize2 = random.randint(2, 5)
+                if n > bsize1 + bsize2:
+                    # Pick start of first block
+                    s1 = random.randint(0, n - bsize1 - bsize2)
+                    # Pick start of second block (after first block)
+                    s2 = random.randint(s1 + bsize1, n - bsize2)
+                    
+                    b1 = neighbor[s1 : s1 + bsize1]
+                    b2 = neighbor[s2 : s2 + bsize2]
+                    
+                    # Place b2 at s1
+                    neighbor[s1 : s1 + bsize1] = b2
+                    # Place b1 where b2 was (adjusted for length diff)
+                    # The length of the sequence changes if bsize1 != bsize2
+                    # After replacing b1 at s1 with b2, the index s2 shifts by (len(b2) - len(b1))
+                    shift = len(b2) - len(b1)
+                    s2_adj = s2 + shift
+                    neighbor[s2_adj : s2_adj + bsize2] = b1
+                else:
+                    continue
+            
+            else:
+                # Sequence Reversal (2-opt like)
+                # Reverse a block of length 3-15
+                bsize = random.randint(3, 15)
+                if n > bsize:
+                    start = random.randint(0, n - bsize)
+                    segment = neighbor[start : start + bsize]
+                    neighbor[start : start + bsize] = segment[::-1]
+                else:
+                    continue
+
+            new_cost = workload.get_opt_seq_cost(neighbor)
+
+            # LAHC Acceptance
+            h_idx = k % history_len
+            if new_cost <= current_cost or new_cost <= history[h_idx]:
+                current_seq = neighbor
+                current_cost = new_cost
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_seq = list(current_seq)
+                    last_imp_idx = k
+
+            history[h_idx] = current_cost
+
+        return best_cost, best_seq
+
+    # 4. Two-Stage Funnel Strategy
+
+    # Sort initial pool
+    candidates_pool.sort(key=lambda x: x[0])
+    
+    # Filter for uniqueness
+    unique_candidates = []
+    seen = set()
+    for cost, seq in candidates_pool:
+        h = tuple(seq)
+        if h not in seen:
+            unique_candidates.append((cost, list(seq)))
+            seen.add(h)
+    
+    # Ensure we have candidates
+    if not unique_candidates:
+        unique_candidates = [(candidates_pool[0][0], list(candidates_pool[0][1]))]
+
+    # Stage 1: Sprint (Top 5)
+    # Give decent budget to top candidates to distinguish potential
+    sprint_candidates = unique_candidates[:5]
+    sprint_results = []
+    
+    for cost, seq in sprint_candidates:
+        sc, ss = run_lahc(seq, cost, 400, enable_kick=False)
+        sprint_results.append((sc, ss))
+
+    sprint_results.sort(key=lambda x: x[0])
+    
+    # Stage 2: Marathon (Top 1)
+    # Heavy optimization on the winner
+    winner_cost, winner_seq = sprint_results[0]
+    final_cost, final_seq = run_lahc(winner_seq, winner_cost, 2500, enable_kick=True)
+
+    return final_cost, final_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END

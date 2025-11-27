@@ -1,0 +1,259 @@
+<NAME>
+resid_tilt_and_severity_adaptive_penalties
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to boost counter repair accuracy while keeping confidence well-calibrated:
+
+1) Residual-tilted, prescaled pair consensus:
+   - Before averaging A.tx vs B.rx (and B.tx vs A.rx), I apply a gentle multiplicative prescaling (±10%) to reduce ratio bias and compute the consensus target and step size on these prescaled values. This is gated to links with significant disagreement and skipped for extremely low-rate links, preventing noise amplification.
+   - I then tilt the consensus weight slightly based on the original router’s signed residual direction to favor changes that reduce local flow-conservation imbalance. The tilt is small (gamma ≤ 0.08) and applied only when disagreement direction matches residual sign.
+
+   This combination improves correction accuracy on mismatched pairs without overreacting on tiny flows.
+
+2) Severity-adaptive, direction-aware router penalties:
+   - I replace fixed 0.6/0.4 weighting with residual-severity–adaptive penalties that tilt weights by the interface’s own TX/RX share and the larger of local/remote residuals. This preserves calibration: the more severe the residuals, the stronger the penalty, and the more we weight the side likely contributing to error.
+
+These changes are minimal and consistent with the Hodor research principles, improving both counter accuracy and confidence calibration without touching status logic or overall structure.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from typing import Dict, Any, Tuple, List
+=======
+from typing import Dict, Any, Tuple, List
+import math
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # First pass: pairwise consensus hardening and status harmonization
+=======
+    # Compute signed router residuals (original telemetry; down interfaces contribute zero)
+    resid_signed: Dict[str, float] = {}
+    for router, if_list in topology.items():
+        s_tx = 0.0
+        s_rx = 0.0
+        for iid in if_list:
+            d = telemetry.get(iid)
+            if not d:
+                continue
+            status = d.get('interface_status', 'unknown')
+            tx = to_float(d.get('tx_rate', 0.0))
+            rx = to_float(d.get('rx_rate', 0.0))
+            if status == 'down':
+                tx = 0.0
+                rx = 0.0
+            s_tx += tx
+            s_rx += rx
+        scale0 = max(s_tx, s_rx, 1.0)
+        resid_signed[router] = (s_tx - s_rx) / scale0 if scale0 > 0 else 0.0
+
+    # First pass: pairwise consensus hardening and status harmonization
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if (d_ab > thr_rel_ab) and (abs_ab > guard_ab):
+                v = 0.5 * (a_tx + b_rx)
+                if d_ab <= partial_upper:
+                    # Asymmetric partial averaging: louder side moves more; low-rate uses slightly steeper ramp
+                    k_base = (d_ab - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                    k_base = min(1.0, max(0.0, k_base))
+                    if max_ab < LOW_RATE_CUTOFF:
+                        k_base = k_base ** 1.2
+                    loud = a_tx if a_tx >= b_rx else b_rx
+                    quiet = b_rx if a_tx >= b_rx else a_tx
+                    r = (loud - quiet) / max(1.0, loud)
+                    k_loud = min(1.0, max(0.0, k_base * (1.0 + 0.5 * r)))
+                    k_quiet = min(1.0, max(0.0, k_base * (1.0 - 0.5 * r)))
+                    if a_tx >= b_rx:
+                        rep_a_tx = a_tx * (1.0 - k_loud) + v * k_loud
+                        rep_b_rx = b_rx * (1.0 - k_quiet) + v * k_quiet
+                    else:
+                        rep_a_tx = a_tx * (1.0 - k_quiet) + v * k_quiet
+                        rep_b_rx = b_rx * (1.0 - k_loud) + v * k_loud
+                else:
+                    rep_a_tx = v
+                    rep_b_rx = v
+                conf_base = max(0.0, 1.0 - d_ab)
+                # Penalize by applied change magnitude for calibration
+                change_a = change_ratio(a_tx, rep_a_tx)
+                change_b = change_ratio(b_rx, rep_b_rx)
+                tx_conf_a = min(conf_base, 1.0 - 0.8 * change_a)
+                rx_conf_b = min(conf_base, 1.0 - 0.8 * change_b)
+=======
+            if (d_ab > thr_rel_ab) and (abs_ab > guard_ab):
+                # Gentle multiplicative prescaling to reduce ratio bias (skip on very low rate)
+                if max_ab >= 1.0:
+                    s = max(0.90, min(1.10, math.sqrt(max(EPS, b_rx) / max(EPS, a_tx))))
+                else:
+                    s = 1.0
+                a_tx_p = a_tx * s
+                b_rx_p = b_rx / max(EPS, s)
+
+                # Residual-tilted consensus target favoring reduction of local router imbalance
+                v = 0.5 * (a_tx_p + b_rx_p)
+                resid_a = resid_signed.get(a.get('local_router'), 0.0)
+                delta_p = a_tx_p - b_rx_p
+                if max_ab >= 1.0 and delta_p != 0.0 and resid_a != 0.0 and ((delta_p > 0) == (resid_a > 0)):
+                    gamma = min(0.08, 0.1 * abs(resid_a))
+                    w_a = max(0.2, min(0.8, 0.5 - gamma))
+                    w_b = 1.0 - w_a
+                    v = w_a * a_tx_p + w_b * b_rx_p
+
+                # Use prescaled disagreement to set step size
+                d_eff = abs(a_tx_p - b_rx_p) / max(a_tx_p, b_rx_p, 1.0)
+                if d_eff <= partial_upper:
+                    # Asymmetric partial averaging: louder side moves more; low-rate uses slightly steeper ramp
+                    k_base = (d_eff - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                    k_base = min(1.0, max(0.0, k_base))
+                    if max_ab < LOW_RATE_CUTOFF:
+                        k_base = k_base ** 1.2
+                    loud = a_tx if a_tx >= b_rx else b_rx
+                    quiet = b_rx if a_tx >= b_rx else a_tx
+                    r = (loud - quiet) / max(1.0, loud)
+                    k_loud = min(1.0, max(0.0, k_base * (1.0 + 0.5 * r)))
+                    k_quiet = min(1.0, max(0.0, k_base * (1.0 - 0.5 * r)))
+                    if a_tx >= b_rx:
+                        rep_a_tx = a_tx * (1.0 - k_loud) + v * k_loud
+                        rep_b_rx = b_rx * (1.0 - k_quiet) + v * k_quiet
+                    else:
+                        rep_a_tx = a_tx * (1.0 - k_quiet) + v * k_quiet
+                        rep_b_rx = b_rx * (1.0 - k_loud) + v * k_loud
+                else:
+                    rep_a_tx = v
+                    rep_b_rx = v
+
+                conf_base = max(0.0, 1.0 - d_ab)
+                # Penalize by applied change magnitude for calibration
+                change_a = change_ratio(a_tx, rep_a_tx)
+                change_b = change_ratio(b_rx, rep_b_rx)
+                tx_conf_a = min(conf_base, 1.0 - 0.8 * change_a)
+                rx_conf_b = min(conf_base, 1.0 - 0.8 * change_b)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if (d_ba > thr_rel_ba) and (abs_ba > guard_ba):
+                v2 = 0.5 * (b_tx + a_rx)
+                if d_ba <= partial_upper_ba:
+                    k_base2 = (d_ba - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                    k_base2 = min(1.0, max(0.0, k_base2))
+                    if max_ba < LOW_RATE_CUTOFF:
+                        k_base2 = k_base2 ** 1.2
+                    loud2 = b_tx if b_tx >= a_rx else a_rx
+                    quiet2 = a_rx if b_tx >= a_rx else b_tx
+                    r2 = (loud2 - quiet2) / max(1.0, loud2)
+                    k_loud2 = min(1.0, max(0.0, k_base2 * (1.0 + 0.5 * r2)))
+                    k_quiet2 = min(1.0, max(0.0, k_base2 * (1.0 - 0.5 * r2)))
+                    if b_tx >= a_rx:
+                        rep_b_tx = b_tx * (1.0 - k_loud2) + v2 * k_loud2
+                        rep_a_rx = a_rx * (1.0 - k_quiet2) + v2 * k_quiet2
+                    else:
+                        rep_b_tx = b_tx * (1.0 - k_quiet2) + v2 * k_quiet2
+                        rep_a_rx = a_rx * (1.0 - k_loud2) + v2 * k_loud2
+                else:
+                    rep_b_tx = v2
+                    rep_a_rx = v2
+                conf_base2 = max(0.0, 1.0 - d_ba)
+                change_b2 = change_ratio(b_tx, rep_b_tx)
+                change_a2 = change_ratio(a_rx, rep_a_rx)
+                tx_conf_b = min(conf_base2, 1.0 - 0.8 * change_b2)
+                rx_conf_a = min(conf_base2, 1.0 - 0.8 * change_a2)
+=======
+            if (d_ba > thr_rel_ba) and (abs_ba > guard_ba):
+                # Gentle multiplicative prescaling to reduce ratio bias (skip on very low rate)
+                if max_ba >= 1.0:
+                    s2 = max(0.90, min(1.10, math.sqrt(max(EPS, a_rx) / max(EPS, b_tx))))
+                else:
+                    s2 = 1.0
+                b_tx_p = b_tx * s2
+                a_rx_p = a_rx / max(EPS, s2)
+
+                # Residual-tilted consensus target favoring reduction of B's local router imbalance
+                v2 = 0.5 * (b_tx_p + a_rx_p)
+                resid_b = resid_signed.get(b.get('local_router'), 0.0)
+                delta_p2 = b_tx_p - a_rx_p
+                if max_ba >= 1.0 and delta_p2 != 0.0 and resid_b != 0.0 and ((delta_p2 > 0) == (resid_b > 0)):
+                    gamma2 = min(0.08, 0.1 * abs(resid_b))
+                    w_b2 = max(0.2, min(0.8, 0.5 - gamma2))
+                    w_a2 = 1.0 - w_b2
+                    v2 = w_b2 * b_tx_p + w_a2 * a_rx_p
+
+                d_eff2 = abs(b_tx_p - a_rx_p) / max(b_tx_p, a_rx_p, 1.0)
+                if d_eff2 <= partial_upper_ba:
+                    k_base2 = (d_eff2 - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                    k_base2 = min(1.0, max(0.0, k_base2))
+                    if max_ba < LOW_RATE_CUTOFF:
+                        k_base2 = k_base2 ** 1.2
+                    loud2 = b_tx if b_tx >= a_rx else a_rx
+                    quiet2 = a_rx if b_tx >= a_rx else b_tx
+                    r2 = (loud2 - quiet2) / max(1.0, loud2)
+                    k_loud2 = min(1.0, max(0.0, k_base2 * (1.0 + 0.5 * r2)))
+                    k_quiet2 = min(1.0, max(0.0, k_base2 * (1.0 - 0.5 * r2)))
+                    if b_tx >= a_rx:
+                        rep_b_tx = b_tx * (1.0 - k_loud2) + v2 * k_loud2
+                        rep_a_rx = a_rx * (1.0 - k_quiet2) + v2 * k_quiet2
+                    else:
+                        rep_b_tx = b_tx * (1.0 - k_quiet2) + v2 * k_quiet2
+                        rep_a_rx = a_rx * (1.0 - k_loud2) + v2 * k_loud2
+                else:
+                    rep_b_tx = v2
+                    rep_a_rx = v2
+                conf_base2 = max(0.0, 1.0 - d_ba)
+                change_b2 = change_ratio(b_tx, rep_b_tx)
+                change_a2 = change_ratio(a_rx, rep_a_rx)
+                tx_conf_b = min(conf_base2, 1.0 - 0.8 * change_b2)
+                rx_conf_a = min(conf_base2, 1.0 - 0.8 * change_a2)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Direction-aware penalties: TX depends more on local, RX more on remote
+        penalty_tx = 1.0 - (0.6 * resid_local + 0.4 * resid_remote)
+        penalty_rx = 1.0 - (0.6 * resid_remote + 0.4 * resid_local)
+        penalty_tx = max(0.0, min(1.0, penalty_tx))
+        penalty_rx = max(0.0, min(1.0, penalty_rx))
+        avg_penalty = 0.5 * (penalty_tx + penalty_rx)
+
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        # Status confidence mildly scaled by average penalty
+        status_conf = max(0.0, min(1.0, status_conf * (0.75 + 0.25 * avg_penalty)))
+=======
+        # Severity-adaptive, direction-aware penalties using local/remote residuals and interface TX/RX share
+        total_dir = max(1e-9, repaired_tx + repaired_rx)
+        tx_share = min(1.0, max(0.0, repaired_tx / total_dir))
+        rx_share = 1.0 - tx_share
+        sev = max(resid_local, resid_remote)
+        if sev < 0.03:
+            amp = 0.1
+        elif sev < 0.12:
+            amp = 0.2
+        else:
+            amp = 0.3
+
+        # Tilt weights to emphasize the more relevant side under higher severity
+        w_local_tx = 0.6 + amp * tx_share
+        w_remote_tx = 0.4 - amp * tx_share
+        w_remote_rx = 0.6 + amp * rx_share
+        w_local_rx = 0.4 - amp * rx_share
+
+        penalty_tx = 1.0 - (w_local_tx * resid_local + w_remote_tx * resid_remote)
+        penalty_rx = 1.0 - (w_remote_rx * resid_remote + w_local_rx * resid_local)
+        penalty_tx = max(0.0, min(1.0, penalty_tx))
+        penalty_rx = max(0.0, min(1.0, penalty_rx))
+        min_penalty = min(penalty_tx, penalty_rx)
+
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        # Status confidence mildly scaled by the weaker penalty for conservatism
+        status_conf = max(0.0, min(1.0, status_conf * (0.85 + 0.15 * min_penalty)))
+>>>>>>> REPLACE
+
+</DIFF>

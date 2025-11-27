@@ -1,0 +1,404 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using Analytic Flow Consensus.
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network telemetry using Analytic Flow Consensus.
+
+    Strategy:
+    1. Status Repair: Infer status from local/remote traffic activity.
+    2. Rate Repair (Iterative):
+       - For each interface, calculate the 'Flow Implied' rate that would perfectly balance the router.
+       - Compare 'Self', 'Peer', and 'Flow Implied' values.
+       - Enforce physical constraints (RX <= Peer TX, TX >= Peer RX).
+       - Arbitrate loss scenarios (RX < Peer TX) using the Flow Implied value.
+    3. Confidence Calibration:
+       - continuous scoring based on residual errors and agreement strength.
+    """
+
+    # --- Configuration ---
+    HARDENING_THRESHOLD = 0.02   # 2% relative error considered 'match'
+    BASE_NOISE_FLOOR = 10.0      # Minimum Mbps to consider 'active'
+    ITERATIONS = 4               # Convergence count
+
+    # --- Helper: Dynamic Noise Floor ---
+    def get_noise_floor(rate_a, rate_b=0.0):
+        # Scale noise floor for high speed links, but keep base floor for IoT/Idle
+        mx = max(rate_a, rate_b)
+        return max(BASE_NOISE_FLOOR, mx * 0.001) # 0.1% of rate or 10Mbps
+
+    # --- Helper: Normalized Error ---
+    def calc_error(v1, v2):
+        nf = get_noise_floor(v1, v2)
+        return abs(v1 - v2) / max(v1, v2, nf)
+
+    # --- Step 1: Initialization ---
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'peer': data.get('connected_to'),
+            'router': data.get('local_router'),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown')
+        }
+
+    # --- Step 2: Robust Status Repair ---
+    for if_id, s in state.items():
+        # Traffic Evidence
+        local_traffic = s['rx'] > BASE_NOISE_FLOOR or s['tx'] > BASE_NOISE_FLOOR
+
+        peer_traffic = False
+        peer_is_down = False
+        if s['peer'] and s['peer'] in state:
+            p = state[s['peer']]
+            if p['orig_rx'] > BASE_NOISE_FLOOR or p['orig_tx'] > BASE_NOISE_FLOOR:
+                peer_traffic = True
+            if p['orig_status'] == 'down':
+                peer_is_down = True
+
+        # Decision Matrix
+        if local_traffic or peer_traffic:
+            s['status'] = 'up'
+        elif peer_is_down and not local_traffic:
+            s['status'] = 'down'
+        # Else: if originally UP and idle, stay UP. If originally DOWN and idle, stay DOWN.
+
+        # Consistency enforce
+        if s['status'] != 'up':
+            s['rx'] = 0.0
+            s['tx'] = 0.0
+
+    # --- Step 3: Iterative Rate Repair ---
+    for _ in range(ITERATIONS):
+
+        # 3.1: Pre-calculate Router Flow States
+        router_stats = {}
+        for r_id, if_ids in topology.items():
+            sum_rx = sum(state[i]['rx'] for i in if_ids if i in state)
+            sum_tx = sum(state[i]['tx'] for i in if_ids if i in state)
+            # Total volume for normalization
+            total_vol = max(sum_rx, sum_tx, BASE_NOISE_FLOOR)
+            imbalance = sum_rx - sum_tx
+            router_stats[r_id] = {
+                'sum_rx': sum_rx,
+                'sum_tx': sum_tx,
+                'imbalance': imbalance,
+                'quality': max(0.0, 1.0 - (abs(imbalance) / total_vol * 10.0)) # 1.0=Perfect, 0.0=Bad
+            }
+
+        next_values = {}
+
+        for if_id, s in state.items():
+            if s['status'] != 'up':
+                next_values[if_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = s['peer']
+            r_id = s['router']
+            remote_r_id = s['remote_router']
+            has_peer = peer_id and peer_id in state
+
+            # --- Solve for Flow-Implied Values ---
+            # 1. Local Flow Target (balances Local Router)
+            flow_local_rx = None
+            flow_local_tx = None
+            local_q = 0.5
+
+            if r_id in router_stats:
+                rs = router_stats[r_id]
+                local_q = rs['quality']
+                # RX_new = RX_old - Imbalance (if Imbalance > 0, we have too much RX, so reduce it)
+                flow_local_rx = max(0.0, s['rx'] - rs['imbalance'])
+                # TX_new = TX_old + Imbalance (if Imbalance > 0, we have too little TX, so increase it)
+                flow_local_tx = max(0.0, s['tx'] + rs['imbalance'])
+
+            # 2. Remote Flow Target (balances Remote Router)
+            # We want to know what value for THIS link would balance the REMOTE router.
+            # Local RX connects to Peer TX. Peer TX balances Remote Router.
+            # Remote Imbalance = Sum_RX_Rem - Sum_TX_Rem
+            # Peer TX Target = Peer_TX_Old + Remote_Imbalance
+            flow_remote_tx = None # Target for Peer TX (matches Local RX)
+            flow_remote_rx = None # Target for Peer RX (matches Local TX)
+            remote_q = 0.5
+
+            if remote_r_id in router_stats and has_peer:
+                rs_rem = router_stats[remote_r_id]
+                remote_q = rs_rem['quality']
+
+                p_tx = state[peer_id]['tx']
+                p_rx = state[peer_id]['rx']
+
+                flow_remote_tx = max(0.0, p_tx + rs_rem['imbalance'])
+                flow_remote_rx = max(0.0, p_rx - rs_rem['imbalance'])
+
+            # --- RX Repair ---
+            # Constraint: RX <= Peer TX
+            val_self = s['rx']
+            val_peer = state[peer_id]['tx'] if has_peer else None
+
+            final_rx = val_self
+
+            if val_peer is not None:
+                # 1. Check strict constraint (Impossible case: RX > Peer TX)
+                if val_self > val_peer * (1.0 + HARDENING_THRESHOLD):
+                    # Impossible.
+                    # Default to Peer TX.
+                    final_rx = val_peer
+
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_rx = (val_self + val_peer) / 2.0
+
+                # 3. Disagreement (Likely Packet Loss: RX < Peer TX)
+                else:
+                    # Logic: Use Quality-Weighted Arbitration
+
+                    # Error distances to Local Flow Target
+                    d_peer_local = calc_error(val_peer, flow_local_rx) if flow_local_rx is not None else 1.0
+                    d_self_local = calc_error(val_self, flow_local_rx) if flow_local_rx is not None else 1.0
+
+                    # Error distances to Remote Flow Target (Does Peer Value fit Remote Flow?)
+                    d_peer_remote = calc_error(val_peer, flow_remote_tx) if flow_remote_tx is not None else 1.0
+
+                    # Consensus Check
+                    peer_fits_local = d_peer_local < HARDENING_THRESHOLD
+                    peer_fits_remote = d_peer_remote < HARDENING_THRESHOLD
+                    self_fits_local = d_self_local < HARDENING_THRESHOLD
+
+                    if peer_fits_local and peer_fits_remote:
+                        # Double Consensus: Peer value balances BOTH routers.
+                        final_rx = val_peer
+                    elif peer_fits_local:
+                        # Peer value balances Local router. (Phantom Loss?)
+                        final_rx = val_peer
+                    elif self_fits_local:
+                        # Self value balances Local router. (Real Loss?)
+                        # But check remote quality.
+                        if remote_q > local_q and peer_fits_remote:
+                             # Remote is high quality and Peer fits it. I am low quality.
+                             # Trust Peer.
+                             final_rx = val_peer
+                        else:
+                             # Trust Self (Real Loss).
+                             final_rx = val_self
+                    else:
+                        # Neither fits Local Flow well.
+                        # If Peer fits Remote Flow well, trust Peer.
+                        if peer_fits_remote:
+                            final_rx = val_peer
+                        else:
+                            # Ambiguous. Default to Peer (Source Truth).
+                            final_rx = val_peer
+
+            # --- TX Repair ---
+            # Constraint: TX >= Peer RX
+            val_self = s['tx']
+            val_peer = state[peer_id]['rx'] if has_peer else None
+
+            final_tx = val_self
+
+            if val_peer is not None:
+                # 1. Check strict constraint (Impossible: TX < Peer RX)
+                if val_self < val_peer * (1.0 - HARDENING_THRESHOLD):
+                     final_tx = val_peer
+
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_tx = (val_self + val_peer) / 2.0
+
+                # 3. Disagreement (Likely TX > Peer RX)
+                else:
+                    # Error distances
+                    d_peer_local = calc_error(val_peer, flow_local_tx) if flow_local_tx is not None else 1.0
+                    d_self_local = calc_error(val_self, flow_local_tx) if flow_local_tx is not None else 1.0
+
+                    # Remote Flow Target for Peer RX (connected to our TX)
+                    d_peer_remote = calc_error(val_peer, flow_remote_rx) if flow_remote_rx is not None else 1.0
+
+                    peer_fits_local = d_peer_local < HARDENING_THRESHOLD
+                    peer_fits_remote = d_peer_remote < HARDENING_THRESHOLD
+                    self_fits_local = d_self_local < HARDENING_THRESHOLD
+
+                    if peer_fits_local and peer_fits_remote:
+                        # Peer balances both.
+                        final_tx = val_peer
+                    elif peer_fits_local:
+                        # Peer balances Local. (Phantom TX?)
+                        final_tx = val_peer
+                    elif self_fits_local:
+                        # Self balances Local. (Real Loss downstream?)
+                        if remote_q > local_q and peer_fits_remote:
+                            final_tx = val_peer
+                        else:
+                            final_tx = val_self
+                    else:
+                        if peer_fits_remote:
+                            final_tx = val_peer
+                        else:
+                            final_tx = val_peer
+
+            next_values[if_id] = {'rx': final_rx, 'tx': final_tx}
+
+        # Apply updates
+        for if_id, vals in next_values.items():
+            state[if_id]['rx'] = vals['rx']
+            state[if_id]['tx'] = vals['tx']
+
+    # --- Step 4: Confidence Calibration ---
+    result = {}
+
+    # Recalculate Final Flow Quality
+    final_router_qual = {}
+    for r_id, if_ids in topology.items():
+        sum_rx = sum(state[i]['rx'] for i in if_ids if i in state)
+        sum_tx = sum(state[i]['tx'] for i in if_ids if i in state)
+        vol = max(sum_rx, sum_tx, BASE_NOISE_FLOOR)
+        imb = abs(sum_rx - sum_tx) / vol
+        # High quality if imbalance < 2%
+        final_router_qual[r_id] = max(0.0, 1.0 - (imb * 10.0))
+
+    for if_id, s in state.items():
+        orig_rx = s['orig_rx']
+        orig_tx = s['orig_tx']
+
+        peer_id = s['peer']
+        has_peer = peer_id and peer_id in state
+
+        # Get Peer Final Values
+        peer_tx = state[peer_id]['tx'] if has_peer else None
+        peer_rx = state[peer_id]['rx'] if has_peer else None
+
+        r_id = s['router']
+        remote_r_id = s['remote_router']
+
+        local_q = final_router_qual.get(r_id, 0.5)
+        remote_q = final_router_qual.get(remote_r_id, 0.5) if remote_r_id else 0.5
+
+        def get_confidence(final, orig, peer_val, l_q, r_q):
+            # 1. Did we change it?
+            was_repaired = calc_error(final, orig) > HARDENING_THRESHOLD
+
+            # 2. Do we match Peer?
+            matches_peer = False
+            if peer_val is not None:
+                if calc_error(final, peer_val) < HARDENING_THRESHOLD:
+                    matches_peer = True
+
+            conf = 1.0
+
+            if was_repaired:
+                if matches_peer:
+                    # We aligned with Peer. This is usually very good.
+                    # If both routers are high quality, this is certain.
+                    # If one is bad, confidence drops slightly.
+                    base = 0.88
+                    bonus_l = 0.06 * l_q
+                    bonus_r = 0.05 * r_q
+                    conf = base + bonus_l + bonus_r
+                else:
+                    # Repaired to non-peer value.
+                    # Must be supported by Local Flow Quality.
+                    if l_q > 0.9:
+                        conf = 0.85
+                    else:
+                        conf = 0.60
+            else:
+                # Kept Original
+                if peer_val is not None and not matches_peer:
+                    # Disagreement. Kept Self.
+                    # Valid if Local Flow validates Self (High Local Q).
+                    if l_q > 0.9:
+                        # If Remote Q is also high, we have a stalemate.
+                        if r_q > 0.9:
+                            conf = 0.90
+                        else:
+                            # Remote is bad, I am good.
+                            conf = 0.95
+                    elif l_q > 0.7:
+                        conf = 0.80
+                    else:
+                        conf = 0.70 # Ambiguous
+                else:
+                    # Agreement or No Peer
+                    conf = 1.0
+
+            return max(0.0, min(1.0, conf))
+
+        rx_conf = get_confidence(s['rx'], orig_rx, peer_tx, local_q, remote_q)
+        tx_conf = get_confidence(s['tx'], orig_tx, peer_rx, local_q, remote_q)
+
+        # Status confidence
+        st_conf = 1.0
+        if s['status'] != s['orig_status']:
+            st_conf = 0.95
+
+        result[if_id] = {
+            'rx_rate': (orig_rx, s['rx'], rx_conf),
+            'tx_rate': (orig_tx, s['tx'], tx_conf),
+            'interface_status': (s['orig_status'], s['status'], st_conf),
+            'connected_to': telemetry[if_id].get('connected_to'),
+            'local_router': telemetry[if_id].get('local_router'),
+            'remote_router': telemetry[if_id].get('remote_router')
+        }
+
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

@@ -1,0 +1,181 @@
+<NAME>
+propagate_status_and_refine_confidence
+</NAME>
+
+<DESCRIPTION>
+1. **Status Propagation**: In the Rate Repair loop, if a rate is repaired to be active (> MIN_ACTIVITY), explicitly force the interface status to 'up'. This prevents inconsistencies where a rate is repaired but the status remains 'down' (causing sanity checks to zero out confidence).
+2. **Robust Confidence Calibration**: Introduce explicit detection of "Broken Routers" (verifiable routers that fail flow conservation). Use this to downgrade confidence for values associated with broken routers, even if the values were left unchanged. This reduces overconfidence in scenarios where a router is malfunctioning structurally.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+
+    # --- 4. Confidence Calibration ---
+=======
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+
+            # Propagate Status: If we determine there is flow, the link must be UP
+            if new_val > MIN_ACTIVITY:
+                if state[if_id]['status'] != 'up':
+                    state[if_id]['status'] = 'up'
+                    status_confidence[if_id] = 0.9  # Inferred active
+                if state[peer_id]['status'] != 'up':
+                    state[peer_id]['status'] = 'up'
+                    status_confidence[peer_id] = 0.9 # Inferred active
+
+    # --- 4. Confidence Calibration ---
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- 4. Confidence Calibration ---
+    result = {}
+
+    # Pre-calculate final flow errors for context
+    final_router_errors = {rid: get_flow_error(rid) for rid in verifiable_routers}
+
+    for if_id, s in state.items():
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+
+        rid = s['local_router']
+        peer_id = s['connected_to']
+
+        def calculate_confidence(orig, final, field):
+            # 1. Verification Status
+            # Local
+            local_err = final_router_errors.get(rid)
+            local_verified = (local_err is not None and local_err < FLOW_TOLERANCE)
+
+            # Remote
+            remote_verified = False
+            rem_rid = s['remote_router']
+            if rem_rid in final_router_errors:
+                 if final_router_errors[rem_rid] < FLOW_TOLERANCE:
+                     remote_verified = True
+
+            # 2. Change Analysis
+            changed = abs(orig - final) > max(orig * 0.001, 0.001)
+            # Smoothing = Changed, but within 5%
+            is_smoothing = changed and (abs(orig - final) < max(orig * 0.05, 0.1))
+
+            # 3. Peer Consistency (Symmetry)
+            peer_consistent = True
+            if peer_id in state:
+                # If checking Rx, compare with Peer Tx
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+
+            # --- Scoring ---
+
+            if not changed:
+                # Unchanged
+                if local_verified and remote_verified: return 1.0
+                if local_verified: return 0.98
+                if not peer_consistent: return 0.7 # Kept original despite conflict
+                return 0.9 # Default for unchanged
+
+            if is_smoothing:
+                return 0.95 # High confidence in smoothing
+
+            # Significant Correction
+            if local_verified and remote_verified:
+                return 0.98 # Validated by both ends
+            if local_verified:
+                return 0.95 # Validated by local math
+            if remote_verified:
+                return 0.90 # Validated by remote math
+
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85
+
+            # Total guess / forced agreement
+            return 0.6
+=======
+    # --- 4. Confidence Calibration ---
+    result = {}
+
+    # Pre-calculate final flow errors for context
+    final_router_errors = {rid: get_flow_error(rid) for rid in verifiable_routers}
+    broken_routers = {rid for rid, err in final_router_errors.items() if err >= FLOW_TOLERANCE}
+
+    for if_id, s in state.items():
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+
+        rid = s['local_router']
+        peer_id = s['connected_to']
+        rem_rid = s['remote_router']
+
+        def calculate_confidence(orig, final, field):
+            # 1. Verification Status
+            local_verified = (rid in verifiable_routers and rid not in broken_routers)
+            remote_verified = (rem_rid in verifiable_routers and rem_rid not in broken_routers)
+
+            # Check if routers are explicitly broken (known bad)
+            local_broken = (rid in broken_routers)
+            remote_broken = (rem_rid in broken_routers)
+
+            # 2. Change Analysis
+            changed = abs(orig - final) > max(orig * 0.001, 0.001)
+            # Smoothing = Changed, but within 5%
+            is_smoothing = changed and (abs(orig - final) < max(orig * 0.05, 0.1))
+
+            # 3. Peer Consistency (Symmetry)
+            peer_consistent = True
+            if peer_id in state:
+                # If checking Rx, compare with Peer Tx
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+
+            # --- Scoring ---
+
+            if not changed:
+                # Unchanged Data
+                if local_verified and remote_verified: return 1.0
+                if local_verified: return 0.99
+
+                # If we rely on peer consistency but peer is on a broken router, reduce confidence
+                if remote_broken: return 0.8
+
+                if not peer_consistent: return 0.7
+
+                if local_broken:
+                    # If local is broken, we can't verify ourselves.
+                    if remote_verified: return 0.95
+                    return 0.6 # Broken local, unverified remote
+
+                return 0.9 # Default for unchanged
+
+            # Changed Data
+            if is_smoothing:
+                return 0.95
+
+            # Significant Correction
+            if local_verified and remote_verified: return 0.99
+            if local_verified: return 0.96
+            if remote_verified: return 0.92
+
+            # Corrections involving broken routers
+            if local_broken and remote_broken:
+                return 0.4 # Total guess in a mess
+
+            # Unverified Corrections (Heuristics)
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                # If remote is broken, be skeptical of this "revival"
+                if remote_broken: return 0.7
+                return 0.85
+
+            # Fallback
+            if local_broken: return 0.5
+            return 0.6
+>>>>>>> REPLACE
+</DIFF>

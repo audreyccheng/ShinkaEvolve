@@ -1,0 +1,227 @@
+<NAME>
+post_repair_confidence_calibration_and_unpaired_down_enforcement
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements focused on boosting confidence calibration while preserving (or improving) counter accuracy:
+
+1) Final confidence calibration using invariant residuals:
+   - After all repairs (pair-level and router-level), compute post-repair residuals:
+     - Pair residuals: rel_diff(my_tx, peer_rx) and rel_diff(my_rx, peer_tx) for up links.
+     - Router residuals: per-router imbalance rel_diff(sum_tx, sum_rx).
+   - Map these residuals to confidence using a tolerant linear function and combine with status confidence. Apply a change penalty for large edits relative to the original. This calibrates confidence to reflect the actual repair quality, improving the confidence_calibration metric without changing repaired values.
+
+2) Enforce "down implies zero traffic" for unpaired interfaces:
+   - Interfaces that are not part of any connected pair but are marked down should have zero traffic. This correction enhances counter accuracy for such cases and improves status-consistent behavior.
+
+The changes retain the current repair logic (which already achieves good counter accuracy) and focus on better confidence scoring plus a safe, invariant-driven fix for unpaired down interfaces. The topology is still used for router-level flow conservation and for computing router residuals in the confidence calibration step.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / denom
+=======
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / denom
+
+    def conf_from_residual(residual: float, tol: float) -> float:
+        # Map residual to confidence: 1 at 0 residual, degrades linearly until ~0 near 5*tol
+        denom = max(tol * 5.0, 1e-9)
+        return clamp(1.0 - residual / denom)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Build connected pairs
+    visited = set()
+    pairs: List[Tuple[str, str]] = []
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            # Use ordered tuple to avoid duplicates
+            key = tuple(sorted([if_id, peer]))
+            if key not in visited:
+                visited.add(key)
+                pairs.append((key[0], key[1]))
+=======
+    # Build connected pairs
+    visited = set()
+    pairs: List[Tuple[str, str]] = []
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            # Use ordered tuple to avoid duplicates
+            key = tuple(sorted([if_id, peer]))
+            if key not in visited:
+                visited.add(key)
+                pairs.append((key[0], key[1]))
+
+    # Map each interface to its peer for quick lookup and record paired IDs
+    peer_of: Dict[str, str] = {}
+    paired_ids = set()
+    for a_id, b_id in pairs:
+        peer_of[a_id] = b_id
+        peer_of[b_id] = a_id
+        paired_ids.add(a_id)
+        paired_ids.add(b_id)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Router-level dynamic flow conservation (R1)
+    # Build router to interfaces map (use provided topology if available, else derive from telemetry)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        router_ifaces = {r: list(if_list) for r, if_list in topology.items()}
+    else:
+        # If topology not provided, derive from telemetry metadata
+        # Note: Topology helps flow conservation; we derive a best-effort map when absent.
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None:
+                router_ifaces.setdefault(r, []).append(if_id)
+=======
+    # Enforce "down implies zero traffic" also for unpaired interfaces
+    for if_id, r in interim.items():
+        if if_id not in paired_ids and r.get('status') == 'down':
+            rx0 = r['rx']
+            tx0 = r['tx']
+            r['rx'] = 0.0
+            r['tx'] = 0.0
+            r['rx_conf'] = clamp(0.9 if rx0 <= TRAFFIC_EVIDENCE_MIN else 0.3)
+            r['tx_conf'] = clamp(0.9 if tx0 <= TRAFFIC_EVIDENCE_MIN else 0.3)
+
+    # Router-level dynamic flow conservation (R1)
+    # Build router to interfaces map (use provided topology if available, else derive from telemetry)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        router_ifaces = {r: list(if_list) for r, if_list in topology.items()}
+    else:
+        # If topology not provided, derive from telemetry metadata
+        # Note: Topology helps flow conservation; we derive a best-effort map when absent.
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None:
+                router_ifaces.setdefault(r, []).append(if_id)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Assemble final result with (original, repaired, confidence) tuples and unchanged metadata
+    for if_id, data in telemetry.items():
+        repaired_data: Dict[str, Tuple] = {}
+        r = interim[if_id]
+
+        repaired_data['rx_rate'] = (r['orig_rx'], r['rx'], clamp(r['rx_conf']))
+        repaired_data['tx_rate'] = (r['orig_tx'], r['tx'], clamp(r['tx_conf']))
+        repaired_data['interface_status'] = (r['orig_status'], r['status'], clamp(r['status_conf']))
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = r['connected_to']
+        repaired_data['local_router'] = r['local_router']
+        repaired_data['remote_router'] = r['remote_router']
+
+        result[if_id] = repaired_data
+
+    return result
+=======
+    # Final confidence calibration based on post-repair invariants
+    # Compute per-router imbalance residuals
+    router_final_imbalance: Dict[str, float] = {}
+    for router, if_list in router_ifaces.items():
+        # only consider interfaces that are in interim and up
+        up_ifaces = [i for i in if_list if i in interim and interim[i].get('status') == 'up']
+        if not up_ifaces:
+            router_final_imbalance[router] = 0.0
+            continue
+        sum_tx = sum(max(0.0, interim[i]['tx']) for i in up_ifaces)
+        sum_rx = sum(max(0.0, interim[i]['rx']) for i in up_ifaces)
+        router_final_imbalance[router] = rel_diff(sum_tx, sum_rx)
+
+    # Weights and tolerances for confidence components
+    w_pair, w_router, w_status = 0.6, 0.3, 0.1
+    TOL_PAIR = HARDENING_THRESHOLD * 1.5
+    TOL_ROUTER = HARDENING_THRESHOLD * 2.0
+
+    for if_id, r in interim.items():
+        router = r.get('local_router')
+        # Peer lookup when available
+        try:
+            peer = peer_of.get(if_id)
+        except NameError:
+            peer = None
+
+        status_comp = clamp(r.get('status_conf', 0.8))
+        resolved_status = r.get('status', 'unknown')
+
+        if peer and interim.get(peer, {}).get('status') == resolved_status:
+            res_fwd = rel_diff(r['tx'], interim[peer]['rx'])
+            res_rev = rel_diff(r['rx'], interim[peer]['tx'])
+            pair_comp_tx = conf_from_residual(res_fwd, TOL_PAIR)
+            pair_comp_rx = conf_from_residual(res_rev, TOL_PAIR)
+        else:
+            pair_comp_tx = 0.55
+            pair_comp_rx = 0.55
+
+        router_imb = router_final_imbalance.get(router, 0.0)
+        router_comp = conf_from_residual(router_imb, TOL_ROUTER)
+
+        base_tx_conf = w_pair * pair_comp_tx + w_router * router_comp + w_status * status_comp
+        base_rx_conf = w_pair * pair_comp_rx + w_router * router_comp + w_status * status_comp
+
+        # Change penalty to discourage overconfidence on large edits
+        delta_tx_rel = rel_diff(r['orig_tx'], r['tx'])
+        delta_rx_rel = rel_diff(r['orig_rx'], r['rx'])
+        pen_tx = max(0.0, delta_tx_rel - HARDENING_THRESHOLD)
+        pen_rx = max(0.0, delta_rx_rel - HARDENING_THRESHOLD)
+        CHANGE_PENALTY_WEIGHT = 0.5
+        final_tx_conf = clamp(base_tx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_rx))
+
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        r['tx_conf'] = final_tx_conf
+        r['rx_conf'] = final_rx_conf
+
+        # Subtle status calibration: if up but effectively idle, reduce status confidence slightly
+        if resolved_status == 'up':
+            if r['rx'] <= TRAFFIC_EVIDENCE_MIN and r['tx'] <= TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(r['status_conf'] * 0.9)
+        elif resolved_status == 'down':
+            if r['rx'] > TRAFFIC_EVIDENCE_MIN or r['tx'] > TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(min(r['status_conf'], 0.3))
+
+    # Assemble final result with (original, repaired, confidence) tuples and unchanged metadata
+    for if_id, data in telemetry.items():
+        repaired_data: Dict[str, Tuple] = {}
+        r = interim[if_id]
+
+        repaired_data['rx_rate'] = (r['orig_rx'], r['rx'], clamp(r['rx_conf']))
+        repaired_data['tx_rate'] = (r['orig_tx'], r['tx'], clamp(r['tx_conf']))
+        repaired_data['interface_status'] = (r['orig_status'], r['status'], clamp(r['status_conf']))
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = r['connected_to']
+        repaired_data['local_router'] = r['local_router']
+        repaired_data['remote_router'] = r['remote_router']
+
+        result[if_id] = repaired_data
+
+    return result
+>>>>>>> REPLACE
+
+</DIFF>

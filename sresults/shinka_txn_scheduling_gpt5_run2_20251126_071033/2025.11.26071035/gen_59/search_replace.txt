@@ -1,0 +1,374 @@
+<NAME>
+insertion_lru_beam_oropt_improve
+</NAME>
+
+<DESCRIPTION>
+I introduce three targeted improvements to reduce makespan by aligning the search more closely with the actual cost function and by reusing expensive evaluations:
+
+1) LRU-capped best-two insertion memo with deterministic position sampling:
+   - Replace the ad-hoc best_two_cache with an OrderedDict-based LRU cache with a capacity that scales with n. This reuses best-insertion evaluations across construction, beam, LNS, and local search moves without uncontrolled growth. Also, make position sampling deterministic (evenly spaced anchors), increasing cache hit rates.
+
+2) Insertion-aware beam expansions and greedy completion:
+   - Change beam expansions from simple append (prefix + [t]) to best-position insertion of t into the current prefix. Also use best-position insertion in greedy completion. This directly optimizes the objective during construction steps, reducing the reliance on later local search to fix poor early placement decisions.
+
+3) Or-opt(1) acceleration using insertion cache:
+   - For block_len == 1 in Or-opt, use the best-two insertion cache to find the best reinsertion position in O(1) cache time, instead of scanning many positions with separate eval_cost calls. This speeds local search and helps quickly exploit promising reinsertion moves.
+
+Additionally, I remove unnecessary cache clear calls to preserve insertion memoization across phases, and I make sensitivity scoring position samples deterministic to boost memo hits.
+
+These changes reduce simulator calls, improve the fidelity of decisions during beam construction, and strengthen the local search, collectively targeting lower makespan schedules.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+from functools import lru_cache
+from math import ceil
+=======
+from functools import lru_cache
+from math import ceil
+from collections import OrderedDict
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Best-two insertion cache reused across a build/LNS episode
+    best_two_cache = {}
+=======
+    # Best-two insertion cache reused across the whole search with simple LRU bound
+    BEST_TWO_CAP = 20000 if n <= 100 else 30000
+    best_two_cache = OrderedDict()
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def positions_stratified(seq_len, cap=POS_SAMPLE_LIMIT, extra_random=8):
+        """Deterministic stratified insertion positions with optional random interiors."""
+        total = seq_len + 1
+        if cap is None or total <= cap:
+            return list(range(total))
+        anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+        anchors = {p for p in anchors if 0 <= p <= seq_len}
+        interior = [p for p in range(1, seq_len) if p not in anchors]
+        R = min(extra_random, len(interior))
+        if R > 0:
+            # Sampled interiors deterministic wrt current length by seeding temporarily
+            sampled = set(random.sample(interior, R))
+            anchors.update(sampled)
+        return sorted(anchors)
+=======
+    def positions_stratified(seq_len, cap=POS_SAMPLE_LIMIT, extra_random=8):
+        """Deterministic stratified insertion positions using evenly spaced anchors (no randomness)."""
+        total = seq_len + 1
+        if cap is None or total <= cap:
+            return list(range(total))
+        # Evenly spaced positions including both ends
+        k = max(2, min(cap, total))
+        anchors = set()
+        # distribute k positions from 0..seq_len inclusive
+        denom = max(1, k - 1)
+        for i in range(k):
+            pos = round(i * seq_len / denom)
+            anchors.add(int(pos))
+        return sorted(p for p in anchors if 0 <= p <= seq_len)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def best_insertion_for_txn(current_seq, txn):
+        """Try inserting txn; return (best_cost, best_pos, second_best_cost), using cache and stratified positions."""
+        key = (tuple(current_seq), txn)
+        cached = best_two_cache.get(key)
+        if cached is not None:
+            return cached
+        seq_len = len(current_seq)
+        best_cost = float('inf')
+        second_best = float('inf')
+        best_pos = 0
+        positions = positions_stratified(seq_len)
+        for pos in positions:
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                second_best = best_cost
+                best_cost = cost
+                best_pos = pos
+            elif cost < second_best:
+                second_best = cost
+        if second_best == float('inf'):
+            second_best = best_cost
+        res = (best_cost, best_pos, second_best)
+        best_two_cache[key] = res
+        return res
+=======
+    def best_insertion_for_txn(current_seq, txn):
+        """Try inserting txn; return (best_cost, best_pos, second_best_cost), using LRU cache and stratified positions."""
+        key = (tuple(current_seq), txn)
+        cached = best_two_cache.get(key)
+        if cached is not None:
+            # refresh LRU position
+            try:
+                best_two_cache.move_to_end(key)
+            except Exception:
+                pass
+            return cached
+        seq_len = len(current_seq)
+        best_cost = float('inf')
+        second_best = float('inf')
+        best_pos = 0
+        positions = positions_stratified(seq_len)
+        for pos in positions:
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                second_best = best_cost
+                best_cost = cost
+                best_pos = pos
+            elif cost < second_best:
+                second_best = cost
+        if second_best == float('inf'):
+            second_best = best_cost
+        res = (best_cost, best_pos, second_best)
+        best_two_cache[key] = res
+        # Enforce LRU capacity
+        if len(best_two_cache) > BEST_TWO_CAP:
+            try:
+                best_two_cache.popitem(last=False)
+            except Exception:
+                pass
+        return res
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                for t in expand_list:
+                    new_prefix = prefix + [t]
+                    c1 = eval_cost(new_prefix)
+                    rem_after = [x for x in rem_list if x != t]
+                    best_c2 = c1
+                    span = 0.0
+                    if rem_after:
+                        k2 = len(rem_after) if endgame and len(rem_after) <= 10 else min(lookahead_k, len(rem_after))
+                        second = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        vals = []
+                        best_c2 = float('inf')
+                        for u in second:
+                            cu = eval_cost(new_prefix + [u])
+                            vals.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        if len(vals) >= 2:
+                            span = max(vals) - min(vals)
+                    raw.append((t, c1, best_c2, span, tuple(rem_after), new_prefix))
+=======
+                for t in expand_list:
+                    # Insert t at its best position within prefix (insertion-aware expansion)
+                    c1, p1, _ = best_insertion_for_txn(prefix, t)
+                    new_prefix = prefix[:]
+                    new_prefix.insert(p1, t)
+                    rem_after = [x for x in rem_list if x != t]
+                    best_c2 = c1
+                    span = 0.0
+                    if rem_after:
+                        k2 = len(rem_after) if endgame and len(rem_after) <= 10 else min(lookahead_k, len(rem_after))
+                        second = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        vals = []
+                        best_c2 = float('inf')
+                        for u in second:
+                            cu, pu, _ = best_insertion_for_txn(new_prefix, u)
+                            vals.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        if len(vals) >= 2:
+                            span = max(vals) - min(vals)
+                    raw.append((t, c1, best_c2, span, tuple(rem_after), new_prefix))
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Greedy completion from best beam state if not complete
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_t = None
+                best_c = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur_seq + [t])
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                cur_seq.append(best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur_seq), cur_seq
+=======
+        # Greedy completion from best beam state if not complete (use best-position insertion)
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            rem_list = list(rem)
+            cur_seq = list(seq)
+            while rem_list:
+                best_t = None
+                best_pos = 0
+                best_c = float('inf')
+                for t in rem_list:
+                    c2, p2, _ = best_insertion_for_txn(cur_seq, t)
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                        best_pos = p2
+                cur_seq.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur_seq), cur_seq
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                    positions = all_positions(m)
+                    move_best_delta = 0.0
+                    move_best_pos = None
+                    for pos in positions:
+                        cand = base[:]
+                        cand[pos:pos] = block
+                        c = eval_cost(cand)
+                        delta = best_cost - c
+                        if delta > move_best_delta:
+                            move_best_delta = delta
+                            move_best_pos = pos
+                    if move_best_pos is not None:
+                        base[move_best_pos:move_best_pos] = block
+                        best_seq = base
+                        best_cost = eval_cost(best_seq)
+                        improved_round = True
+                        move_applied = True
+                        # Reset DLB around affected area
+                        dlb = [False] * len(best_seq)
+                        break
+=======
+                    move_best_delta = 0.0
+                    move_best_pos = None
+                    if blk == 1:
+                        # Use best-insertion cache for single-item Or-opt
+                        t1 = block[0]
+                        c_ins, p_ins, _ = best_insertion_for_txn(base, t1)
+                        delta = best_cost - c_ins
+                        if delta > move_best_delta:
+                            move_best_delta = delta
+                            move_best_pos = p_ins
+                    else:
+                        positions = all_positions(m)
+                        for pos in positions:
+                            cand = base[:]
+                            cand[pos:pos] = block
+                            c = eval_cost(cand)
+                            delta = best_cost - c
+                            if delta > move_best_delta:
+                                move_best_delta = delta
+                                move_best_pos = pos
+                    if move_best_pos is not None:
+                        base[move_best_pos:move_best_pos] = block
+                        best_seq = base
+                        best_cost = eval_cost(best_seq)
+                        improved_round = True
+                        move_applied = True
+                        # Reset DLB around affected area
+                        dlb = [False] * len(best_seq)
+                        break
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        def pos_samples(m):
+            if m + 1 <= 18:
+                return list(range(m + 1))
+            anchors = {0, m, m // 2, m // 4, (3 * m) // 4}
+            anchors = {p for p in anchors if 0 <= p <= m}
+            interior = [p for p in range(1, m) if p not in anchors]
+            R = min(max(2, sample_positions_per_idx - len(anchors)), len(interior))
+            if R > 0:
+                anchors.update(random.sample(interior, R))
+            return sorted(anchors)
+=======
+        def pos_samples(m):
+            total = m + 1
+            if total <= 18:
+                return list(range(total))
+            k = max(2, sample_positions_per_idx)
+            anchors = set()
+            denom = max(1, k - 1)
+            for i in range(k):
+                pos = round(i * m / denom)
+                anchors.add(int(pos))
+            return sorted(p for p in anchors if 0 <= p <= m)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(seed_count):
+        # reset insertion cache per construction to keep memory bounded
+        best_two_cache.clear()
+        c, s = construct_grasp()
+        elites = add_elite(elites, c, s, cap=elite_size)
+=======
+    for _ in range(seed_count):
+        # keep insertion cache across constructions for reuse
+        pass
+        c, s = construct_grasp()
+        elites = add_elite(elites, c, s, cap=elite_size)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    best_two_cache.clear()
+    c_beam, s_beam = construct_beam()
+    elites = add_elite(elites, c_beam, s_beam, cap=elite_size)
+=======
+    # keep insertion cache across beam for reuse
+    c_beam, s_beam = construct_beam()
+    elites = add_elite(elites, c_beam, s_beam, cap=elite_size)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # LNS escape and quick polish
+        best_two_cache.clear()
+        s2, c2 = ruin_and_recreate(s1, c1, rounds=lns_rounds_base, stagnation=0)
+=======
+        # LNS escape and quick polish (keep cache for reuse)
+        s2, c2 = ruin_and_recreate(s1, c1, rounds=lns_rounds_base, stagnation=0)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        best_two_cache.clear()
+        s_pert, c_pert = ruin_and_recreate(incumbent_seq, incumbent_cost, rounds=rounds, stagnation=stagnation)
+=======
+        # keep insertion cache across ILS iterations for reuse
+        s_pert, c_pert = ruin_and_recreate(incumbent_seq, incumbent_cost, rounds=rounds, stagnation=stagnation)
+>>>>>>> REPLACE
+
+</DIFF>

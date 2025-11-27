@@ -1,0 +1,716 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+from collections import defaultdict, deque
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Tournament-guided merge construction + targeted LNS with memoized costs.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of multistart variants (used as an intensity parameter)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+
+    N = workload.num_txns
+    start_time = time.time()
+    # Overall per-workload budget; tuned for combined score (quality+speed)
+    base_budget = 0.62
+    time_budget_sec = base_budget
+
+    def time_left():
+        return (time.time() - start_time) < time_budget_sec
+
+    # Memoized cost oracles
+    cost_cache = {}
+    ext_cache = {}
+
+    def eval_seq_cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is None:
+            c = workload.get_opt_seq_cost(seq)
+            cost_cache[key] = c
+        return c
+
+    def eval_ext_cost(prefix_tuple, cand):
+        key = (prefix_tuple, cand)
+        c = ext_cache.get(key)
+        if c is None:
+            c = eval_seq_cost(list(prefix_tuple) + [cand])
+            ext_cache[key] = c
+        return c
+
+    all_txns = list(range(N))
+
+    # -----------------------------
+    # 1) Sparse pairwise tournament
+    # -----------------------------
+    # For sampled pairs (i, j), compute margin m[i][j] = cost([i,j]) - cost([j,i]).
+    # Negative => prefer i before j. Positive => prefer j before i.
+    margin = defaultdict(dict)
+    wins = defaultdict(int)
+    losses = defaultdict(int)
+    strength = defaultdict(float)  # accumulate advantage magnitude
+
+    # Sampling plan: for each i, sample K others; adapt K to N
+    if N <= 30:
+        sample_per_txn = min(max(12, N - 1), 20)
+    elif N <= 60:
+        sample_per_txn = 16
+    else:
+        sample_per_txn = 14
+
+    # Also sample a small set of strong candidates by singleton cost
+    singleton_cost = {}
+    for t in all_txns:
+        if not time_left():
+            break
+        singleton_cost[t] = eval_seq_cost([t])
+    singles_sorted = sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf')))
+
+    pair_cost_cache = {}
+
+    def pair_ext_cost(a, b):
+        # Cost of [a, b]
+        key = (a, b)
+        c = pair_cost_cache.get(key)
+        if c is not None:
+            return c
+        base = eval_seq_cost([a])  # cached
+        ec = eval_ext_cost((a,), b)
+        pair_cost_cache[key] = ec
+        return ec
+
+    # Build margins under time budget
+    rng = random
+    for i in all_txns:
+        if not time_left():
+            break
+        # Compose candidate pool: mix of top by singleton and random
+        others = [x for x in all_txns if x != i]
+        k_top = min(len(others), max(6, N // 10))
+        top_pool = [t for t in singles_sorted[:k_top] if t != i]
+        extra_need = max(0, sample_per_txn - len(top_pool))
+        rand_pool = rng.sample([x for x in others if x not in top_pool], min(extra_need, len(others) - len(top_pool))) if extra_need > 0 else []
+        cand_pool = top_pool + rand_pool
+        # If still small (e.g., very small N), just use others
+        if len(cand_pool) == 0:
+            cand_pool = others
+
+        for j in cand_pool:
+            if not time_left():
+                break
+            if j in margin[i] or i in margin[j]:
+                continue
+            cij = pair_ext_cost(i, j)
+            cji = pair_ext_cost(j, i)
+            m = cij - cji
+            margin[i][j] = m
+            margin[j][i] = -m
+            if m < 0:
+                wins[i] += 1
+                losses[j] += 1
+                strength[i] += (-m)
+            elif m > 0:
+                wins[j] += 1
+                losses[i] += 1
+                strength[j] += m
+            # ties: no updates
+
+    # Aggregate score for ranking
+    # Combine Copeland (wins - losses) with total margin strength
+    agg_score = {}
+    for t in all_txns:
+        copeland = wins.get(t, 0) - losses.get(t, 0)
+        agg_score[t] = 1.0 * copeland + 0.02 * strength.get(t, 0.0)
+
+    # ----------------------------------------
+    # 2) Merge construction guided by ext cost
+    # ----------------------------------------
+    # Start from an initial ranking and merge small blocks using true costs
+    def merge_two_blocks(left, right):
+        """Merge two sequences by repeatedly choosing head that minimizes extension cost."""
+        out = []
+        i = 0
+        j = 0
+        prefix_tuple = tuple(out)
+        # We must keep updating prefix_tuple as out grows; reuse extension cache heavily
+        while i < len(left) and j < len(right) and time_left():
+            a = left[i]
+            b = right[j]
+            # Evaluate ext cost of appending a vs b
+            # For correctness we need current prefix cost; eval_ext_cost handles it by calling get_opt_seq_cost(prefix+[cand])
+            # Because prefix_tuple changes, recompute it every few steps
+            prefix_tuple = tuple(out)
+            ca = eval_ext_cost(prefix_tuple, a)
+            cb = eval_ext_cost(prefix_tuple, b)
+            if ca <= cb:
+                out.append(a)
+                i += 1
+            else:
+                out.append(b)
+                j += 1
+        # append leftovers
+        if i < len(left):
+            out.extend(left[i:])
+        if j < len(right):
+            out.extend(right[j:])
+        return out
+
+    def merge_blocks(blocks):
+        """Repeatedly merge blocks pairwise until single sequence remains."""
+        cur = [list(b) for b in blocks]
+        while len(cur) > 1 and time_left():
+            nxt = []
+            for k in range(0, len(cur), 2):
+                if k + 1 < len(cur):
+                    merged = merge_two_blocks(cur[k], cur[k + 1])
+                    nxt.append(merged)
+                else:
+                    nxt.append(cur[k])
+            cur = nxt
+        return cur[0] if cur else []
+
+    def build_by_merge(order):
+        # Chunk the order into small blocks (size 7–10) and merge
+        B = min(10, max(7, N // 12)) if N >= 14 else max(3, N // 5)
+        blocks = [order[i:i+B] for i in range(0, len(order), B)]
+        merged = merge_blocks(blocks)
+        # Ensure all transactions appear exactly once; repair if necessary
+        seen = set()
+        repaired = []
+        for t in merged:
+            if t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        return repaired[:N]
+
+    # ----------------------------------------
+    # 3) Local improvement: swaps and LNS RnR
+    # ----------------------------------------
+    def adjacent_swap_pass(seq, current_cost, max_passes=2):
+        best_seq = seq[:]
+        best_cost = current_cost
+        for _ in range(max_passes):
+            improved = False
+            for i in range(len(best_seq) - 1):
+                if not time_left():
+                    break
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_seq_cost(cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand
+                    improved = True
+            if not improved or not time_left():
+                break
+        return best_cost, best_seq
+
+    def limited_two_opt(seq, current_cost, trials=30):
+        best_seq = seq[:]
+        best_cost = current_cost
+        n = len(best_seq)
+        t = trials
+        while t > 0 and time_left():
+            t -= 1
+            i = random.randrange(n)
+            j = random.randrange(n)
+            if abs(i - j) <= 1:
+                continue
+            if i > j:
+                i, j = j, i
+            cand = best_seq[:]
+            cand[i:j+1] = reversed(cand[i:j+1])
+            c = eval_seq_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+        return best_cost, best_seq
+
+    def most_violated_edges(seq, k=3):
+        # Use learned margins to score adjacent violations
+        viols = []
+        for i in range(len(seq) - 1):
+            a = seq[i]
+            b = seq[i + 1]
+            m = margin.get(a, {}).get(b, 0.0)
+            # If m > 0, we prefer b before a; adjacency a->b violates preference
+            viols.append((m, i))
+        viols.sort(key=lambda x: -x[0])
+        return viols[:k]
+
+    def reinsertion_positions(n, center, radius=6, extra=10):
+        pos = set()
+        # positions around center window
+        for d in range(-radius, radius + 1):
+            p = center + d
+            if 0 <= p <= n:
+                pos.add(p)
+        # random extras for diversity
+        while len(pos) < min(n + 1, len(pos) + extra):
+            pos.add(random.randrange(0, n + 1))
+        return list(pos)
+
+    def ruin_and_recreate(seq, current_cost, rounds=2):
+        best_seq = seq[:]
+        best_cost = current_cost
+        n = len(best_seq)
+        for _ in range(rounds):
+            if not time_left():
+                break
+            # pick worst adjacency index
+            viols = most_violated_edges(best_seq, k=1)
+            if not viols or viols[0][0] <= 0:
+                # fallback: random center
+                worst_idx = random.randrange(max(1, n - 1))
+            else:
+                worst_idx = viols[0][1]
+            # choose block around worst
+            block_size = min(6, max(3, n // 30))
+            start = max(0, min(worst_idx - block_size // 2, n - block_size))
+            block = best_seq[start:start + block_size]
+            remaining = best_seq[:start] + best_seq[start + block_size:]
+
+            # Reinsert greedily with limited positions
+            seq_build = remaining[:]
+            for x in block:
+                if not time_left():
+                    break
+                candidates = reinsertion_positions(len(seq_build), start, radius=5, extra=8)
+                local_best_c = float('inf')
+                local_best_p = None
+                for p in candidates:
+                    cand = seq_build[:]
+                    cand.insert(p, x)
+                    c = eval_seq_cost(cand)
+                    if c < local_best_c:
+                        local_best_c = c
+                        local_best_p = p
+                if local_best_p is None:
+                    # fallback to end
+                    seq_build.append(x)
+                else:
+                    seq_build.insert(local_best_p, x)
+            if len(seq_build) == n:
+                c_try = eval_seq_cost(seq_build)
+                if c_try < best_cost:
+                    best_cost = c_try
+                    best_seq = seq_build
+        return best_cost, best_seq
+
+    # ----------------------------------------
+    # 4) Buddy-guided beam seed + Multi-start portfolio
+    # ----------------------------------------
+    # Build several initial orders:
+    #  - by aggregated tournament score
+    #  - reverse (to diversify)
+    #  - singleton-cost sorted
+    #  - random
+    base_rank = sorted(all_txns, key=lambda t: (-agg_score.get(t, 0.0), t))
+    seeds_orders = []
+    if base_rank:
+        seeds_orders.append(base_rank)
+        seeds_orders.append(list(reversed(base_rank)))
+    seeds_orders.append(sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf'))))
+    # Add a couple of random orders
+    if N > 0:
+        rnd = all_txns[:]
+        random.shuffle(rnd)
+        seeds_orders.append(rnd)
+        rnd2 = all_txns[:]
+        random.shuffle(rnd2)
+        seeds_orders.append(rnd2)
+
+    # Build small buddy lists B[t]: top partners minimizing delta cost cost([t,u]) - cost([t])
+    def build_buddies(max_buddies=8, sample_per_t=16):
+        buds = {t: [] for t in all_txns}
+        singles_sorted = sorted(all_txns, key=lambda x: singleton_cost.get(x, float('inf')))
+        for t in all_txns:
+            if not time_left():
+                break
+            base = singleton_cost[t]
+            # candidate pool: top by singleton + random sample
+            pool = [u for u in singles_sorted[:min(20, max(6, N // 6))] if u != t]
+            others = [u for u in all_txns if u != t and u not in pool]
+            if others:
+                pool.extend(random.sample(others, min(sample_per_t, len(others))))
+            seen = set()
+            scored = []
+            for u in pool:
+                if u in seen or u == t:
+                    continue
+                seen.add(u)
+                ec = pair_ext_cost(t, u)  # cost([t,u])
+                scored.append((ec - base, u))
+            scored.sort(key=lambda x: x[0])
+            buds[t] = [u for _d, u in scored[:max_buddies]]
+        return buds
+
+    buddies = build_buddies(max_buddies=8, sample_per_t=min(16, max(8, N // 10)))
+
+    # Lower bound using max remaining singleton cost
+    def lb_singleton(cur_cost, rem_set):
+        if not rem_set:
+            return cur_cost
+        m = 0.0
+        for t in rem_set:
+            c = singleton_cost.get(t)
+            if c is None:
+                c = eval_seq_cost([t])
+                singleton_cost[t] = c
+            if c > m:
+                m = c
+        return max(cur_cost, m)
+
+    # Greedy completion guided by buddies and extension cost
+    def greedy_finish(seq, rem_set, branch_k=10, incumbent=None):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0.0
+        while rem and time_left():
+            if incumbent is not None and lb_singleton(cur_cost, rem) >= incumbent:
+                break
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+            cand_pool = []
+            if last is not None and last in buddies:
+                for u in buddies[last]:
+                    if u in rem:
+                        cand_pool.append(u)
+            # fill with random to reach pool size
+            need = max(0, branch_k - len(cand_pool))
+            if need > 0:
+                others = [x for x in rem_list if x not in cand_pool]
+                if others:
+                    cand_pool.extend(random.sample(others, min(need, len(others))))
+            if not cand_pool:
+                cand_pool = rem_list if len(rem_list) <= branch_k else random.sample(rem_list, branch_k)
+            pt = tuple(seq_out)
+            best_t = None
+            best_ec = float('inf')
+            for t in cand_pool:
+                ec = eval_ext_cost(pt, t)
+                if ec < best_ec:
+                    best_ec = ec
+                    best_t = t
+            if best_t is None:
+                # Fallback if time exhausted
+                seq_out.extend(list(rem))
+                cur_cost = eval_seq_cost(seq_out)
+                break
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_ec
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+
+    # Lightweight beam search seeded by best singletons and guided by buddies
+    def beam_seed(incumbent=float('inf')):
+        beam_width = min(12, max(8, N // 8))
+        branch_factor = min(12, max(8, N // 10))
+        lookahead_top = 3
+        probe_k = 4
+
+        # Global/local prefix dominance: key = (frozenset(rem), suffix)
+        dom = {}
+        def sig_of(rem_set, seq, k=3):
+            tail = tuple(seq[-k:]) if len(seq) >= k else tuple(seq)
+            return (frozenset(rem_set), tail)
+
+        # Initialize beam with best singletons
+        seeds = sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf')))[:max(beam_width * 2, 8)]
+        beam = []
+        for t in seeds:
+            if not time_left():
+                break
+            seq = [t]
+            rem = set(all_txns)
+            rem.remove(t)
+            c = eval_seq_cost(seq)
+            beam.append((c, seq, rem))
+        if not beam:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            return eval_seq_cost(seq), seq
+
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_width]
+
+        best_full_cost = incumbent
+        best_full_seq = None
+
+        steps = N - 1
+        depth = 0
+        while depth < steps and time_left():
+            depth += 1
+            new_beam = []
+            # adaptive suffix length
+            if depth < int(0.4 * N):
+                k_suffix = 3
+            elif depth < int(0.75 * N):
+                k_suffix = 2
+            else:
+                k_suffix = 2
+
+            for cost_so_far, seq, rem in beam:
+                if not rem:
+                    if cost_so_far < best_full_cost:
+                        best_full_cost, best_full_seq = cost_so_far, seq[:]
+                    continue
+                if cost_so_far >= best_full_cost:
+                    continue
+                # dominance
+                s = sig_of(rem, seq, k=k_suffix)
+                prev = dom.get(s)
+                if prev is not None and cost_so_far >= prev:
+                    continue
+                dom[s] = cost_so_far
+
+                last = seq[-1]
+                rem_list = list(rem)
+                cand_pool = []
+                if last in buddies:
+                    for u in buddies[last]:
+                        if u in rem:
+                            cand_pool.append(u)
+                need = max(0, branch_factor * 2 - len(cand_pool))
+                if need > 0:
+                    others = [x for x in rem_list if x not in cand_pool]
+                    if others:
+                        cand_pool.extend(random.sample(others, min(need, len(others))))
+                if not cand_pool:
+                    cand_pool = rem_list if len(rem_list) <= branch_factor * 2 else random.sample(rem_list, branch_factor * 2)
+
+                pt = tuple(seq)
+                scored = []
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(pt, cand)
+                    if ec >= best_full_cost:
+                        continue
+                    # shallow lookahead
+                    la_best = ec
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    la_pool = []
+                    if cand in buddies:
+                        for v in buddies[cand]:
+                            if v in new_rem:
+                                la_pool.append(v)
+                    if not la_pool:
+                        la_pool = list(new_rem)
+                    if len(la_pool) > lookahead_top:
+                        la_pool = random.sample(la_pool, lookahead_top)
+                    new_pt = tuple(seq + [cand])
+                    for nxt in la_pool:
+                        c2 = eval_ext_cost(new_pt, nxt)
+                        if c2 < la_best:
+                            la_best = c2
+                    scored.append((ec, la_best, cand))
+                if not scored:
+                    continue
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+                # expand children and probe a few greedily
+                for idx, (ec, la, cand) in enumerate(top):
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+                    # greedy probe to tighten incumbent
+                    if idx < probe_k and time_left():
+                        g_cost, g_seq = greedy_finish(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        la = min(la, g_cost)
+                    new_beam.append((ec, new_seq, new_rem, la))
+            if not new_beam:
+                break
+            new_beam.sort(key=lambda x: x[3])
+            unique = []
+            seen = set()
+            for ec, s, r, la in new_beam:
+                key = tuple(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append((ec, s, r))
+                if len(unique) >= beam_width:
+                    break
+            beam = unique
+
+        # finalize remaining prefixes greedily
+        for ec, s, r in beam:
+            if not time_left():
+                break
+            c_fin, s_fin = greedy_finish(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost)
+            if len(s_fin) == N and c_fin < best_full_cost:
+                best_full_cost, best_full_seq = c_fin, s_fin
+
+        if best_full_seq is None:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            best_full_seq = seq
+            best_full_cost = eval_seq_cost(seq)
+        return best_full_cost, best_full_seq
+
+    # Limit restarts by num_seqs but ensure coverage
+    max_starts = max(3, min(len(seeds_orders), int(num_seqs) + 2))
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    # Beam-seeded candidate first (to set a strong incumbent)
+    if time_left():
+        cb, sb = beam_seed(incumbent=global_best_cost)
+        # quick polish
+        cb1, sb1 = adjacent_swap_pass(sb, cb, max_passes=1) if time_left() else (cb, sb)
+        cb2, sb2 = ruin_and_recreate(sb1, cb1, rounds=1) if time_left() else (cb1, sb1)
+        cb3, sb3 = limited_two_opt(sb2, cb2, trials=20) if time_left() else (cb2, sb2)
+        if cb3 < global_best_cost:
+            global_best_cost, global_best_seq = cb3, sb3
+
+    # Multi-start portfolio with existing constructors and LNS
+    for r in range(max_starts):
+        if not time_left():
+            break
+        order = seeds_orders[r % len(seeds_orders)]
+        # Merge-based construction
+        seq0 = build_by_merge(order)
+        c0 = eval_seq_cost(seq0)
+
+        # Quick adjacent swap polish
+        c1, s1 = adjacent_swap_pass(seq0, c0, max_passes=1)
+
+        # Ruin-and-recreate around worst edges
+        c2, s2 = ruin_and_recreate(s1, c1, rounds=2)
+
+        # Limited 2-opt
+        c3, s3 = limited_two_opt(s2, c2, trials=28)
+
+        # Final adjacent swap pass
+        c4, s4 = adjacent_swap_pass(s3, c3, max_passes=1)
+
+        if c4 < global_best_cost:
+            global_best_cost, global_best_seq = c4, s4
+
+    # Safety: ensure a valid permutation of all transactions
+    if global_best_seq is None:
+        global_best_seq = list(range(N))
+        random.shuffle(global_best_seq)
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    if len(global_best_seq) != N or len(set(global_best_seq)) != N:
+        seen = set()
+        repaired = []
+        for t in global_best_seq:
+            if 0 <= t < N and t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        global_best_seq = repaired[:N]
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

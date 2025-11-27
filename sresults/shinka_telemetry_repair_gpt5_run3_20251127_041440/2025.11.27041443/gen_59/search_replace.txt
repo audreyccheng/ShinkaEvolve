@@ -1,0 +1,186 @@
+<NAME>
+adaptive_lookahead_and_finishing
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements that align with the Hodor principles and the provided recommendations to boost counter repair accuracy while preserving calibration:
+
+1) Adaptive fusion for large link mismatches:
+   - Replace the fixed 30/70 peer bias in fuse_direction with an adaptive beta that increases with mismatch severity and status/near-zero hints. This reduces residual asymmetry earlier and leads to more accurate per-link hardening.
+
+2) Expected-penalty lookahead for router-side selection and Huber-like weight caps:
+   - When choosing whether to adjust TX or RX on a router, compute each side’s adjustable capacity (sum over (1 − conf) * rate^1.95), and pick the side with the lower expected penalty (larger capacity), falling back to the previous confidence-based rule when capacities are similar. This improves targeted scaling decisions.
+   - In targeted per-interface scaling, soften dominance by using weights ∝ (1 − conf) * rate^0.95 and cap individual weights to ≤50% of the total eligible weight before computing the effective denominator. This prevents over-reliance on a single interface and stabilizes projection.
+
+3) Micro high-confidence finishing tier (Stage 2.7):
+   - If a router still has a residual mismatch > 60% of its adaptive tolerance after targeted scaling, apply a tiny, damped uniform scaling to only high-confidence links (conf ≥ 0.85), clipped to ±3% and damped at 0.25. This safely closes stubborn gaps, improving counters without harming calibration.
+
+Additionally, I add a small confidence penalty when any direction had strong scaling (>8%) to tighten calibration, while keeping the existing clip-hit penalties and small boosts for untouched, invariant-satisfying links.
+
+These changes are small, local, and consistent with the existing code structure, and should improve both counter repair and confidence calibration.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Default: bias to peer to reconcile asymmetry
+        fused = 0.3 * v_local + 0.7 * v_peer
+        return fused, clamp01(1.0 - mismatch)
+=======
+        # Default: adaptive peer-biased fusion for decisive reconciliation
+        mm = clamp01((mismatch - 0.10) / 0.20)  # normalized beyond 10% up to 30%
+        bias_local_down = 1.0 if (s_local == "down" or (v_local < ZERO_THRESH and v_peer >= ZERO_THRESH)) else 0.0
+        bias_peer_down = 1.0 if (s_peer == "down") else 0.0
+        beta = 0.7 + 0.2 * mm + 0.1 * bias_local_down - 0.1 * bias_peer_down
+        beta = clamp(beta, 0.7, 0.9)
+        fused = (1.0 - beta) * v_local + beta * v_peer
+        return fused, clamp01(1.0 - mismatch)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            weights = {i: (1.0 - confs[i]) * vals[i] for i in elig}
+            # denom over v*w (as per linearized change derivation)
+            denom_vw = sum(vals[i] * weights[i] for i in elig)
+=======
+            # Huber-like weight caps and softened dominance: use rate^0.95 and cap each weight to ≤ 50% of total
+            raw_weights = {i: (1.0 - confs[i]) * (max(vals[i], ZERO_THRESH) ** 0.95) for i in elig}
+            sumW = sum(raw_weights.values())
+            weights = {}
+            capW = 0.5 * sumW if len(elig) >= 2 else None
+            for i in elig:
+                w = raw_weights[i]
+                if capW is not None and w > capW:
+                    w = capW
+                weights[i] = w
+            # denom over v*w (as per linearized change derivation)
+            denom_vw = sum(vals[i] * weights[i] for i in elig)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Choose side with lower aggregate confidence
+        c_tx_total = sum(conf_tx_link.get(i, 0.6) for i in if_list)
+        c_rx_total = sum(conf_rx_link.get(i, 0.6) for i in if_list)
+        if c_tx_total < c_rx_total:
+            targeted_scale(router, "tx", if_list, tau_r)
+        else:
+            targeted_scale(router, "rx", if_list, tau_r)
+=======
+        # Choose side via expected-penalty lookahead (capacity-based), fallback to lower aggregate confidence
+        c_tx_total = sum(clamp01(conf_tx_link.get(i, 0.6)) for i in if_list)
+        c_rx_total = sum(clamp01(conf_rx_link.get(i, 0.6)) for i in if_list)
+
+        def capacity(side: str) -> float:
+            if side == "tx":
+                vals = [hard_tx.get(i, 0.0) for i in if_list]
+                confs = [clamp01(conf_tx_link.get(i, 0.6)) for i in if_list]
+            else:
+                vals = [hard_rx.get(i, 0.0) for i in if_list]
+                confs = [clamp01(conf_rx_link.get(i, 0.6)) for i in if_list]
+            # Adjustable capacity ~ sum (1 - conf) * v^1.95 (matches v * weight with weight ~ v^0.95)
+            return sum((1.0 - c) * (v ** 1.95) for v, c in zip(vals, confs) if v >= ZERO_THRESH)
+
+        delta_tx = sum_rx - sum_tx
+        cap_tx = capacity("tx")
+        cap_rx = capacity("rx")
+        # Estimate penalties; larger capacity => smaller expected penalty
+        pen_tx = abs(delta_tx) / max(0.6 * cap_tx, EPS) if cap_tx > 0.0 else float("inf")
+        pen_rx = abs(-delta_tx) / max(0.6 * cap_rx, EPS) if cap_rx > 0.0 else float("inf")
+
+        if pen_tx < pen_rx or (math.isfinite(pen_tx) and not math.isfinite(pen_rx)):
+            chosen = "tx"
+        elif pen_rx < pen_tx or (math.isfinite(pen_rx) and not math.isfinite(pen_tx)):
+            chosen = "rx"
+        else:
+            # Fallback: lower aggregate confidence side
+            chosen = "tx" if c_tx_total < c_rx_total else "rx"
+
+        targeted_scale(router, chosen, if_list, tau_r)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2.5: Post-projection link re-sync (confidence-gap proportional, guarded and attenuated)
+=======
+    # Stage 2.7: Micro high-confidence finishing tier to close stubborn router gaps
+    for router, if_list in router_ifaces.items():
+        if len(if_list) <= 1:
+            continue
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        if max(sum_tx, sum_rx) < EPS:
+            continue
+        n_active_tx = sum(1 for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+        n_active_rx = sum(1 for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+        tau_r = tau_router(max(n_active_tx, n_active_rx))
+        mismatch = rel_diff(sum_tx, sum_rx)
+        if mismatch <= 0.6 * tau_r:
+            continue
+        # Adjust the side with lower aggregate confidence using tiny, damped, uniform scaling on high-confidence links
+        c_tx_total = sum(clamp01(conf_tx_link.get(i, 0.6)) for i in if_list)
+        c_rx_total = sum(clamp01(conf_rx_link.get(i, 0.6)) for i in if_list)
+        adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+        if adjust_side == "tx":
+            elig = [i for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH and clamp01(conf_tx_link.get(i, 0.6)) >= 0.85]
+            total_elig = sum(hard_tx.get(i, 0.0) for i in elig)
+            if total_elig >= EPS:
+                delta = sum_rx - sum_tx
+                alpha_raw = 1.0 + delta / max(total_elig, EPS)
+                alpha_raw = clamp(alpha_raw, 0.97, 1.03)
+                alpha_eff = 1.0 + 0.25 * (alpha_raw - 1.0)
+                for i in elig:
+                    v = hard_tx.get(i, 0.0)
+                    hard_tx[i] = v * alpha_eff
+                    scaled_tx_factor[i] *= alpha_eff
+                    pen = abs(alpha_eff - 1.0)
+                    conf_tx_link[i] *= clamp01(1.0 - 0.15 * clamp01(pen))
+        else:
+            elig = [i for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH and clamp01(conf_rx_link.get(i, 0.6)) >= 0.85]
+            total_elig = sum(hard_rx.get(i, 0.0) for i in elig)
+            if total_elig >= EPS:
+                delta = sum_tx - sum_rx
+                alpha_raw = 1.0 + delta / max(total_elig, EPS)
+                alpha_raw = clamp(alpha_raw, 0.97, 1.03)
+                alpha_eff = 1.0 + 0.25 * (alpha_raw - 1.0)
+                for i in elig:
+                    v = hard_rx.get(i, 0.0)
+                    hard_rx[i] = v * alpha_eff
+                    scaled_rx_factor[i] *= alpha_eff
+                    pen = abs(alpha_eff - 1.0)
+                    conf_rx_link[i] *= clamp01(1.0 - 0.15 * clamp01(pen))
+
+    # Stage 2.5: Post-projection link re-sync (confidence-gap proportional, guarded and attenuated)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Confidence refinements: clip-hit penalty and untouched boost
+        if clip_hit_tx.get(if_id, False) or abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if clip_hit_rx.get(if_id, False) or abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - tau_h_dir(rep_tx, rep_tx, base_tx_conf, base_tx_conf)):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - tau_h_dir(rep_rx, rep_rx, base_rx_conf, base_rx_conf)):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+=======
+        # Confidence refinements: clip-hit penalty, strong-scale guard, and untouched boost
+        if clip_hit_tx.get(if_id, False) or abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if clip_hit_rx.get(if_id, False) or abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if strong_scaled_tx.get(if_id, False):
+            conf_tx_final *= 0.97
+        if strong_scaled_rx.get(if_id, False):
+            conf_rx_final *= 0.97
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - tau_h_dir(rep_tx, rep_tx, base_tx_conf, base_tx_conf)):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - tau_h_dir(rep_rx, rep_rx, base_rx_conf, base_rx_conf)):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+>>>>>>> REPLACE
+</DIFF>

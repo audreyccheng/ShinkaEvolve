@@ -1,0 +1,157 @@
+<NAME>
+beam_search_placement
+</NAME>
+
+<DESCRIPTION>
+Replace the multi-heuristic greedy strategy in `check_placement` with an adaptive Beam Search.
+The Beam Search uses the linearized cost `w + k*s` to sort items (Best Fit Decreasing) and explores packing states by maintaining the top `W` candidates based on the sum of squared loads (preference for tight packing).
+It uses symmetry breaking (skipping bins with identical loads during expansion) to drastically reduce the search space, making it efficient.
+It attempts a small beam width (2) first for speed, then a larger width (8) for robustness if the first fails.
+This approach is more systematic than randomized greedy and generally faster and more effective for bin packing with variable constraints.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Feasibility Check (Multi-Heuristic Greedy)
+    def check_placement(k_target):
+        lin_cap = k_target * GPU_MEM_SIZE
+
+        def try_pack(ordered_items):
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for item in ordered_items:
+                w, s = item['w'], item['s']
+                v_lin = w + k_target * s
+
+                best_idx = -1
+                best_fill = -1.0
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    # Physical Check
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    # KVPR Check: (current_w + w) + K*(current_s + s) <= K*C
+                    # <=> current_lin + v_lin <= lin_cap
+                    lin_load = b['w'] + k_target * b['s']
+                    if lin_load + v_lin > lin_cap + 1e-7: continue
+
+                    # Best Fit: Maximize current linearized load
+                    if lin_load > best_fill:
+                        best_fill = lin_load
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['w'] += w
+                    bins[best_idx]['s'] += s
+                    bins[best_idx]['items'].append(item['m'])
+                else:
+                    return None
+            return {i: bins[i]['items'] for i in range(gpu_num)}
+
+        # A. Deterministic Sort Strategies
+        keys = [
+            lambda x: x['w'] + k_target * x['s'],   # Linearized Cost
+            lambda x: x['s'],                       # Physical Size
+            lambda x: x['w'],                       # Weight
+            lambda x: x['w'] / (x['s'] + 1e-9)      # Density
+        ]
+
+        for key in keys:
+            res = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # B. Randomized Strategy
+        # Perturb the Linearized Cost key
+        rng = random.Random(42 + int(k_target * 100))
+        base_key = lambda x: x['w'] + k_target * x['s']
+
+        for _ in range(50):
+            # Add noise to the key: key * uniform(0.9, 1.1)
+            noisy_items = []
+            for item in items:
+                score = base_key(item) * rng.uniform(0.9, 1.1)
+                noisy_items.append((score, item))
+
+            noisy_items.sort(key=lambda x: x[0], reverse=True)
+            res = try_pack([x[1] for x in noisy_items])
+            if res: return res
+
+        return None
+=======
+    # 3. Feasibility Check (Beam Search)
+    def check_placement(k_target):
+        limit = k_target * GPU_MEM_SIZE
+
+        # Prepare items with linearized cost
+        # w + k*s <= k*C
+        weighted_items = []
+        for x in items:
+            cost = x['w'] + k_target * x['s']
+            if cost > limit + 1e-7: return None
+            weighted_items.append((cost, x))
+
+        # Sort by linearized cost descending (Best Fit Decreasing)
+        # This heuristic is generally strongest for this constraint type
+        weighted_items.sort(key=lambda x: x[0], reverse=True)
+
+        def run_beam(width):
+            # State: (score, loads_tuple, placement_tuple)
+            # score: Sum of squares of loads (preference for tight packing)
+            # loads_tuple: tuple of current linearized loads per GPU
+            # placement_tuple: tuple of lists of models
+
+            # Initial State
+            # Using tuples for state immutability where needed, lists for construction
+            start_loads = tuple([0.0] * gpu_num)
+            start_pl = tuple([[] for _ in range(gpu_num)])
+            beam = [(0.0, start_loads, start_pl)]
+
+            for cost, item_data in weighted_items:
+                candidates = []
+
+                for score, loads, pl in beam:
+                    tried_loads = set()
+
+                    for i in range(gpu_num):
+                        l = loads[i]
+                        # Symmetry breaking: If multiple bins have exact same load, only try the first one encountered.
+                        # This significantly reduces branching factor especially at start.
+                        if l in tried_loads: continue
+
+                        if l + cost <= limit + 1e-7:
+                            tried_loads.add(l)
+
+                            # Calculate new score incrementally
+                            # new_sum_sq = old_sum_sq - l^2 + (l+cost)^2 = old_sum_sq + 2*l*cost + cost^2
+                            new_score = score + cost * (2 * l + cost)
+
+                            new_loads = list(loads)
+                            new_loads[i] += cost
+
+                            new_pl = list(pl)
+                            new_pl[i] = pl[i] + [item_data['m']]
+
+                            candidates.append((new_score, tuple(new_loads), tuple(new_pl)))
+
+                if not candidates:
+                    return None
+
+                # Select top 'width' candidates based on score
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                beam = candidates[:width]
+
+            # Return best placement from beam
+            return beam[0][2]
+
+        # Adaptive Beam Search
+        # Try small width first for speed, then larger for robustness
+        for w in [2, 8]:
+            res = run_beam(w)
+            if res:
+                return {i: res[i] for i in range(gpu_num)}
+
+        return None
+>>>>>>> REPLACE
+
+</DIFF>

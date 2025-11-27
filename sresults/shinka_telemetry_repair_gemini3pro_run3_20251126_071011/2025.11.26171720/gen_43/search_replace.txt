@@ -1,0 +1,272 @@
+<NAME>
+refine_bayesian_update_and_noise_model
+</NAME>
+
+<DESCRIPTION>
+1. Reverts the noise model (sigma) to a linear function of flow (3% tolerance) rather than square root. The sqrt model was too loose for medium/high flows, reducing repair accuracy.
+2. Simplifies confidence calculation for internal flows to use the relative probability (`win_p`) directly, removing the `fit_quality` scaling which caused underconfidence and poor calibration.
+3. Adds momentum (0.5 alpha) to external flow corrections to improve stability and convergence of continuous variables.
+4. Improves the prior for external flow correction to a Gaussian decay rather than a binary penalty.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(ITERATIONS):
+        # 2a. Solve Internal Suspect Flows
+        internal_updates = {}
+        for flow_prob in suspect_flows:
+            link_key = flow_prob['key']
+            direction = flow_prob['dir']
+            candidates = flow_prob['candidates']
+
+            info = links[link_key]
+            if direction == '1_to_2':
+                src_if, dst_if = info['if1'], info['if2']
+            else:
+                src_if, dst_if = info['if2'], info['if1']
+
+            router_src = if_to_router.get(src_if)
+            router_dst = if_to_router.get(dst_if)
+
+            # Candidates + Zero Flow (Phantom traffic check)
+            hyps = list(set(candidates + [0.0]))
+            scores = []
+
+            for h_val in hyps:
+                # Test Hypothesis
+                old_tx = current_estimates[src_if]['tx']
+                current_estimates[src_if]['tx'] = h_val
+                imb_src, flow_src = get_router_imbalance(router_src)
+                current_estimates[src_if]['tx'] = old_tx
+
+                old_rx = current_estimates[dst_if]['rx']
+                current_estimates[dst_if]['rx'] = h_val
+                imb_dst, flow_dst = get_router_imbalance(router_dst)
+                current_estimates[dst_if]['rx'] = old_rx
+
+                # Likelihood with Non-Linear Noise Model (Sqrt scaling for Poisson noise)
+                sigma_src = max(math.sqrt(flow_src), flow_src * CONSERVATION_TOLERANCE_PCT, 1.0)
+                sigma_dst = max(math.sqrt(flow_dst), flow_dst * CONSERVATION_TOLERANCE_PCT, 1.0)
+
+                score_src = math.exp(-abs(imb_src) / sigma_src) if router_src else 1.0
+                score_dst = math.exp(-abs(imb_dst) / sigma_dst) if router_dst else 1.0
+
+                # Prior: penalize 0.0 slightly if measurements are large to avoid collapse on noise
+                prior = 1.0
+                if h_val == 0.0 and max(candidates) > 5.0:
+                    prior = 0.5
+
+                scores.append(score_src * score_dst * prior)
+
+            # Select Winner
+            total_s = sum(scores) + 1e-20
+            probs = [s / total_s for s in scores]
+
+            best_idx = scores.index(max(scores))
+            winner_val = hyps[best_idx]
+            win_p = probs[best_idx]
+
+            # Absolute quality (geometric mean of fit)
+            # We normalize by removing the prior penalty for quality estimation
+            raw_score = scores[best_idx] / (0.5 if (winner_val == 0.0 and max(candidates) > 5.0) else 1.0)
+            fit_quality = math.sqrt(raw_score)
+
+            conf = win_p * fit_quality
+            conf = max(0.01, min(0.99, conf))
+
+            internal_updates[(src_if, 'tx')] = (winner_val, conf)
+            internal_updates[(dst_if, 'rx')] = (winner_val, conf)
+
+        # Apply Internal Updates Immediately
+        for (if_id, metric), (val, conf) in internal_updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+
+        # 2b. Refine External Flows (Edge Correction)
+        external_updates = {}
+        for if_id, metric in external_flows:
+            rid = if_to_router.get(if_id)
+            if not rid: continue
+
+            # Current state (post-internal-correction)
+            curr_val = current_estimates[if_id][metric]
+            imb, flow = get_router_imbalance(rid)
+
+            sigma = max(math.sqrt(flow), flow * CONSERVATION_TOLERANCE_PCT, 1.0)
+
+            # Only intervene if significant imbalance
+            if abs(imb) > sigma:
+                # Calculate implied value that would fix imbalance
+                # If metric is RX (In), Imb = In - Out. To fix, In needs to change by -Imb.
+                # If metric is TX (Out), Imb = In - Out. To fix, Out needs to change by +Imb.
+
+                if metric == 'rx':
+                    target = curr_val - imb
+                else: # tx
+                    target = curr_val + imb
+
+                target = max(0.0, target)
+
+                # Hypotheses: [Measured, Target, 0.0]
+                measured = telemetry[if_id].get(f'{metric}_rate', 0.0)
+                hyps = list(set([measured, target, 0.0]))
+
+                best_val = curr_val
+                best_score = -1.0
+
+                for h_val in hyps:
+                    # Apply
+                    old_val = current_estimates[if_id][metric]
+                    current_estimates[if_id][metric] = h_val
+                    new_imb, new_flow = get_router_imbalance(rid)
+                    current_estimates[if_id][metric] = old_val
+
+                    new_sigma = max(math.sqrt(new_flow), new_flow * CONSERVATION_TOLERANCE_PCT, 1.0)
+                    score = math.exp(-abs(new_imb) / new_sigma)
+
+                    # Priors
+                    prior = 1.0
+                    # Penalty for deviation from measurement
+                    if abs(h_val - measured) > sigma:
+                         prior *= 0.5
+
+                    final_score = score * prior
+                    if final_score > best_score:
+                        best_score = final_score
+                        best_val = h_val
+
+                # Update if we found a better hypothesis
+                conf = best_score
+                external_updates[(if_id, metric)] = (best_val, conf)
+
+        # Apply External Updates
+        for (if_id, metric), (val, conf) in external_updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+=======
+    for _ in range(ITERATIONS):
+        # 2a. Solve Internal Suspect Flows
+        internal_updates = {}
+        for flow_prob in suspect_flows:
+            link_key = flow_prob['key']
+            direction = flow_prob['dir']
+            candidates = flow_prob['candidates']
+
+            info = links[link_key]
+            if direction == '1_to_2':
+                src_if, dst_if = info['if1'], info['if2']
+            else:
+                src_if, dst_if = info['if2'], info['if1']
+
+            router_src = if_to_router.get(src_if)
+            router_dst = if_to_router.get(dst_if)
+
+            # Candidates + Zero Flow (Phantom traffic check)
+            hyps = list(set(candidates + [0.0]))
+            scores = []
+
+            for h_val in hyps:
+                # Test Hypothesis
+                old_tx = current_estimates[src_if]['tx']
+                current_estimates[src_if]['tx'] = h_val
+                imb_src, flow_src = get_router_imbalance(router_src)
+                current_estimates[src_if]['tx'] = old_tx
+
+                old_rx = current_estimates[dst_if]['rx']
+                current_estimates[dst_if]['rx'] = h_val
+                imb_dst, flow_dst = get_router_imbalance(router_dst)
+                current_estimates[dst_if]['rx'] = old_rx
+
+                # Likelihood with Linear Noise Model (Stricter than sqrt for accuracy)
+                # Using 3% tolerance plus absolute floor
+                sigma_src = max(flow_src * CONSERVATION_TOLERANCE_PCT, ABS_TOLERANCE)
+                sigma_dst = max(flow_dst * CONSERVATION_TOLERANCE_PCT, ABS_TOLERANCE)
+
+                score_src = math.exp(-abs(imb_src) / sigma_src) if router_src else 1.0
+                score_dst = math.exp(-abs(imb_dst) / sigma_dst) if router_dst else 1.0
+
+                # Prior: penalize 0.0 slightly if measurements are large
+                prior = 1.0
+                if h_val == 0.0 and max(candidates) > 5.0:
+                    prior = 0.5
+
+                scores.append(score_src * score_dst * prior)
+
+            # Select Winner
+            total_s = sum(scores) + 1e-20
+            probs = [s / total_s for s in scores]
+
+            best_idx = scores.index(max(scores))
+            winner_val = hyps[best_idx]
+            win_p = probs[best_idx]
+
+            # Confidence: Use relative probability directly (better calibration than fit_quality)
+            # If win_p is high, it means this hypothesis is much better than others.
+            conf = win_p
+            conf = max(0.01, min(0.99, conf))
+
+            internal_updates[(src_if, 'tx')] = (winner_val, conf)
+            internal_updates[(dst_if, 'rx')] = (winner_val, conf)
+
+        # Apply Internal Updates
+        for (if_id, metric), (val, conf) in internal_updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+
+        # 2b. Refine External Flows (Edge Correction) with Momentum
+        external_updates = {}
+        for if_id, metric in external_flows:
+            rid = if_to_router.get(if_id)
+            if not rid: continue
+
+            curr_val = current_estimates[if_id][metric]
+            imb, flow = get_router_imbalance(rid)
+            sigma = max(flow * CONSERVATION_TOLERANCE_PCT, ABS_TOLERANCE)
+
+            # Hypotheses: Measured, Target (fix imbalance), Zero
+            measured = telemetry[if_id].get(f'{metric}_rate', 0.0)
+
+            # Target to fix imbalance completely
+            if metric == 'rx': target = curr_val - imb
+            else: target = curr_val + imb
+            target = max(0.0, target)
+
+            hyps = list(set([measured, target, 0.0]))
+
+            best_val = curr_val
+            best_score = -1.0
+
+            for h_val in hyps:
+                # Apply
+                old_val = current_estimates[if_id][metric]
+                current_estimates[if_id][metric] = h_val
+                new_imb, new_flow = get_router_imbalance(rid)
+                current_estimates[if_id][metric] = old_val
+
+                new_sigma = max(new_flow * CONSERVATION_TOLERANCE_PCT, ABS_TOLERANCE)
+                score = math.exp(-abs(new_imb) / new_sigma)
+
+                # Prior: Penalize deviation from measurement
+                prior = 1.0
+                if abs(h_val - measured) > sigma:
+                    # Gaussian decay prior centered on measurement
+                    prior = math.exp(-abs(h_val - measured) / (sigma * 2))
+
+                final_score = score * prior
+                if final_score > best_score:
+                    best_score = final_score
+                    best_val = h_val
+
+            # Soft Update (Momentum) for stability on continuous external adjustments
+            # Blend 50% with current estimate
+            final_val = (curr_val * 0.5) + (best_val * 0.5)
+
+            conf = best_score # Raw score works well as confidence here (0-1)
+            external_updates[(if_id, metric)] = (final_val, conf)
+
+        # Apply External Updates
+        for (if_id, metric), (val, conf) in external_updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+>>>>>>> REPLACE
+</DIFF>

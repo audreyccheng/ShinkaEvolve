@@ -1,0 +1,220 @@
+<NAME>
+add_local_search_refinement
+</NAME>
+
+<DESCRIPTION>
+Integrates a Hill Climbing local search optimization into the binary search loop. This procedure iteratively moves or swaps models from the bottleneck GPU to other GPUs to minimize the maximum KVPR. By applying this refinement to every feasible solution found during the binary search, the algorithm can aggressively tighten the upper search bound (high) based on the *optimized* placement's actual max KVPR, rather than just the target K. This leads to convergence on a better final solution.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Binary Search for the Minimum Maximum KVPR (K)
+
+    # Initialization
+    high = 1e9
+    best_placement = check_placement(high)
+
+    if best_placement is None:
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+
+    # Refine 'high' based on found solution
+    current_max = 0.0
+    for gpu_p in best_placement.values():
+        w_sum = sum(m.req_rate / m.slo for m in gpu_p)
+        s_sum = sum(m.model_size for m in gpu_p)
+        rem = GPU_MEM_SIZE - s_sum
+        if rem > 1e-9:
+            current_max = max(current_max, w_sum / rem)
+        elif w_sum > 0:
+            current_max = high
+
+    high = current_max
+    low = 0.0
+
+    # Binary Search Loop
+    for _ in range(30):
+        mid = (low + high) / 2
+        result = check_placement(mid)
+        if result is not None:
+            best_placement = result
+
+            # Refine high bound using the actual max KVPR of the valid solution
+            actual_max = 0.0
+            for gpu_p in best_placement.values():
+                w_sum = sum(m.req_rate / m.slo for m in gpu_p)
+                s_sum = sum(m.model_size for m in gpu_p)
+                rem = GPU_MEM_SIZE - s_sum
+                if rem > 1e-9:
+                    val = w_sum / rem
+                elif w_sum > 0:
+                    val = float('inf')
+                else:
+                    val = 0.0
+                if val > actual_max:
+                    actual_max = val
+
+            high = min(mid, actual_max)
+        else:
+            low = mid
+
+    return best_placement
+=======
+    # Helper: Local Search Optimization
+    def local_optimize(placement):
+        # Initialize state
+        state = []
+        for i in range(gpu_num):
+            models_on_gpu = placement[i]
+            w = sum(m.req_rate / m.slo for m in models_on_gpu)
+            s = sum(m.model_size for m in models_on_gpu)
+            rem = GPU_MEM_SIZE - s
+            if rem <= 1e-9:
+                val = float('inf') if w > 1e-9 else 0.0
+            else:
+                val = w / rem
+            state.append({'w': w, 's': s, 'val': val, 'models': list(models_on_gpu)})
+
+        def calc_val(w, s):
+            rem = GPU_MEM_SIZE - s
+            if rem <= 1e-9: return float('inf') if w > 1e-9 else 0.0
+            return w / rem
+
+        # Hill Climbing
+        for _ in range(100):
+            # Identify bottleneck
+            max_val = -1.0
+            src_idx = -1
+            for i, st in enumerate(state):
+                if st['val'] > max_val:
+                    max_val = st['val']
+                    src_idx = i
+
+            if max_val <= 1e-9: break
+
+            improved = False
+            src = state[src_idx]
+
+            # 1. Try Move
+            for i, m in enumerate(src['models']):
+                m_w = m.req_rate / m.slo
+                m_s = m.model_size
+
+                ns_s = src['s'] - m_s
+                ns_w = src['w'] - m_w
+                ns_val = calc_val(ns_w, ns_s)
+
+                # Heuristic: only move if source actually improves significantly
+                # or if we are just trying to get below max_val
+                if ns_val >= max_val - 1e-9: continue
+
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = state[dst_idx]
+
+                    if dst['s'] + m_s > GPU_MEM_SIZE: continue
+
+                    nd_val = calc_val(dst['w'] + m_w, dst['s'] + m_s)
+
+                    if nd_val < max_val - 1e-9:
+                        # Move
+                        src['models'].pop(i)
+                        src['w'], src['s'], src['val'] = ns_w, ns_s, ns_val
+
+                        dst['models'].append(m)
+                        dst['w'] += m_w
+                        dst['s'] += m_s
+                        dst['val'] = nd_val
+                        improved = True
+                        break
+                if improved: break
+
+            if improved: continue
+
+            # 2. Try Swap
+            for i, m1 in enumerate(src['models']):
+                m1_w = m1.req_rate / m1.slo
+                m1_s = m1.model_size
+
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = state[dst_idx]
+                    if dst['val'] > max_val * 0.95: continue
+
+                    for j, m2 in enumerate(dst['models']):
+                        m2_w = m2.req_rate / m2.slo
+                        m2_s = m2.model_size
+
+                        ns_s = src['s'] - m1_s + m2_s
+                        nd_s = dst['s'] - m2_s + m1_s
+                        if ns_s > GPU_MEM_SIZE or nd_s > GPU_MEM_SIZE: continue
+
+                        ns_val = calc_val(src['w'] - m1_w + m2_w, ns_s)
+                        nd_val = calc_val(dst['w'] - m2_w + m1_w, nd_s)
+
+                        if max(ns_val, nd_val) < max_val - 1e-9:
+                            # Swap
+                            src['models'][i] = m2
+                            src['w'] += (m2_w - m1_w)
+                            src['s'] += (m2_s - m1_s)
+                            src['val'] = ns_val
+
+                            dst['models'][j] = m1
+                            dst['w'] += (m1_w - m2_w)
+                            dst['s'] += (m1_s - m2_s)
+                            dst['val'] = nd_val
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+
+        return {i: state[i]['models'] for i in range(gpu_num)}
+
+    def get_max_kvpr(placement):
+        mx = 0.0
+        for p in placement.values():
+            w = sum(m.req_rate / m.slo for m in p)
+            s = sum(m.model_size for m in p)
+            rem = GPU_MEM_SIZE - s
+            if rem <= 1e-9:
+                val = float('inf') if w > 1e-9 else 0.0
+            else:
+                val = w / rem
+            if val > mx: mx = val
+        return mx
+
+    # Binary Search for the Minimum Maximum KVPR (K)
+
+    # Initialization
+    high = 1e9
+    best_placement = check_placement(high)
+
+    if best_placement is None:
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+
+    # Optimize initial
+    best_placement = local_optimize(best_placement)
+    high = get_max_kvpr(best_placement)
+    low = 0.0
+
+    # Binary Search Loop
+    for _ in range(25):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+        result = check_placement(mid)
+        if result is not None:
+            # Try to improve the found placement to tighten the bound further
+            refined_result = local_optimize(result)
+            refined_max = get_max_kvpr(refined_result)
+
+            if refined_max < get_max_kvpr(best_placement):
+                best_placement = refined_result
+
+            high = min(mid, refined_max)
+        else:
+            low = mid
+
+    # Final polish
+    best_placement = local_optimize(best_placement)
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

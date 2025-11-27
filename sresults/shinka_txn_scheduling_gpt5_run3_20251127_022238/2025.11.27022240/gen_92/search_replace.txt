@@ -1,0 +1,258 @@
+<prefix_dom_child_promotion>
+Introduce dynamic suffix length for prefix-dominance, early pruning in greedy rollouts, and child-level greedy promotion/pruning in beam expansion.
+</NAME>
+
+<DESCRIPTION>
+I implement three targeted improvements that directly reduce makespan by focusing search on promising prefixes and aggressively pruning dominated states:
+
+1) Dynamic suffix length for global prefix-dominance and unification across beam and greedy:
+   - Replace the previous depth-adaptive scheme that shrank suffix length late with one that uses k=3 until 70% depth, then k=4 afterwards. This captures more context near the end where conflicts are tight, preventing harmful merging of different contexts.
+   - Use the same dynamic suffix length inside greedy rollouts, unifying dominance logic across beam and greedy.
+
+2) Greedy rollout early-abort via prefix-dominance:
+   - In greedy completion, before evaluating candidates, check the global prefix-dominance state for the current (remaining, suffix). If an equal or better cost prefix is already known, abort the rollout early. This saves time and avoids exploring dominated completions that cannot improve the incumbent.
+
+3) Child-level greedy promotion and pruning in beam:
+   - For each expanded parent, greedily complete only the top K children (K=2 for depth/N < 0.7 else K=1). If the greedy completion cost of a child is not better than the current incumbent, prune that child immediately. Otherwise, lower its lookahead score using the greedy completion cost and update the global dominance table for the child’s state.
+   - This concentrates compute on high-yield continuations and tightens the incumbent earlier, enabling stronger pruning in subsequent layers.
+
+These changes align with conflict-driven scheduling: we evaluate true extension costs, use dominance to avoid redundant prefixes, and promote children with high-quality greedy completions while removing those that cannot beat the incumbent. Runtime remains within the existing budget since we only probe a small subset of children and add early-abort checks in greedy completion.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Greedy completion guided by buddies and extension costs
+    def greedy_finish(seq, rem_set, branch_k=10, incumbent=None):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0
+        while rem and time_left():
+            if incumbent is not None:
+                if lb_singleton(cur_cost, rem) >= incumbent:
+                    break
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+            cand_pool = []
+
+            # Prefer buddies of last
+            if last is not None and last in buddies:
+                for u in buddies[last]:
+                    if u in rem:
+                        cand_pool.append(u)
+
+            # Fill with random sample for diversity
+            need = max(0, branch_k - len(cand_pool))
+            if need > 0:
+                others = [x for x in rem_list if x not in cand_pool]
+                if len(others) > need:
+                    cand_pool.extend(random.sample(others, need))
+                else:
+                    cand_pool.extend(others)
+
+            if not cand_pool:
+                cand_pool = rem_list if len(rem_list) <= branch_k else random.sample(rem_list, branch_k)
+
+            # Update global prefix-dominance for this greedy prefix state
+            sig_g = make_signature(rem, seq_out, 3)
+            prev_g = best_state_global.get(sig_g)
+            if prev_g is None or cur_cost < prev_g:
+                best_state_global[sig_g] = cur_cost
+
+            prefix_tuple = tuple(seq_out)
+            # Score immediate extensions
+            scored = []
+            best_immediate = float('inf')
+            for t in cand_pool:
+                c = eval_ext_cost(prefix_tuple, t)
+                scored.append((c, t))
+                if c < best_immediate:
+                    best_immediate = c
+            # Anti-buddy filtering: skip strongly disfavored unless within 1% of best
+            filtered = []
+            last_txn = seq_out[-1] if seq_out else None
+            tol = best_immediate * 1.01 if best_immediate < float('inf') else float('inf')
+            for c, t in scored:
+                if is_antibuddy(last_txn, t) and c > tol:
+                    continue
+                filtered.append((c, t))
+            if not filtered:
+                filtered = scored
+
+            # Pick best candidate after filtering
+            filtered.sort(key=lambda x: x[0])
+            best_c, best_t = filtered[0]
+            if best_t is None:
+                # Time exhausted; append remaining arbitrarily
+                seq_out.extend(rem)
+                cur_cost = eval_seq_cost(seq_out)
+                return cur_cost, seq_out
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+=======
+    # Greedy completion guided by buddies and extension costs with global dominance and early-abort
+    def suffix_k_for(len_prefix):
+        return 3 if len_prefix < int(0.7 * N) else 4
+
+    def greedy_finish(seq, rem_set, branch_k=10, incumbent=None):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0
+        while rem and time_left():
+            if incumbent is not None:
+                if lb_singleton(cur_cost, rem) >= incumbent:
+                    break
+            # Global prefix-dominance check/update for current prefix
+            k_dyn = suffix_k_for(len(seq_out))
+            sig_g = make_signature(rem, seq_out, k_dyn)
+            prev_g = best_state_global.get(sig_g)
+            if prev_g is not None and cur_cost >= prev_g:
+                # Dominated; abort rollout
+                break
+            if prev_g is None or cur_cost < prev_g:
+                best_state_global[sig_g] = cur_cost
+
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+            cand_pool = []
+
+            # Prefer buddies of last
+            if last is not None and last in buddies:
+                for u in buddies[last]:
+                    if u in rem:
+                        cand_pool.append(u)
+
+            # Fill with random sample for diversity
+            need = max(0, branch_k - len(cand_pool))
+            if need > 0:
+                others = [x for x in rem_list if x not in cand_pool]
+                if len(others) > need:
+                    cand_pool.extend(random.sample(others, need))
+                else:
+                    cand_pool.extend(others)
+
+            if not cand_pool:
+                cand_pool = rem_list if len(rem_list) <= branch_k else random.sample(rem_list, branch_k)
+
+            prefix_tuple = tuple(seq_out)
+            # Score immediate extensions
+            scored = []
+            best_immediate = float('inf')
+            for t in cand_pool:
+                c = eval_ext_cost(prefix_tuple, t)
+                scored.append((c, t))
+                if c < best_immediate:
+                    best_immediate = c
+            # Anti-buddy filtering: skip strongly disfavored unless within 1% of best
+            filtered = []
+            last_txn = seq_out[-1] if seq_out else None
+            tol = best_immediate * 1.01 if best_immediate < float('inf') else float('inf')
+            for c, t in scored:
+                if is_antibuddy(last_txn, t) and c > tol:
+                    continue
+                filtered.append((c, t))
+            if not filtered:
+                filtered = scored
+
+            # Pick best candidate after filtering
+            filtered.sort(key=lambda x: x[0])
+            best_c, best_t = filtered[0]
+            if best_t is None:
+                # Time exhausted; append remaining arbitrarily
+                seq_out.extend(rem)
+                cur_cost = eval_seq_cost(seq_out)
+                return cur_cost, seq_out
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Depth-adaptive suffix length for dominance
+            # Keep more context early; shrink later to merge states
+            if depth < int(0.35 * N):
+                k_cur = max(3, k_suffix)
+            elif depth < int(0.7 * N):
+                k_cur = max(2, k_suffix - 1)
+            else:
+                k_cur = max(2, k_suffix - 2)
+=======
+            # Unified prefix-dominance: use small context early, increase late to avoid collisions
+            if depth < int(0.7 * N):
+                k_cur = 3
+            else:
+                k_cur = 4
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                # rank by marginal delta then lookahead score
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+                # Probe a few best children by greedily completing them to tighten incumbent
+                probe_k = min(params.get('next_k', 4), len(top))
+                idx_child = 0
+                for _delta, la_score, ec, cand in top:
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    # Child LB pruning
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+                    # Greedy probe for first few children to update incumbent and refine ranking
+                    if idx_child < probe_k and time_left():
+                        g_cost, g_seq = greedy_finish(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        la_score = min(la_score, g_cost)
+                    idx_child += 1
+                    new_beam.append((ec, new_seq, new_rem, la_score))
+=======
+                # rank by marginal delta then lookahead score
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+                # Probe a few best children by greedily completing them to tighten incumbent and prune
+                probe_k = min(len(top), 2 if depth < int(0.7 * N) else 1)
+                idx_child = 0
+                for _delta, la_score, ec, cand in top:
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    # Child LB pruning
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+
+                    # Child-level prefix-dominance update/prune
+                    sig_child = make_signature(new_rem, new_seq, k_cur)
+                    prev_child = best_state_global.get(sig_child)
+                    if prev_child is not None and ec >= prev_child:
+                        continue
+                    if prev_child is None or ec < prev_child:
+                        best_state_global[sig_child] = ec
+
+                    # Greedy probe for first few children to update incumbent and refine ranking
+                    if idx_child < probe_k and time_left():
+                        g_cost, g_seq = greedy_finish(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        # prune child if its greedy completion doesn't beat incumbent
+                        if g_cost >= best_full_cost:
+                            idx_child += 1
+                            continue
+                        la_score = min(la_score, g_cost)
+                    idx_child += 1
+
+                    new_beam.append((ec, new_seq, new_rem, la_score))
+>>>>>>> REPLACE
+</DIFF>

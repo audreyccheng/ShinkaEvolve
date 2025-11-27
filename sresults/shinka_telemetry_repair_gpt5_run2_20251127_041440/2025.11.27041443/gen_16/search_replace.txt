@@ -1,0 +1,231 @@
+<NAME>
+magnitude_aware_tolerance_and_directional_penalty
+</NAME>
+
+<DESCRIPTION>
+Two targeted improvements to increase counter repair accuracy and confidence calibration:
+
+1) Magnitude-aware symmetry tolerance with absolute guard:
+- Keep 2% default relative tolerance, but use 5% when max(counter) < 10 Mbps.
+- Add an absolute guard of 0.5 Mbps: if absolute difference ≤ 0.5 Mbps, do not adjust even if relative diff is large.
+- Within tolerance, apply stronger confidence floors: 0.99 when max ≥ 10 Mbps and normalized diff ≤ 0.5%, else 0.98 for high rates and 0.97 for low rates.
+- Only use router-imbalance-minimizing adjustments when both relative threshold and absolute guard are violated.
+
+2) Direction-aware router residual penalties:
+- Scale tx_conf with local residual more (penalty_tx = 1 − (0.6×resid_local + 0.4×resid_remote)) and rx_conf with remote residual more (penalty_rx = 1 − (0.6×resid_remote + 0.4×resid_local)).
+- Status confidence is mildly scaled by the average of these penalties.
+
+Additionally, has_traffic now casts counters to float for robustness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+
+    def norm_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(a, b, 1.0)
+
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (d.get('rx_rate', 0.0) > EPS) or (d.get('tx_rate', 0.0) > EPS)
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02  # default relative tolerance for higher rates
+    LOW_RATE_REL_TOL = 0.05     # relaxed tolerance for low-rate links
+    LOW_RATE_THRESHOLD = 10.0   # Mbps threshold to consider a link "low-rate"
+    ABS_GUARD_MBPS = 0.5        # absolute guard to avoid over-correcting tiny flows
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+
+    def norm_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(a, b, 1.0)
+
+    def rel_tol_for(vmax: float) -> float:
+        # Raise tolerance for low-rate links
+        return LOW_RATE_REL_TOL if vmax < LOW_RATE_THRESHOLD else HARDENING_THRESHOLD
+
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (float(d.get('rx_rate', 0.0)) > EPS) or (float(d.get('tx_rate', 0.0)) > EPS)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Direction A->B (A.tx vs B.rx)
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+
+                def cost_fwd(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = (tx_ra - a_tx + val) - rx_ra
+                    imb_rb_p = tx_rb - (rx_rb - b_rx + val)
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ab = [(a_tx, cost_fwd(a_tx)), (b_rx, cost_fwd(b_rx)), (avg_ab, cost_fwd(avg_ab))]
+                # Choose candidate with minimal router-imbalance cost; tie-breaker prefers non-average if within 1% of best
+                candidates_ab.sort(key=lambda kv: kv[1])
+                best_val_ab, best_cost_ab = candidates_ab[0]
+                # If the best is average but not significantly better, consider choosing the nearest endpoint value
+                if best_val_ab == avg_ab and len(candidates_ab) > 1:
+                    second_cost = candidates_ab[1][1]
+                    if (second_cost - best_cost_ab) / max(second_cost, 1e-9) <= 0.01:
+                        # Pick the endpoint closer to average
+                        best_val_ab = a_tx if abs(a_tx - avg_ab) <= abs(b_rx - avg_ab) else b_rx
+                rep_a_tx = best_val_ab
+                rep_b_rx = best_val_ab
+                improvement_ab = max(0.0, (pre_cost_pair - best_cost_ab) / max(pre_cost_pair, 1e-9))
+                base_ab = max(0.0, 1.0 - min(1.0, diff_ab))
+                conf_ab = clamp01(0.5 * base_ab + 0.5 * improvement_ab)
+                tx_conf_a = conf_ab
+                rx_conf_b = conf_ab
+            else:
+                # Within tolerance; keep unchanged with high confidence
+                conf_ab = min(1.0, max(0.98, 1.0 - diff_ab))
+                tx_conf_a = conf_ab
+                rx_conf_b = conf_ab
+=======
+            # Direction A->B (A.tx vs B.rx)
+            vmax_ab = max(a_tx, b_rx)
+            abs_ab = abs(a_tx - b_rx)
+            ndiff_ab = abs_ab / max(vmax_ab, 1.0)
+            thr_ab = rel_tol_for(vmax_ab)
+            within_ab = (abs_ab <= ABS_GUARD_MBPS) or (ndiff_ab <= thr_ab)
+
+            if not within_ab:
+                avg_ab = 0.5 * (a_tx + b_rx)
+
+                def cost_fwd(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = (tx_ra - a_tx + val) - rx_ra
+                    imb_rb_p = tx_rb - (rx_rb - b_rx + val)
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ab = [(a_tx, cost_fwd(a_tx)), (b_rx, cost_fwd(b_rx)), (avg_ab, cost_fwd(avg_ab))]
+                candidates_ab.sort(key=lambda kv: kv[1])
+                best_val_ab, best_cost_ab = candidates_ab[0]
+                # If average is only marginally better, prefer the nearest endpoint
+                if best_val_ab == avg_ab and len(candidates_ab) > 1:
+                    second_cost = candidates_ab[1][1]
+                    if (second_cost - best_cost_ab) / max(second_cost, 1e-9) <= 0.01:
+                        best_val_ab = a_tx if abs(a_tx - avg_ab) <= abs(b_rx - avg_ab) else b_rx
+                rep_a_tx = best_val_ab
+                rep_b_rx = best_val_ab
+                improvement_ab = max(0.0, (pre_cost_pair - best_cost_ab) / max(pre_cost_pair, 1e-9))
+                base_ab = max(0.0, 1.0 - min(1.0, ndiff_ab))
+                conf_ab = clamp01(0.5 * base_ab + 0.5 * improvement_ab)
+            else:
+                # Within tolerance; keep unchanged with magnitude-aware confidence floors
+                conf_ab = min(1.0, max(0.0, 1.0 - ndiff_ab))
+                if vmax_ab >= LOW_RATE_THRESHOLD and ndiff_ab <= 0.005:
+                    conf_ab = max(conf_ab, 0.99)
+                else:
+                    conf_ab = max(conf_ab, 0.97 if vmax_ab < LOW_RATE_THRESHOLD else 0.98)
+            tx_conf_a = conf_ab
+            rx_conf_b = conf_ab
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Direction B->A (B.tx vs A.rx)
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+
+                def cost_rev(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = tx_ra - (rx_ra - a_rx + val)
+                    imb_rb_p = (tx_rb - b_tx + val) - rx_rb
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ba = [(b_tx, cost_rev(b_tx)), (a_rx, cost_rev(a_rx)), (avg_ba, cost_rev(avg_ba))]
+                candidates_ba.sort(key=lambda kv: kv[1])
+                best_val_ba, best_cost_ba = candidates_ba[0]
+                if best_val_ba == avg_ba and len(candidates_ba) > 1:
+                    second_cost = candidates_ba[1][1]
+                    if (second_cost - best_cost_ba) / max(second_cost, 1e-9) <= 0.01:
+                        best_val_ba = b_tx if abs(b_tx - avg_ba) <= abs(a_rx - avg_ba) else a_rx
+                rep_b_tx = best_val_ba
+                rep_a_rx = best_val_ba
+                improvement_ba = max(0.0, (pre_cost_pair - best_cost_ba) / max(pre_cost_pair, 1e-9))
+                base_ba = max(0.0, 1.0 - min(1.0, diff_ba))
+                conf_ba = clamp01(0.5 * base_ba + 0.5 * improvement_ba)
+                tx_conf_b = conf_ba
+                rx_conf_a = conf_ba
+            else:
+                conf_ba = min(1.0, max(0.98, 1.0 - diff_ba))
+                tx_conf_b = conf_ba
+                rx_conf_a = conf_ba
+=======
+            # Direction B->A (B.tx vs A.rx)
+            vmax_ba = max(b_tx, a_rx)
+            abs_ba = abs(b_tx - a_rx)
+            ndiff_ba = abs_ba / max(vmax_ba, 1.0)
+            thr_ba = rel_tol_for(vmax_ba)
+            within_ba = (abs_ba <= ABS_GUARD_MBPS) or (ndiff_ba <= thr_ba)
+
+            if not within_ba:
+                avg_ba = 0.5 * (b_tx + a_rx)
+
+                def cost_rev(val: float) -> float:
+                    tx_ra = router_tx_base.get(ra, 0.0)
+                    rx_ra = router_rx_base.get(ra, 0.0)
+                    tx_rb = router_tx_base.get(rb, 0.0)
+                    rx_rb = router_rx_base.get(rb, 0.0)
+                    imb_ra_p = tx_ra - (rx_ra - a_rx + val)
+                    imb_rb_p = (tx_rb - b_tx + val) - rx_rb
+                    return abs(imb_ra_p) + abs(imb_rb_p)
+
+                candidates_ba = [(b_tx, cost_rev(b_tx)), (a_rx, cost_rev(a_rx)), (avg_ba, cost_rev(avg_ba))]
+                candidates_ba.sort(key=lambda kv: kv[1])
+                best_val_ba, best_cost_ba = candidates_ba[0]
+                if best_val_ba == avg_ba and len(candidates_ba) > 1:
+                    second_cost = candidates_ba[1][1]
+                    if (second_cost - best_cost_ba) / max(second_cost, 1e-9) <= 0.01:
+                        best_val_ba = b_tx if abs(b_tx - avg_ba) <= abs(a_rx - avg_ba) else a_rx
+                rep_b_tx = best_val_ba
+                rep_a_rx = best_val_ba
+                improvement_ba = max(0.0, (pre_cost_pair - best_cost_ba) / max(pre_cost_pair, 1e-9))
+                base_ba = max(0.0, 1.0 - min(1.0, ndiff_ba))
+                conf_ba = clamp01(0.5 * base_ba + 0.5 * improvement_ba)
+            else:
+                conf_ba = min(1.0, max(0.0, 1.0 - ndiff_ba))
+                if vmax_ba >= LOW_RATE_THRESHOLD and ndiff_ba <= 0.005:
+                    conf_ba = max(conf_ba, 0.99)
+                else:
+                    conf_ba = max(conf_ba, 0.97 if vmax_ba < LOW_RATE_THRESHOLD else 0.98)
+            tx_conf_b = conf_ba
+            rx_conf_a = conf_ba
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        penalty = 1.0 - 0.5 * (resid_local + resid_remote)
+        penalty = max(0.0, min(1.0, penalty))
+
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty))
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty))
+        # Status confidence is less sensitive to flow residuals; apply mild scaling
+        status_conf = max(0.0, min(1.0, status_conf * (0.75 + 0.25 * penalty)))
+=======
+        penalty_tx = 1.0 - (0.6 * resid_local + 0.4 * resid_remote)
+        penalty_rx = 1.0 - (0.6 * resid_remote + 0.4 * resid_local)
+        penalty_tx = max(0.0, min(1.0, penalty_tx))
+        penalty_rx = max(0.0, min(1.0, penalty_rx))
+
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        # Status confidence mildly scaled by average of direction-aware penalties
+        status_penalty = 0.75 + 0.25 * (0.5 * (penalty_rx + penalty_tx))
+        status_conf = max(0.0, min(1.0, status_conf * status_penalty))
+>>>>>>> REPLACE
+</DIFF>

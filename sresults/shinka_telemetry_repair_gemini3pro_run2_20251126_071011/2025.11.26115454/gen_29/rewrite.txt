@@ -1,0 +1,285 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Takes interface telemetry data and detects/repairs inconsistencies based on
+network invariants like link symmetry and flow conservation.
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by detecting and correcting inconsistencies.
+
+    Core principle: Use network invariants to validate and repair telemetry:
+    1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+    2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+    3. Interface Consistency: Status should be consistent across connected pairs
+
+    Args:
+        telemetry: Dictionary where key is interface_id and value contains:
+            - interface_status: "up" or "down"
+            - rx_rate: receive rate in Mbps
+            - tx_rate: transmit rate in Mbps
+            - connected_to: interface_id this interface connects to
+            - local_router: router_id this interface belongs to
+            - remote_router: router_id on the other side
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary with same structure but telemetry values become tuples of:
+        (original_value, repaired_value, confidence_score)
+        where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+    """
+
+    HARDENING_THRESHOLD = 0.02
+    NOISE_FLOOR = 5.0  # Mbps
+
+    # Initialize working state
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'orig': data,
+            # Placeholders for confidence
+            'rx_conf': 0.0,
+            'tx_conf': 0.0,
+            'status_conf': 0.0
+        }
+
+    # Helper: Check traffic presence
+    def has_traffic(s):
+        return s['rx'] > 0.1 or s['tx'] > 0.1
+
+    # 1. Status Resolution (Peer Dominance + Traffic Awareness)
+    for if_id, s in state.items():
+        peer_id = s['orig'].get('connected_to')
+        peer = state.get(peer_id)
+        
+        s_stat = s['status']
+        p_stat = peer['status'] if peer else 'unknown'
+        
+        traffic_here = has_traffic(s)
+        traffic_there = has_traffic(peer) if peer else False
+        
+        # Conflict Resolution
+        if s_stat == 'down' and p_stat == 'down':
+            final_status = 'down'
+            conf = 1.0
+        elif (s_stat == 'down' or p_stat == 'down') and not (traffic_here or traffic_there):
+            # One says down, no traffic -> Assume Down
+            final_status = 'down'
+            conf = 0.9
+        else:
+            # Either both Up, or conflict with Traffic -> Assume Up
+            final_status = 'up'
+            if s_stat != p_stat:
+                conf = 0.8
+            else:
+                conf = 1.0
+                
+        s['new_status'] = final_status
+        s['status_conf'] = conf
+        
+    # Apply Status & Enforce Zero Rates
+    for s in state.values():
+        s['status'] = s.pop('new_status')
+        if s['status'] == 'down':
+            s['rx'] = 0.0
+            s['tx'] = 0.0
+            
+    # 2. Iterative Rate Solver (Gauss-Seidel)
+    
+    def get_router_balance_error(rid, current_state):
+        if not rid or rid not in topology: return 0.0
+        in_sum = 0.0
+        out_sum = 0.0
+        for iid in topology[rid]:
+            if iid in current_state:
+                in_sum += current_state[iid]['rx']
+                out_sum += current_state[iid]['tx']
+        return in_sum - out_sum
+
+    ITERATIONS = 5
+    sorted_ifs = sorted(state.keys())
+    
+    for _ in range(ITERATIONS):
+        processed_links = set()
+        
+        for if_id in sorted_ifs:
+            s = state[if_id]
+            if s['status'] == 'down': continue
+            
+            peer_id = s['orig'].get('connected_to')
+            if not peer_id or peer_id not in state: continue
+            
+            # Process each link only once (use min ID as key)
+            link_key = tuple(sorted([if_id, peer_id]))
+            if link_key in processed_links: continue
+            processed_links.add(link_key)
+            
+            # Identify Sender (TX) and Receiver (RX) for Direction 1
+            # We process both directions. 
+            # Direction 1: if_id (TX) -> peer_id (RX)
+            
+            def solve_flow(src_node, dst_node, src_meas, dst_meas, current_flow):
+                r_src = src_node['orig'].get('local_router')
+                r_dst = dst_node['orig'].get('local_router')
+                
+                # Calculate targets based on flow conservation
+                # Target = (Sum_Other_Out - Sum_Other_In) for the missing link
+                # Imb = In - Out.
+                # Src (Outflow): Imb = In - (Out_rest + f) => f = In - Out_rest - Imb_target(0)
+                # Dst (Inflow): Imb = (In_rest + f) - Out => f = Out - In_rest
+                
+                # Get current imbalance
+                imb_src = get_router_balance_error(r_src, state)
+                # Remove current flow from calculation to get "Rest"
+                # src_node['tx'] is current flow
+                # imb_src = In - (Out_rest + current_flow)
+                # In - Out_rest = imb_src + current_flow
+                target_src = imb_src + current_flow
+                
+                imb_dst = get_router_balance_error(r_dst, state)
+                # dst_node['rx'] is current flow
+                # imb_dst = (In_rest + current_flow) - Out
+                # Out - In_rest = current_flow - imb_dst
+                target_dst = current_flow - imb_dst
+                
+                # Candidates
+                candidates = {src_meas, dst_meas, current_flow}
+                if r_src in topology: candidates.add(max(0.0, target_src))
+                if r_dst in topology: candidates.add(max(0.0, target_dst))
+                
+                # Evaluate
+                best_f = current_flow
+                min_cost = float('inf')
+                
+                for f in candidates:
+                    cost = 0.0
+                    
+                    # 1. Fidelity (Bias towards TX as per recommendation)
+                    # "Repair RX to Peer TX" implies we trust TX more.
+                    cost += 1.2 * abs(f - src_meas)
+                    cost += 0.8 * abs(f - dst_meas)
+                    
+                    # 2. Flow Conservation (High weight)
+                    if r_src in topology:
+                        cost += 2.0 * abs(f - target_src)
+                    if r_dst in topology:
+                        cost += 2.0 * abs(f - target_dst)
+                        
+                    if cost < min_cost:
+                        min_cost = cost
+                        best_f = f
+                
+                return best_f
+
+            p = state[peer_id]
+            if p['status'] == 'down': continue
+            
+            # Direction 1: if_id(TX) -> p(RX)
+            f1 = solve_flow(s, p, 
+                            float(s['orig'].get('tx_rate', 0.0)), 
+                            float(p['orig'].get('rx_rate', 0.0)), 
+                            s['tx'])
+            s['tx'] = f1
+            p['rx'] = f1
+            
+            # Direction 2: p(TX) -> if_id(RX)
+            f2 = solve_flow(p, s,
+                            float(p['orig'].get('tx_rate', 0.0)),
+                            float(s['orig'].get('rx_rate', 0.0)),
+                            p['tx'])
+            p['tx'] = f2
+            s['rx'] = f2
+
+    # 3. Confidence Calculation
+    for if_id, s in state.items():
+        if s['status'] == 'down':
+            s['rx_conf'] = 1.0
+            s['tx_conf'] = 1.0
+            continue
+            
+        orig = s['orig']
+        
+        def calc_conf(rate_type, val):
+            meas = float(orig.get(f'{rate_type}_rate', 0.0))
+            denom = max(val, NOISE_FLOOR)
+            
+            # 1. Measurement Agreement
+            meas_err = abs(val - meas) / denom
+            
+            # 2. Flow Agreement
+            rid = orig.get('local_router')
+            flow_err = 0.0
+            has_topo = False
+            if rid and rid in topology:
+                has_topo = True
+                imb = abs(get_router_balance_error(rid, state))
+                total_flow = sum(state[k]['rx']+state[k]['tx'] for k in topology[rid] if k in state)
+                flow_err = imb / max(total_flow, NOISE_FLOOR)
+            
+            # Base logic
+            if meas_err < HARDENING_THRESHOLD:
+                # We kept the original value (or close to it)
+                # High confidence unless flow is terrible
+                base_conf = 1.0
+            else:
+                # We changed the value
+                if has_topo:
+                    if flow_err < HARDENING_THRESHOLD:
+                        # Changed it, but Flow confirms it -> High Confidence
+                        base_conf = 0.95
+                    else:
+                        # Changed it, and Flow still bad -> Low Confidence
+                        base_conf = 0.5
+                else:
+                    # No topology, changed based on peer?
+                    peer_id = orig.get('connected_to')
+                    peer_val = 0.0
+                    if peer_id and peer_id in state:
+                        peer_type = 'tx' if rate_type == 'rx' else 'rx'
+                        peer_val = float(state[peer_id]['orig'].get(f'{peer_type}_rate', 0.0))
+                    
+                    peer_err = abs(val - peer_val) / denom
+                    if peer_err < HARDENING_THRESHOLD:
+                        # Matches peer -> Good
+                        base_conf = 0.8
+                    else:
+                        base_conf = 0.6
+            
+            # Sigmoid Decay for Flow Error
+            # Even if we are confident, significant flow error should degrade it
+            if has_topo:
+                # decay = 1 / (1 + k * error)
+                # If error is 0.05 (5%), conf drops significantly
+                decay = 1.0 / (1.0 + 15.0 * flow_err)
+                base_conf = base_conf * decay
+                
+            return base_conf
+
+        s['rx_conf'] = calc_conf('rx', s['rx'])
+        s['tx_conf'] = calc_conf('tx', s['tx'])
+
+    # Final Output
+    result = {}
+    for if_id, s in state.items():
+        result[if_id] = {
+            'rx_rate': (s['orig'].get('rx_rate', 0.0), s['rx'], s['rx_conf']),
+            'tx_rate': (s['orig'].get('tx_rate', 0.0), s['tx'], s['tx_conf']),
+            'interface_status': (s['orig'].get('interface_status', 'unknown'), s['status'], s['status_conf']),
+            'connected_to': s['orig'].get('connected_to'),
+            'local_router': s['orig'].get('local_router'),
+            'remote_router': s['orig'].get('remote_router')
+        }
+
+    return result
+
+# EVOLVE-BLOCK-END

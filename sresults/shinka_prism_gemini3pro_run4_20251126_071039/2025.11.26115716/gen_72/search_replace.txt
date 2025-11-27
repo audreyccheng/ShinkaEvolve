@@ -1,0 +1,371 @@
+<NAME>
+ils_with_secondary_obj
+</NAME>
+
+<DESCRIPTION>
+Replacing the standard greedy local search with an Iterated Local Search (ILS) that optimizes a lexicographical objective: (Max KVPR, Sum of Squared KVPR).
+- The secondary objective (Sum of Squared KVPR) encourages load balancing even when the maximum pressure cannot be immediately reduced, helping the algorithm escape plateaus (local optima).
+- The search iterates through "Moves" and "Swaps" originating from the bottleneck GPU.
+- If no improving move/swap is found (stagnation), a perturbation step forces a random move from the bottleneck GPU to another feasible GPU to shake up the state, followed by resumed optimization.
+- This allows exploring the solution space more thoroughly given the low execution time budget.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 3. Local Search Refinement
+    # ---------------------------------------------------------
+    # Iteratively move or swap models to reduce the peak KVPR
+
+    # Calculate initial states
+    gpu_states = []
+    current_kvpr = []
+    for i in range(gpu_num):
+        assigned = best_placement[i]
+        w = sum(m.req_rate / m.slo for m in assigned)
+        s = sum(m.model_size for m in assigned)
+        gpu_states.append({'w': w, 's': s})
+        rem = GPU_MEM_SIZE - s
+        p = w / rem if rem > 1e-9 else float('inf')
+        current_kvpr.append(p)
+
+    for _ in range(100):
+        # Find current global max pressure
+        max_p = max(current_kvpr)
+        if max_p < 1e-9: break
+
+        # Identify bottleneck GPUs
+        src_gpus = [i for i, p in enumerate(current_kvpr) if abs(p - max_p) < 1e-9]
+        # Pick one to optimize
+        src_gpu = src_gpus[0]
+        src_models = best_placement[src_gpu]
+
+        improved = False
+
+        # 1. Try MOVE (src -> dst)
+        for m_idx, model in enumerate(src_models):
+            w = model.req_rate / model.slo
+            s = model.model_size
+
+            # Hypothetical Src State
+            new_src_s = gpu_states[src_gpu]['s'] - s
+            new_src_w = gpu_states[src_gpu]['w'] - w
+            new_src_rem = GPU_MEM_SIZE - new_src_s
+            new_src_p = new_src_w / new_src_rem if new_src_rem > 1e-9 else float('inf')
+
+            for dst_gpu in range(gpu_num):
+                if dst_gpu == src_gpu: continue
+
+                if gpu_states[dst_gpu]['s'] + s > GPU_MEM_SIZE: continue
+
+                new_dst_s = gpu_states[dst_gpu]['s'] + s
+                new_dst_w = gpu_states[dst_gpu]['w'] + w
+                new_dst_rem = GPU_MEM_SIZE - new_dst_s
+                new_dst_p = new_dst_w / new_dst_rem if new_dst_rem > 1e-9 else float('inf')
+
+                # Check if this move reduces the pressure of the bottleneck
+                # and doesn't create a new bottleneck worse than current max_p
+                if max(new_src_p, new_dst_p) < max_p - 1e-6:
+                    # Apply Move
+                    moved_model = src_models.pop(m_idx)
+                    best_placement[dst_gpu].append(moved_model)
+
+                    gpu_states[src_gpu] = {'w': new_src_w, 's': new_src_s}
+                    gpu_states[dst_gpu] = {'w': new_dst_w, 's': new_dst_s}
+                    current_kvpr[src_gpu] = new_src_p
+                    current_kvpr[dst_gpu] = new_dst_p
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # 2. Try SWAP (src <-> dst)
+        # Iterate over all models in src and all models in other GPUs
+        for m_idx, m_src in enumerate(src_models):
+            w_src = m_src.req_rate / m_src.slo
+            s_src = m_src.model_size
+
+            for dst_gpu in range(gpu_num):
+                if dst_gpu == src_gpu: continue
+
+                dst_models = best_placement[dst_gpu]
+                for d_idx, m_dst in enumerate(dst_models):
+                    w_dst = m_dst.req_rate / m_dst.slo
+                    s_dst = m_dst.model_size
+
+                    # Check Capacity
+                    new_src_s = gpu_states[src_gpu]['s'] - s_src + s_dst
+                    if new_src_s > GPU_MEM_SIZE: continue
+
+                    new_dst_s = gpu_states[dst_gpu]['s'] - s_dst + s_src
+                    if new_dst_s > GPU_MEM_SIZE: continue
+
+                    # Check Pressure
+                    new_src_w = gpu_states[src_gpu]['w'] - w_src + w_dst
+                    new_src_rem = GPU_MEM_SIZE - new_src_s
+                    new_src_p = new_src_w / new_src_rem if new_src_rem > 1e-9 else float('inf')
+
+                    new_dst_w = gpu_states[dst_gpu]['w'] - w_dst + w_src
+                    new_dst_rem = GPU_MEM_SIZE - new_dst_s
+                    new_dst_p = new_dst_w / new_dst_rem if new_dst_rem > 1e-9 else float('inf')
+
+                    if max(new_src_p, new_dst_p) < max_p - 1e-6:
+                        # Apply Swap
+                        mod_src = src_models.pop(m_idx)
+                        mod_dst = dst_models.pop(d_idx)
+
+                        src_models.append(mod_dst) # Put dst model into src list
+                        dst_models.append(mod_src) # Put src model into dst list
+
+                        gpu_states[src_gpu] = {'w': new_src_w, 's': new_src_s}
+                        gpu_states[dst_gpu] = {'w': new_dst_w, 's': new_dst_s}
+                        current_kvpr[src_gpu] = new_src_p
+                        current_kvpr[dst_gpu] = new_dst_p
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if not improved:
+            break
+
+    return best_placement
+=======
+    # ---------------------------------------------------------
+    # 3. Iterated Local Search (ILS)
+    # ---------------------------------------------------------
+    # Refines solution by minimizing lexicographical objective: (Max KVPR, Sum of Squared KVPR)
+    # Allows side-steps on Max KVPR to improve balance, preventing local optima.
+    # Uses random perturbations when stuck.
+
+    # Data setup
+    curr_sol = {g: list(best_placement[g]) for g in range(gpu_num)}
+
+    # State tracking
+    g_stats = []
+    for g in range(gpu_num):
+        w = sum(m.req_rate / m.slo for m in curr_sol[g])
+        s = sum(m.model_size for m in curr_sol[g])
+        rem = GPU_MEM_SIZE - s
+        p = w / rem if rem > 1e-9 else (float('inf') if w > 0 else 0.0)
+        g_stats.append({'w': w, 's': s, 'p': p})
+
+    def get_metrics(stats):
+        """Returns (max_p, sum_sq_p)"""
+        m_p = 0.0
+        ssq = 0.0
+        for st in stats:
+            p = st['p']
+            if p > m_p: m_p = p
+            ssq += p * p
+        return m_p, ssq
+
+    curr_max, curr_ssq = get_metrics(g_stats)
+
+    # Keep track of the absolute best solution found
+    best_final_sol = {g: list(curr_sol[g]) for g in range(gpu_num)}
+    best_final_max = curr_max
+
+    no_improve_iters = 0
+    max_iters = 300 # Computational budget
+
+    for _ in range(max_iters):
+        if curr_max < 1e-9: break
+
+        # 3.1 Identification of Bottleneck
+        # Select GPU with the maximum pressure
+        candidates = [g for g in range(gpu_num) if abs(g_stats[g]['p'] - curr_max) < 1e-6]
+        if not candidates: break
+
+        # If stuck, maybe perturb one of the bottlenecks?
+        src_gpu = random.choice(candidates)
+        src_items = curr_sol[src_gpu]
+
+        improved = False
+
+        # 3.2 Move Operator
+        # Try moving an item from bottleneck to another GPU
+        move_indices = list(range(len(src_items)))
+        random.shuffle(move_indices) # Randomize order
+
+        for m_idx in move_indices:
+            model = src_items[m_idx]
+            w, s = model.req_rate / model.slo, model.model_size
+
+            # Src State Update
+            src_s = g_stats[src_gpu]['s'] - s
+            src_w = g_stats[src_gpu]['w'] - w
+            src_rem = GPU_MEM_SIZE - src_s
+            src_p = src_w / src_rem if src_rem > 1e-9 else float('inf')
+
+            # Check all destinations
+            # Heuristic: Check GPUs with low pressure first?
+            # Random order helps exploration
+            dst_indices = list(range(gpu_num))
+            random.shuffle(dst_indices)
+
+            for dst in dst_indices:
+                if dst == src_gpu: continue
+                if g_stats[dst]['s'] + s > GPU_MEM_SIZE: continue
+
+                # Dst State Update
+                dst_s = g_stats[dst]['s'] + s
+                dst_w = g_stats[dst]['w'] + w
+                dst_rem = GPU_MEM_SIZE - dst_s
+                dst_p = dst_w / dst_rem if dst_rem > 1e-9 else float('inf')
+
+                # Check metrics
+                # Calculate new global max and ssq efficiently
+                # Delta SSQ: (src_p^2 + dst_p^2) - (old_src_p^2 + old_dst_p^2)
+                # Global Max: max(others_max, src_p, dst_p)
+
+                # Fast reject: if local max > curr_max, we definitely didn't improve global max
+                if max(src_p, dst_p) > curr_max + 1e-9: continue
+
+                old_pair_ssq = g_stats[src_gpu]['p']**2 + g_stats[dst]['p']**2
+                new_pair_ssq = src_p**2 + dst_p**2
+                new_ssq = curr_ssq - old_pair_ssq + new_pair_ssq
+
+                # Recompute true max (others might be at curr_max)
+                new_max = max(src_p, dst_p)
+                # If new local max is less than curr_max, we might have reduced global max
+                # But we need to verify if other GPUs hold the max
+                if new_max < curr_max:
+                    for g_chk in range(gpu_num):
+                        if g_chk == src_gpu or g_chk == dst: continue
+                        if g_stats[g_chk]['p'] > new_max:
+                            new_max = g_stats[g_chk]['p']
+
+                # Acceptance Criteria: Lexicographical (Max, SSQ)
+                # 1. Strictly lower Max
+                # 2. Same Max (within epsilon), strictly lower SSQ
+                accept = False
+                if new_max < curr_max - 1e-6:
+                    accept = True
+                elif abs(new_max - curr_max) < 1e-6 and new_ssq < curr_ssq - 1e-6:
+                    accept = True
+
+                if accept:
+                    # Execute Move
+                    curr_sol[src_gpu].pop(m_idx)
+                    curr_sol[dst].append(model)
+                    g_stats[src_gpu] = {'w': src_w, 's': src_s, 'p': src_p}
+                    g_stats[dst] = {'w': dst_w, 's': dst_s, 'p': dst_p}
+                    curr_max, curr_ssq = new_max, new_ssq
+                    improved = True
+                    break
+            if improved: break
+
+        if improved:
+            no_improve_iters = 0
+            if curr_max < best_final_max:
+                best_final_max = curr_max
+                best_final_sol = {g: list(curr_sol[g]) for g in range(gpu_num)}
+            continue
+
+        # 3.3 Swap Operator
+        # If move didn't help, try swapping items
+        for m_idx in move_indices: # Reuse shuffled indices
+            m_src = src_items[m_idx]
+            w_src, s_src = m_src.req_rate / m_src.slo, m_src.model_size
+
+            dst_indices = list(range(gpu_num))
+            random.shuffle(dst_indices)
+
+            for dst in dst_indices:
+                if dst == src_gpu: continue
+
+                dst_items = curr_sol[dst]
+                for d_idx, m_dst in enumerate(dst_items):
+                    w_dst, s_dst = m_dst.req_rate / m_dst.slo, m_dst.model_size
+
+                    # Capacity Check
+                    n_src_s = g_stats[src_gpu]['s'] - s_src + s_dst
+                    if n_src_s > GPU_MEM_SIZE: continue
+                    n_dst_s = g_stats[dst]['s'] - s_dst + s_src
+                    if n_dst_s > GPU_MEM_SIZE: continue
+
+                    # Pressure Update
+                    n_src_w = g_stats[src_gpu]['w'] - w_src + w_dst
+                    n_src_rem = GPU_MEM_SIZE - n_src_s
+                    n_src_p = n_src_w / n_src_rem if n_src_rem > 1e-9 else float('inf')
+
+                    n_dst_w = g_stats[dst]['w'] - w_dst + w_src
+                    n_dst_rem = GPU_MEM_SIZE - n_dst_s
+                    n_dst_p = n_dst_w / n_dst_rem if n_dst_rem > 1e-9 else float('inf')
+
+                    if max(n_src_p, n_dst_p) > curr_max + 1e-9: continue
+
+                    # Metrics
+                    old_pair_ssq = g_stats[src_gpu]['p']**2 + g_stats[dst]['p']**2
+                    new_pair_ssq = n_src_p**2 + n_dst_p**2
+                    new_ssq = curr_ssq - old_pair_ssq + new_pair_ssq
+
+                    new_max = max(n_src_p, n_dst_p)
+                    if new_max < curr_max:
+                        for g_chk in range(gpu_num):
+                            if g_chk == src_gpu or g_chk == dst: continue
+                            if g_stats[g_chk]['p'] > new_max:
+                                new_max = g_stats[g_chk]['p']
+
+                    accept = False
+                    if new_max < curr_max - 1e-6:
+                        accept = True
+                    elif abs(new_max - curr_max) < 1e-6 and new_ssq < curr_ssq - 1e-6:
+                        accept = True
+
+                    if accept:
+                        # Execute Swap
+                        curr_sol[src_gpu][m_idx] = m_dst
+                        curr_sol[dst][d_idx] = m_src
+                        g_stats[src_gpu] = {'w': n_src_w, 's': n_src_s, 'p': n_src_p}
+                        g_stats[dst] = {'w': n_dst_w, 's': n_dst_s, 'p': n_dst_p}
+                        curr_max, curr_ssq = new_max, new_ssq
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if improved:
+            no_improve_iters = 0
+            if curr_max < best_final_max:
+                best_final_max = curr_max
+                best_final_sol = {g: list(curr_sol[g]) for g in range(gpu_num)}
+            continue
+
+        # 3.4 Perturbation (Kick)
+        # If we are here, no greedy move/swap improved the solution
+        no_improve_iters += 1
+        if no_improve_iters > 5:
+            # Randomly force a valid move from bottleneck
+            # to shake up the configuration
+            if src_items:
+                m_idx = random.randrange(len(src_items))
+                model = src_items[m_idx]
+
+                targets = list(range(gpu_num))
+                random.shuffle(targets)
+                for t in targets:
+                    if t == src_gpu: continue
+                    if g_stats[t]['s'] + model.model_size <= GPU_MEM_SIZE:
+                        # Force Move
+                        curr_sol[src_gpu].pop(m_idx)
+                        curr_sol[t].append(model)
+
+                        # Recalculate stats completely for safety/simplicity
+                        for g in [src_gpu, t]:
+                            w = sum(m.req_rate / m.slo for m in curr_sol[g])
+                            s = sum(m.model_size for m in curr_sol[g])
+                            rem = GPU_MEM_SIZE - s
+                            p = w / rem if rem > 1e-9 else (float('inf') if w > 0 else 0.0)
+                            g_stats[g] = {'w': w, 's': s, 'p': p}
+
+                        curr_max, curr_ssq = get_metrics(g_stats)
+                        no_improve_iters = 0 # Reset counter after kick
+                        break
+
+    return best_final_sol
+>>>>>>> REPLACE
+
+</DIFF>

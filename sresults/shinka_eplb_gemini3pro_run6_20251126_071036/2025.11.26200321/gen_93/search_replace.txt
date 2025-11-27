@@ -1,0 +1,334 @@
+<NAME>
+pairwise_greedy_rebalance_v2
+</NAME>
+
+<DESCRIPTION>
+This edit introduces a "Pairwise Greedy Rebalance" phase (ABBA heuristic) and increases the candidate pool size and diversity.
+1.  **Increased Candidates**: Candidates increased from 128 to 256 for broader exploration, with adjusted strategies (0-127 Noisy LPT, 128-191 Interleaved, 192-255 Random).
+2.  **Pairwise Greedy Rebalance (ABBA)**: Iteratively selects the Max Load Pack and the Min Load Pack, pools their items, and performs a greedy partition (A-B-B-A pattern) to optimally balance the two packs. This allows moving multiple items simultaneously, overcoming local optima where single item swaps fail. This runs for 30 iterations.
+3.  **Refinement**: The "Max-Any Swap" is kept as a second refinement stage (reduced to 50 iterations) to fine-tune the result.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 1: Diverse Candidate Generation ---
+    # We use 128 candidates to explore the solution space.
+    # Strategies:
+    # 0-63:   Randomized LPT (Descending Sort + Noise)
+    # 64-95:  Interleaved (Heavy, Light, Heavy, Light...)
+    # 96-127: Random Permutation
+    num_candidates = 128
+    num_problems = num_layers * num_candidates
+
+    # Expand weights [L*C, N]
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Base: Sort descending (LPT)
+    # Add noise to creating diverse LPT rankings
+    # Scale noise from 0.0 to 0.2 across the candidates to vary "greediness"
+    scales = torch.linspace(0, 0.2, num_candidates, device=device)
+    noise_scale = scales.repeat(num_layers).view(-1, 1)
+
+    noise = torch.rand_like(w_expanded) * w_expanded * noise_scale
+    # Ensure Candidate 0 is pure LPT (no noise)
+    noise.view(num_layers, num_candidates, num_groups)[:, 0, :] = 0
+
+    sort_keys = w_expanded + noise
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+
+    # Apply Strategies
+    cand_ids = torch.arange(num_candidates, device=device).repeat_interleave(num_layers)
+
+    # Strategy 2: Interleaved (64-95)
+    # Reorder the sorted indices: [0, N-1, 1, N-2, 2, N-3...]
+    mask_interleave = (cand_ids >= 64) & (cand_ids < 96)
+    if mask_interleave.any():
+        # Precompute interleave map
+        imap = torch.empty(num_groups, dtype=torch.long, device=device)
+        imap[0::2] = torch.arange((num_groups + 1) // 2, device=device)
+        imap[1::2] = torch.arange(num_groups - 1, (num_groups + 1) // 2 - 1, -1, device=device)
+
+        # Apply map
+        subset = sorted_indices[mask_interleave]
+        sorted_indices[mask_interleave] = subset[:, imap]
+
+    # Strategy 3: Random Shuffle (96-127)
+    mask_random = (cand_ids >= 96)
+    if mask_random.any():
+        # Generate random indices
+        rand_keys = torch.rand(mask_random.sum(), num_groups, device=device)
+        _, rand_idx = rand_keys.sort(dim=-1)
+        sorted_indices[mask_random] = rand_idx
+
+    # Gather weights in the determined order
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+
+    # --- Phase 2: Vectorized Greedy Assignment ---
+    pack_weights = torch.zeros(num_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_problems, num_packs, device=device, dtype=torch.int64)
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+
+    # Pre-allocate infinity for masking
+    inf_val = torch.tensor(float('inf'), device=device)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [LC, 1]
+
+        # Mask full packs
+        is_full = (pack_counts >= groups_per_pack)
+        candidates = torch.where(is_full, inf_val, pack_weights)
+
+        # Choose pack with min weight
+        chosen_pack = candidates.argmin(dim=1, keepdim=True)
+
+        sorted_pack_index[:, i:i+1] = chosen_pack
+
+        # Optimized update
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # --- Phase 3: Vectorized Max-Any Swap Refinement ---
+    # Construct pack structure: [LC, M, K]
+    _, pack_content_sort_idx = sorted_pack_index.sort(dim=1, stable=True)
+    pack_contents = pack_content_sort_idx.view(num_problems, num_packs, groups_per_pack)
+
+    K = groups_per_pack
+    num_iters = 100 # Increased depth for better convergence
+
+    for _ in range(num_iters):
+        # 1. Weights in current configuration
+        flat_contents = pack_contents.view(num_problems, -1)
+        current_weights = torch.gather(sorted_weight, 1, flat_contents).view(num_problems, num_packs, K)
+        pack_sums = current_weights.sum(dim=2)
+
+        # 2. Identify Max Pack for each candidate
+        val_max, idx_max_pack = pack_sums.max(dim=1) # [LC]
+
+        # Gather items in Max Pack: [LC, 1, K]
+        gather_idx = idx_max_pack.view(-1, 1, 1).expand(-1, 1, K)
+        w_max = torch.gather(current_weights, 1, gather_idx).squeeze(1) # [LC, K]
+
+        # 3. Compute Swap Diffs with ALL other packs
+        # Broadcast Max Items vs All Packs' Items
+        # w_max: [LC, 1, K, 1]
+        # current_weights: [LC, M, 1, K]
+        # diffs[b, m, i, j] = max_item[i] - other_item[j]
+        diffs = w_max.view(num_problems, 1, K, 1) - current_weights.view(num_problems, num_packs, 1, K)
+
+        # 4. Compute Improvement
+        # New Max Load if we do this swap (assuming MaxPack determines peak)
+        # We need to check if the Target Pack becomes the new global max?
+        # A simpler heuristic is sufficient: maximize (OldMax - NewPairMax)
+        # New MaxPack Load = val_max - diff
+        # New OtherPack Load = pack_sums[other] + diff
+
+        val_max_exp = val_max.view(num_problems, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_problems, num_packs, 1, 1)
+
+        new_pair_max = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_pair_max
+
+        # 5. Masking
+        # Don't swap with self
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == idx_max_pack.view(-1, 1))
+        mask_self = mask_self.view(num_problems, num_packs, 1, 1)
+
+        # Validity: Must reduce max pack load (diff > 0) AND improve pair-wise max
+        valid_mask = (diffs > 0) & (improvement > 1e-6) & (~mask_self)
+
+        # Apply score
+        improvement = torch.where(valid_mask, improvement, torch.tensor(float('-inf'), device=device))
+
+        # 6. Select Best Swap per candidate
+        flat_imp = improvement.view(num_problems, -1)
+        best_imp, flat_idx = flat_imp.max(dim=1)
+
+        if not (best_imp > float('-inf')).any():
+            break
+
+        # 7. Execute Swaps
+        valid_layers = torch.nonzero(best_imp > float('-inf')).squeeze(1)
+
+        if len(valid_layers) > 0:
+            f_idx = flat_idx[valid_layers]
+
+            # Decode indices: M * K * K
+            K2 = K * K
+            p_other = f_idx // K2
+            rem = f_idx % K2
+            idx_in_max = rem // K
+            idx_in_other = rem % K
+
+            p_max = idx_max_pack[valid_layers]
+
+            # Perform Swap in `pack_contents`
+            # Note: pack_contents stores indices into sorted_weight[b]
+            val_max_item = pack_contents[valid_layers, p_max, idx_in_max]
+            val_other_item = pack_contents[valid_layers, p_other, idx_in_other]
+
+            pack_contents[valid_layers, p_max, idx_in_max] = val_other_item
+            pack_contents[valid_layers, p_other, idx_in_other] = val_max_item
+=======
+    # --- Phase 1: Diverse Candidate Generation ---
+    # Increased candidates to 256 for broader search
+    num_candidates = 256
+    num_problems = num_layers * num_candidates
+
+    # Expand weights [L*C, N]
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Strategy 1: Randomized LPT (0-127)
+    scales = torch.linspace(0, 0.4, 128, device=device)
+    # Pad scales
+    scales = torch.cat([scales, torch.zeros(128, device=device)])
+
+    noise_scale = scales.repeat(num_layers).view(-1, 1)
+    noise = torch.rand_like(w_expanded) * w_expanded * noise_scale
+    noise.view(num_layers, num_candidates, num_groups)[:, 0, :] = 0
+
+    sort_keys = w_expanded + noise
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+
+    # Strategy 2: Interleaved (128-191)
+    cand_ids = torch.arange(num_candidates, device=device).repeat_interleave(num_layers)
+    mask_interleave = (cand_ids >= 128) & (cand_ids < 192)
+
+    if mask_interleave.any():
+        perms = torch.empty(num_groups, dtype=torch.long, device=device)
+        perms[0::2] = torch.arange((num_groups + 1) // 2, device=device)
+        perms[1::2] = torch.arange(num_groups - 1, (num_groups + 1) // 2 - 1, -1, device=device)
+
+        subset = sorted_indices[mask_interleave]
+        sorted_indices[mask_interleave] = subset[:, perms]
+
+    # Strategy 3: Random (192-255)
+    mask_random = (cand_ids >= 192)
+    if mask_random.any():
+        rand_keys = torch.rand(mask_random.sum(), num_groups, device=device)
+        _, rand_idx = rand_keys.sort(dim=-1)
+        sorted_indices[mask_random] = rand_idx
+
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+
+    # --- Phase 2: Vectorized Greedy Assignment ---
+    pack_weights = torch.zeros(num_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_problems, num_packs, device=device, dtype=torch.int64)
+    # Track which pack each item (in sorted order) is assigned to
+    assignments = torch.zeros(num_problems, num_groups, dtype=torch.int64, device=device)
+
+    inf_val = torch.tensor(float('inf'), device=device)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [LC, 1]
+
+        is_full = (pack_counts >= groups_per_pack)
+        candidates = torch.where(is_full, inf_val, pack_weights)
+        chosen_pack = candidates.argmin(dim=1, keepdim=True)
+
+        assignments[:, i:i+1] = chosen_pack
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # Convert assignments to [Batch, Pack, Group] structure
+    # We sort assignments to group indices by pack
+    _, sort_by_pack = assignments.sort(dim=1, stable=True)
+    pack_contents = sort_by_pack.view(num_problems, num_packs, groups_per_pack)
+    K = groups_per_pack
+
+    # --- Phase 3: Pairwise Greedy Rebalance (ABBA) ---
+    # Iteratively balance the heaviest and lightest packs
+    # Pattern: A, B, B, A...
+    arange_2k = torch.arange(2 * K, device=device)
+    mask_b = (arange_2k % 4 == 1) | (arange_2k % 4 == 2)
+    idx_a = torch.nonzero(~mask_b).squeeze()
+    idx_b = torch.nonzero(mask_b).squeeze()
+
+    for _ in range(30):
+        # Calculate pack weights
+        flat_c = pack_contents.view(num_problems, -1)
+        curr_w = torch.gather(sorted_weight, 1, flat_c).view(num_problems, num_packs, K)
+        pack_sums = curr_w.sum(dim=2)
+
+        # Identify Max/Min packs
+        noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-6
+        _, p_max = noisy_sums.max(dim=1)
+        _, p_min = noisy_sums.min(dim=1)
+
+        # Gather items
+        gather_max = p_max.view(-1, 1, 1).expand(-1, 1, K)
+        gather_min = p_min.view(-1, 1, 1).expand(-1, 1, K)
+
+        # Indices in sorted_weight
+        idx_max = torch.gather(pack_contents, 1, gather_max).squeeze(1)
+        idx_min = torch.gather(pack_contents, 1, gather_min).squeeze(1)
+
+        w_max_items = torch.gather(sorted_weight, 1, idx_max)
+        w_min_items = torch.gather(sorted_weight, 1, idx_min)
+
+        # Merge and sort
+        merged_idx = torch.cat([idx_max, idx_min], dim=1)
+        merged_w = torch.cat([w_max_items, w_min_items], dim=1)
+
+        _, sort_merged = merged_w.sort(dim=1, descending=True)
+        sorted_merged_idx = torch.gather(merged_idx, 1, sort_merged)
+
+        # Redistribute
+        new_max = sorted_merged_idx[:, idx_a]
+        new_min = sorted_merged_idx[:, idx_b]
+
+        batch_idx = torch.arange(num_problems, device=device)
+        pack_contents[batch_idx, p_max, :] = new_max
+        pack_contents[batch_idx, p_min, :] = new_min
+
+    # --- Phase 4: Vectorized Max-Any Swap Refinement ---
+    num_iters = 50
+    for _ in range(num_iters):
+        flat_contents = pack_contents.view(num_problems, -1)
+        curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_problems, num_packs, K)
+        pack_sums = curr_w.sum(dim=2)
+
+        val_max, idx_max_pack = pack_sums.max(dim=1)
+
+        gather_idx = idx_max_pack.view(-1, 1, 1).expand(-1, 1, K)
+        w_max = torch.gather(curr_w, 1, gather_idx).squeeze(1) # [LC, K]
+
+        diffs = w_max.view(num_problems, 1, K, 1) - curr_w.view(num_problems, num_packs, 1, K)
+
+        val_max_exp = val_max.view(num_problems, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_problems, num_packs, 1, 1)
+
+        new_pair_max = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_pair_max
+
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == idx_max_pack.view(-1, 1))
+        mask_self = mask_self.view(num_problems, num_packs, 1, 1)
+
+        valid_mask = (diffs > 0) & (improvement > 1e-6) & (~mask_self)
+        improvement = torch.where(valid_mask, improvement, torch.tensor(float('-inf'), device=device))
+
+        flat_imp = improvement.view(num_problems, -1)
+        best_imp, flat_idx = flat_imp.max(dim=1)
+
+        if not (best_imp > float('-inf')).any():
+            break
+
+        valid_layers = torch.nonzero(best_imp > float('-inf')).squeeze(1)
+        if len(valid_layers) == 0: break
+
+        f_idx = flat_idx[valid_layers]
+        K2 = K * K
+        p_other = f_idx // K2
+        rem = f_idx % K2
+        idx_in_max = rem // K
+        idx_in_other = rem % K
+
+        p_max = idx_max_pack[valid_layers]
+
+        val_max_item = pack_contents[valid_layers, p_max, idx_in_max].clone()
+        val_other_item = pack_contents[valid_layers, p_other, idx_in_other].clone()
+
+        pack_contents[valid_layers, p_max, idx_in_max] = val_other_item
+        pack_contents[valid_layers, p_other, idx_in_other] = val_max_item
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,333 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Adaptive Decay Greedy Construction and Time-Varying LAHC.
+    
+    Key Innovations:
+    1. Adaptive Decay Greedy: The weight of the duration heuristic decays non-linearly 
+       as the schedule fills, transitioning from 'Big Rocks' packing to 'Sand' gap-filling.
+    2. Time-Varying LAHC: Operator probabilities shift dynamically over the search budget.
+       starts with macro-structural moves (Block Reversal, Large Shifts) and converges to 
+       fine-grained optimization (Single Inserts).
+    3. Block Reversal Operator: Explicitly targets inverted dependency chains.
+    """
+    # 1. Pre-calculation
+    # Compute transaction durations for heuristic guidance
+    txn_durations = {t: workload.get_opt_seq_cost([t]) for t in range(workload.num_txns)}
+    # Sort transactions by duration (descending) for Big Rocks lookup
+    sorted_txns_by_len = sorted(range(workload.num_txns), key=lambda t: txn_durations[t], reverse=True)
+
+    candidates_pool = []
+
+    # 2. Greedy Construction Phase with Adaptive Decay
+    for i in range(num_seqs):
+        # Diversity: Randomize parameters for each sequence
+        if i == 0:
+            # Baseline parameters
+            base_alpha = 0.5
+            decay_power = 1.0 # Linear decay
+            rock_ratio = 0.90
+        else:
+            # Randomized parameters for structural diversity
+            base_alpha = random.uniform(0.3, 0.8)
+            # Power < 1: Rapid decay (Sand filling early)
+            # Power > 1: Slow decay (Big Rocks focus longer)
+            decay_power = random.uniform(0.5, 2.5) 
+            rock_ratio = random.uniform(0.85, 0.98)
+
+        start_txn = random.randint(0, workload.num_txns - 1)
+        schedule = [start_txn]
+        remaining = set(range(workload.num_txns))
+        remaining.remove(start_txn)
+        
+        total_txns = workload.num_txns
+
+        while remaining:
+            # Calculate construction progress (0.0 to 1.0)
+            progress = len(schedule) / total_txns
+            
+            # Decay alpha: Early on, we prioritize long transactions (Big Rocks).
+            # Later, we prioritize minimal cost increase (Gap Filling).
+            eff_alpha = base_alpha * ((1.0 - progress) ** decay_power)
+            
+            candidates = set()
+
+            # Dynamic Big Rocks Heuristic
+            # Identify max duration in remaining set
+            max_dur = 0
+            for t in sorted_txns_by_len:
+                if t in remaining:
+                    max_dur = txn_durations[t]
+                    break
+
+            threshold = max_dur * rock_ratio
+
+            # Select candidates based on threshold
+            rocks_added = 0
+            # Allow slightly more candidates in the middle of construction
+            rock_limit = 5 + int(5 * (1.0 - progress)) 
+
+            for t in sorted_txns_by_len:
+                if t in remaining:
+                    if txn_durations[t] >= threshold:
+                        candidates.add(t)
+                        rocks_added += 1
+                        if rocks_added >= rock_limit:
+                            break
+                    else:
+                        break # Sorted list, no larger items remain
+
+            # Fallback/Diversity: If pool is small, add random samples
+            if len(candidates) < 3 or len(remaining) < 15:
+                # Add a few random items to prevent getting stuck
+                remaining_list = list(remaining)
+                sample_size = min(len(remaining_list), 5)
+                candidates.update(random.sample(remaining_list, sample_size))
+
+            # Weighted Selection
+            # Score = Cost - (EffectiveAlpha * Duration)
+            best_t = -1
+            best_score = float('inf')
+
+            for t in candidates:
+                cost = workload.get_opt_seq_cost(schedule + [t])
+                score = cost - (eff_alpha * txn_durations[t])
+
+                if score < best_score:
+                    best_score = score
+                    best_t = t
+                elif score == best_score:
+                    if txn_durations[t] > txn_durations.get(best_t, 0):
+                        best_t = t
+            
+            # Fail-safe
+            if best_t == -1:
+                best_t = list(remaining)[0]
+
+            schedule.append(best_t)
+            remaining.remove(best_t)
+
+        total_cost = workload.get_opt_seq_cost(schedule)
+        candidates_pool.append((total_cost, schedule))
+
+    # 3. Optimization Helper: Adaptive LAHC
+    def run_adaptive_lahc(schedule, start_cost, budget, stage='sprint'):
+        current_seq = list(schedule)
+        current_cost = start_cost
+        best_seq = list(schedule)
+        best_cost = start_cost
+
+        # Adaptive history length: shorter for warmup, longer for deep search
+        history_len = 50 if budget < 500 else 100
+        history = [start_cost] * history_len
+        last_imp_idx = 0
+
+        for k in range(budget):
+            progress = k / budget
+
+            # Stagnation Kick (Marathon Phase Only)
+            if stage == 'marathon' and (k - last_imp_idx > 600):
+                # Major Perturbation: Shuffle a block
+                # This acts as a "Ruin & Random Recreate"
+                idx = random.randint(0, max(0, len(current_seq) - 20))
+                slen = random.randint(15, 30)
+                end = min(len(current_seq), idx + slen)
+                segment = current_seq[idx:end]
+                random.shuffle(segment)
+                current_seq[idx:end] = segment
+
+                current_cost = workload.get_opt_seq_cost(current_seq)
+                history = [current_cost] * history_len
+                last_imp_idx = k
+                continue
+
+            neighbor = list(current_seq)
+            n = len(neighbor)
+            op_rand = random.random()
+
+            # Dynamic Operator Probabilities
+            # Early search: High probability of structural moves (Block Move, Reversal)
+            # Late search: High probability of fine tuning (Single Insert, Swap)
+            
+            # Probabilities decay or grow linearly
+            p_reverse = 0.15 * (1.0 - progress)  # 15% -> 0%
+            p_block = 0.50 * (1.0 - 0.5 * progress)  # 50% -> 25% (Block Move)
+            # Remainder is Single Insert / Swap
+            
+            if op_rand < p_reverse:
+                # Operator: Block Reversal (New!)
+                # Reverses a dependency chain
+                bsize = random.randint(3, 12)
+                if n > bsize:
+                    s = random.randint(0, n - bsize)
+                    segment = neighbor[s : s + bsize]
+                    neighbor[s : s + bsize] = segment[::-1]
+                else:
+                    continue
+            
+            elif op_rand < (p_reverse + p_block):
+                # Operator: Block Insert (Macro Shift)
+                # Size scales down slightly with progress
+                max_bsize = 10 if progress < 0.5 else 6
+                bsize = random.randint(2, max_bsize)
+                if n > bsize:
+                    start = random.randint(0, n - bsize)
+                    block = neighbor[start : start + bsize]
+                    del neighbor[start : start + bsize]
+                    dest = random.randint(0, len(neighbor))
+                    neighbor[dest : dest] = block
+                else:
+                    continue
+            
+            else:
+                # Fine Tuning (Insert / Swap)
+                # Split roughly 80/20
+                if random.random() < 0.8:
+                    # Single Insert
+                    idx1 = random.randint(0, n - 1)
+                    idx2 = random.randint(0, n - 1)
+                    if idx1 != idx2:
+                        item = neighbor.pop(idx1)
+                        neighbor.insert(idx2, item)
+                else:
+                    # Swap
+                    idx1, idx2 = random.sample(range(n), 2)
+                    neighbor[idx1], neighbor[idx2] = neighbor[idx2], neighbor[idx1]
+
+            new_cost = workload.get_opt_seq_cost(neighbor)
+
+            # LAHC Acceptance
+            v = k % history_len
+            if new_cost <= current_cost or new_cost <= history[v]:
+                current_seq = neighbor
+                current_cost = new_cost
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_seq = list(current_seq)
+                    last_imp_idx = k
+
+            history[v] = current_cost
+
+        return best_cost, best_seq
+
+    # 4. Funnel Execution Structure
+
+    # Sort initial pool
+    candidates_pool.sort(key=lambda x: x[0])
+
+    # Deduplicate based on sequence hash
+    unique_candidates = []
+    seen = set()
+    for cost, seq in candidates_pool:
+        h = tuple(seq)
+        if h not in seen:
+            unique_candidates.append((cost, list(seq)))
+            seen.add(h)
+    
+    # Ensure at least one candidate
+    if not unique_candidates:
+        unique_candidates = [(candidates_pool[0][0], list(candidates_pool[0][1]))]
+
+    # Stage 1: Warmup (Top 5)
+    # Quick check to see which structures optimize well
+    stage1_results = []
+    for cost, seq in unique_candidates[:5]:
+        c, s = run_adaptive_lahc(seq, cost, 100, stage='warmup')
+        stage1_results.append((c, s))
+    
+    stage1_results.sort(key=lambda x: x[0])
+
+    # Stage 2: Sprint (Top 3)
+    # Medium optimization
+    stage2_results = []
+    for cost, seq in stage1_results[:3]:
+        c, s = run_adaptive_lahc(seq, cost, 400, stage='sprint')
+        stage2_results.append((c, s))
+        
+    stage2_results.sort(key=lambda x: x[0])
+
+    # Stage 3: Marathon (Winner)
+    # Deep optimization with kicks
+    winner_cost, winner_seq = stage2_results[0]
+    final_cost, final_seq = run_adaptive_lahc(winner_seq, winner_cost, 2500, stage='marathon')
+
+    return final_cost, final_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END

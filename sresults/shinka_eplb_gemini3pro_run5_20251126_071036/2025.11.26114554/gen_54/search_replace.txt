@@ -1,0 +1,239 @@
+<NAME>
+optimize_and_2item_swap
+</NAME>
+
+<DESCRIPTION>
+1. Optimize the Greedy LPT initialization in `balanced_packing` by deferring the construction of `pack_contents` and `pack_item_ids` until after the loop. This replaces repeated Python-loop-level tensor slicing updates with a single batched `index_put_` operation, reducing overhead.
+2. Introduce a "2-for-2 Swap" refinement phase in `balanced_packing`. This attempts to swap pairs of items between the heaviest and lightest packs to escape local optima where 1-for-1 swaps fail. This is implemented with vectorized operations and restricted to cases where `items_per_pack <= 16` to maintain efficiency and avoid OOM.
+3. Increase `num_restarts` in `rebalance_experts` from 64 to 128 to leverage the improved efficiency and explore more configurations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 1. Greedy LPT with Incremental Update ---
+
+    # Sort weights (LPT heuristic)
+    sorted_weight, sorted_indices = weight.sort(dim=-1, descending=True)
+
+    # State initialization
+    pack_weights = torch.zeros(batch_size, num_packs, device=device)
+    pack_counts = torch.zeros(batch_size, num_packs, dtype=torch.int64, device=device)
+
+    # [Batch, Packs, ItemsPerPack]
+    pack_contents = torch.zeros(batch_size, num_packs, items_per_pack, device=device)
+    pack_item_ids = torch.zeros(batch_size, num_packs, items_per_pack, dtype=torch.int64, device=device)
+
+    row_indices = torch.arange(batch_size, device=device)
+
+    # Assign items one by one
+    for i in range(num_items):
+        w = sorted_weight[:, i]
+        original_idx = sorted_indices[:, i]
+
+        # Valid packs mask
+        valid_mask = pack_counts < items_per_pack
+
+        # Select pack with min weight among valid packs
+        # Using clone to avoid modifying pack_weights for argmin
+        curr_weights = pack_weights.clone()
+        curr_weights[~valid_mask] = float('inf')
+
+        chosen_pack = torch.argmin(curr_weights, dim=1)
+
+        # Get rank
+        chosen_rank = pack_counts[row_indices, chosen_pack]
+
+        # Update State
+        pack_weights[row_indices, chosen_pack] += w
+        pack_counts[row_indices, chosen_pack] += 1
+
+        pack_contents[row_indices, chosen_pack, chosen_rank] = w
+        pack_item_ids[row_indices, chosen_pack, chosen_rank] = original_idx
+
+    # --- 2. Vectorized Refinement ---
+=======
+    # --- 1. Greedy LPT with Incremental Update ---
+
+    # Sort weights (LPT heuristic)
+    sorted_weight, sorted_indices = weight.sort(dim=-1, descending=True)
+
+    # State initialization
+    pack_weights = torch.zeros(batch_size, num_packs, device=device)
+    pack_counts = torch.zeros(batch_size, num_packs, dtype=torch.int64, device=device)
+
+    # Temporary storage for assignments [Batch, NumItems]
+    # We reconstruct structured format later to speed up the loop
+    assigned_packs = torch.empty(batch_size, num_items, dtype=torch.int64, device=device)
+    assigned_ranks = torch.empty(batch_size, num_items, dtype=torch.int64, device=device)
+
+    row_indices = torch.arange(batch_size, device=device)
+
+    # Assign items one by one
+    for i in range(num_items):
+        w = sorted_weight[:, i]
+
+        # Valid packs mask
+        valid_mask = pack_counts < items_per_pack
+
+        # Select pack with min weight among valid packs
+        # Using clone to avoid modifying pack_weights for argmin
+        curr_weights = pack_weights.clone()
+        curr_weights[~valid_mask] = float('inf')
+
+        chosen_pack = torch.argmin(curr_weights, dim=1)
+
+        # Get rank
+        chosen_rank = pack_counts[row_indices, chosen_pack]
+
+        # Update State
+        # scatter_add_ is generally slower than index select for simple updates, but efficient enough
+        # Here we use basic indexing as row_indices is a range
+        pack_weights[row_indices, chosen_pack] += w
+        pack_counts[row_indices, chosen_pack] += 1
+
+        # Store assignment
+        assigned_packs[:, i] = chosen_pack
+        assigned_ranks[:, i] = chosen_rank
+
+    # Reconstruct structured format: [Batch, Packs, ItemsPerPack]
+    pack_contents = torch.zeros(batch_size, num_packs, items_per_pack, device=device)
+    pack_item_ids = torch.zeros(batch_size, num_packs, items_per_pack, dtype=torch.int64, device=device)
+
+    # Flat indices for scatter
+    flat_rows = row_indices.unsqueeze(1).expand(-1, num_items).flatten()
+    flat_packs = assigned_packs.flatten()
+    flat_ranks = assigned_ranks.flatten()
+
+    pack_contents.index_put_((flat_rows, flat_packs, flat_ranks), sorted_weight.flatten())
+    pack_item_ids.index_put_((flat_rows, flat_packs, flat_ranks), sorted_indices.flatten())
+
+    # --- 2. Vectorized Refinement ---
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            # Update Pack Weights Incrementally
+            delta_w = val_h - val_l
+            pack_weights[batch_indices, p_max] -= delta_w
+            pack_weights[batch_indices, p_min] += delta_w
+
+    # --- 3. Final Formatting ---
+=======
+            # Update Pack Weights Incrementally
+            delta_w = val_h - val_l
+            pack_weights[batch_indices, p_max] -= delta_w
+            pack_weights[batch_indices, p_min] += delta_w
+
+    # 2-item Swap (Pairwise between max and min pack)
+    # Only if G is small enough to keep memory usage reasonable (O(Batch * G^4))
+    if items_per_pack <= 16:
+        G = items_per_pack
+        for _ in range(10): # Fewer iterations for expensive swap
+            val_max, idx_max = pack_weights.max(dim=1)
+            val_min, idx_min = pack_weights.min(dim=1)
+
+            diff = val_max - val_min
+            active_mask = diff > 1e-4
+            if not active_mask.any():
+                break
+
+            items_max = pack_contents[row_indices, idx_max] # [B, G]
+            items_min = pack_contents[row_indices, idx_min] # [B, G]
+
+            # Compute sum of all pairs within max pack: [B, G, G]
+            # pairs_max[b, i, j] = items_max[b, i] + items_max[b, j]
+            pairs_max = items_max.unsqueeze(2) + items_max.unsqueeze(1)
+
+            # Compute sum of all pairs within min pack: [B, G, G]
+            pairs_min = items_min.unsqueeze(2) + items_min.unsqueeze(1)
+
+            # Compute delta for swapping (i, j) from max with (k, l) from min
+            # We want w_max_pair - w_min_pair
+            # Flatten pairs: [B, G*G]
+            pairs_max_flat = pairs_max.view(batch_size, -1)
+            pairs_min_flat = pairs_min.view(batch_size, -1)
+
+            # Delta: [B, G*G, G*G]
+            delta = pairs_max_flat.unsqueeze(2) - pairs_min_flat.unsqueeze(1)
+
+            # We must filter out invalid pairs where i==j or k==l (same item used twice)
+            # Create mask for valid pairs [G, G]
+            eye = torch.eye(G, device=device).bool()
+            valid_pair_mask = ~eye # True if i != j
+            valid_pair_flat = valid_pair_mask.view(-1) # [G*G]
+
+            # Combine masks: valid_pair_max AND valid_pair_min
+            # [G*G, G*G]
+            combined_mask = valid_pair_flat.unsqueeze(1) & valid_pair_flat.unsqueeze(0)
+
+            # Improvement calculation
+            diff_view = diff.view(-1, 1, 1)
+            improvement = diff_view - (diff_view - 2 * delta).abs()
+
+            # Apply masks
+            improvement = torch.where((delta > 0) & combined_mask.unsqueeze(0), improvement, -1.0)
+
+            # Find best swap
+            imp_flat = improvement.view(batch_size, -1)
+            best_imp, best_idx_flat = imp_flat.max(dim=1)
+
+            do_swap = (best_imp > 1e-5) & active_mask
+            if not do_swap.any():
+                break
+
+            # Execute Swaps
+            batch_indices = row_indices[do_swap]
+            flat_indices = best_idx_flat[do_swap]
+
+            # Decode indices
+            GG = G * G
+            idx_pair_min = flat_indices % GG
+            idx_pair_max = flat_indices // GG
+
+            u1 = idx_pair_max // G
+            u2 = idx_pair_max % G
+            v1 = idx_pair_min // G
+            v2 = idx_pair_min % G
+
+            p_max = idx_max[batch_indices]
+            p_min = idx_min[batch_indices]
+
+            # Swap values
+            val_u1 = pack_contents[batch_indices, p_max, u1]
+            val_u2 = pack_contents[batch_indices, p_max, u2]
+            val_v1 = pack_contents[batch_indices, p_min, v1]
+            val_v2 = pack_contents[batch_indices, p_min, v2]
+
+            pack_contents[batch_indices, p_max, u1] = val_v1
+            pack_contents[batch_indices, p_max, u2] = val_v2
+            pack_contents[batch_indices, p_min, v1] = val_u1
+            pack_contents[batch_indices, p_min, v2] = val_u2
+
+            # Swap IDs
+            id_u1 = pack_item_ids[batch_indices, p_max, u1]
+            id_u2 = pack_item_ids[batch_indices, p_max, u2]
+            id_v1 = pack_item_ids[batch_indices, p_min, v1]
+            id_v2 = pack_item_ids[batch_indices, p_min, v2]
+
+            pack_item_ids[batch_indices, p_max, u1] = id_v1
+            pack_item_ids[batch_indices, p_max, u2] = id_v2
+            pack_item_ids[batch_indices, p_min, v1] = id_u1
+            pack_item_ids[batch_indices, p_min, v2] = id_u2
+
+            # Update weights
+            delta_w = (val_u1 + val_u2) - (val_v1 + val_v2)
+            pack_weights[batch_indices, p_max] -= delta_w
+            pack_weights[batch_indices, p_min] += delta_w
+
+    # --- 3. Final Formatting ---
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Parallel Randomized Restarts Strategy ---
+    # We expand the problem size by `num_restarts` to explore multiple solutions in parallel.
+    # The GPU can handle this increased batch size efficiently.
+    num_restarts = 64
+=======
+    # --- Parallel Randomized Restarts Strategy ---
+    # We expand the problem size by `num_restarts` to explore multiple solutions in parallel.
+    # The GPU can handle this increased batch size efficiently.
+    num_restarts = 128
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,130 @@
+<NAME>
+optimize_packing_and_replication
+</NAME>
+
+<DESCRIPTION>
+1. Enhance `balanced_packing` by adding a local search refinement step after the initial greedy assignment. This iteratively swaps items between the most and least loaded packs to improve load balancing.
+2. Optimize `replicate_experts` by using incremental updates for expert scores. Instead of recomputing scores for all experts in every iteration ($O(N \cdot K)$), we only update the scores for the experts that received a new replica ($O(N)$), significantly improving efficiency.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    weight_cpu = weight.float().cpu()
+    indices = weight_cpu.sort(-1, descending=True).indices
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+
+    for i in range(num_layers):
+        pack_weights = [0.0] * num_packs
+        packs = [[] for _ in range(num_packs)]
+
+        # Greedy LPT
+        for group in indices[i].tolist():
+            pack = min(
+                (p for p in range(num_packs) if len(packs[p]) < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            packs[pack].append(group)
+            pack_weights[pack] += weight_cpu[i, group].item()
+
+        # Local Search Refinement
+        # Perform pairwise swaps between the heaviest and lightest packs
+        for _ in range(20):
+            min_pack = min(range(num_packs), key=pack_weights.__getitem__)
+            max_pack = max(range(num_packs), key=pack_weights.__getitem__)
+            if min_pack == max_pack:
+                break
+
+            diff = pack_weights[max_pack] - pack_weights[min_pack]
+            best_swap = None
+            # Target improvement: reduce diff
+
+            for idx_max, item_max in enumerate(packs[max_pack]):
+                w_max = weight_cpu[i, item_max].item()
+                for idx_min, item_min in enumerate(packs[min_pack]):
+                    w_min = weight_cpu[i, item_min].item()
+
+                    if w_max <= w_min:
+                        continue
+
+                    delta = w_max - w_min
+                    reduction = diff - abs(diff - 2 * delta)
+                    if reduction > 1e-6:
+                        if best_swap is None or reduction > best_swap[2]:
+                            best_swap = (idx_max, idx_min, reduction)
+
+            if best_swap:
+                idx_h, idx_l, _ = best_swap
+                item_h = packs[max_pack][idx_h]
+                item_l = packs[min_pack][idx_l]
+
+                packs[max_pack][idx_h] = item_l
+                packs[min_pack][idx_l] = item_h
+
+                w_h = weight_cpu[i, item_h].item()
+                w_l = weight_cpu[i, item_l].item()
+
+                pack_weights[max_pack] -= (w_h - w_l)
+                pack_weights[min_pack] += (w_h - w_l)
+            else:
+                break
+
+        for p in range(num_packs):
+            for rank, item in enumerate(packs[p]):
+                pack_index[i, item] = p
+                rank_in_pack[i, item] = rank
+
+    return pack_index.to(weight.device), rank_in_pack.to(weight.device)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+    # Pre-compute scores to avoid redundant division
+    current_scores = weight.float() / logcnt.float()
+
+    for i in range(num_log, num_phy):
+        redundant_indices = current_scores.argmax(dim=-1)
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+
+        # Update logcnt
+        logcnt[arangen, redundant_indices] += 1
+
+        # Incrementally update scores only for modified experts
+        new_cnt = logcnt[arangen, redundant_indices].float()
+        chosen_weight = weight[arangen, redundant_indices].float()
+        current_scores[arangen, redundant_indices] = chosen_weight / new_cnt
+
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+</DIFF>

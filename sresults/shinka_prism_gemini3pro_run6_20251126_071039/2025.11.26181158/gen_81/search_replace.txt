@@ -1,0 +1,214 @@
+<NAME>
+init_param_search_and_helper_perturb
+</NAME>
+
+<DESCRIPTION>
+1.  **Objective-Aware Initialization:** Replaces the single-point randomized initialization with a parameter search over the linearization constant $K$. By testing multiple multipliers of the baseline $K$, the algorithm finds a sorting weight that produces a better initial packing shape (balancing $L$ vs $S$) before applying random noise.
+2.  **Helper-Based Perturbation:** Enhances the Ruin & Recreate phase. Instead of only perturbing the bottleneck GPU, it also removes items from a "helper" GPU (lowest load). This creates a larger pool of items and free space, facilitating swaps that require coordination between full and empty GPUs to resolve bottlenecks.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 4. Randomized Restarts
+    best_plc = None
+    best_score = float('inf')
+
+    # Run restarts near base_k to find a configuration with lower actual max KVPR
+    # base_k is the theoretical limit where sum(w) <= Capacity, but actual KVPR might differ due to bin packing inefficiencies
+    search_k = base_k * 1.001
+    seeds = [None] + list(range(19)) # 20 total starts
+
+    for seed in seeds:
+        if time.time() - start_time > 0.4: break
+        res = solve_packing(search_k, seed)
+        if res:
+            max_k = 0
+            for g in range(gpu_num):
+                l = sum(x['l'] for x in res[g])
+                s = sum(x['s'] for x in res[g])
+                k = get_kvpr(l, s)
+                if k > max_k: max_k = k
+
+            if max_k < best_score:
+                best_score = max_k
+                best_plc = res
+
+    if best_plc is None:
+        best_plc = solve_packing(base_k) or solve_packing(1e9)
+        if best_plc is None: # Emergency fallback
+             best_plc = [[] for _ in range(gpu_num)]
+             for i, m in enumerate(model_data): best_plc[i%gpu_num].append(m)
+=======
+    # 4. Randomized Restarts with Parameter Search
+    best_plc = None
+    best_score = float('inf')
+    best_k_factor = 1.0
+
+    # Search over different K multipliers to find the best packing shape
+    # K balances size vs load. Higher K prioritizes fitting large items.
+    multipliers = [1.0, 1.02, 1.05, 1.1, 1.2, 1.3, 1.5, 2.0, 5.0]
+
+    for m_val in multipliers:
+        if time.time() - start_time > 0.3: break
+        res = solve_packing(base_k * m_val)
+        if res:
+            max_k = 0
+            for g in range(gpu_num):
+                l = sum(x['l'] for x in res[g])
+                s = sum(x['s'] for x in res[g])
+                k = get_kvpr(l, s)
+                if k > max_k: max_k = k
+
+            if max_k < best_score:
+                best_score = max_k
+                best_plc = res
+                best_k_factor = m_val
+
+    # Fill remaining budget with randomized restarts around the best found K
+    seed_idx = 0
+    while time.time() - start_time < 0.4:
+        res = solve_packing(base_k * best_k_factor, seed=seed_idx)
+        if res:
+            max_k = 0
+            for g in range(gpu_num):
+                l = sum(x['l'] for x in res[g])
+                s = sum(x['s'] for x in res[g])
+                k = get_kvpr(l, s)
+                if k > max_k: max_k = k
+
+            if max_k < best_score:
+                best_score = max_k
+                best_plc = res
+        seed_idx += 1
+
+    if best_plc is None:
+        best_plc = solve_packing(base_k) or solve_packing(1e9)
+        if best_plc is None: # Emergency fallback
+             best_plc = [[] for _ in range(gpu_num)]
+             for i, m in enumerate(model_data): best_plc[i%gpu_num].append(m)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Perturbation (Ruins & Recreate)
+        if not bottlenecks: break
+
+        b_idx = random.choice(bottlenecks)
+        if not plc[b_idx]: break
+
+        # Remove 1-2 random items
+        num_remove = min(len(plc[b_idx]), random.randint(1, 2))
+        removed_items = []
+        for _ in range(num_remove):
+            if not plc[b_idx]: break
+            idx = random.randrange(len(plc[b_idx]))
+            item = plc[b_idx].pop(idx)
+            removed_items.append(item)
+            gpu_stats[b_idx]['l'] -= item['l']
+            gpu_stats[b_idx]['s'] -= item['s']
+
+        # Re-insert greedily into best feasible GPU
+        success = True
+        for item in removed_items:
+            best_t = -1
+            best_k = float('inf')
+
+            # Check all other GPUs
+            candidates = list(range(gpu_num))
+            random.shuffle(candidates)
+
+            for t in candidates:
+                if t == b_idx: continue
+                if gpu_stats[t]['s'] + item['s'] < GPU_MEM_SIZE:
+                    k = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+                    if k < best_k:
+                        best_k = k
+                        best_t = t
+
+            if best_t != -1:
+                plc[best_t].append(item)
+                gpu_stats[best_t]['l'] += item['l']
+                gpu_stats[best_t]['s'] += item['s']
+            else:
+                # Put back
+                plc[b_idx].append(item)
+                gpu_stats[b_idx]['l'] += item['l']
+                gpu_stats[b_idx]['s'] += item['s']
+                success = False
+=======
+        # Perturbation (Ruins & Recreate with Helper)
+        if not bottlenecks: break
+
+        b_idx = random.choice(bottlenecks)
+        if not plc[b_idx]: break
+
+        # Identify a helper GPU: the one with lowest pressure to absorb load
+        helper_idx = -1
+        min_helper_k = float('inf')
+        for g in range(gpu_num):
+            if g == b_idx: continue
+            k_val = get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s'])
+            if k_val < min_helper_k:
+                min_helper_k = k_val
+                helper_idx = g
+
+        removed_items = []
+
+        # Ruin Bottleneck: Remove random items (more aggressive if stuck)
+        num_remove_b = min(len(plc[b_idx]), random.randint(1, 3))
+        for _ in range(num_remove_b):
+            if not plc[b_idx]: break
+            idx = random.randrange(len(plc[b_idx]))
+            item = plc[b_idx].pop(idx)
+            removed_items.append(item)
+            gpu_stats[b_idx]['l'] -= item['l']
+            gpu_stats[b_idx]['s'] -= item['s']
+
+        # Ruin Helper: Remove items to create space for swaps
+        if helper_idx != -1 and plc[helper_idx]:
+            num_remove_h = min(len(plc[helper_idx]), random.randint(1, 2))
+            for _ in range(num_remove_h):
+                if not plc[helper_idx]: break
+                idx = random.randrange(len(plc[helper_idx]))
+                item = plc[helper_idx].pop(idx)
+                removed_items.append(item)
+                gpu_stats[helper_idx]['l'] -= item['l']
+                gpu_stats[helper_idx]['s'] -= item['s']
+
+        # Re-insert all removed items greedily
+        random.shuffle(removed_items)
+
+        for item in removed_items:
+            best_t = -1
+            best_k = float('inf')
+
+            # Check all GPUs, sort by pressure to encourage balancing
+            candidates = list(range(gpu_num))
+            candidates.sort(key=lambda g: get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s']))
+
+            for t in candidates:
+                if gpu_stats[t]['s'] + item['s'] < GPU_MEM_SIZE:
+                    k = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+                    if k < best_k:
+                        best_k = k
+                        best_t = t
+
+            if best_t != -1:
+                plc[best_t].append(item)
+                gpu_stats[best_t]['l'] += item['l']
+                gpu_stats[best_t]['s'] += item['s']
+            else:
+                # Emergency: Put back to bottleneck or helper if possible
+                if gpu_stats[b_idx]['s'] + item['s'] < GPU_MEM_SIZE:
+                    plc[b_idx].append(item)
+                    gpu_stats[b_idx]['l'] += item['l']; gpu_stats[b_idx]['s'] += item['s']
+                elif helper_idx != -1 and gpu_stats[helper_idx]['s'] + item['s'] < GPU_MEM_SIZE:
+                    plc[helper_idx].append(item)
+                    gpu_stats[helper_idx]['l'] += item['l']; gpu_stats[helper_idx]['s'] += item['s']
+                else:
+                    # Last resort: Any valid gpu
+                    for g in range(gpu_num):
+                        if gpu_stats[g]['s'] + item['s'] < GPU_MEM_SIZE:
+                             plc[g].append(item)
+                             gpu_stats[g]['l'] += item['l']; gpu_stats[g]['s'] += item['s']
+                             break
+>>>>>>> REPLACE
+</DIFF>

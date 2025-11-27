@@ -1,0 +1,261 @@
+<NAME>
+improved_bin_search_packing
+</NAME>
+
+<DESCRIPTION>
+Optimizes the binary search phase by implementing:
+1. Persistent failure memory: 'Hard' items that fail to pack are tracked across binary search iterations, prioritizing them in future attempts regardless of the 'mid' value.
+2. Aggressive search space pruning: When a valid packing is found, the upper bound `high` is updated to the actual max KVPR of that packing, rather than the target `mid`, accelerating convergence.
+3. Enhanced bin packing strategies: Adds 'Weight' and 'Density' sorting keys and randomly toggles between 'Best Fit' and 'Worst Fit' strategies to better navigate the solution space.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ------------------------------------------------------------------
+    # 2. Phase II: Binary Search with Adaptive Stochastic Packing
+    # ------------------------------------------------------------------
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    # Theoretical lower bound
+    lb = total_w / rem_global if rem_global > 1e-6 else best_val
+
+    # Range setup
+    low = lb
+    high = best_val if best_val != float('inf') else 2000.0
+
+    if high > low + 1e-4:
+
+        def try_pack(target_k):
+            """
+            Attempts to pack items such that KVPR <= target_k.
+            Uses randomized sorting with failure feedback.
+            """
+            # Track failure counts to prioritize difficult items
+            fail_counts = {i: 0 for i in range(len(m_data))}
+
+            # Strategies for base sorting
+            # 1. Effective Size: s + w/K
+            # 2. Physical Size: s
+            strategies = [
+                lambda idx: m_data[idx]['s'] + m_data[idx]['w'] / target_k,
+                lambda idx: m_data[idx]['s']
+            ]
+
+            # Number of stochastic trials per K check
+            num_trials = 30
+
+            for attempt in range(num_trials):
+                # Cycle strategies
+                base_key_fn = strategies[attempt % len(strategies)]
+
+                # Noise increases with attempts to break loops
+                noise_scale = 0.02 + (0.005 * attempt)
+
+                # Dynamic Sort Key
+                def sort_key(idx):
+                    val = base_key_fn(idx)
+                    # Multiplicative noise
+                    val *= random.uniform(1.0 - noise_scale, 1.0 + noise_scale)
+                    # Failure boost: if item failed before, add huge value to put it first
+                    val += fail_counts[idx] * 1e6
+                    return val
+
+                indices = sorted(range(len(m_data)), key=sort_key, reverse=True)
+
+                # Bin Packing (Best Fit Decreasing on Effective Slack)
+                bins_s = [0.0] * gpu_num
+                bins_w = [0.0] * gpu_num
+                placement = [[] for _ in range(gpu_num)]
+
+                possible_iter = True
+                first_fail_idx = None
+
+                for idx in indices:
+                    item = m_data[idx]
+                    eff_size = item['s'] + item['w'] / target_k
+
+                    best_b = None
+                    min_rem_eff = float('inf')
+
+                    for b in range(gpu_num):
+                        # 1. Physical constraint
+                        if bins_s[b] + item['s'] > GPU_MEM_SIZE: continue
+
+                        # 2. Pressure constraint: sum(w) / (C - sum(s)) <= K
+                        # equivalent to: sum(w)/K + sum(s) <= C
+                        # equivalent to: current_eff + item_eff <= C
+                        curr_eff = bins_s[b] + bins_w[b] / target_k
+
+                        if curr_eff + eff_size <= GPU_MEM_SIZE + 1e-6:
+                            # Valid bin. Minimize remaining effective space (Best Fit)
+                            rem_eff = GPU_MEM_SIZE - (curr_eff + eff_size)
+                            if rem_eff < min_rem_eff:
+                                min_rem_eff = rem_eff
+                                best_b = b
+
+                    if best_b is None:
+                        possible_iter = False
+                        first_fail_idx = idx
+                        break
+
+                    placement[best_b].append(idx)
+                    bins_s[best_b] += item['s']
+                    bins_w[best_b] += item['w']
+
+                if possible_iter:
+                    return {i: placement[i] for i in range(gpu_num)}
+                else:
+                    if first_fail_idx is not None:
+                        fail_counts[first_fail_idx] += 1
+
+            return None
+
+        # Binary Search Loop
+        # 20 steps is enough precision
+        for _ in range(20):
+            mid = (low + high) / 2.0
+            sol = try_pack(mid)
+
+            if sol:
+                # Found feasible configuration for K=mid.
+                # Calculate actual max KVPR (it might be slightly less than mid)
+                actual_score = calc_score(sol)
+                if actual_score < best_val:
+                    best_val = actual_score
+                    best_sol_indices = sol
+                # Try harder constraint
+                high = mid
+            else:
+                # Cannot fit, relax constraint
+                low = mid
+=======
+    # ------------------------------------------------------------------
+    # 2. Phase II: Binary Search with Adaptive Stochastic Packing
+    # ------------------------------------------------------------------
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    # Theoretical lower bound
+    lb = total_w / rem_global if rem_global > 1e-6 else best_val
+
+    # Range setup
+    low = lb
+    high = best_val if best_val != float('inf') else 2000.0
+
+    if high > low + 1e-4:
+
+        # Persistent failure memory across binary search steps
+        fail_counts = {i: 0 for i in range(len(m_data))}
+
+        def try_pack(target_k):
+            """
+            Attempts to pack items such that KVPR <= target_k.
+            Uses randomized sorting with failure feedback.
+            """
+
+            # Strategies for base sorting
+            strategies = [
+                lambda idx: m_data[idx]['s'] + m_data[idx]['w'] / target_k, # Effective Size
+                lambda idx: m_data[idx]['s'],                               # Physical Size
+                lambda idx: m_data[idx]['w'],                               # Weight
+                lambda idx: m_data[idx]['w'] / (m_data[idx]['s'] + 1e-9)    # Density
+            ]
+
+            # Number of stochastic trials per K check
+            num_trials = 30
+
+            for attempt in range(num_trials):
+                # Cycle strategies
+                base_key_fn = strategies[attempt % len(strategies)]
+
+                # Randomly choose Best Fit (minimize rem) or Worst Fit (maximize rem)
+                # Worst fit (maximize remaining space) helps keep large chunks open.
+                use_worst_fit = (random.random() < 0.2)
+
+                # Noise increases with attempts to break loops
+                noise_scale = 0.02 + (0.005 * attempt)
+
+                # Dynamic Sort Key
+                def sort_key(idx):
+                    val = base_key_fn(idx)
+                    # Multiplicative noise
+                    val *= random.uniform(1.0 - noise_scale, 1.0 + noise_scale)
+                    # Failure boost: if item failed before, add huge value to put it first
+                    val += fail_counts[idx] * 1e6
+                    return val
+
+                indices = sorted(range(len(m_data)), key=sort_key, reverse=True)
+
+                # Bin Packing
+                bins_s = [0.0] * gpu_num
+                bins_w = [0.0] * gpu_num
+                placement = [[] for _ in range(gpu_num)]
+
+                possible_iter = True
+                first_fail_idx = None
+
+                for idx in indices:
+                    item = m_data[idx]
+                    eff_size = item['s'] + item['w'] / target_k
+
+                    best_b = None
+                    best_metric = float('inf') # We want to minimize this metric
+
+                    for b in range(gpu_num):
+                        # 1. Physical constraint
+                        if bins_s[b] + item['s'] > GPU_MEM_SIZE: continue
+
+                        # 2. Pressure constraint: sum(w) / (C - sum(s)) <= K
+                        # equivalent to: current_eff + item_eff <= C
+                        curr_eff = bins_s[b] + bins_w[b] / target_k
+
+                        if curr_eff + eff_size <= GPU_MEM_SIZE + 1e-6:
+                            # Valid bin.
+                            rem_eff = GPU_MEM_SIZE - (curr_eff + eff_size)
+
+                            # Metric to minimize
+                            if use_worst_fit:
+                                val = -rem_eff # Minimize negative => Maximize positive rem_eff
+                            else:
+                                val = rem_eff  # Best Fit
+
+                            if val < best_metric:
+                                best_metric = val
+                                best_b = b
+
+                    if best_b is None:
+                        possible_iter = False
+                        first_fail_idx = idx
+                        break
+
+                    placement[best_b].append(idx)
+                    bins_s[best_b] += item['s']
+                    bins_w[best_b] += item['w']
+
+                if possible_iter:
+                    return {i: placement[i] for i in range(gpu_num)}
+                else:
+                    if first_fail_idx is not None:
+                        fail_counts[first_fail_idx] += 1
+
+            return None
+
+        # Binary Search Loop
+        for _ in range(25):
+            mid = (low + high) / 2.0
+            sol = try_pack(mid)
+
+            if sol:
+                # Found feasible configuration for K=mid.
+                actual_score = calc_score(sol)
+                if actual_score < best_val:
+                    best_val = actual_score
+                    best_sol_indices = sol
+
+                # Aggressive bound update:
+                # If we found a solution with max_kvpr = actual_score,
+                # we don't need to search above actual_score.
+                high = min(mid, actual_score)
+            else:
+                # Cannot fit, relax constraint
+                low = mid
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,305 @@
+<NAME>
+stability_bundle_confidence_and_expected_penalty
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements:
+
+1) Improve router-side selection during flow-conservation by using a more principled expected-penalty simulation with dominance awareness. It simulates the two-tier scaling with confidence-dependent clip ceilings and HHI-based concentration penalty, then chooses the side (rx vs tx) with lower expected penalty. This reduces harmful concentration on dominant links and tends to yield more accurate counter repairs.
+
+2) Enrich confidence calibration with router stability and bundle-consistency terms, plus router-aware smoothing and a guarded penalty if router imbalance worsens after corrections. Specifically:
+   - Stability term reduces confidence for interfaces dominating a router’s traffic share.
+   - Bundle-consistency term rewards links closer to their bundle median residual.
+   - Router-aware smoothing gently harmonizes confidences across interfaces when little scaling occurred.
+   - Extra penalty if a clip occurred and the router imbalance worsened mid-to-final.
+
+These changes should improve both counter repair accuracy (safer side selection) and confidence calibration (better alignment with actual repair quality), boosting the combined score. The edits are localized and maintain all I/O contracts.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Choose side via expected-penalty simulation with dominance awareness
+        def side_penalty(side: str) -> float:
+            vals = [(i, (hardened_rx[i] if side == 'rx' else hardened_tx[i]),
+                     clamp01(conf_rx[i] if side == 'rx' else conf_tx[i]))
+                    for i in up_ifs]
+            w = {i: (1.0 - c) * max(v, ZERO_THRESH) for (i, v, c) in vals}
+            total_w = sum(w.values()) or 1.0
+            order = sorted(up_ifs, key=lambda x: w[x], reverse=True)
+            focus: List[str] = []
+            acc_w = 0.0
+            for i2 in order:
+                if acc_w / total_w >= WEIGHT_FOCUS:
+                    break
+                focus.append(i2)
+                acc_w += w[i2]
+            if not focus:
+                focus = list(up_ifs)
+                acc_w = total_w
+            sim_total = ((-imbalance) if side == 'rx' else imbalance) * DAMP_ROUTER
+            cap_per = DOMINANCE_CAP * acc_w
+            eff_w = {i3: min(w[i3], cap_per) for i3 in focus}
+            eff_total = sum(eff_w.values()) or 1.0
+            penalty = 0.0
+            hhi = sum((eff_w[i4] / eff_total) ** 2 for i4 in focus)
+            for i5 in focus:
+                vi = hardened_rx[i5] if side == 'rx' else hardened_tx[i5]
+                wi = eff_w[i5] / eff_total
+                adj_raw = sim_total * wi
+                cap = PER_LINK_CLIP * max(vi, ZERO_THRESH)
+                adj = max(-cap, min(cap, adj_raw))
+                penalty += abs(adj) / max(1.0, abs(vi)) + 0.5 * (1.0 - (conf_rx[i5] if side == 'rx' else conf_tx[i5]))
+            penalty += 0.05 * hhi * len(focus)
+            return penalty
+=======
+        # Choose side via expected-penalty simulation with dominance awareness
+        def side_penalty(side: str) -> float:
+            vals = [(i, (hardened_rx[i] if side == 'rx' else hardened_tx[i]),
+                     clamp01(conf_rx[i] if side == 'rx' else conf_tx[i]))
+                    for i in up_ifs]
+            # weights w_i = (1 - conf_i) * rate_i
+            w = {i: (1.0 - c) * max(v, ZERO_THRESH) for (i, v, c) in vals}
+            total_w = sum(w.values()) or 1.0
+            # Focused subset covering WEIGHT_FOCUS of total weight
+            order = sorted(up_ifs, key=lambda x: w[x], reverse=True)
+            focus: List[str] = []
+            acc_w = 0.0
+            for i2 in order:
+                if acc_w / total_w >= WEIGHT_FOCUS:
+                    break
+                focus.append(i2)
+                acc_w += w[i2]
+            if not focus:
+                focus = list(up_ifs)
+                acc_w = total_w
+            # Dominance-aware cap in focus
+            cap_per = DOMINANCE_CAP * acc_w
+            eff_w = {i3: min(w[i3], cap_per) for i3 in focus}
+            eff_total = sum(eff_w.values()) or 1.0
+            # HHI concentration metric
+            hhi = sum((eff_w[i4] / eff_total) ** 2 for i4 in focus)
+
+            # Simulate two-tier scaling using current weights
+            delta = (-imbalance if side == 'rx' else imbalance)
+            denom_k = 0.0
+            for i5 in focus:
+                vi = hardened_rx[i5] if side == 'rx' else hardened_tx[i5]
+                denom_k += vi * eff_w[i5]
+            k = 0.0 if denom_k == 0.0 else delta / (0.6 * denom_k)
+
+            penalty = 0.0
+            for i6 in focus:
+                vi = hardened_rx[i6] if side == 'rx' else hardened_tx[i6]
+                ci = clamp01(conf_rx[i6] if side == 'rx' else conf_tx[i6])
+                # confidence-dependent ceiling: 1.12 if conf < 0.70 else 1.10
+                clip_hi = 1.12 if ci < 0.70 else 1.10
+                scale_sim = 1.0 + 0.6 * k * eff_w[i6]
+                # apply lower bound and ceiling
+                scale_sim = max(0.90, min(clip_hi, scale_sim))
+                penalty += abs(scale_sim - 1.0) + 0.5 * (1.0 - ci)
+            # concentration cost
+            penalty += 0.05 * hhi
+            return penalty
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 4: Confidence calibration with scale penalty and peer smoothing
+    def compute_conf(i: str) -> Tuple[float, float]:
+        p = peer_of.get(i)
+        # Measurement residuals
+        r_meas_rx = rel_diff(hardened_rx[i], orig_rx[i])
+        r_meas_tx = rel_diff(hardened_tx[i], orig_tx[i])
+        # Link residuals
+        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
+            r_link_rx = rel_diff(hardened_rx[i], hardened_tx[p])
+            r_link_tx = rel_diff(hardened_tx[i], hardened_rx[p])
+        else:
+            r_link_rx = 0.2
+            r_link_tx = 0.2
+        # Router residual
+        rtr = router_residual.get(local_router_of.get(i), 0.0)
+        # Base confidence blend
+        base_rx = 1.0 - (0.55 * r_meas_rx + 0.35 * r_link_rx + 0.10 * rtr)
+        base_tx = 1.0 - (0.55 * r_meas_tx + 0.35 * r_link_tx + 0.10 * rtr)
+        base_rx = clamp01(base_rx)
+        base_tx = clamp01(base_tx)
+
+        # Scale-factor term (penalize big routed adjustments)
+        alpha_rx = abs(scaled_rx_factor.get(i, 1.0) - 1.0)
+        alpha_tx = abs(scaled_tx_factor.get(i, 1.0) - 1.0)
+        scale_term_rx = clamp01(1.0 - min(0.5, alpha_rx))
+        scale_term_tx = clamp01(1.0 - min(0.5, alpha_tx))
+
+        c_rx = clamp01(0.90 * base_rx + 0.10 * scale_term_rx)
+        c_tx = clamp01(0.90 * base_tx + 0.10 * scale_term_tx)
+
+        if status.get(i) != 'up':
+            c_rx = max(c_rx, 0.85)
+            c_tx = max(c_tx, 0.85)
+        return c_rx, c_tx
+=======
+    # Stage 4: Confidence calibration enriched with stability, bundle-consistency, scale penalty, and router/peer smoothing
+    # Pre-compute router totals per direction for stability term
+    router_sum_rx: Dict[str, float] = {}
+    router_sum_tx: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        ups = [i for i in ifs if status.get(i) == 'up']
+        router_sum_rx[r] = sum(hardened_rx.get(i, 0.0) for i in ups)
+        router_sum_tx[r] = sum(hardened_tx.get(i, 0.0) for i in ups)
+
+    # Pre-compute bundle median residuals for bundle-consistency
+    bundle_e_map_tx: Dict[Tuple[Any, Any], List[float]] = {}
+    bundle_e_map_rx: Dict[Tuple[Any, Any], List[float]] = {}
+    for a, b in link_pairs:
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        ra = local_router_of.get(a)
+        rb = local_router_of.get(b)
+        e1 = hardened_tx[a] - hardened_rx[b]
+        e2 = hardened_tx[b] - hardened_rx[a]
+        bundle_e_map_tx.setdefault((ra, rb), []).append(e1)
+        bundle_e_map_rx.setdefault((rb, ra), []).append(e2)
+
+    def _median_local(vals: List[float]) -> float:
+        s = sorted(vals)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        if n % 2 == 1:
+            return s[n // 2]
+        return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+    bundle_e_med_tx: Dict[Tuple[Any, Any], float] = {k: _median_local(v) for k, v in bundle_e_map_tx.items()}
+    bundle_e_med_rx: Dict[Tuple[Any, Any], float] = {k: _median_local(v) for k, v in bundle_e_map_rx.items()}
+
+    def compute_conf(i: str) -> Tuple[float, float]:
+        p = peer_of.get(i)
+        # Measurement residuals
+        r_meas_rx = rel_diff(hardened_rx[i], orig_rx[i])
+        r_meas_tx = rel_diff(hardened_tx[i], orig_tx[i])
+        # Link residuals
+        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
+            r_link_rx = rel_diff(hardened_rx[i], hardened_tx[p])
+            r_link_tx = rel_diff(hardened_tx[i], hardened_rx[p])
+        else:
+            r_link_rx = 0.2
+            r_link_tx = 0.2
+        # Router residual
+        rtr = router_residual.get(local_router_of.get(i), 0.0)
+        # Base confidence blend (slightly more weight to router residual than before)
+        base_rx = 1.0 - (0.53 * r_meas_rx + 0.33 * r_link_rx + 0.14 * rtr)
+        base_tx = 1.0 - (0.53 * r_meas_tx + 0.33 * r_link_tx + 0.14 * rtr)
+        base_rx = clamp01(base_rx)
+        base_tx = clamp01(base_tx)
+
+        # Scale-factor term (penalize big routed adjustments)
+        alpha_rx = abs(scaled_rx_factor.get(i, 1.0) - 1.0)
+        alpha_tx = abs(scaled_tx_factor.get(i, 1.0) - 1.0)
+        scale_term_rx = clamp01(1.0 - min(0.5, alpha_rx))
+        scale_term_tx = clamp01(1.0 - min(0.5, alpha_tx))
+
+        c_rx = clamp01(0.90 * base_rx + 0.10 * scale_term_rx)
+        c_tx = clamp01(0.90 * base_tx + 0.10 * scale_term_tx)
+
+        # Stability term: interfaces dominating router totals are less reliable
+        r_id = local_router_of.get(i)
+        sum_r_rx = max(1.0, router_sum_rx.get(r_id, 1.0))
+        sum_r_tx = max(1.0, router_sum_tx.get(r_id, 1.0))
+        share_rx = 0.0 if sum_r_rx <= 0 else hardened_rx[i] / sum_r_rx
+        share_tx = 0.0 if sum_r_tx <= 0 else hardened_tx[i] / sum_r_tx
+        stab_rx = clamp01(1.0 - 0.5 * share_rx)
+        stab_tx = clamp01(1.0 - 0.5 * share_tx)
+        c_rx = clamp01(c_rx + 0.05 * stab_rx)
+        c_tx = clamp01(c_tx + 0.05 * stab_tx)
+
+        # Bundle-consistency term: closeness to bundle median residual
+        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
+            lr = local_router_of.get(i)
+            rr = local_router_of.get(p)
+            e_tx = hardened_tx[i] - hardened_rx[p]
+            e_rx = hardened_rx[i] - hardened_tx[p]
+            med_tx = bundle_e_med_tx.get((lr, rr), 0.0)
+            med_rx = bundle_e_med_rx.get((lr, rr), 0.0)
+            bcons_tx = clamp01(1.0 - abs(e_tx - med_tx) / (abs(med_tx) + max(hardened_tx[i], 1.0)))
+            bcons_rx = clamp01(1.0 - abs(e_rx - med_rx) / (abs(med_rx) + max(hardened_rx[i], 1.0)))
+            c_tx = clamp01(c_tx + 0.06 * bcons_tx)
+            c_rx = clamp01(c_rx + 0.06 * bcons_rx)
+
+        # If interface is down, zero is a strong invariant; raise confidence floor
+        if status.get(i) != 'up':
+            c_rx = max(c_rx, 0.85)
+            c_tx = max(c_tx, 0.85)
+        return c_rx, c_tx
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Compute confidences
+    for i in telemetry:
+        cr, ct = compute_conf(i)
+        conf_rx[i], conf_tx[i] = cr, ct
+        # Clip-hit penalty when strong scaling occurred (>=10%) or cap hit
+        if abs(scaled_rx_factor.get(i, 1.0) - 1.0) >= 0.10 or clip_hit_rx.get(i, False):
+            conf_rx[i] = clamp01(conf_rx[i] * CLIP_HIT_PENALTY)
+        if abs(scaled_tx_factor.get(i, 1.0) - 1.0) >= 0.10 or clip_hit_tx.get(i, False):
+            conf_tx[i] = clamp01(conf_tx[i] * CLIP_HIT_PENALTY)
+        # Untouched boost when minimal change (<1%) and good final symmetry on link
+        p = peer_of.get(i)
+        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
+            if rel_diff(hardened_rx[i], orig_rx[i]) < 0.01:
+                if rel_diff(hardened_rx[i], hardened_tx[p]) <= adaptive_tau(hardened_rx[i], hardened_tx[p]):
+                    conf_rx[i] = min(0.98, conf_rx[i] + UNTOUCHED_BOOST)
+            if rel_diff(hardened_tx[i], orig_tx[i]) < 0.01:
+                if rel_diff(hardened_tx[i], hardened_rx[p]) <= adaptive_tau(hardened_tx[i], hardened_rx[p]):
+                    conf_tx[i] = min(0.98, conf_tx[i] + UNTOUCHED_BOOST)
+=======
+    # Compute confidences (preliminary)
+    for i in telemetry:
+        cr, ct = compute_conf(i)
+        conf_rx[i], conf_tx[i] = cr, ct
+
+    # Apply penalties for clip/strong scaling and if router imbalance worsened
+    for i in telemetry:
+        r_id = local_router_of.get(i)
+        if abs(scaled_rx_factor.get(i, 1.0) - 1.0) >= 0.10 or clip_hit_rx.get(i, False):
+            conf_rx[i] = clamp01(conf_rx[i] * CLIP_HIT_PENALTY)
+        if abs(scaled_tx_factor.get(i, 1.0) - 1.0) >= 0.10 or clip_hit_tx.get(i, False):
+            conf_tx[i] = clamp01(conf_tx[i] * CLIP_HIT_PENALTY)
+        # extra small penalty when both clipping and router got worse (mid -> final)
+        if router_residual.get(r_id, 0.0) > router_residual_mid.get(r_id, 0.0):
+            if clip_hit_rx.get(i, False):
+                conf_rx[i] = clamp01(conf_rx[i] * 0.97)
+            if clip_hit_tx.get(i, False):
+                conf_tx[i] = clamp01(conf_tx[i] * 0.97)
+
+    # Router-aware smoothing when |scale - 1| < 0.05
+    router_mean_conf_rx: Dict[str, float] = {}
+    router_mean_conf_tx: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        ups = [i for i in ifs if i in telemetry and status.get(i) == 'up']
+        if ups:
+            router_mean_conf_rx[r] = sum(conf_rx[i] for i in ups) / len(ups)
+            router_mean_conf_tx[r] = sum(conf_tx[i] for i in ups) / len(ups)
+    for i in telemetry:
+        r = local_router_of.get(i)
+        if abs(scaled_rx_factor.get(i, 1.0) - 1.0) < 0.05 and r in router_mean_conf_rx:
+            conf_rx[i] = clamp01(0.85 * conf_rx[i] + 0.15 * router_mean_conf_rx[r])
+        if abs(scaled_tx_factor.get(i, 1.0) - 1.0) < 0.05 and r in router_mean_conf_tx:
+            conf_tx[i] = clamp01(0.85 * conf_tx[i] + 0.15 * router_mean_conf_tx[r])
+
+    # Untouched boost when minimal change (<1%) and good final symmetry on link
+    for i in telemetry:
+        p = peer_of.get(i)
+        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
+            if rel_diff(hardened_rx[i], orig_rx[i]) < 0.01:
+                if rel_diff(hardened_rx[i], hardened_tx[p]) <= adaptive_tau(hardened_rx[i], hardened_tx[p]):
+                    conf_rx[i] = min(0.98, conf_rx[i] + UNTOUCHED_BOOST)
+            if rel_diff(hardened_tx[i], orig_tx[i]) < 0.01:
+                if rel_diff(hardened_tx[i], hardened_rx[p]) <= adaptive_tau(hardened_tx[i], hardened_rx[p]):
+                    conf_tx[i] = min(0.98, conf_tx[i] + UNTOUCHED_BOOST)
+>>>>>>> REPLACE
+</DIFF>

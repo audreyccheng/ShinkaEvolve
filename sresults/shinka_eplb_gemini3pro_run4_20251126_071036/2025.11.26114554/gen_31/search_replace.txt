@@ -1,0 +1,424 @@
+system
+I will implement the `lns_repacking_heuristic` which replaces the `balanced_packing` function with a Target-Aware Best-Fit Decreasing initialization followed by a Large Neighborhood Search (LNS) refinement loop that uses "Ruin and Recreate" on the heaviest and lightest packs (and potentially a random third pack) to improve load balancing.
+
+<NAME>
+lns_repacking_heuristic
+</NAME>
+
+<DESCRIPTION>
+I am replacing the `balanced_packing` function's logic.
+1.  **Initialization**: I use a "Target-Aware Best-Fit Decreasing" strategy. Items are sorted by weight descending. Each item is placed in the pack (with remaining capacity) that minimizes the absolute difference between the pack's new weight and the `target_average`. This tends to create very balanced initial solutions compared to just filling the lightest bin.
+2.  **Refinement**: I replace the pairwise swap logic with a **Large Neighborhood Search (LNS)** loop involving "Ruin and Recreate".
+    - In each iteration, I identify the heaviest (`max_p`) and lightest (`min_p`) packs.
+    - I attempt to **repack** the items from `max_p` and `min_p`. Repacking involves pooling their items and re-assigning them using the same Target-Aware Best-Fit Decreasing logic. This effectively finds optimal multi-item swaps between the two packs.
+    - If repacking just two packs doesn't yield an improvement, I escalate the neighborhood size by including a **random third pack**. This allows 3-way transfers (e.g., A->B->C->A) to resolve imbalances that 2-way exchanges cannot.
+    - This process is repeated for a fixed number of iterations (e.g., 50) or until convergence.
+    - This approach is computationally efficient (sorting small lists) and more powerful than single-item swaps.
+
+I am also retaining the CPU offloading optimization.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Handle trivial case where each pack gets exactly one item
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups,
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # Optimization: Process on CPU using standard Python lists for flexibility and speed in scalar logic
+    weight_cpu = weight.to("cpu", dtype=torch.float32)
+
+    # Pre-allocate output tensors
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64, device="cpu")
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64, device="cpu")
+
+    for i in range(num_layers):
+        row_w = weight_cpu[i]
+        total_weight = row_w.sum().item()
+        target_avg = total_weight / num_packs
+
+        # Prepare items: list of (original_index, weight)
+        items = []
+        for idx in range(num_groups):
+            items.append((idx, row_w[idx].item()))
+
+        # Sort items descending by weight (common for all heuristics)
+        items_desc = sorted(items, key=lambda x: x[1], reverse=True)
+
+        candidates = []
+
+        # --- Strategy 1: ZigZag (Snake) Packing ---
+        # Distribute items 0..M-1, then M-1..0, etc.
+        # This naturally pairs large with small items.
+        packs_zz = [[] for _ in range(num_packs)]
+        loads_zz = [0.0] * num_packs
+        for k, (idx, w) in enumerate(items_desc):
+            row = k // num_packs
+            col = k % num_packs
+            # Zig-zag mapping
+            bin_idx = col if (row % 2 == 0) else (num_packs - 1 - col)
+            packs_zz[bin_idx].append((idx, w))
+            loads_zz[bin_idx] += w
+        candidates.append((packs_zz, loads_zz))
+
+        # --- Strategy 2: Projected Best-Fit LPT ---
+        # Greedy allocation that accounts for remaining empty slots.
+        # We try to keep the "Projected Load" of all bins close to Target.
+        packs_plpt = [[] for _ in range(num_packs)]
+        loads_plpt = [0.0] * num_packs
+        caps_plpt = [groups_per_pack] * num_packs
+
+        current_rem_weight = total_weight
+        current_rem_count = num_groups
+
+        for idx, w in items_desc:
+            # Update remaining stats (excluding current item)
+            current_rem_weight -= w
+            current_rem_count -= 1
+            avg_rem = current_rem_weight / current_rem_count if current_rem_count > 0 else 0.0
+
+            best_p = -1
+            min_score = float('inf')
+
+            for p in range(num_packs):
+                if caps_plpt[p] > 0:
+                    # Score is deviation of (current + new + future_fill) from Target
+                    # Future fill assumption: remaining slots filled with average remaining weight
+                    proj_load = loads_plpt[p] + w + (caps_plpt[p] - 1) * avg_rem
+                    score = abs(proj_load - target_avg)
+                    if score < min_score:
+                        min_score = score
+                        best_p = p
+
+            packs_plpt[best_p].append((idx, w))
+            loads_plpt[best_p] += w
+            caps_plpt[best_p] -= 1
+
+        candidates.append((packs_plpt, loads_plpt))
+
+        # --- Evaluation and Refinement ---
+        best_diff_global = float('inf')
+        best_packing_global = None
+
+        for packs_init, loads_init in candidates:
+            # Create a working copy
+            current_packs = [list(p) for p in packs_init]
+            current_loads = list(loads_init)
+
+            # Iterative Improvement
+            # We specifically target the MAX load pack to reduce it.
+            max_iter = 20
+            for _ in range(max_iter):
+                # Identify Min and Max packs
+                min_p = 0
+                max_p = 0
+                min_v = current_loads[0]
+                max_v = current_loads[0]
+
+                for p in range(1, num_packs):
+                    v = current_loads[p]
+                    if v < min_v:
+                        min_v = v
+                        min_p = p
+                    if v > max_v:
+                        max_v = v
+                        max_p = p
+
+                diff = max_v - min_v
+                if diff < 1e-6:
+                    break
+
+                # We want to swap u (from max_p) with v (from other_p)
+                # Goal: reduce max_v.
+                # Ideally, we swap with min_p to also raise min_v (reduce range both ends).
+
+                best_swap = None
+
+                # 1. Try swapping with Min Pack (Most efficient for range reduction)
+                target_delta = diff / 2.0
+                best_gap_sq = diff * diff
+
+                p1 = max_p
+                p2 = min_p
+
+                # Check items to find u in max_p and v in min_p
+                for i1, (u, w_u) in enumerate(current_packs[p1]):
+                    for i2, (v, w_v) in enumerate(current_packs[p2]):
+                        delta = w_u - w_v
+                        # We need w_u > w_v (delta > 0) to reduce max
+                        if 0 < delta < diff:
+                            gap = abs(delta - target_delta)
+                            if gap * gap < best_gap_sq:
+                                best_gap_sq = gap * gap
+                                best_swap = (p1, p2, i1, i2, delta, u, w_u, v, w_v)
+                                if gap < 1e-5: break # Perfect swap
+                    if best_swap and best_gap_sq < 1e-10: break
+
+                # 2. If no good swap with Min, try Any Pack that allows reduction of Max
+                # A good swap with Min is usually one that brings us close to target.
+                # If the best swap with min is still poor (e.g. barely reduces max), look elsewhere.
+                if best_swap is None:
+                    # We iterate all other packs. We just want ANY valid reduction of Max.
+                    # Sort others by load ascending (lighter first)
+                    other_packs = sorted([p for p in range(num_packs) if p != max_p],
+                                         key=lambda k: current_loads[k])
+
+                    for p_other in other_packs:
+                        # Maximum allowed weight increase for p_other is strictly less than what makes it reach old max_v
+                        # We want: current_loads[p_other] + delta < max_v
+                        # So: delta < max_v - current_loads[p_other]
+                        limit = max_v - current_loads[p_other]
+                        if limit < 1e-6: continue
+
+                        local_best = None
+                        local_max_delta = -1.0 # We want max delta to reduce max_p as much as possible
+
+                        for i1, (u, w_u) in enumerate(current_packs[max_p]):
+                            for i2, (v, w_v) in enumerate(current_packs[p_other]):
+                                delta = w_u - w_v
+                                if 0 < delta < limit:
+                                    # Valid swap. Does it reduce max_p more?
+                                    if delta > local_max_delta:
+                                        local_max_delta = delta
+                                        local_best = (max_p, p_other, i1, i2, delta, u, w_u, v, w_v)
+
+                        if local_best:
+                            best_swap = local_best
+                            break # Take the first valid swap with a lighter bin (Greedy on bin order)
+
+                if best_swap:
+                    p_from, p_to, i_from, i_to, delta, u_idx, u_w, v_idx, v_w = best_swap
+                    current_packs[p_from][i_from] = (v_idx, v_w)
+                    current_packs[p_to][i_to] = (u_idx, u_w)
+                    current_loads[p_from] -= delta
+                    current_loads[p_to] += delta
+                else:
+                    break # No moves possible to alleviate Max Load
+
+            # Check final score for this candidate
+            final_max = max(current_loads)
+            final_min = min(current_loads)
+            final_diff = final_max - final_min
+
+            if final_diff < best_diff_global:
+                best_diff_global = final_diff
+                best_packing_global = current_packs
+                if best_diff_global < 1e-6:
+                    break # Optimal
+
+        # Write results
+        for p in range(num_packs):
+            for r, (idx, _) in enumerate(best_packing_global[p]):
+                pack_index[i, idx] = p
+                rank_in_pack[i, idx] = r
+
+    return pack_index.to(weight.device), rank_in_pack.to(weight.device)
+=======
+import random
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Handle trivial case where each pack gets exactly one item
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups,
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # Optimization: Process on CPU using standard Python lists for flexibility and speed in scalar logic
+    weight_cpu = weight.to("cpu", dtype=torch.float32)
+
+    # Pre-allocate output tensors
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64, device="cpu")
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64, device="cpu")
+
+    for i in range(num_layers):
+        row_w = weight_cpu[i]
+        total_weight = row_w.sum().item()
+        target_avg = total_weight / num_packs
+
+        # Prepare items: list of (original_index, weight)
+        items = []
+        for idx in range(num_groups):
+            items.append((idx, row_w[idx].item()))
+
+        # Sort items descending by weight
+        items_desc = sorted(items, key=lambda x: x[1], reverse=True)
+
+        # --- Initialization: Target-Aware Best-Fit Decreasing ---
+        # This tends to produce better balanced initial solutions than pure Least-Loaded Best-Fit
+        current_packs = [[] for _ in range(num_packs)]
+        current_loads = [0.0] * num_packs
+        # We also need to track available slots if we were using a different method,
+        # but here we can just check len(pack)
+
+        for item in items_desc:
+            w = item[1]
+            best_p = -1
+            min_dist = float('inf')
+
+            # Find pack where adding this item gets us closest to target
+            for p in range(num_packs):
+                if len(current_packs[p]) < groups_per_pack:
+                    new_load = current_loads[p] + w
+                    dist = abs(new_load - target_avg)
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_p = p
+
+            current_packs[best_p].append(item)
+            current_loads[best_p] += w
+
+        # --- Refinement: Large Neighborhood Search (Ruin and Recreate) ---
+        # Instead of single swaps, we take 2 or 3 packs, pool their items, and repack them.
+
+        max_iters = 50
+        no_improv_limit = 5
+        no_improv_count = 0
+
+        best_diff = max(current_loads) - min(current_loads)
+
+        for _ in range(max_iters):
+            if best_diff < 1e-6:
+                break
+
+            # Identify critical packs
+            min_p = 0
+            max_p = 0
+            min_v = current_loads[0]
+            max_v = current_loads[0]
+
+            for p in range(1, num_packs):
+                v = current_loads[p]
+                if v < min_v:
+                    min_v = v
+                    min_p = p
+                elif v > max_v:
+                    max_v = v
+                    max_p = p
+
+            # Select packs to "ruin"
+            packs_to_repack = [max_p, min_p]
+
+            # Heuristic: if stuck, include a random 3rd pack to allow 3-way transfers
+            # We use a randomized strategy: mostly just max/min, sometimes 3 packs
+            if no_improv_count >= 2 and num_packs > 2:
+                # Pick a random pack distinct from max_p and min_p
+                others = [p for p in range(num_packs) if p != max_p and p != min_p]
+                if others:
+                    p3 = random.choice(others)
+                    packs_to_repack.append(p3)
+
+            # "Ruin": Collect items
+            pooled_items = []
+            for p in packs_to_repack:
+                pooled_items.extend(current_packs[p])
+
+            # Sort descending for Best-Fit
+            pooled_items.sort(key=lambda x: x[1], reverse=True)
+
+            # "Recreate": Target-Aware Best Fit on the subset
+            # We create temporary structures
+            temp_packs = {p: [] for p in packs_to_repack}
+            temp_loads = {p: 0.0 for p in packs_to_repack}
+
+            # Calculate local target for these packs to preserve sum
+            local_total = sum(item[1] for item in pooled_items)
+            local_target = local_total / len(packs_to_repack)
+
+            valid_repack = True
+            for item in pooled_items:
+                w = item[1]
+                best_sub_p = -1
+                min_sub_dist = float('inf')
+
+                # Find best pack among the chosen ones
+                for p in packs_to_repack:
+                    if len(temp_packs[p]) < groups_per_pack:
+                        new_load = temp_loads[p] + w
+                        dist = abs(new_load - local_target)
+                        if dist < min_sub_dist:
+                            min_sub_dist = dist
+                            best_sub_p = p
+
+                if best_sub_p == -1:
+                    valid_repack = False
+                    break
+
+                temp_packs[best_sub_p].append(item)
+                temp_loads[best_sub_p] += w
+
+            if valid_repack:
+                # Check if this move improved the global state by tentatively updating
+                prev_loads = [current_loads[p] for p in packs_to_repack]
+                for p in packs_to_repack:
+                    current_loads[p] = temp_loads[p]
+
+                new_global_max = max(current_loads)
+                new_global_min = min(current_loads)
+                new_global_diff = new_global_max - new_global_min
+
+                if new_global_diff < best_diff - 1e-6:
+                    # Improvement accepted
+                    best_diff = new_global_diff
+                    for p in packs_to_repack:
+                        current_packs[p] = temp_packs[p]
+                    no_improv_count = 0
+                else:
+                    # Revert
+                    for i, p in enumerate(packs_to_repack):
+                        current_loads[p] = prev_loads[i]
+                    no_improv_count += 1
+            else:
+                no_improv_count += 1
+
+            if no_improv_count >= no_improv_limit:
+                 break
+
+        # Write results
+        for p in range(num_packs):
+            for r, (idx, _) in enumerate(current_packs[p]):
+                pack_index[i, idx] = p
+                rank_in_pack[i, idx] = r
+
+    return pack_index.to(weight.device), rank_in_pack.to(weight.device)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,223 @@
+<NAME>
+improved_packing_lb
+</NAME>
+
+<DESCRIPTION>
+This edit improves the performance and solution quality of the model placement algorithm by refining the binary search bounds and the feasibility check heuristic.
+
+1.  **Lower Bound Calculation**: Instead of starting `low=0.0`, we calculate a rigorous lower bound (LB) for the KVPR target `K`. This is derived from the global capacity constraint ($K \ge \sum w / (N \cdot C - \sum s)$) and item-wise constraints ($K \ge w_i / (C - s_i)$). A tighter lower bound reduces the search space for the binary search, allowing it to converge faster or more accurately within fixed iterations.
+
+2.  **Failure-Driven Prioritization**: In the randomized packing strategy, instead of relying solely on random shuffling, we implement an adaptive approach. When a packing attempt fails, the item that caused the failure is identified and moved to the front of the queue for the next attempt. This explicitly addresses "bottleneck" items that are hard to place, increasing the success rate of the feasibility check for tight `K` values.
+
+3.  **Asymptotic Pressure Key**: A new deterministic sort key `w / (C - s)` is added. This heuristic prioritizes items that exert high pressure on a bin's remaining capacity, ensuring they are placed early when bins are empty.
+
+These changes aim to improve the `max_kvpr` score by finding better placements and reducing execution time via smarter search bounds and packing heuristics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Feasibility Check (Multi-Heuristic Greedy)
+    def check_placement(k_target):
+        lin_cap = k_target * GPU_MEM_SIZE
+
+        def try_pack(ordered_items):
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for item in ordered_items:
+                w, s = item['w'], item['s']
+                v_lin = w + k_target * s
+
+                best_idx = -1
+                best_fill = -1.0
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    # Physical Check
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    # KVPR Check: (current_w + w) + K*(current_s + s) <= K*C
+                    # <=> current_lin + v_lin <= lin_cap
+                    lin_load = b['w'] + k_target * b['s']
+                    if lin_load + v_lin > lin_cap + 1e-7: continue
+
+                    # Best Fit: Maximize current linearized load
+                    if lin_load > best_fill:
+                        best_fill = lin_load
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['w'] += w
+                    bins[best_idx]['s'] += s
+                    bins[best_idx]['items'].append(item['m'])
+                else:
+                    return None
+            return {i: bins[i]['items'] for i in range(gpu_num)}
+
+        # A. Deterministic Sort Strategies
+        keys = [
+            lambda x: x['w'] + k_target * x['s'],   # Linearized Cost
+            lambda x: x['s'],                       # Physical Size
+            lambda x: x['w'],                       # Weight
+            lambda x: x['w'] / (x['s'] + 1e-9)      # Density
+        ]
+
+        for key in keys:
+            res = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # B. Randomized Strategy
+        # Perturb the Linearized Cost key
+        rng = random.Random(42 + int(k_target * 100))
+        base_key = lambda x: x['w'] + k_target * x['s']
+
+        for _ in range(50):
+            # Add noise to the key: key * uniform(0.9, 1.1)
+            noisy_items = []
+            for item in items:
+                score = base_key(item) * rng.uniform(0.9, 1.1)
+                noisy_items.append((score, item))
+
+            noisy_items.sort(key=lambda x: x[0], reverse=True)
+            res = try_pack([x[1] for x in noisy_items])
+            if res: return res
+
+        return None
+
+    # 4. Binary Search Driver
+    high = 1e9
+
+    # Initial valid solution
+    best_placement = check_placement(high)
+    if best_placement is None:
+        raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+
+    # Initial Optimization
+    best_placement = local_optimize(best_placement)
+    high = get_max_kvpr(best_placement)
+    low = 0.0
+
+    for _ in range(30):
+        mid = (low + high) / 2
+        res = check_placement(mid)
+        if res:
+            res = local_optimize(res)
+            mx = get_max_kvpr(res)
+            if mx < get_max_kvpr(best_placement):
+                best_placement = res
+            high = min(mid, mx)
+        else:
+            low = mid
+=======
+    # 3. Feasibility Check (Multi-Heuristic Greedy with Failure Learning)
+    def check_placement(k_target):
+        lin_cap = k_target * GPU_MEM_SIZE
+
+        # Returns (placement, failed_item_index)
+        def try_pack(ordered_items):
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for idx, item in enumerate(ordered_items):
+                w, s = item['w'], item['s']
+                v_lin = w + k_target * s
+
+                best_idx = -1
+                best_fill = -1.0
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+
+                    lin_load = b['w'] + k_target * b['s']
+                    if lin_load + v_lin > lin_cap + 1e-7: continue
+
+                    if lin_load > best_fill:
+                        best_fill = lin_load
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['w'] += w
+                    bins[best_idx]['s'] += s
+                    bins[best_idx]['items'].append(item['m'])
+                else:
+                    return None, idx
+            return {i: bins[i]['items'] for i in range(gpu_num)}, None
+
+        # A. Deterministic Strategies
+        pressure_key = lambda x: x['w'] / (GPU_MEM_SIZE - x['s'] + 1e-9)
+        keys = [
+            lambda x: x['w'] + k_target * x['s'],
+            pressure_key,
+            lambda x: x['s'],
+            lambda x: x['w'] / (x['s'] + 1e-9)
+        ]
+
+        for key in keys:
+            res, _ = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # B. Adaptive Randomized Strategy
+        rng = random.Random(42 + int(k_target * 100))
+        base_key = lambda x: x['w'] + k_target * x['s']
+        current_items = sorted(items, key=lambda x: base_key(x), reverse=True)
+
+        for i in range(40):
+            if i < 10:
+                # Noisy perturbation first
+                noisy = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+                res, _ = try_pack(noisy)
+                if res: return res
+                if i == 9: current_items = list(noisy)
+                continue
+
+            # Failure-Driven Adaptation
+            res, fail_idx = try_pack(current_items)
+            if res: return res
+
+            # Move failed item to front
+            failed_item = current_items.pop(fail_idx)
+            current_items.insert(0, failed_item)
+
+            # Occasional shuffle to escape local loops
+            if i % 5 == 0:
+                a = rng.randint(1, len(current_items)-2)
+                b = rng.randint(a+1, len(current_items))
+                sub = current_items[a:b]
+                rng.shuffle(sub)
+                current_items[a:b] = sub
+
+        return None
+
+    # 4. Binary Search Driver
+
+    # Calculate Lower Bound
+    total_w = sum(x['w'] for x in items)
+    total_s = sum(x['s'] for x in items)
+    rem_global = gpu_num * GPU_MEM_SIZE - total_s
+    lb = total_w / rem_global if rem_global > 1e-9 else 0.0
+    for x in items:
+        rem = GPU_MEM_SIZE - x['s']
+        if rem > 1e-9: lb = max(lb, x['w'] / rem)
+
+    high = 1e9
+    best_placement = check_placement(high)
+    if best_placement is None:
+        raise ValueError("Unable to place models on GPUs.")
+
+    best_placement = local_optimize(best_placement)
+    high = min(high, get_max_kvpr(best_placement))
+    low = lb
+
+    for _ in range(25):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+        res = check_placement(mid)
+        if res:
+            res = local_optimize(res)
+            mx = get_max_kvpr(res)
+            if mx < get_max_kvpr(best_placement):
+                best_placement = res
+            high = min(mid, mx)
+        else:
+            low = mid
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,152 @@
+<NAME>
+two_pass_micro_resync_and_router_residual_fix
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements:
+
+1) Add a second, conservative micro re-sync pass (Stage 3.6) to close stubborn per-link residuals that remain after the existing re-sync, but only when both adjacent routers are already within tolerance. The pass adjusts only the lower-confidence side of each offending direction, skips any interface that hit clip/strong scaling, applies a halved gain with a tighter absolute cap (±1% of local reference), and uses a small confidence attenuation. This improves counter accuracy while maintaining strong safety and confidence calibration.
+
+2) Fix a small bug in the final router residual computation that mistakenly included down interfaces. This improves the accuracy of the router residual used in the confidence model, resulting in better-calibrated confidence scores.
+
+Both changes are consistent with the existing design: they leverage the current Hodor-style validation invariants (symmetry and flow conservation), use the already-computed router residuals for gating, and respect existing guards (clip flags and strong scaling thresholds).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    CLIP_HIT_PENALTY = 0.95  # confidence penalty multiplier when clipping/strong scaling hit
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+=======
+    CLIP_HIT_PENALTY = 0.95  # confidence penalty multiplier when clipping/strong scaling hit
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+    # Second micro re-sync pass parameters
+    RESYNC2_CAP_FRAC = 0.01  # per-move absolute cap as fraction of local reference (±1%)
+    RESYNC2_GAIN = 0.50      # halved gain relative to Stage 3
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 3.8: Dispersion-aware bundle finishing with per-router zero-sum enforcement
+=======
+    # Stage 3.6: Two-pass, saturating micro re-sync for stubborn residuals
+    # Only when both adjacent routers are within tolerance; adjust lower-confidence side,
+    # skip any interface flagged strong_scaled or clip-hit in Stage 2, and cap per-move to ±1% of local ref.
+    def routers_balanced(i_a: str, i_b: str) -> bool:
+        ra = local_router_of.get(i_a)
+        rb = local_router_of.get(i_b)
+        na = len([i for i in router_ifaces.get(ra, []) if status.get(i) == 'up'])
+        nb = len([i for i in router_ifaces.get(rb, []) if status.get(i) == 'up'])
+        tau_ra = min(0.07, max(0.03, 0.05 * (2.0 / max(2, na)) ** 0.5))
+        tau_rb = min(0.07, max(0.03, 0.05 * (2.0 / max(2, nb)) ** 0.5))
+        return router_residual_mid.get(ra, 0.0) <= tau_ra and router_residual_mid.get(rb, 0.0) <= tau_rb
+
+    for a, b in link_pairs:
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        if not routers_balanced(a, b):
+            continue
+
+        # Direction 1: a.tx vs b.rx
+        a_tx, b_rx = hardened_tx[a], hardened_rx[b]
+        if max(a_tx, b_rx) > ZERO_EPS:
+            d1 = rel_diff(a_tx, b_rx)
+            tau1 = adaptive_tau(a_tx, b_rx)
+            if d1 > 1.5 * tau1:
+                ca, cb = conf_tx.get(a, 0.6), conf_rx.get(b, 0.6)
+                # choose lower-confidence side that didn't hit clip/strong scaling
+                can_move_b = (not clip_hit_rx.get(b, False)) and (abs(scaled_rx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD)
+                can_move_a = (not clip_hit_tx.get(a, False)) and (abs(scaled_tx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD)
+                move_b = (cb <= ca) and can_move_b
+                move_a = (ca < cb) and can_move_a
+                # fallback: if preferred side blocked, try the other if allowed
+                if not move_b and not move_a:
+                    move_b = can_move_b
+                    move_a = (not move_b) and can_move_a
+                gap_norm = clamp01((d1 - tau1) / max(tau1, 1e-9))
+                f2 = RESYNC2_GAIN * min(0.20, gap_norm)
+                if move_b and f2 > 0.0:
+                    old = b_rx
+                    target = a_tx
+                    step = nudge_toward_mean(old, target, f2)
+                    cap_abs2 = RESYNC2_CAP_FRAC * max(old, 1.0)
+                    new = max(0.0, min(old + cap_abs2, max(old - cap_abs2, step)))
+                    hardened_rx[b] = new
+                    # modest confidence attenuation
+                    conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.15 * rel_diff(new, old)))
+                elif move_a and f2 > 0.0:
+                    old = a_tx
+                    target = b_rx
+                    step = nudge_toward_mean(old, target, f2)
+                    cap_abs2 = RESYNC2_CAP_FRAC * max(old, 1.0)
+                    new = max(0.0, min(old + cap_abs2, max(old - cap_abs2, step)))
+                    hardened_tx[a] = new
+                    conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.15 * rel_diff(new, old)))
+
+        # Direction 2: a.rx vs b.tx
+        a_rx, b_tx = hardened_rx[a], hardened_tx[b]
+        if max(a_rx, b_tx) > ZERO_EPS:
+            d2 = rel_diff(a_rx, b_tx)
+            tau2 = adaptive_tau(a_rx, b_tx)
+            if d2 > 1.5 * tau2:
+                ca, cb = conf_rx.get(a, 0.6), conf_tx.get(b, 0.6)
+                can_move_b = (not clip_hit_tx.get(b, False)) and (abs(scaled_tx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD)
+                can_move_a = (not clip_hit_rx.get(a, False)) and (abs(scaled_rx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD)
+                move_b = (cb <= ca) and can_move_b
+                move_a = (ca < cb) and can_move_a
+                if not move_b and not move_a:
+                    move_b = can_move_b
+                    move_a = (not move_b) and can_move_a
+                gap_norm = clamp01((d2 - tau2) / max(tau2, 1e-9))
+                f2 = RESYNC2_GAIN * min(0.20, gap_norm)
+                if move_b and f2 > 0.0:
+                    old = b_tx
+                    target = a_rx
+                    step = nudge_toward_mean(old, target, f2)
+                    cap_abs2 = RESYNC2_CAP_FRAC * max(old, 1.0)
+                    new = max(0.0, min(old + cap_abs2, max(old - cap_abs2, step)))
+                    hardened_tx[b] = new
+                    conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.15 * rel_diff(new, old)))
+                elif move_a and f2 > 0.0:
+                    old = a_rx
+                    target = b_tx
+                    step = nudge_toward_mean(old, target, f2)
+                    cap_abs2 = RESYNC2_CAP_FRAC * max(old, 1.0)
+                    new = max(0.0, min(old + cap_abs2, max(old - cap_abs2, step)))
+                    hardened_rx[a] = new
+                    conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.15 * rel_diff(new, old)))
+
+    # Stage 3.8: Dispersion-aware bundle finishing with per-router zero-sum enforcement
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Compute router residuals after all adjustments (for confidence calibration)
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if i in telemetry]
+        if not up_ifs:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+=======
+    # Compute router residuals after all adjustments (for confidence calibration)
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if not up_ifs:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+>>>>>>> REPLACE
+
+</DIFF>

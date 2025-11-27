@@ -1,0 +1,419 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+from collections import deque
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+class CostOracle:
+    """
+    Shared memoized evaluator with:
+    - cost_cache: sequence -> cost
+    - delta_cache: (prefix_tuple, cand) -> Δ cost = cost(prefix+[cand]) - cost(prefix)
+    Optionally limits cache size with simple eviction.
+    """
+    def __init__(self, workload, max_cost_cache=250000, max_delta_cache=300000):
+        self.workload = workload
+        self.cost_cache = {}
+        self.delta_cache = {}
+        self.max_cost_cache = max_cost_cache
+        self.max_delta_cache = max_delta_cache
+        # Simple FIFO order for eviction
+        self.cost_q = deque()
+        self.delta_q = deque()
+
+    def _evict_if_needed(self, which):
+        if which == 'cost' and len(self.cost_cache) > self.max_cost_cache:
+            for _ in range(len(self.cost_cache) - self.max_cost_cache):
+                if not self.cost_q:
+                    break
+                key = self.cost_q.popleft()
+                self.cost_cache.pop(key, None)
+        elif which == 'delta' and len(self.delta_cache) > self.max_delta_cache:
+            for _ in range(len(self.delta_cache) - self.max_delta_cache):
+                if not self.delta_q:
+                    break
+                key = self.delta_q.popleft()
+                self.delta_cache.pop(key, None)
+
+    def evaluate(self, seq):
+        key = tuple(seq)
+        if key in self.cost_cache:
+            return self.cost_cache[key]
+        c = self.workload.get_opt_seq_cost(seq)
+        self.cost_cache[key] = c
+        self.cost_q.append(key)
+        self._evict_if_needed('cost')
+        return c
+
+    def delta(self, prefix, cand):
+        key = (tuple(prefix), cand)
+        if key in self.delta_cache:
+            return self.delta_cache[key]
+        c_prev = self.evaluate(prefix)
+        c_new = self.evaluate(prefix + [cand])
+        d = c_new - c_prev
+        self.delta_cache[key] = d
+        self.delta_q.append(key)
+        self._evict_if_needed('delta')
+        return d
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    A*-guided beam search with marginal Δ ordering, lower-bound pruning, and local polishing.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Controls exploration budget (beam width, branching, restarts)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+
+    # Seed RNG deterministically per workload size with slight time salt for diversity
+    rng = random.Random(1729 + n * 17)
+    rng.seed((1729 + n * 17) ^ (int(time.time() * 1000) & 0xFFFF))
+
+    oracle = CostOracle(workload)
+
+    # Precompute singleton costs and some ordering helpers
+    singleton_costs = [oracle.evaluate([i]) for i in range(n)]
+    txns = list(range(n))
+
+    # Some cheap stats
+    sorted_singletons_asc = sorted(txns, key=lambda t: (singleton_costs[t], t))
+    sorted_singletons_desc = list(reversed(sorted_singletons_asc))
+
+    # Adaptive parameters from num_seqs and size
+    base_beam = max(8, min(30, int(1.25 * (num_seqs if num_seqs else 10))))
+    base_branch = max(6, min(18, n // 6 + 6))
+    restarts = 3
+
+    # Restarts diversify the widths/branches slightly
+    restart_profiles = [
+        (int(base_beam * 1.25), max(4, int(base_branch * 0.8))),
+        (base_beam, base_branch),
+        (max(6, int(base_beam * 0.8)), int(base_branch * 1.2)),
+    ]
+
+    # Lower bound h(remaining) = max singleton cost among remaining txns
+    def lower_bound_max_singleton(remaining_set):
+        if not remaining_set:
+            return 0
+        maxi = 0
+        # remaining_set is a frozenset or set
+        for t in remaining_set:
+            c = singleton_costs[t]
+            if c > maxi:
+                maxi = c
+        return maxi
+
+    # Greedy completion from a prefix guided by marginal Δ and fast lookahead
+    def greedy_complete(prefix, remaining):
+        seq = list(prefix)
+        rem = set(remaining)
+        g = oracle.evaluate(seq)
+        while rem:
+            # rank by Δ
+            deltas = []
+            for t in rem:
+                d = oracle.delta(seq, t)
+                deltas.append((d, t))
+            deltas.sort(key=lambda x: (x[0], x[1]))
+            # two-step lookahead among cheapest few
+            topk = min(4, len(deltas))
+            best_t = deltas[0][1]
+            best_metric = float('inf')
+            for i in range(topk):
+                t1 = deltas[i][1]
+                d1 = deltas[i][0]
+                if len(rem) == 1:
+                    metric = g + d1
+                else:
+                    # pick cheapest next Δ after t1
+                    rem2 = rem - {t1}
+                    best_next = float('inf')
+                    cnt = 0
+                    for u in rem2:
+                        du = oracle.delta(seq + [t1], u)
+                        if du < best_next:
+                            best_next = du
+                        cnt += 1
+                        if cnt >= 8:
+                            # partial sampling for speed when many remain
+                            pass
+                    metric = g + d1 + (best_next if best_next != float('inf') else 0)
+                if metric < best_metric:
+                    best_metric = metric
+                    best_t = t1
+            # commit best_t
+            g += oracle.delta(seq, best_t)
+            seq.append(best_t)
+            rem.remove(best_t)
+        return g, seq
+
+    # Beam+A* search returning an incumbent
+    def run_beam_astar(beam_width, branch_factor):
+        # Initial seeds: mix best, worst, and random singletons
+        seeds = []
+        k_each = max(2, min(6, beam_width // 3))
+        seeds.extend(sorted_singletons_asc[:k_each])
+        seeds.extend(sorted_singletons_desc[:k_each])
+        remaining_slots = max(0, beam_width - len(seeds))
+        if remaining_slots > 0:
+            rnd = txns[:]
+            rng.shuffle(rnd)
+            seeds.extend(rnd[:remaining_slots])
+        seeds = list(dict.fromkeys(seeds))[:beam_width]  # unique and cap
+
+        beam = []
+        incumbent_cost = float('inf')
+        incumbent_seq = None
+
+        # initialize beam entries: (f, g, seq, remaining)
+        for s in seeds:
+            seq = [s]
+            remaining = frozenset(set(txns) - {s})
+            g = oracle.evaluate(seq)
+            h = lower_bound_max_singleton(remaining)
+            f = max(g, h)
+            beam.append((f, g, seq, remaining))
+
+        # Early greedy completion to tighten incumbent
+        if beam:
+            f0, g0, seq0, rem0 = min(beam, key=lambda x: x[0])
+            cand_cost, cand_seq = greedy_complete(seq0, rem0)
+            if cand_cost < incumbent_cost:
+                incumbent_cost, incumbent_seq = cand_cost, cand_seq
+
+        depth = 1
+        while depth < n and beam:
+            next_beam = []
+            seen = set()
+            # rank beam by f then g
+            beam.sort(key=lambda x: (x[0], x[1]))
+            for (f, g, seq, remaining) in beam:
+                if not remaining:
+                    # complete
+                    if g < incumbent_cost:
+                        incumbent_cost, incumbent_seq = g, seq
+                    next_beam.append((f, g, seq, remaining))
+                    continue
+
+                # Candidate ranking by marginal Δ
+                deltas = []
+                for t in remaining:
+                    d = oracle.delta(seq, t)
+                    deltas.append((d, t))
+                deltas.sort(key=lambda x: (x[0], x[1]))
+
+                # Limit branching by top deltas
+                expand_list = [t for (_, t) in deltas[:min(branch_factor, len(deltas))]]
+
+                # Two-step lookahead to refine order for top few
+                refined = []
+                for t in expand_list[:min(6, len(expand_list))]:
+                    d1 = oracle.delta(seq, t)
+                    rem2 = remaining - {t}
+                    if not rem2:
+                        metric = g + d1
+                    else:
+                        # choose best next Δ
+                        best2 = float('inf')
+                        cnt = 0
+                        for u in rem2:
+                            du = oracle.delta(seq + [t], u)
+                            if du < best2:
+                                best2 = du
+                            cnt += 1
+                            if cnt >= 8:
+                                pass
+                        metric = g + d1 + (best2 if best2 != float('inf') else 0)
+                    refined.append((metric, t))
+                if refined:
+                    refined.sort(key=lambda x: (x[0], x[1]))
+                    top_refined = [t for (_, t) in refined]
+                    # merge: keep refined order first, then remaining chosen
+                    refined_set = set(top_refined)
+                    expand_order = top_refined + [t for t in expand_list if t not in refined_set]
+                else:
+                    expand_order = expand_list
+
+                # Expand
+                for t in expand_order:
+                    # exact new cost via Δ
+                    dg = oracle.delta(seq, t)
+                    g_new = g + dg
+                    rem_new = remaining - {t}
+                    h_new = lower_bound_max_singleton(rem_new)
+                    f_new = max(g_new, h_new)
+
+                    # prune by incumbent
+                    if f_new >= incumbent_cost:
+                        continue
+
+                    new_seq = seq + [t]
+                    key = tuple(new_seq)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+
+                    # Periodically perform greedy completion from best partial states
+                    # Here we opportunistically try on very promising nodes
+                    if len(rem_new) > 0 and (len(next_beam) < max(2, beam_width // 3)) and (f_new < incumbent_cost):
+                        comp_cost, comp_seq = greedy_complete(new_seq, rem_new)
+                        if comp_cost < incumbent_cost:
+                            incumbent_cost, incumbent_seq = comp_cost, comp_seq
+
+                    next_beam.append((f_new, g_new, new_seq, rem_new))
+
+            # Keep top-k beam entries
+            if not next_beam:
+                break
+            next_beam.sort(key=lambda x: (x[0], x[1]))
+            beam = next_beam[:beam_width]
+            depth += 1
+
+        # If we didn't get a complete sequence in beam, complete the best
+        if incumbent_seq is None and beam:
+            best_partial = min(beam, key=lambda x: (x[0], x[1]))
+            _, _, pseq, prem = best_partial
+            c, s = greedy_complete(pseq, prem)
+            incumbent_cost, incumbent_seq = c, s
+
+        return incumbent_cost, incumbent_seq
+
+    # Local polishing with cached evaluations
+    def local_polish(seq, base_cost):
+        best_seq = list(seq)
+        best_cost = base_cost
+        nloc = len(best_seq)
+
+        # Adjacent swap hill-climb (bounded passes)
+        for _ in range(2):
+            improved = False
+            for i in range(nloc - 1):
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = oracle.evaluate(cand)
+                if c < best_cost:
+                    best_seq, best_cost = cand, c
+                    improved = True
+            if not improved:
+                break
+
+        # Sampled insertion moves (bounded)
+        move_budget = min(120, max(40, nloc))
+        for _ in range(move_budget):
+            i, j = rng.sample(range(nloc), 2)
+            if i == j:
+                continue
+            cand = best_seq[:]
+            item = cand.pop(j)
+            cand.insert(i, item)
+            c = oracle.evaluate(cand)
+            if c < best_cost:
+                best_seq, best_cost = cand, c
+
+        return best_cost, best_seq
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    # Perform structured restarts with diversity
+    for ri in range(restarts):
+        beam_w, branch_f = restart_profiles[min(ri, len(restart_profiles) - 1)]
+        cost, seq = run_beam_astar(beam_w, branch_f)
+        # Local improvement
+        cost2, seq2 = local_polish(seq, cost)
+        if cost2 < global_best_cost:
+            global_best_cost, global_best_seq = cost2, seq2
+
+    return global_best_cost, global_best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 16)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 14)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 12)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

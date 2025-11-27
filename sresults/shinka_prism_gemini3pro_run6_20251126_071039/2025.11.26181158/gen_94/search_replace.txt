@@ -1,0 +1,322 @@
+<NAME>
+diversified_restarts
+</NAME>
+
+<DESCRIPTION>
+Improvements to the model placement algorithm:
+1. Enhanced Initialization: The `solve_packing` function now supports multiple heuristics ('best_fit', 'worst_fit', 'min_kvpr') to generate diverse initial solutions.
+2. Extended Restarts: Increased the number of restarts from 3 to 20 to better explore the solution space, leveraging the fast execution time.
+3. Randomized Parameter Sweep: During restarts, the algorithm now randomizes the linearization parameter `target_k` and item weights to escape local basins.
+4. Tighter Local Search: Increased iteration limit and adjusted pruning thresholds in the local search phase to fine-tune solutions further.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def solve_packing(target_k, randomize=False):
+        capacity = target_k * GPU_MEM_SIZE
+
+        # Base weights: L + K*S
+        items = []
+        for x in model_data:
+            w = x['l'] + target_k * x['s']
+            if randomize:
+                w *= random.uniform(0.95, 1.05)
+            items.append((w, x))
+
+        # Sort descending by weight
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins_l = [0.0] * gpu_num
+        bins_s = [0.0] * gpu_num
+        bins_items = [[] for _ in range(gpu_num)]
+
+        for _, item in items:
+            best_bin = -1
+            min_slack = float('inf')
+
+            item_w = item['l'] + target_k * item['s']
+
+            # Randomized start index for tie-breaking if randomize=True
+            indices = list(range(gpu_num))
+            if randomize:
+                random.shuffle(indices)
+
+            for b in indices:
+                if bins_s[b] + item['s'] >= GPU_MEM_SIZE - 1e-6:
+                    continue
+
+                current_bin_w = bins_l[b] + target_k * bins_s[b]
+                if current_bin_w + item_w <= capacity + 1e-9:
+                    slack = capacity - (current_bin_w + item_w)
+                    if slack < min_slack:
+                        min_slack = slack
+                        best_bin = b
+
+            if best_bin != -1:
+                bins_l[best_bin] += item['l']
+                bins_s[best_bin] += item['s']
+                bins_items[best_bin].append(item)
+            else:
+                return None
+
+        return bins_items
+
+    def get_kvpr(l, s):
+        if s >= GPU_MEM_SIZE - 1e-6: return 1e15
+        return l / (GPU_MEM_SIZE - s)
+
+    # --- Phase 1: Determine Baseline K ---
+    low, high = 0.0, 1.0
+    for _ in range(20):
+        if solve_packing(high) is not None: break
+        low = high
+        high *= 2.0
+    else: high = 1e9
+
+    for _ in range(20):
+        mid = (low + high) / 2
+        if solve_packing(mid) is not None: high = mid
+        else: low = mid
+    base_k = high
+
+    best_global_plc = None
+    best_global_score = float('inf')
+
+    # --- Phase 2: Multi-Start ILS ---
+    # Run 3 restarts
+    for restart in range(3):
+        # Generate initial solution
+        randomize = (restart > 0)
+        init_bins = solve_packing(base_k, randomize=randomize)
+
+        # If random packing fails at base_k, relax slightly or skip
+        if init_bins is None:
+            if restart == 0:
+                # Should not happen given Phase 1, but safety
+                init_bins = solve_packing(high * 1.01)
+                if init_bins is None: continue
+            else:
+                continue
+
+        # Convert to mutable state
+        gpu_states = []
+        for g in range(gpu_num):
+            items = init_bins[g]
+            g_l = sum(x['l'] for x in items)
+            g_s = sum(x['s'] for x in items)
+            gpu_states.append({'l': g_l, 's': g_s, 'items': list(items)})
+
+        current_max = max(get_kvpr(g['l'], g['s']) for g in gpu_states)
+
+        # Steepest Descent Local Search
+        iter_limit = 150
+        for _ in range(iter_limit):
+            if current_max < 1e-9: break
+
+            # Find bottleneck
+            max_val = -1.0
+            max_gpu = -1
+            gpu_kvprs = []
+            for g in range(gpu_num):
+                val = get_kvpr(gpu_states[g]['l'], gpu_states[g]['s'])
+                gpu_kvprs.append(val)
+                if val > max_val:
+                    max_val = val
+                    max_gpu = g
+
+            best_move = None
+            best_gain = 0.0
+
+            src = gpu_states[max_gpu]
+            src_n = len(src['items'])
+
+            # Function to eval move
+            def eval_state(s_l, s_s, t_l, t_s):
+                if s_s >= GPU_MEM_SIZE or t_s >= GPU_MEM_SIZE: return -1.0
+                nk_s = get_kvpr(s_l, s_s)
+                nk_t = get_kvpr(t_l, t_s)
+                new_peak = max(nk_s, nk_t)
+                if new_peak < current_max - 1e-7:
+                    return current_max - new_peak
+                return -1.0
+
+            # Scan targets
+            for t in range(gpu_num):
+                if t == max_gpu: continue
+                # Skip if target is already close to max (heuristic pruning)
+                if gpu_kvprs[t] > current_max * 0.95: continue
+
+                tgt = gpu_states[t]
+=======
+    def get_kvpr(l, s):
+        if s >= GPU_MEM_SIZE - 1e-6: return 1e15
+        return l / (GPU_MEM_SIZE - s)
+
+    def solve_packing(target_k, mode='best_fit', randomize=False):
+        capacity = target_k * GPU_MEM_SIZE
+
+        # Base weights: L + K*S
+        items = []
+        for x in model_data:
+            w = x['l'] + target_k * x['s']
+            if randomize:
+                w *= random.uniform(0.90, 1.10)
+            items.append((w, x))
+
+        # Sort descending by weight
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins_l = [0.0] * gpu_num
+        bins_s = [0.0] * gpu_num
+        bins_items = [[] for _ in range(gpu_num)]
+
+        for _, item in items:
+            best_bin = -1
+
+            # Setup metrics for comparison
+            if mode == 'best_fit':
+                best_val = float('inf') # Min slack
+            elif mode == 'worst_fit':
+                best_val = -1.0 # Max slack
+            else: # min_kvpr
+                best_val = float('inf') # Min resulting KVPR
+
+            item_w = item['l'] + target_k * item['s']
+
+            # Randomized start index
+            indices = list(range(gpu_num))
+            if randomize:
+                random.shuffle(indices)
+
+            for b in indices:
+                # Physical Check
+                if bins_s[b] + item['s'] >= GPU_MEM_SIZE - 1e-6:
+                    continue
+
+                # Linearized Constraint Check (soft check for min_kvpr but generally kept for feasibility)
+                current_bin_w = bins_l[b] + target_k * bins_s[b]
+                if current_bin_w + item_w > capacity + 1e-9:
+                    continue
+
+                if mode == 'best_fit':
+                    slack = capacity - (current_bin_w + item_w)
+                    if slack < best_val:
+                        best_val = slack
+                        best_bin = b
+                elif mode == 'worst_fit':
+                    slack = capacity - (current_bin_w + item_w)
+                    if slack > best_val:
+                        best_val = slack
+                        best_bin = b
+                else: # min_kvpr
+                    new_l = bins_l[b] + item['l']
+                    new_s = bins_s[b] + item['s']
+                    kvpr = get_kvpr(new_l, new_s)
+                    if kvpr < best_val:
+                        best_val = kvpr
+                        best_bin = b
+
+            if best_bin != -1:
+                bins_l[best_bin] += item['l']
+                bins_s[best_bin] += item['s']
+                bins_items[best_bin].append(item)
+            else:
+                return None
+
+        return bins_items
+
+    # --- Phase 1: Determine Baseline K ---
+    # We use Best Fit for finding K as it is most efficient at packing
+    low, high = 0.0, 1.0
+    for _ in range(20):
+        if solve_packing(high, mode='best_fit') is not None: break
+        low = high
+        high *= 2.0
+    else: high = 1e9
+
+    for _ in range(20):
+        mid = (low + high) / 2
+        if solve_packing(mid, mode='best_fit') is not None: high = mid
+        else: low = mid
+    base_k = high
+
+    best_global_plc = None
+    best_global_score = float('inf')
+
+    # --- Phase 2: Multi-Start ILS ---
+    strategies = ['best_fit', 'worst_fit', 'min_kvpr']
+
+    # Run 20 restarts for diversity
+    for restart in range(20):
+        # Strategy Selection
+        if restart == 0:
+            mode = 'best_fit'
+            k_factor = 1.0
+            rnd = False
+        else:
+            mode = random.choice(strategies)
+            k_factor = random.uniform(0.8, 1.3)
+            rnd = True
+
+        current_k = base_k * k_factor
+        init_bins = solve_packing(current_k, mode=mode, randomize=rnd)
+
+        # Fallback if aggressive parameters failed
+        if init_bins is None:
+            if restart == 0:
+                init_bins = solve_packing(high * 1.01, mode='best_fit', randomize=False)
+                if init_bins is None: continue
+            else:
+                continue
+
+        # Convert to mutable state
+        gpu_states = []
+        for g in range(gpu_num):
+            items = init_bins[g]
+            g_l = sum(x['l'] for x in items)
+            g_s = sum(x['s'] for x in items)
+            gpu_states.append({'l': g_l, 's': g_s, 'items': list(items)})
+
+        current_max = max(get_kvpr(g['l'], g['s']) for g in gpu_states)
+
+        # Steepest Descent Local Search
+        iter_limit = 200
+        for _ in range(iter_limit):
+            if current_max < 1e-9: break
+
+            # Find bottleneck
+            max_val = -1.0
+            max_gpu = -1
+            gpu_kvprs = []
+            for g in range(gpu_num):
+                val = get_kvpr(gpu_states[g]['l'], gpu_states[g]['s'])
+                gpu_kvprs.append(val)
+                if val > max_val:
+                    max_val = val
+                    max_gpu = g
+
+            best_move = None
+            best_gain = 0.0
+
+            src = gpu_states[max_gpu]
+            src_n = len(src['items'])
+
+            # Function to eval move
+            def eval_state(s_l, s_s, t_l, t_s):
+                if s_s >= GPU_MEM_SIZE or t_s >= GPU_MEM_SIZE: return -1.0
+                nk_s = get_kvpr(s_l, s_s)
+                nk_t = get_kvpr(t_l, t_s)
+                new_peak = max(nk_s, nk_t)
+                if new_peak < current_max - 1e-9:
+                    return current_max - new_peak
+                return -1.0
+
+            # Scan targets
+            for t in range(gpu_num):
+                if t == max_gpu: continue
+                # Skip if target is already close to max (heuristic pruning)
+                if gpu_kvprs[t] > current_max * 0.98: continue
+
+                tgt = gpu_states[t]
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,271 @@
+<NAME>
+tolerance_asymmetric_pair_reconcile_and_post_router_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to increase repair accuracy and confidence calibration:
+
+1) Rate-aware pair reconciliation with asymmetric partial moves:
+   - Replace hard, full-value substitutions on link reconciliation with tolerance-gated, asymmetric partial adjustments toward agreement.
+   - Use a traffic-aware tolerance and move the lower-trust side more (35%) and the higher-trust side less (20%), capped at 20% per interface.
+   - This reduces overcorrections and preserves good counters, improving both counter accuracy and calibration.
+
+2) Use post-repair router imbalance for confidence:
+   - Compute router imbalance after all edits and use it in the confidence router factor instead of pre-scaling imbalance.
+   - This better reflects the final state’s consistency, improving calibration.
+
+3) Explicit pair-edit magnitude penalty in confidence:
+   - Track per-interface relative deltas caused by pair reconciliation and subtract a small penalty proportional to the edit size (capped).
+   - This avoids overconfidence when large pair edits were needed.
+
+Additionally, I added helper functions clamp and pair_tolerance to support bounded moves and traffic-aware tolerances. All changes are local, preserve existing logic and interfaces, and leverage topology and invariants.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+=======
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def clamp(x: float, lo: float, hi: float) -> float:
+        return max(lo, min(hi, x))
+
+    def pair_tolerance(a: float, b: float) -> float:
+        # Traffic-aware tolerance to account for sampling skew; looser on tiny links
+        traffic = max(abs(a), abs(b), 1.0)
+        return max(HARDENING_THRESHOLD, 2.5 / traffic)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Only reconcile when both interfaces are locally up (we trust counters more in this case)
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Compute residuals after router scaling
+        tx_pair_resid = rel_diff(post[iface]['tx'], post[peer_id]['rx'])  # A.tx vs B.rx
+        rx_pair_resid = rel_diff(post[iface]['rx'], post[peer_id]['tx'])  # A.rx vs B.tx
+
+        # Suspicion metric combines pre link diffs, scale magnitude, and router imbalance
+        def suspicion(ifc: str, kind: str) -> float:
+            rid = telemetry.get(ifc, {}).get('local_router')
+            imb = router_imbalance.get(rid, 0.0)
+            if kind == 'tx':
+                return pre[ifc]['tx_link_diff'] + 0.5 * abs(scale_tx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+            else:
+                return pre[ifc]['rx_link_diff'] + 0.5 * abs(scale_rx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+
+        # Reconcile A.tx <-> B.rx if residual exceeds tolerance
+        if tx_pair_resid > HARDENING_THRESHOLD:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx if residual exceeds tolerance
+        if rx_pair_resid > HARDENING_THRESHOLD:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+=======
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Only reconcile when both interfaces are locally up (we trust counters more in this case)
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Compute residuals after router scaling (use rate-aware tolerances)
+        a_tx = post[iface]['tx']
+        a_rx = post[iface]['rx']
+        b_rx = post[peer_id]['rx']
+        b_tx = post[peer_id]['tx']
+        tx_pair_resid = rel_diff(a_tx, b_rx)  # A.tx vs B.rx
+        rx_pair_resid = rel_diff(a_rx, b_tx)  # A.rx vs B.tx
+        tol_tx = pair_tolerance(a_tx, b_rx)
+        tol_rx = pair_tolerance(a_rx, b_tx)
+
+        # Suspicion metric combines pre link diffs, scale magnitude, and router imbalance
+        def suspicion(ifc: str, kind: str) -> float:
+            rid = telemetry.get(ifc, {}).get('local_router')
+            imb = router_imbalance.get(rid, 0.0)
+            if kind == 'tx':
+                return pre[ifc]['tx_link_diff'] + 0.5 * abs(scale_tx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+            else:
+                return pre[ifc]['rx_link_diff'] + 0.5 * abs(scale_rx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+
+        # Reconcile A.tx <-> B.rx if residual exceeds tolerance using asymmetric partial moves
+        if tx_pair_resid > tol_tx:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            # Lower-trust side moves more
+            if a_tx_s >= b_rx_s:
+                move_a = 0.35 * (b_rx - a_tx)
+                move_b = 0.20 * (a_tx - b_rx)
+            else:
+                move_a = 0.20 * (b_rx - a_tx)
+                move_b = 0.35 * (a_tx - b_rx)
+            cap_a = 0.20 * max(a_tx, 1.0)
+            cap_b = 0.20 * max(b_rx, 1.0)
+            move_a = clamp(move_a, -cap_a, cap_a)
+            move_b = clamp(move_b, -cap_b, cap_b)
+            post[iface]['tx'] = max(0.0, a_tx + move_a)
+            post[peer_id]['rx'] = max(0.0, b_rx + move_b)
+
+        # Reconcile A.rx <-> B.tx if residual exceeds tolerance using asymmetric partial moves
+        # recompute with updated values
+        a_tx = post[iface]['tx']
+        a_rx = post[iface]['rx']
+        b_rx = post[peer_id]['rx']
+        b_tx = post[peer_id]['tx']
+        rx_pair_resid = rel_diff(a_rx, b_tx)
+        tol_rx = pair_tolerance(a_rx, b_tx)
+        if rx_pair_resid > tol_rx:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                move_a = 0.35 * (b_tx - a_rx)
+                move_b = 0.20 * (a_rx - b_tx)
+            else:
+                move_a = 0.20 * (b_tx - a_rx)
+                move_b = 0.35 * (a_rx - b_tx)
+            cap_a = 0.20 * max(a_rx, 1.0)
+            cap_b = 0.20 * max(b_tx, 1.0)
+            move_a = clamp(move_a, -cap_a, cap_a)
+            move_b = clamp(move_b, -cap_b, cap_b)
+            post[iface]['rx'] = max(0.0, a_rx + move_a)
+            post[peer_id]['tx'] = max(0.0, b_tx + move_b)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Determine which interfaces were edited during pair reconciliation
+    pair_edits: Dict[str, Dict[str, bool]] = {}
+    for iface in telemetry:
+        base = base_post[iface]
+        now = post[iface]
+        pair_edits[iface] = {
+            'rx_edited': abs(now['rx'] - base['rx']) > 1e-9,
+            'tx_edited': abs(now['tx'] - base['tx']) > 1e-9,
+        }
+=======
+    # Determine which interfaces were edited during pair reconciliation and by how much
+    pair_edits: Dict[str, Dict[str, float]] = {}
+    for iface in telemetry:
+        base = base_post[iface]
+        now = post[iface]
+        rx_delta = abs(now['rx'] - base['rx'])
+        tx_delta = abs(now['tx'] - base['tx'])
+        pair_edits[iface] = {
+            'rx_edited': rx_delta > 1e-9,
+            'tx_edited': tx_delta > 1e-9,
+            'rx_delta_rel': rx_delta / max(base['rx'], 1.0),
+            'tx_delta_rel': tx_delta / max(base['tx'], 1.0),
+        }
+
+    # Compute post-repair router imbalance for confidence calibration
+    router_imbalance_post: Dict[str, float] = {}
+    for router_id, if_list in topology.items():
+        up_ifaces = [i for i in if_list if i in telemetry and pre[i]['local_status'] == 'up']
+        if not up_ifaces:
+            router_imbalance_post[router_id] = 0.0
+            continue
+        sum_rx = sum(post[i]['rx'] for i in up_ifaces)
+        sum_tx = sum(post[i]['tx'] for i in up_ifaces)
+        denom = max(sum_rx, sum_tx, 1.0)
+        router_imbalance_post[router_id] = abs(sum_tx - sum_rx) / denom
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Router imbalance factor
+        router_id = data.get('local_router')
+        imbalance = router_imbalance.get(router_id, 0.0)
+        router_factor = max(0.2, 1.0 - imbalance)
+=======
+        # Router imbalance factor (post-repair)
+        router_id = data.get('local_router')
+        imbalance_post = router_imbalance_post.get(router_id, 0.0)
+        router_factor = max(0.2, 1.0 - imbalance_post)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Additional large-change penalties (complements multiplicative change factor)
+        if rx_change > 0.7:
+            rx_confidence -= 0.05
+        elif rx_change > 0.4:
+            rx_confidence -= 0.03
+        if tx_change > 0.7:
+            tx_confidence -= 0.05
+        elif tx_change > 0.4:
+            tx_confidence -= 0.03
+
+        # Bonus for untouched directions (no pre change, no scaling, no pair reconciliation)
+        rx_untouched = (not pre[iface]['pre_rx_changed']) and (s_dev_rx == 0.0) and (not pair_edits.get(iface, {}).get('rx_edited', False))
+        tx_untouched = (not pre[iface]['pre_tx_changed']) and (s_dev_tx == 0.0) and (not pair_edits.get(iface, {}).get('tx_edited', False))
+        if rx_untouched:
+            rx_confidence += 0.03
+        if tx_untouched:
+            tx_confidence += 0.03
+=======
+        # Additional large-change penalties (complements multiplicative change factor)
+        if rx_change > 0.7:
+            rx_confidence -= 0.05
+        elif rx_change > 0.4:
+            rx_confidence -= 0.03
+        if tx_change > 0.7:
+            tx_confidence -= 0.05
+        elif tx_change > 0.4:
+            tx_confidence -= 0.03
+
+        # Penalty proportional to pair reconciliation magnitude (calibration)
+        rx_confidence -= min(0.05, 0.25 * pair_edits.get(iface, {}).get('rx_delta_rel', 0.0))
+        tx_confidence -= min(0.05, 0.25 * pair_edits.get(iface, {}).get('tx_delta_rel', 0.0))
+
+        # Bonus for untouched directions (no pre change, no scaling, no pair reconciliation)
+        rx_untouched = (not pre[iface]['pre_rx_changed']) and (s_dev_rx == 0.0) and (not pair_edits.get(iface, {}).get('rx_edited', False))
+        tx_untouched = (not pre[iface]['pre_tx_changed']) and (s_dev_tx == 0.0) and (not pair_edits.get(iface, {}).get('tx_edited', False))
+        if rx_untouched:
+            rx_confidence += 0.03
+        if tx_untouched:
+            tx_confidence += 0.03
+>>>>>>> REPLACE
+</DIFF>

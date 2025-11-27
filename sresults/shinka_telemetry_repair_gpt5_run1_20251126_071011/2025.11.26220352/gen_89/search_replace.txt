@@ -1,0 +1,654 @@
+<NAME>
+elastic_guard_and_prestep_with_weighted_redistribution
+</NAME>
+
+<DESCRIPTION>
+I propose to improve counter repair accuracy and confidence calibration by enhancing the router-level flow conservation step with:
+- An elastic per-router delta guard that depends on current imbalance and trust gap (protects against overcorrection).
+- A targeted multiplicative pre-step applied only to lower-trust/high-residual ports with bounded per-interface change.
+- A richer, traffic-aware weighting function in the additive redistribution that includes pair residuals, with tiny-link protection and per-pass reweighting when a port has consumed most of its cap.
+- Tracking of per-interface edits and cap hits and recording router-scale signals for later confidence calibration.
+- Refinements to the final confidence computation: dynamic edit penalty weights, penalties when router scaling is high or guard is nearly exhausted, cap-consumption penalties, and an improvement bonus when both pair residuals and router imbalance improve substantially.
+
+These changes follow the Hodor validation/repair principles and the provided recommendations, aiming to improve both repair quality and confidence calibration without overly aggressive edits. The topology remains utilized to enforce router-level conservation and link symmetry.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    # Small traffic level used to infer link up when statuses disagree (Mbps)
+    TRAFFIC_EVIDENCE_MIN = 0.5
+    # Max fractional per-interface adjustment during router redistribution
+    MAX_ROUTER_ADJ_FRAC = 0.35
+    # Limited reconciliation strength to pull pair endpoints toward symmetry
+    PAIR_RECONCILE_ALPHA = 0.30
+    EPS = 1e-9
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    # Small traffic level used to infer link up when statuses disagree (Mbps)
+    TRAFFIC_EVIDENCE_MIN = 0.5
+    # Max fractional per-interface adjustment during router redistribution
+    MAX_ROUTER_ADJ_FRAC = 0.35
+    # Limited reconciliation strength to pull pair endpoints toward symmetry
+    PAIR_RECONCILE_ALPHA = 0.30
+    # Tie-break threshold for direction scaling selection
+    TIE_EPS_CONF = 0.05
+    # Pair tolerance base used in weighting and reconciliation (traffic-aware adjustments applied later)
+    TOL_PAIR_BASE = HARDENING_THRESHOLD * 1.5
+    # Router guard bounds (elastic guard)
+    ROUTER_GUARD_MIN, ROUTER_GUARD_MAX = 0.15, 0.35
+    EPS = 1e-9
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Initialize defaults for all interfaces
+    for if_id, data in telemetry.items():
+        interim[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'rx_conf': 1.0,
+            'tx_conf': 1.0,
+            'status': data.get('interface_status', 'unknown'),
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            # Keep originals for output tuples
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown'),
+        }
+=======
+    # Initialize defaults for all interfaces
+    for if_id, data in telemetry.items():
+        interim[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'rx_conf': 1.0,
+            'tx_conf': 1.0,
+            'status': data.get('interface_status', 'unknown'),
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            # Keep originals for output tuples
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown'),
+            # Edit tracking and cap indicators for confidence calibration
+            'edit_rx_rel': 0.0,
+            'edit_tx_rel': 0.0,
+            'cap_hit_rx': False,
+            'cap_hit_tx': False,
+            'touched': False,
+        }
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Router-level dynamic flow conservation (R1)
+    # Build router to interfaces map (use provided topology if available, else derive from telemetry)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        router_ifaces = {r: [i for i in if_list if i in interim] for r, if_list in topology.items()}
+    else:
+        # If topology not provided, derive from telemetry metadata
+        # Note: Topology helps flow conservation; we derive a best-effort map when absent.
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None:
+                router_ifaces.setdefault(r, []).append(if_id)
+=======
+    # Router-level dynamic flow conservation (R1)
+    # Build router to interfaces map (use provided topology if available, else derive from telemetry)
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        router_ifaces = {r: [i for i in if_list if i in interim] for r, if_list in topology.items()}
+    else:
+        # If topology not provided, derive from telemetry metadata
+        # Note: Topology helps flow conservation; we derive a best-effort map when absent.
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None:
+                router_ifaces.setdefault(r, []).append(if_id)
+
+    # Helper to compute pair residual for a given interface and direction
+    def pair_residual_dir(iface_id: str, direction: str) -> float:
+        peer = peer_of.get(iface_id)
+        if not peer or interim.get(peer) is None:
+            return 0.0
+        if interim[iface_id]['status'] != 'up' or interim[peer]['status'] != 'up':
+            return 0.0
+        if direction == 'rx':
+            return rel_diff(interim[iface_id]['rx'], interim[peer]['tx'])
+        else:
+            return rel_diff(interim[iface_id]['tx'], interim[peer]['rx'])
+
+    # Track router-scale signals for confidence calibration
+    router_s_bounded: Dict[str, float] = {}
+    router_guard_used_frac: Dict[str, float] = {}
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Uncertainty-weighted, capacity-capped redistribution towards flow conservation
+    for router, if_list in router_ifaces.items():
+        # Consider only interfaces present in telemetry
+        interfaces = [i for i in if_list if i in interim]
+        if not interfaces:
+            continue
+
+        # Compute sums over "up" interfaces
+        sum_tx = 0.0
+        sum_rx = 0.0
+        tx_conf_acc = 0.0
+        rx_conf_acc = 0.0
+        up_count_tx = 0
+        up_count_rx = 0
+        for i in interfaces:
+            if interim[i]['status'] == 'up':
+                sum_tx += max(0.0, interim[i]['tx'])
+                sum_rx += max(0.0, interim[i]['rx'])
+                tx_conf_acc += interim[i]['tx_conf']
+                rx_conf_acc += interim[i]['rx_conf']
+                up_count_tx += 1
+                up_count_rx += 1
+
+        if up_count_tx == 0 or up_count_rx == 0:
+            continue
+
+        # Evaluate flow imbalance
+        imbalance = rel_diff(sum_tx, sum_rx)
+        if imbalance <= HARDENING_THRESHOLD * 2:
+            # Within tolerance; no router-level scaling needed
+            continue
+
+        avg_tx_conf = tx_conf_acc / max(1, up_count_tx)
+        avg_rx_conf = rx_conf_acc / max(1, up_count_rx)
+
+        # Decide which direction to scale: scale the less trusted direction
+        scale_rx = avg_tx_conf >= avg_rx_conf  # if TX more trusted, scale RX to match TX
+        if scale_rx and sum_rx > 0.0:
+            s = sum_tx / sum_rx
+        elif (not scale_rx) and sum_tx > 0.0:
+            s = sum_rx / sum_tx
+        else:
+            s = 1.0
+
+        # Bound scaling magnitude for confidence penalty computation
+        s_bounded = max(0.5, min(2.0, s))
+
+        # Weighted additive redistribution toward target using lower-trust interfaces more
+        up_list = [i for i in interfaces if interim[i]['status'] == 'up']
+        if not up_list:
+            continue
+
+        if scale_rx:
+            sum_old = sum(max(0.0, interim[i]['rx']) for i in up_list)
+            target_total = sum_tx
+        else:
+            sum_old = sum(max(0.0, interim[i]['tx']) for i in up_list)
+            target_total = sum_rx
+
+        need = target_total - sum_old
+        if abs(need) <= max(sum_old, target_total, 1.0) * (HARDENING_THRESHOLD * 0.5):
+            # Tiny residual; skip redistribution
+            continue
+
+        # Build weights from direction-specific confidence (lower confidence -> larger weight)
+        weights: Dict[str, float] = {}
+        caps_pos: Dict[str, float] = {}
+        caps_neg: Dict[str, float] = {}
+        values: Dict[str, float] = {}
+        for i in up_list:
+            if scale_rx:
+                conf = float(interim[i]['rx_conf'])
+                v = max(0.0, float(interim[i]['rx']))
+            else:
+                conf = float(interim[i]['tx_conf'])
+                v = max(0.0, float(interim[i]['tx']))
+            w = max(0.05, 1.0 - conf)
+            weights[i] = w
+            cap = MAX_ROUTER_ADJ_FRAC * max(v, 1.0)
+            caps_pos[i] = cap
+            caps_neg[i] = cap
+            values[i] = v
+
+        # Iterative allocation with capacity clipping
+        alloc_passes = 2
+        for _alloc in range(alloc_passes):
+            if abs(need) <= EPS:
+                break
+            if need > 0:
+                elig = [i for i in up_list if caps_pos[i] > EPS]
+            else:
+                elig = [i for i in up_list if caps_neg[i] > EPS]
+            if not elig:
+                break
+            sumW = sum(weights[i] for i in elig)
+            if sumW <= EPS:
+                break
+            for i in elig:
+                quota = need * (weights[i] / sumW)
+                if need > 0:
+                    d = min(max(0.0, quota), caps_pos[i])
+                    caps_pos[i] -= d
+                else:
+                    d = max(min(0.0, quota), -caps_neg[i])
+                    caps_neg[i] -= -d
+                if abs(d) <= EPS:
+                    continue
+                old_v = values[i]
+                new_v = max(0.0, old_v + d)
+                values[i] = new_v
+                # Confidence drops with global imbalance, scaling magnitude and per-interface change
+                delta_rel = rel_diff(old_v, new_v)
+                if scale_rx:
+                    interim[i]['rx'] = new_v
+                    interim[i]['rx_conf'] = clamp(min(interim[i]['rx_conf'],
+                                                      1.0 - min(1.0, imbalance + 0.5 * delta_rel + abs(1.0 - s_bounded) * 0.5)))
+                else:
+                    interim[i]['tx'] = new_v
+                    interim[i]['tx_conf'] = clamp(min(interim[i]['tx_conf'],
+                                                      1.0 - min(1.0, imbalance + 0.5 * delta_rel + abs(1.0 - s_bounded) * 0.5)))
+                need -= d
+=======
+    # Uncertainty-weighted, capacity-capped redistribution towards flow conservation
+    for router, if_list in router_ifaces.items():
+        # Consider only interfaces present in telemetry
+        interfaces = [i for i in if_list if i in interim]
+        if not interfaces:
+            router_s_bounded[router] = 0.0
+            router_guard_used_frac[router] = 0.0
+            continue
+
+        # Compute sums over "up" interfaces
+        sum_tx = 0.0
+        sum_rx = 0.0
+        tx_conf_acc = 0.0
+        rx_conf_acc = 0.0
+        up_list = []
+        for i in interfaces:
+            if interim[i]['status'] == 'up':
+                up_list.append(i)
+                sum_tx += max(0.0, interim[i]['tx'])
+                sum_rx += max(0.0, interim[i]['rx'])
+                tx_conf_acc += interim[i]['tx_conf']
+                rx_conf_acc += interim[i]['rx_conf']
+
+        if not up_list:
+            router_s_bounded[router] = 0.0
+            router_guard_used_frac[router] = 0.0
+            continue
+
+        avg_tx_conf = tx_conf_acc / max(1, len(up_list))
+        avg_rx_conf = rx_conf_acc / max(1, len(up_list))
+
+        # Evaluate flow imbalance
+        imbalance = rel_diff(sum_tx, sum_rx)
+        if imbalance <= HARDENING_THRESHOLD * 2:
+            # Within tolerance; no router-level scaling needed
+            router_s_bounded[router] = 0.0
+            router_guard_used_frac[router] = 0.0
+            continue
+
+        # Decide which direction to scale: scale the less trusted direction; tie-break by larger absolute need
+        need_rx = sum_tx - sum_rx  # need applied to RX to match TX
+        need_tx = -need_rx         # need applied to TX to match RX
+        if abs(avg_tx_conf - avg_rx_conf) < TIE_EPS_CONF:
+            scale_rx = abs(need_rx) >= abs(need_tx)
+        else:
+            scale_rx = avg_tx_conf >= avg_rx_conf  # if TX more trusted, scale RX to match TX
+
+        if scale_rx and sum_rx > 0.0:
+            s = sum_tx / sum_rx
+        elif (not scale_rx) and sum_tx > 0.0:
+            s = sum_rx / sum_tx
+        else:
+            s = 1.0
+
+        # Bound scaling magnitude for penalties
+        s_bounded = max(0.5, min(2.0, s))
+        router_s_bounded[router] = abs(1.0 - s_bounded)
+
+        # Targeted multiplicative pre-step on less-trusted direction (bounded)
+        dir_key = 'rx' if scale_rx else 'tx'
+        # Compute low-confidence cutoff (bottom 40%) for chosen direction
+        dir_confs = [float(interim[x][f'{dir_key}_conf']) for x in up_list]
+        sorted_confs = sorted(dir_confs)
+        idx_cut = max(0, min(len(sorted_confs) - 1, int(len(sorted_confs) * 0.4) - 1))
+        low_conf_cut = sorted_confs[idx_cut] if sorted_confs else 0.0
+
+        # m factor tuned by imbalance
+        alpha = clamp(imbalance / 0.15 if 0.15 > 0 else 0.25, 0.25, 0.60)
+        m = 1.0 + alpha * (s_bounded - 1.0)
+
+        if abs(1.0 - m) > 1e-6:
+            for i in up_list:
+                old_v = max(0.0, float(interim[i][dir_key]))
+                conf_dir = float(interim[i][f'{dir_key}_conf'])
+                peer = peer_of.get(i)
+                pair_resid = 0.0
+                if peer and interim[peer]['status'] == 'up':
+                    if dir_key == 'rx':
+                        pair_resid = rel_diff(interim[i]['rx'], interim[peer]['tx'])
+                    else:
+                        pair_resid = rel_diff(interim[i]['tx'], interim[peer]['rx'])
+                tol_pair_i = max(0.02, 2.5 / max(old_v, 1.0))
+                eligible = (conf_dir <= low_conf_cut) or (pair_resid > tol_pair_i)
+                if not eligible:
+                    continue
+                proposed = old_v * m
+                delta = proposed - old_v
+                # Per-interface multiplicative cap ±15% and absolute |Δ| ≤ 0.15*max(v,1.0)
+                cap = 0.15 * max(old_v, 1.0)
+                if delta > 0:
+                    delta = min(delta, cap)
+                else:
+                    delta = max(delta, -cap)
+                new_v = max(0.0, old_v + delta)
+                if abs(new_v - old_v) > EPS:
+                    delta_rel = rel_diff(old_v, new_v)
+                    interim[i][dir_key] = new_v
+                    # Confidence drops with imbalance, per-interface change and scale magnitude
+                    penalty = 1.0 - min(1.0, 0.5 * imbalance + 0.5 * delta_rel + 0.5 * abs(1.0 - s_bounded))
+                    interim[i][f'{dir_key}_conf'] = clamp(min(interim[i][f'{dir_key}_conf'], penalty))
+                    # Track edits for calibration
+                    if dir_key == 'rx':
+                        interim[i]['edit_rx_rel'] = max(interim[i]['edit_rx_rel'], delta_rel)
+                    else:
+                        interim[i]['edit_tx_rel'] = max(interim[i]['edit_tx_rel'], delta_rel)
+                    interim[i]['touched'] = True
+
+        # Recompute current totals after multiplicative step
+        sum_tx = sum(max(0.0, interim[i]['tx']) for i in up_list)
+        sum_rx = sum(max(0.0, interim[i]['rx']) for i in up_list)
+
+        if scale_rx:
+            sum_old = sum(max(0.0, interim[i]['rx']) for i in up_list)
+            target_total = sum_tx
+        else:
+            sum_old = sum(max(0.0, interim[i]['tx']) for i in up_list)
+            target_total = sum_rx
+
+        need = target_total - sum_old
+        if abs(need) <= max(sum_old, target_total, 1.0) * (HARDENING_THRESHOLD * 0.5):
+            # Tiny residual; skip redistribution
+            router_guard_used_frac[router] = 0.0
+            continue
+
+        # Elastic router guard based on imbalance and trust gap
+        avg_up_traffic = 0.5 * (sum_tx + sum_rx)
+        avg_tx_conf_new = sum(interim[i]['tx_conf'] for i in up_list) / max(1, len(up_list))
+        avg_rx_conf_new = sum(interim[i]['rx_conf'] for i in up_list) / max(1, len(up_list))
+        guard_frac = clamp(ROUTER_GUARD_MIN + 0.4 * imbalance + 0.4 * abs(avg_tx_conf_new - avg_rx_conf_new),
+                           ROUTER_GUARD_MIN, ROUTER_GUARD_MAX)
+        router_delta_guard = guard_frac * avg_up_traffic
+        router_delta_used = 0.0
+
+        # Build initial per-interface values and caps
+        weights: Dict[str, float] = {}
+        caps_pos: Dict[str, float] = {}
+        caps_neg: Dict[str, float] = {}
+        values: Dict[str, float] = {}
+        for i in up_list:
+            v = max(0.0, float(interim[i][dir_key]))
+            cap = MAX_ROUTER_ADJ_FRAC * max(v, 1.0)
+            caps_pos[i] = cap
+            caps_neg[i] = cap
+            values[i] = v
+
+        # Multi-pass allocation with capacity clipping and weight rebalancing
+        consumed_frac_prev: Dict[str, float] = {i: 0.0 for i in up_list}
+        for pass_idx in range(3):
+            if abs(need) <= EPS or router_delta_used >= router_delta_guard - EPS:
+                break
+
+            # Build enriched weights
+            sum_v_for_norm = sum(max(0.0, values[i]) for i in up_list) + EPS
+            weights.clear()
+            for i in up_list:
+                conf = float(interim[i][f'{dir_key}_conf'])
+                v = max(0.0, values[i])
+                # Pair residual term scaled by tolerance
+                peer_resid = pair_residual_dir(i, dir_key)
+                tol_pair = max(0.02, 2.5 / max(v, 1.0))
+                pair_term = min(2.0, peer_resid / max(tol_pair, 1e-9))
+                w = 0.6 * (1.0 - conf) + 0.25 * pair_term + 0.15 * (v / sum_v_for_norm)
+                if v < 1.0:
+                    w *= 0.5
+                if pass_idx > 0 and consumed_frac_prev.get(i, 0.0) > 0.7:
+                    w *= 0.7
+                if peer_resid > 2.0 * tol_pair:
+                    w += 0.1
+                weights[i] = max(0.02, w)
+
+            # Eligible based on remaining capacity
+            if need > 0:
+                elig = [i for i in up_list if caps_pos[i] > EPS]
+            else:
+                elig = [i for i in up_list if caps_neg[i] > EPS]
+            if not elig:
+                continue
+
+            sumW = sum(weights[i] for i in elig)
+            if sumW <= EPS:
+                continue
+
+            for i in elig:
+                if abs(need) <= EPS or router_delta_used >= router_delta_guard - EPS:
+                    break
+                quota = need * (weights[i] / sumW)
+                if need > 0:
+                    d = min(max(0.0, quota), caps_pos[i])
+                else:
+                    d = max(min(0.0, quota), -caps_neg[i])
+
+                # Apply router guard
+                remaining_guard = router_delta_guard - router_delta_used
+                if abs(d) > remaining_guard:
+                    d = max(-remaining_guard, min(remaining_guard, d))
+
+                if abs(d) <= EPS:
+                    continue
+
+                old_v = values[i]
+                new_v = max(0.0, old_v + d)
+                values[i] = new_v
+                # Update caps
+                if d > 0:
+                    caps_pos[i] = max(0.0, caps_pos[i] - d)
+                else:
+                    caps_neg[i] = max(0.0, caps_neg[i] - (-d))
+
+                # Confidence drops with global imbalance, scaling magnitude and per-interface change
+                delta_rel = rel_diff(old_v, new_v)
+                interim[i][dir_key] = new_v
+                penalty = 1.0 - min(1.0, imbalance + 0.5 * delta_rel + abs(1.0 - s_bounded) * 0.5)
+                interim[i][f'{dir_key}_conf'] = clamp(min(interim[i][f'{dir_key}_conf'], penalty))
+                if dir_key == 'rx':
+                    interim[i]['edit_rx_rel'] = max(interim[i]['edit_rx_rel'], delta_rel)
+                    if caps_pos[i] <= EPS * 10 or caps_neg[i] <= EPS * 10:
+                        interim[i]['cap_hit_rx'] = True
+                else:
+                    interim[i]['edit_tx_rel'] = max(interim[i]['edit_tx_rel'], delta_rel)
+                    if caps_pos[i] <= EPS * 10 or caps_neg[i] <= EPS * 10:
+                        interim[i]['cap_hit_tx'] = True
+                interim[i]['touched'] = True
+
+                router_delta_used += abs(d)
+                need -= d
+
+            # Track capacity consumption for the needed sign
+            for i in up_list:
+                cap_total = MAX_ROUTER_ADJ_FRAC * max(max(values[i], 1.0), 1.0)
+                if need > 0:
+                    used = cap_total - caps_pos[i]
+                else:
+                    used = cap_total - caps_neg[i]
+                consumed_frac_prev[i] = (used / max(cap_total, EPS)) if cap_total > 0 else 1.0
+
+        router_guard_used_frac[router] = (router_delta_used / max(router_delta_guard, EPS)) if router_delta_guard > 0 else 0.0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for if_id, r in interim.items():
+        router = r.get('local_router')
+        peer = peer_of.get(if_id)
+
+        status_comp = clamp(r.get('status_conf', 0.8))
+        resolved_status = r.get('status', 'unknown')
+
+        if peer and interim.get(peer, {}).get('status') == resolved_status:
+            res_fwd = rel_diff(r['tx'], interim[peer]['rx'])
+            res_rev = rel_diff(r['rx'], interim[peer]['tx'])
+            # Rate-aware pair tolerances to avoid over-penalizing low-rate links
+            traffic_tx = max(r['tx'], interim[peer]['rx'], 1.0)
+            traffic_rx = max(r['rx'], interim[peer]['tx'], 1.0)
+            tol_pair_tx = max(HARDENING_THRESHOLD, 5.0 / traffic_tx)
+            tol_pair_rx = max(HARDENING_THRESHOLD, 5.0 / traffic_rx)
+            pair_comp_tx = conf_from_residual(res_fwd, tol_pair_tx)
+            pair_comp_rx = conf_from_residual(res_rev, tol_pair_rx)
+        else:
+            pair_comp_tx = 0.55
+            pair_comp_rx = 0.55
+
+        router_imb = router_final_imbalance.get(router, 0.0)
+        router_comp = conf_from_residual(router_imb, TOL_ROUTER)
+
+        base_tx_conf = w_pair * pair_comp_tx + w_router * router_comp + w_status * status_comp
+        base_rx_conf = w_pair * pair_comp_rx + w_router * router_comp + w_status * status_comp
+
+        # Change penalty to discourage overconfidence on large edits
+        delta_tx_rel = rel_diff(r['orig_tx'], r['tx'])
+        delta_rx_rel = rel_diff(r['orig_rx'], r['rx'])
+        pen_tx = max(0.0, delta_tx_rel - HARDENING_THRESHOLD)
+        pen_rx = max(0.0, delta_rx_rel - HARDENING_THRESHOLD)
+        CHANGE_PENALTY_WEIGHT = 0.5
+        final_tx_conf = clamp(base_tx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_rx))
+
+        # No-edit bonus: reward stable counters that didn't require repair
+        if rel_diff(r['orig_tx'], r['tx']) <= 1e-3:
+            final_tx_conf = clamp(final_tx_conf + 0.05)
+        if rel_diff(r['orig_rx'], r['rx']) <= 1e-3:
+            final_rx_conf = clamp(final_rx_conf + 0.05)
+
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        r['tx_conf'] = final_tx_conf
+        r['rx_conf'] = final_rx_conf
+
+        # Subtle status calibration: if up but effectively idle, reduce status confidence slightly
+        if resolved_status == 'up':
+            if r['rx'] <= TRAFFIC_EVIDENCE_MIN and r['tx'] <= TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(r['status_conf'] * 0.9)
+        elif resolved_status == 'down':
+            if r['rx'] > TRAFFIC_EVIDENCE_MIN or r['tx'] > TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(min(r['status_conf'], 0.3))
+=======
+    for if_id, r in interim.items():
+        router = r.get('local_router')
+        peer = peer_of.get(if_id)
+
+        status_comp = clamp(r.get('status_conf', 0.8))
+        resolved_status = r.get('status', 'unknown')
+
+        if peer and interim.get(peer, {}).get('status') == resolved_status:
+            res_fwd = rel_diff(r['tx'], interim[peer]['rx'])
+            res_rev = rel_diff(r['rx'], interim[peer]['tx'])
+            # Rate-aware pair tolerances to avoid over-penalizing low-rate links
+            traffic_tx = max(r['tx'], interim[peer]['rx'], 1.0)
+            traffic_rx = max(r['rx'], interim[peer]['tx'], 1.0)
+            tol_pair_tx = max(HARDENING_THRESHOLD, 5.0 / traffic_tx)
+            tol_pair_rx = max(HARDENING_THRESHOLD, 5.0 / traffic_rx)
+            pair_comp_tx = conf_from_residual(res_fwd, tol_pair_tx)
+            pair_comp_rx = conf_from_residual(res_rev, tol_pair_rx)
+        else:
+            pair_comp_tx = 0.55
+            pair_comp_rx = 0.55
+
+        router_imb = router_final_imbalance.get(router, 0.0)
+        router_comp = conf_from_residual(router_imb, TOL_ROUTER)
+
+        base_tx_conf = w_pair * pair_comp_tx + w_router * router_comp + w_status * status_comp
+        base_rx_conf = w_pair * pair_comp_rx + w_router * router_comp + w_status * status_comp
+
+        # Refined, magnitude-aware edit penalty
+        edit_tx_rel = r.get('edit_tx_rel', rel_diff(r['orig_tx'], r['tx']))
+        edit_rx_rel = r.get('edit_rx_rel', rel_diff(r['orig_rx'], r['rx']))
+        weight_tx = 0.4 if edit_tx_rel < 0.15 else 0.55
+        weight_rx = 0.4 if edit_rx_rel < 0.15 else 0.55
+        pen_tx = max(0.0, edit_tx_rel - HARDENING_THRESHOLD)
+        pen_rx = max(0.0, edit_rx_rel - HARDENING_THRESHOLD)
+        final_tx_conf = clamp(base_tx_conf * (1.0 - weight_tx * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - weight_rx * pen_rx))
+
+        # Router-scale penalties based on scaling magnitude and guard usage
+        s_mag = router_s_bounded.get(router, 0.0)
+        if s_mag > 0.25:
+            final_tx_conf = clamp(final_tx_conf - 0.03)
+            final_rx_conf = clamp(final_rx_conf - 0.03)
+        guard_used = router_guard_used_frac.get(router, 0.0)
+        if guard_used >= 0.9:
+            final_tx_conf = clamp(final_tx_conf - 0.05)
+            final_rx_conf = clamp(final_rx_conf - 0.05)
+
+        # Cap-consumption soft penalty
+        if r.get('cap_hit_tx', False):
+            final_tx_conf = clamp(final_tx_conf - 0.04)
+        if r.get('cap_hit_rx', False):
+            final_rx_conf = clamp(final_rx_conf - 0.04)
+
+        # Improvement bonus: pair residuals drop ≥50% and router imbalance decreases ≥30%
+        if peer:
+            orig_peer = telemetry.get(peer, {})
+            res_fwd_orig = rel_diff(r['orig_tx'], float(orig_peer.get('rx_rate', 0.0)))
+            res_rev_orig = rel_diff(r['orig_rx'], float(orig_peer.get('tx_rate', 0.0)))
+            res_fwd_now = rel_diff(r['tx'], interim.get(peer, {}).get('rx', 0.0))
+            res_rev_now = rel_diff(r['rx'], interim.get(peer, {}).get('tx', 0.0))
+            improved_pair = False
+            if res_fwd_orig > 0 and res_rev_orig > 0:
+                improved_pair = ((res_fwd_orig - res_fwd_now) / res_fwd_orig >= 0.5) and ((res_rev_orig - res_rev_now) / res_rev_orig >= 0.5)
+            # Router improvement
+            init_router_imb = 0.0  # unknown initial; use magnitude signal and final only for bonus gating
+            final_router_imb = router_final_imbalance.get(router, 0.0)
+            # If scaling was applied (s_mag > 0), treat router as improved if final imbalance is small
+            improved_router = (s_mag > 0 and final_router_imb <= max(HARDENING_THRESHOLD, 0.03))
+            if improved_pair and improved_router:
+                final_tx_conf = clamp(final_tx_conf + 0.04)
+                final_rx_conf = clamp(final_rx_conf + 0.04)
+
+        # No-edit bonus: reward stable counters that didn't require repair
+        if rel_diff(r['orig_tx'], r['tx']) <= 1e-3:
+            final_tx_conf = clamp(final_tx_conf + 0.05)
+        if rel_diff(r['orig_rx'], r['rx']) <= 1e-3:
+            final_rx_conf = clamp(final_rx_conf + 0.05)
+
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        r['tx_conf'] = final_tx_conf
+        r['rx_conf'] = final_rx_conf
+
+        # Subtle status calibration: if up but effectively idle, reduce status confidence slightly
+        if resolved_status == 'up':
+            if r['rx'] <= TRAFFIC_EVIDENCE_MIN and r['tx'] <= TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(r['status_conf'] * 0.9)
+        elif resolved_status == 'down':
+            if r['rx'] > TRAFFIC_EVIDENCE_MIN or r['tx'] > TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(min(r['status_conf'], 0.3))
+>>>>>>> REPLACE
+</DIFF>

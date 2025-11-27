@@ -1,0 +1,169 @@
+<NAME>
+smart_perturbation_with_trials
+</NAME>
+
+<DESCRIPTION>
+Implements a "Smart Perturbation" strategy in the Iterated Local Search (ILS) phase. Instead of selecting random partners for the bottleneck GPU, this strategy explicitly includes the least loaded GPU (which has the most capacity to absorb pressure) and a few random GPUs. Additionally, the perturbation phase now performs multiple randomized packing trials (5 trials) using a noise-injected density sort. This increases the probability of finding a valid and high-quality local configuration to escape local optima, rather than relying on a single random attempt.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            # 4. Perturbation (Burst Kick)
+            # If stuck, destroy packing of Bottleneck + k Random Partners
+            k_partners = min(gpu_num - 1, 3)
+            if k_partners == 0: break
+
+            victims = [bottleneck] + random.sample([g for g in range(gpu_num) if g != bottleneck], k_partners)
+
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Randomized Density Sort
+            # Add noise to density to traverse search space
+            repack_items.sort(key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.85, 1.15), reverse=True)
+
+            # Greedy Repack into Victims
+            success_kick = True
+            for item in repack_items:
+                w, s = item.req_rate / item.slo, item.model_size
+                best_v = -1
+                best_sc = float('inf')
+
+                for v in victims:
+                    if used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                        rem = GPU_MEM_SIZE - used[v] - s
+                        sc = (loads[v] + w) / rem if rem > 1e-6 else (float('inf') if loads[v]+w > 0 else 0)
+                        if sc < best_sc:
+                            best_sc = sc
+                            best_v = v
+
+                if best_v != -1:
+                    current_placement[best_v].append(item)
+                    loads[best_v] += w
+                    used[best_v] += s
+                else:
+                    success_kick = False
+                    break
+
+            if success_kick:
+                for v in victims:
+                    pressures[v] = get_pressure(loads[v], used[v])
+            else:
+                # Kick failed to find feasible packing (unlikely but possible), Revert
+                current_placement = {k: list(v) for k, v in best_global_placement.items()}
+                # Recompute state
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_pressure(loads[g], used[g]) for g in range(gpu_num)]
+=======
+        else:
+            # 4. Smart Perturbation (Targeted Ruin & Recreate)
+            # Strategy: Bottleneck + Least Loaded + Random Partners
+
+            # Find least loaded GPU (to help absorb bottleneck items)
+            min_p = float('inf')
+            least_loaded = -1
+            for g in range(gpu_num):
+                if g != bottleneck and pressures[g] < min_p:
+                    min_p = pressures[g]
+                    least_loaded = g
+
+            victim_set = {bottleneck}
+            if least_loaded != -1:
+                victim_set.add(least_loaded)
+
+            # Add random partners to increase neighborhood size
+            candidates = [g for g in range(gpu_num) if g not in victim_set]
+            if candidates:
+                # Add up to 2 random partners
+                k_random = min(len(candidates), 2)
+                victim_set.update(random.sample(candidates, k_random))
+
+            victims = list(victim_set)
+
+            # Extract items
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Try multiple randomized packings to find a feasible and decent local configuration
+            best_local_config = None
+            best_local_max_p = float('inf')
+
+            # 5 trials of randomized greedy
+            for _ in range(5):
+                # Shuffle then Sort with noise to create diversity
+                random.shuffle(repack_items)
+                # Density-based sort with noise is robust
+                iter_items = sorted(repack_items, key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.9, 1.1), reverse=True)
+
+                l_loads = {v: 0.0 for v in victims}
+                l_used = {v: 0.0 for v in victims}
+                l_placement = {v: [] for v in victims}
+                feasible_local = True
+
+                for item in iter_items:
+                    w, s = item.req_rate / item.slo, item.model_size
+                    best_v = -1
+                    best_sc = float('inf')
+
+                    for v in victims:
+                        if l_used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                            rem = GPU_MEM_SIZE - l_used[v] - s
+                            if rem > 1e-6:
+                                sc = (l_loads[v] + w) / rem
+                            else:
+                                sc = float('inf') if (l_loads[v] + w) > 0 else 0
+
+                            if sc < best_sc:
+                                best_sc = sc
+                                best_v = v
+
+                    if best_v != -1:
+                        l_placement[best_v].append(item)
+                        l_loads[best_v] += w
+                        l_used[best_v] += s
+                    else:
+                        feasible_local = False
+                        break
+
+                if feasible_local:
+                    local_max = max(get_pressure(l_loads[v], l_used[v]) for v in victims)
+                    if local_max < best_local_max_p:
+                        best_local_max_p = local_max
+                        best_local_config = (l_placement, l_loads, l_used)
+
+            if best_local_config:
+                # Apply best local result
+                l_place, l_l, l_u = best_local_config
+                for v in victims:
+                    current_placement[v] = l_place[v]
+                    loads[v] = l_l[v]
+                    used[v] = l_u[v]
+                    pressures[v] = get_pressure(loads[v], used[v])
+            else:
+                # Revert to global best if perturbation fails
+                current_placement = {k: list(v) for k, v in best_global_placement.items()}
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_pressure(loads[g], used[g]) for g in range(gpu_num)]
+>>>>>>> REPLACE
+</DIFF>

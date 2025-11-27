@@ -1,0 +1,333 @@
+<NAME>
+iterative_conservation_refinement
+</NAME>
+
+<DESCRIPTION>
+Replaces the single-pass combinatorial router solver with an iterative coordinate descent algorithm.
+1. Initializes flow estimates based on link symmetry (Consensus or Average).
+2. Iteratively minimizes router imbalance by adjusting "suspect" links.
+3. Considers 'Zero Flow' (0.0) as a hypothesis to handle phantom traffic on down links.
+4. Propagates updates to peer interfaces to maintain link consistency during solving.
+5. Calibrates confidence based on the final residual imbalance of the router (Goodness-of-Fit).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- PHASE 2: Router Conservation Voting ---
+    # We iterate over routers to resolve conflicts using Flow Conservation.
+
+    final_decisions = {} # if_id -> {'rx': (val, conf), ...}
+
+    for router_id, if_list in topology.items():
+
+        # 2a. Identify Reliable vs Unreliable flows on this router
+        reliable_inputs = 0.0
+        reliable_outputs = 0.0
+
+        unreliable_ifs = [] # List of (if_id, type 'rx'|'tx')
+
+        # Preliminary pass: calculate "Trusted" flow mass
+        for if_id in if_list:
+            if if_id not in link_analysis: continue
+
+            # RX Check
+            rx_info = link_analysis[if_id]['rx']
+            if rx_info['symmetry'] > 0.95:
+                # High symmetry, assume correct
+                val = rx_info['candidates'].get('consensus', rx_info['candidates']['local'])
+                reliable_inputs += val
+            else:
+                unreliable_ifs.append((if_id, 'rx'))
+
+            # TX Check
+            tx_info = link_analysis[if_id]['tx']
+            if tx_info['symmetry'] > 0.95:
+                val = tx_info['candidates'].get('consensus', tx_info['candidates']['local'])
+                reliable_outputs += val
+            else:
+                unreliable_ifs.append((if_id, 'tx'))
+
+        # 2b. Resolve Unreliable Interfaces with Combinatorial Optimization
+        # We want to select candidates (Local vs Peer) to minimize |Inputs - Outputs|.
+
+        # Calculate Base State: Reliable Flow + Unreliable(Peer/Default)
+        current_in = reliable_inputs
+        current_out = reliable_outputs
+
+        # Setup optimization candidates
+        # Each candidate represents a potential swap from Peer(Default) to Local
+        # We store: (key, impact_on_net_flow, local_val)
+        swap_candidates = []
+
+        decisions = {} # Stores final selected values
+
+        for if_id, metric in unreliable_ifs:
+            cands = link_analysis[if_id][metric]['candidates']
+
+            # Default to Peer (or Local if Peer missing)
+            default_val = cands.get('peer', cands['local'])
+            decisions[(if_id, metric)] = default_val # Initialize with default
+
+            if metric == 'rx':
+                current_in += default_val
+            else:
+                current_out += default_val
+
+            # If we have both, we can consider swapping to Local
+            if 'peer' in cands and 'local' in cands:
+                local_val = cands['local']
+                peer_val = cands['peer']
+
+                # Calculate impact of swapping to Local on NetFlow (In - Out)
+                # If RX: In increases by (Local - Peer) -> NetFlow increases by (Local - Peer)
+                # If TX: Out increases by (Local - Peer) -> NetFlow decreases by (Local - Peer)
+                diff = local_val - peer_val
+                if metric == 'rx':
+                    impact = diff
+                else:
+                    impact = -diff
+
+                swap_candidates.append({
+                    'key': (if_id, metric),
+                    'impact': impact,
+                    'val_local': local_val
+                })
+
+        # Base Imbalance (NetFlow = In - Out)
+        base_net_flow = current_in - current_out
+
+        # Optimize: Find subset of swap_candidates to minimize |base_net_flow + sum(impacts)|
+
+        best_mask = 0
+        min_imbalance = abs(base_net_flow)
+        n_cands = len(swap_candidates)
+
+        if n_cands > 0:
+            # If N is small enough, brute force all combinations (2^N)
+            # N=12 -> 4096 iters, very fast for per-router logic.
+            if n_cands <= 12:
+                for mask in range(1 << n_cands):
+                    current_impact = 0.0
+                    for i in range(n_cands):
+                        if (mask >> i) & 1:
+                            current_impact += swap_candidates[i]['impact']
+
+                    imbalance = abs(base_net_flow + current_impact)
+                    if imbalance < min_imbalance:
+                        min_imbalance = imbalance
+                        best_mask = mask
+            else:
+                # If N is large, greedy heuristic
+                # Sort by absolute impact to prioritize large corrections
+                sorted_cands = sorted(swap_candidates, key=lambda x: abs(x['impact']), reverse=True)
+
+                # Greedy pass
+                current_impact = 0.0
+                for cand in sorted_cands:
+                    new_impact = current_impact + cand['impact']
+                    if abs(base_net_flow + new_impact) < abs(base_net_flow + current_impact):
+                        current_impact = new_impact
+                        decisions[cand['key']] = cand['val_local']
+
+                # Disable the mask loop below
+                n_cands = 0
+
+        # Apply best swaps (for small N case)
+        for i in range(n_cands):
+            if (best_mask >> i) & 1:
+                cand = swap_candidates[i]
+                decisions[cand['key']] = cand['val_local']
+
+        # Re-calculate final sums for conservation score
+        h0_inputs = reliable_inputs
+        h0_outputs = reliable_outputs
+        for if_id, metric in unreliable_ifs:
+            val = decisions[(if_id, metric)]
+            if metric == 'rx': h0_inputs += val
+            else: h0_outputs += val
+
+        # 2d. Calculate Final Conservation Score for Confidence
+        final_imbalance = abs(h0_inputs - h0_outputs)
+        max_flow = max(h0_inputs, h0_outputs, 1.0)
+        conservation_score = max(0.0, 1.0 - (final_imbalance / max_flow))
+
+        # 2e. Store Decisions and compute Confidence
+        for if_id in if_list:
+            if if_id not in final_decisions: final_decisions[if_id] = {}
+
+            # Process RX
+            if (if_id, 'rx') in decisions:
+                # It was unreliable
+                val = decisions[(if_id, 'rx')]
+                # Confidence is combination of how well it matches peer (0 by def if unreliable) + conservation
+                # If we picked Peer (usually means Link Symmetry error is ignored/fixed), Conf relies on Conservation
+                # If we picked Local (means Peer was wrong), Conf relies on Conservation
+                final_decisions[if_id]['rx'] = (val, 0.5 + 0.5 * conservation_score)
+            else:
+                # It was reliable (Symmetry > 0.95)
+                # Confidence is high, modulated slightly by conservation
+                val = link_analysis[if_id]['rx']['candidates'].get('consensus', link_analysis[if_id]['rx']['candidates']['local'])
+                final_decisions[if_id]['rx'] = (val, 0.9 + 0.1 * conservation_score)
+
+            # Process TX
+            if (if_id, 'tx') in decisions:
+                val = decisions[(if_id, 'tx')]
+                final_decisions[if_id]['tx'] = (val, 0.5 + 0.5 * conservation_score)
+            else:
+                val = link_analysis[if_id]['tx']['candidates'].get('consensus', link_analysis[if_id]['tx']['candidates']['local'])
+                final_decisions[if_id]['tx'] = (val, 0.9 + 0.1 * conservation_score)
+=======
+    # --- PHASE 2: Router Conservation Voting ---
+    # We iterate over routers to resolve conflicts using Flow Conservation.
+    # We use an iterative "Coordinate Descent" approach to allow decisions to propagate.
+
+    ITERATIONS = 4
+
+    # Store the currently accepted flow value for every interface metric
+    # Key: (if_id, metric_type) where metric_type is 'rx' or 'tx'
+    # Value: float flow_rate
+    current_decisions = {}
+
+    # Track which decisions are fixed (Reliable links)
+    fixed_decisions = set()
+
+    # Initialization
+    for if_id, analysis in link_analysis.items():
+        for metric in ['rx', 'tx']:
+            data = analysis[metric]
+            candidates = data['candidates']
+
+            if data['symmetry'] > 0.95:
+                # High symmetry - lock it in
+                val = candidates.get('consensus', candidates['local'])
+                current_decisions[(if_id, metric)] = val
+                fixed_decisions.add((if_id, metric))
+            else:
+                # Low symmetry - init with average to be neutral
+                # If we have peer, avg. If not, local.
+                if 'peer' in candidates:
+                    val = (candidates['local'] + candidates['peer']) / 2.0
+                else:
+                    val = candidates['local']
+                current_decisions[(if_id, metric)] = val
+
+    # Iterative Refinement Loop
+    for _ in range(ITERATIONS):
+        # We verify conservation at each router and update the 'mutable' decisions
+
+        for router_id, if_list in topology.items():
+            # Calculate current flows and imbalance
+            router_in = 0.0
+            router_out = 0.0
+
+            # Identify mutable interfaces on this router
+            mutable_ifs = []
+
+            for if_id in if_list:
+                # RX Flow
+                rx_val = current_decisions.get((if_id, 'rx'), 0.0)
+                router_in += rx_val
+                if (if_id, 'rx') not in fixed_decisions and if_id in link_analysis:
+                    mutable_ifs.append((if_id, 'rx'))
+
+                # TX Flow
+                tx_val = current_decisions.get((if_id, 'tx'), 0.0)
+                router_out += tx_val
+                if (if_id, 'tx') not in fixed_decisions and if_id in link_analysis:
+                    mutable_ifs.append((if_id, 'tx'))
+
+            current_imbalance = router_in - router_out
+
+            if not mutable_ifs:
+                continue
+
+            # Local optimization: Adjust each mutable interface to minimize router imbalance.
+            # We try specific candidates: Local Measurement, Peer Measurement, and Zero.
+
+            for key in mutable_ifs:
+                if_id, metric = key
+                current_val = current_decisions[key]
+
+                # Candidates
+                candidates = link_analysis[if_id][metric]['candidates']
+                possible_values = [candidates['local']]
+                if 'peer' in candidates:
+                    possible_values.append(candidates['peer'])
+                possible_values.append(0.0) # Zero flow hypothesis (Link Down / Phantom Traffic)
+
+                best_val = current_val
+                best_abs_imb = abs(current_imbalance)
+
+                # Calculate contribution of this flow to imbalance:
+                # Imb = In - Out.
+                # RX contributes (+), TX contributes (-)
+                sign = 1.0 if metric == 'rx' else -1.0
+                remainder = current_imbalance - (sign * current_val)
+
+                for val in possible_values:
+                    # New Imb = Remainder + (sign * val)
+                    new_imb = remainder + (sign * val)
+                    if abs(new_imb) < best_abs_imb:
+                        best_abs_imb = abs(new_imb)
+                        best_val = val
+
+                if best_val != current_val:
+                    # Apply update immediately (Gauss-Seidel)
+                    diff = best_val - current_val
+                    current_decisions[key] = best_val
+                    current_imbalance += (sign * diff)
+
+                    # Propagate to Peer (Link Consistency)
+                    # If I change my TX, I should change peer's RX to match, if mutable.
+                    peer_id = telemetry[if_id].get('connected_to')
+                    if peer_id:
+                        peer_metric = 'rx' if metric == 'tx' else 'tx'
+                        peer_key = (peer_id, peer_metric)
+                        if peer_key in current_decisions and peer_key not in fixed_decisions:
+                            current_decisions[peer_key] = best_val
+                            # Note: We don't update current_imbalance here as peer is on a different router
+
+    # Final Scoring and Assembly
+    final_decisions = {}
+
+    # Calculate final conservation scores per router
+    router_scores = {}
+    for router_id, if_list in topology.items():
+        r_in = sum(current_decisions.get((i, 'rx'), 0.0) for i in if_list)
+        r_out = sum(current_decisions.get((i, 'tx'), 0.0) for i in if_list)
+
+        imb = abs(r_in - r_out)
+        flow = max(r_in, r_out, 1.0)
+
+        # Exponential score: 1.0 -> Perfect balance, decays with imbalance
+        score = math.exp(-imb / (flow * 0.05 + 1.0))
+        router_scores[router_id] = score
+
+    for if_id in telemetry:
+        final_decisions[if_id] = {}
+
+        # Calculate final confidence
+        local_rid = if_to_router.get(if_id)
+        r_score = router_scores.get(local_rid, 0.5) if local_rid else 0.5
+
+        for metric in ['rx', 'tx']:
+            val = current_decisions.get((if_id, metric), 0.0)
+            is_reliable = (if_id, metric) in fixed_decisions
+
+            if is_reliable:
+                # High confidence for reliable links
+                base_conf = 0.95
+                # Slight modulation by router health (if router is chaos, maybe we are wrong?)
+                conf = base_conf * (0.9 + 0.1 * r_score)
+            else:
+                # Lower baseline for repaired links
+                base_conf = 0.6
+                # Strong dependency on router conservation success
+                # If r_score is 1.0 (perfect balance), conf -> 0.9
+                # If r_score is 0.0 (bad balance), conf -> 0.3
+                conf = base_conf * 0.5 + (0.6 * r_score)
+
+            conf = min(1.0, max(0.0, conf))
+            final_decisions[if_id][metric] = (val, conf)
+>>>>>>> REPLACE
+</DIFF>

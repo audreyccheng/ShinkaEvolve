@@ -1,0 +1,272 @@
+<NAME>
+hybrid_refinement_with_guard
+</NAME>
+
+<DESCRIPTION>
+1. Modifies `_refine_packing_batched` to include a "2-swap" refinement step (swapping a pair of items from the heaviest pack with a pair from the lightest pack). This helps break local optima that single swaps cannot resolve. Includes a guard to prevent excessive memory usage when groups per pack is large.
+2. Increases `num_iters` in `balanced_packing` from 3 to 4 to give the iterative re-weighting more time to converge.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing_batched(weights: torch.Tensor,
+                            pack_indices: torch.Tensor,
+                            pack_weights: torch.Tensor,
+                            max_iters: int = 100) -> torch.Tensor:
+    """
+    Batched version of refinement that minimizes load variance by checking all pairwise swaps.
+
+    Args:
+        weights: [B, N] The weight of every item (global indexing).
+        pack_indices: [B, num_packs, groups_per_pack] Item IDs assigned to packs.
+        pack_weights: [B, num_packs] Current total weight of each pack.
+        max_iters: Maximum number of refinement iterations.
+
+    Returns:
+        pack_indices: Refined item assignments [B, M, G].
+    """
+    B, num_packs, groups_per_pack = pack_indices.shape
+    device = weights.device
+
+    # Mask for diagonal packs (u=v) to prevent self-swapping in the all-pairs matrix
+    # [1, M, M, 1, 1]
+    eye_mask = torch.eye(num_packs, device=device).view(1, num_packs, num_packs, 1, 1).bool()
+
+    for _ in range(max_iters):
+        # Gather current item weights: [B, M, G]
+        w_items = torch.gather(weights, 1, pack_indices.view(B, -1)).view(B, num_packs, groups_per_pack)
+
+        # We want to find best swap u <-> v (items i <-> j) to minimize sum of squared pack weights.
+        # Change in L2 = 2 * delta * (W_v - W_u + delta)
+        # where delta = w_{u,i} - w_{v,j} (weight moved from u to v)
+
+        # Prepare broadcast tensors
+        # W_u: [B, M, 1, 1, 1]
+        W = pack_weights.view(B, num_packs, 1, 1, 1)
+
+        # w_u: [B, M, 1, G, 1] (Item i in Pack u)
+        w_u = w_items.view(B, num_packs, 1, groups_per_pack, 1)
+
+        # w_v: [B, 1, M, 1, G] (Item j in Pack v)
+        w_v = w_items.view(B, 1, num_packs, 1, groups_per_pack)
+
+        # Compute delta for all combinations: [B, M, M, G, G]
+        # delta[b, u, v, i, j] is weight change for pack v (and -change for pack u)
+        delta = w_u - w_v
+
+        # Pack weight diff: W_v - W_u
+        # [B, M, M, 1, 1]
+        W_diff = W.permute(0, 2, 1, 3, 4) - W
+
+        # Calculate expected L2 change
+        change = 2 * delta * (W_diff + delta)
+
+        # Mask out self-swaps (u == v)
+        change.masked_fill_(eye_mask, float('inf'))
+
+        # Find best swap per batch
+        # Flatten to [B, M*M*G*G]
+        change_flat = change.view(B, -1)
+        min_val, min_idx = torch.min(change_flat, dim=1)
+
+        # Convergence check: stop if no beneficial swap
+        active = min_val < -1e-5
+        if not active.any():
+            break
+
+        # Decode indices for active batches
+        active_idx = torch.nonzero(active).squeeze(-1)
+        best_flat = min_idx[active_idx]
+
+        # Constants for decoding
+        G = groups_per_pack
+        M = num_packs
+        G2 = G * G
+        MG2 = M * G2
+
+        # Decode: u, v, i, j
+        u = best_flat // MG2
+        rem = best_flat % MG2
+        v = rem // G2
+        rem = rem % G2
+        i = rem // G
+        j = rem % G
+
+        # Apply swaps
+        # Indices: [active_idx, u, i] <-> [active_idx, v, j]
+        val_u = pack_indices[active_idx, u, i]
+        val_v = pack_indices[active_idx, v, j]
+
+        pack_indices[active_idx, u, i] = val_v
+        pack_indices[active_idx, v, j] = val_u
+
+        # Update weights
+        # delta was calculated as w_u - w_v
+        d_val = delta[active_idx, u, v, i, j]
+
+        pack_weights[active_idx, u] -= d_val
+        pack_weights[active_idx, v] += d_val
+
+    return pack_indices
+=======
+def _refine_packing_batched(weights: torch.Tensor,
+                            pack_indices: torch.Tensor,
+                            pack_weights: torch.Tensor,
+                            max_iters: int = 100) -> torch.Tensor:
+    """
+    Batched version of refinement that minimizes load variance by checking both:
+    1. All pairwise 1-item swaps.
+    2. 2-item swaps between the heaviest and lightest packs.
+
+    Args:
+        weights: [B, N] The weight of every item (global indexing).
+        pack_indices: [B, num_packs, groups_per_pack] Item IDs assigned to packs.
+        pack_weights: [B, num_packs] Current total weight of each pack.
+        max_iters: Maximum number of refinement iterations.
+    """
+    B, num_packs, groups_per_pack = pack_indices.shape
+    device = weights.device
+
+    # Pre-compute indices for 2-item combinations if pack size is reasonable
+    # Limit to groups_per_pack <= 20 to avoid excessive memory usage (20C2 = 190, 190^2 = 36100 pairs)
+    if 2 <= groups_per_pack <= 20:
+        pair_indices = torch.triu_indices(groups_per_pack, groups_per_pack, offset=1, device=device)
+        num_pairs = pair_indices.shape[1]
+    else:
+        num_pairs = 0
+
+    # Mask for diagonal packs (u=v) to prevent self-swapping in the all-pairs matrix
+    eye_mask = torch.eye(num_packs, device=device).view(1, num_packs, num_packs, 1, 1).bool()
+
+    for _ in range(max_iters):
+        # Gather current item weights: [B, M, G]
+        w_items = torch.gather(weights, 1, pack_indices.view(B, -1)).view(B, num_packs, groups_per_pack)
+
+        # --- 1. Compute 1-Swap Gains (All Pairs) ---
+        # w_u: [B, M, 1, G, 1], w_v: [B, 1, M, 1, G]
+        w_u = w_items.view(B, num_packs, 1, groups_per_pack, 1)
+        w_v = w_items.view(B, 1, num_packs, 1, groups_per_pack)
+
+        # Delta: w_u - w_v [B, M, M, G, G]
+        delta_1 = w_u - w_v
+
+        # W_diff: [B, M, M, 1, 1] (W_v - W_u)
+        W = pack_weights.view(B, num_packs, 1, 1, 1)
+        W_diff = W.permute(0, 2, 1, 3, 4) - W
+
+        # Gain = -Change = -2 * delta * (W_diff + delta)
+        gain_1 = -2 * delta_1 * (W_diff + delta_1)
+        gain_1.masked_fill_(eye_mask, -float('inf'))
+
+        flat_gain_1 = gain_1.view(B, -1)
+        max_gain_1, max_idx_1 = torch.max(flat_gain_1, dim=1)
+
+        # --- 2. Compute 2-Swap Gains (Max-Min Pairs) ---
+        max_gain_2 = torch.full((B,), -float('inf'), device=device)
+        max_idx_2 = None
+
+        if num_pairs > 0:
+            max_load, max_pid = torch.max(pack_weights, dim=1) # [B]
+            min_load, min_pid = torch.min(pack_weights, dim=1) # [B]
+
+            # Gather items from max/min packs: [B, G]
+            gather_max_idx = max_pid.view(B, 1, 1).expand(-1, 1, groups_per_pack)
+            gather_min_idx = min_pid.view(B, 1, 1).expand(-1, 1, groups_per_pack)
+
+            w_max_items = torch.gather(w_items, 1, gather_max_idx).squeeze(1) # [B, G]
+            w_min_items = torch.gather(w_items, 1, gather_min_idx).squeeze(1) # [B, G]
+
+            # Pair sums: [B, num_pairs]
+            w_max_pairs = w_max_items[:, pair_indices[0]] + w_max_items[:, pair_indices[1]]
+            w_min_pairs = w_min_items[:, pair_indices[0]] + w_min_items[:, pair_indices[1]]
+
+            # Delta for 2-swap: (max_pair - min_pair)
+            # Shape [B, num_pairs, num_pairs]
+            delta_2 = w_max_pairs.unsqueeze(2) - w_min_pairs.unsqueeze(1)
+
+            # W_diff_2 = L_min - L_max (negative)
+            W_diff_2 = (min_load - max_load).view(B, 1, 1)
+
+            # Gain = -2 * delta * (W_diff + delta)
+            gain_2 = -2 * delta_2 * (W_diff_2 + delta_2)
+
+            flat_gain_2 = gain_2.view(B, -1)
+            max_gain_2, max_idx_2 = torch.max(flat_gain_2, dim=1)
+
+        # --- 3. Execute Swaps ---
+        threshold = 1e-5
+
+        use_2swap = (max_gain_2 > max_gain_1) & (max_gain_2 > threshold)
+        use_1swap = (~use_2swap) & (max_gain_1 > threshold)
+
+        if not (use_2swap.any() or use_1swap.any()):
+            break
+
+        if use_1swap.any():
+            batches = torch.nonzero(use_1swap).squeeze(-1)
+            idx = max_idx_1[batches]
+
+            G = groups_per_pack
+            M = num_packs
+            G2 = G * G
+            MG2 = M * G2
+
+            u = idx // MG2
+            rem = idx % MG2
+            v = rem // G2
+            rem = rem % G2
+            i = rem // G
+            j = rem % G
+
+            val_u = pack_indices[batches, u, i]
+            val_v = pack_indices[batches, v, j]
+            pack_indices[batches, u, i] = val_v
+            pack_indices[batches, v, j] = val_u
+
+            d = delta_1[batches, u, v, i, j]
+            pack_weights[batches, u] -= d
+            pack_weights[batches, v] += d
+
+        if use_2swap.any():
+            batches = torch.nonzero(use_2swap).squeeze(-1)
+            idx = max_idx_2[batches]
+
+            p_max_idx = idx // num_pairs
+            p_min_idx = idx % num_pairs
+
+            i1_local = pair_indices[0, p_max_idx]
+            i2_local = pair_indices[1, p_max_idx]
+            j1_local = pair_indices[0, p_min_idx]
+            j2_local = pair_indices[1, p_min_idx]
+
+            u = max_pid[batches]
+            v = min_pid[batches]
+
+            val_u1 = pack_indices[batches, u, i1_local]
+            val_v1 = pack_indices[batches, v, j1_local]
+            val_u2 = pack_indices[batches, u, i2_local]
+            val_v2 = pack_indices[batches, v, j2_local]
+
+            pack_indices[batches, u, i1_local] = val_v1
+            pack_indices[batches, v, j1_local] = val_u1
+            pack_indices[batches, u, i2_local] = val_v2
+            pack_indices[batches, v, j2_local] = val_u2
+
+            d = delta_2[batches, p_max_idx, p_min_idx]
+            pack_weights[batches, u] -= d
+            pack_weights[batches, v] += d
+
+    return pack_indices
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_iters: int = 3,
+                     num_candidates: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_iters: int = 4,
+                     num_candidates: int = 32) -> tuple[torch.Tensor, torch.Tensor]:
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,281 @@
+<NAME>
+preplace_mem_only_and_residual_tpacking
+</NAME>
+
+<DESCRIPTION>
+This edit implements a key improvement: pre-place memory-only models (slo==0) before running the T-based slack equalization on the remaining request-bearing models. Previously, slo==0 items were encoded with infinite demand, forcing the T-packer to fail and fall back to a simple greedy, which significantly degraded performance. The changes:
+- Split models into mem-only and rate-bearing sets. Pre-pack mem-only items largest-first onto GPUs with the most remaining memory to freeze per-GPU capacities.
+- Build the T-based item list from rate-bearing models only and update global bounds using the remaining total memory after pre-placement.
+- Initialize the T-packer with the pre-placement state: used memory per GPU and K_g = T*(remaining_mem_g). This ensures feasibility checks and placements are with respect to the residual capacities.
+- Provide a greedy add-on fallback to place the remaining rate models onto the pre-placement if T-packing fails.
+- Early return when there are no rate-bearing models.
+
+These targeted changes respect the original structure, avoid heavy rewrites, and directly address the minimization of maximum KVPR while ensuring memory feasibility. They should restore and improve the combined score by re-enabling the more powerful T-based packing for the request-bearing subset with accurate residual capacities.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Extract per-model attributes once
+    items = []
+    total_R = 0.0
+    total_size = 0.0
+    for m in models:
+        slo = float(m.slo)
+        dR = float(m.req_rate) / slo if slo != 0 else float('inf')
+        s = float(m.model_size)
+        items.append({'obj': m, 'dR': dR, 'size': s})
+        total_R += 0.0 if dR == float('inf') else dR
+        total_size += s
+
+    # Lower bounds on optimal T
+    def compute_lower_bound():
+        # Per-item bound: T >= dR / (S - s)
+        lb1 = 0.0
+        infeasible_single = False
+        for it in items:
+            dR = it['dR']; s = it['size']
+            denom = S - s
+            if denom <= 0:
+                if dR > 0 and dR != float('inf'):
+                    infeasible_single = True
+                elif dR == float('inf'):
+                    infeasible_single = True
+                continue
+            if dR > 0 and dR != float('inf'):
+                cand = dR / denom
+                if cand > lb1:
+                    lb1 = cand
+
+        # Global bound: T >= total_R / (gpu_num*S - total_size)
+        denom2 = gpu_num * S - total_size
+        if denom2 <= 0 and total_R > 0:
+            return float('inf'), True, infeasible_single
+        lb2 = 0.0 if total_R <= 0 or denom2 <= 0 else (total_R / denom2)
+
+        # Pair bound: for pairs that cannot co-reside (s_i + s_j > S)
+        lb_pair = 0.0
+        P = min(len(items), 200)
+        by_size = sorted(items, key=lambda x: x['size'], reverse=True)[:P]
+        for i in range(len(by_size)):
+            si = by_size[i]['size']; ri = by_size[i]['dR']
+            for j in range(i + 1, len(by_size)):
+                sj = by_size[j]['size']; rj = by_size[j]['dR']
+                if si + sj > S:
+                    denom = 2 * S - (si + sj)
+                    if denom > 0:
+                        ri_f = 0.0 if ri == float('inf') else ri
+                        rj_f = 0.0 if rj == float('inf') else rj
+                        cand = (ri_f + rj_f) / denom
+                        if cand > lb_pair:
+                            lb_pair = cand
+
+        # k-bin prefix bound for k in {1..min(gpu_num,4)}
+        lb_k = 0.0
+        sorted_by_size = sorted(items, key=lambda x: x['size'], reverse=True)
+        prefix_sizes = []
+        prefix_rates = []
+        cs = 0.0; cr = 0.0
+        for it in sorted_by_size:
+            cs += it['size']; cr += (0.0 if it['dR'] == float('inf') else it['dR'])
+            prefix_sizes.append(cs); prefix_rates.append(cr)
+        for k in range(1, min(gpu_num, 4) + 1):
+            threshold = (k - 1) * S
+            idx = -1
+            for t in range(len(prefix_sizes)):
+                if prefix_sizes[t] > threshold:
+                    idx = t
+                    break
+            if idx >= 0:
+                numer = prefix_rates[idx]
+                denom = k * S - prefix_sizes[idx]
+                if denom > 0 and numer > 0:
+                    cand = numer / denom
+                    if cand > lb_k:
+                        lb_k = cand
+
+        lower = max(0.0, lb1, lb2, lb_pair, lb_k)
+        return lower, False, infeasible_single
+
+    lower, infeasible_global, infeasible_single = compute_lower_bound()
+    if infeasible_single or infeasible_global or lower == float('inf'):
+        # Fallback: simple greedy minimizing local KVPR increase
+        return _greedy_fallback_kvpr(gpu_num, models, S)
+=======
+    # Greedy helper to place remaining (rate-bearing) models onto an existing base placement
+    def _greedy_place_remaining(base_placement, remaining_models, S):
+        placement = {i: list(base_placement.get(i, [])) for i in range(gpu_num)}
+        used_mem = [sum(float(m.model_size) for m in placement[i]) for i in range(gpu_num)]
+        sum_R = [sum((float(m.req_rate) / float(m.slo)) if getattr(m, "slo", 0) != 0 else 0.0 for m in placement[i]) for i in range(gpu_num)]
+        # Sort by demand intensity then size
+        sorted_models = sorted(
+            remaining_models,
+            key=lambda m: ((m.req_rate / m.slo) if getattr(m, "slo", 0) != 0 else 0.0, m.model_size),
+            reverse=True
+        )
+        for m in sorted_models:
+            dR = (m.req_rate / m.slo) if getattr(m, "slo", 0) != 0 else 0.0
+            s = float(m.model_size)
+            best_gid, best_val = None, float('inf')
+            for gid in range(gpu_num):
+                if used_mem[gid] + s <= S:
+                    rem = S - (used_mem[gid] + s)
+                    if rem <= 0:
+                        continue
+                    val = (sum_R[gid] + dR) / rem
+                    if val < best_val:
+                        best_val = val
+                        best_gid = gid
+            if best_gid is None:
+                raise ValueError(f"Unable to place model of size {m.model_size} GB on any GPU. Remaining per-GPU memory: {[S - u for u in used_mem]}")
+            placement[best_gid].append(m)
+            used_mem[best_gid] += s
+            sum_R[best_gid] += dR
+        return placement
+
+    # Pre-place memory-only models (slo == 0) to freeze residual capacities
+    mem_only = [m for m in models if float(m.slo) == 0.0]
+    rate_models = [m for m in models if float(m.slo) != 0.0]
+
+    # Base placement after memory-only packing
+    base_placement = {i: [] for i in range(gpu_num)}
+    pre_used_mem = [0.0] * gpu_num
+    if mem_only:
+        # Largest-first to GPUs with most remaining memory
+        for m in sorted(mem_only, key=lambda x: float(x.model_size), reverse=True):
+            size = float(m.model_size)
+            # pick GPU with maximum remaining memory; tie-break by fewest items
+            candidates = sorted(
+                range(gpu_num),
+                key=lambda g: (-(S - pre_used_mem[g]), len(base_placement[g]))
+            )
+            chosen = None
+            for gid in candidates:
+                if pre_used_mem[gid] + size <= S + 1e-9:
+                    chosen = gid
+                    break
+            if chosen is None:
+                raise ValueError(f"Unable to place memory-only model of size {m.model_size} GB on any GPU.")
+            base_placement[chosen].append(m)
+            pre_used_mem[chosen] += size
+
+    # Extract per-model attributes for rate-bearing items
+    items = []
+    total_R = 0.0
+    total_size_rate = 0.0
+    for m in rate_models:
+        slo = float(m.slo)
+        dR = float(m.req_rate) / slo
+        s = float(m.model_size)
+        items.append({'obj': m, 'dR': dR, 'size': s})
+        total_R += dR
+        total_size_rate += s
+    total_size_pre = sum(pre_used_mem)
+
+    # If there are no rate-bearing models, we're done
+    if not items:
+        return base_placement
+
+    # Lower bounds on optimal T (computed over rate-bearing items with remaining total memory)
+    def compute_lower_bound():
+        # Per-item bound: T >= dR / (S - s)
+        lb1 = 0.0
+        infeasible_single = False
+        for it in items:
+            dR = it['dR']; s = it['size']
+            denom = S - s
+            if denom <= 0:
+                if dR > 0:
+                    infeasible_single = True
+                continue
+            if dR > 0:
+                cand = dR / denom
+                if cand > lb1:
+                    lb1 = cand
+
+        # Global bound: T >= total_R / (sum_remaining_mem - total_size_rate)
+        remaining_total_mem = gpu_num * S - total_size_pre
+        denom2 = remaining_total_mem - total_size_rate
+        if denom2 <= 0 and total_R > 0:
+            return float('inf'), True, infeasible_single
+        lb2 = 0.0 if total_R <= 0 or denom2 <= 0 else (total_R / denom2)
+
+        # Pair bound: for pairs that cannot co-reside (s_i + s_j > S)
+        lb_pair = 0.0
+        P = min(len(items), 200)
+        by_size = sorted(items, key=lambda x: x['size'], reverse=True)[:P]
+        for i in range(len(by_size)):
+            si = by_size[i]['size']; ri = by_size[i]['dR']
+            for j in range(i + 1, len(by_size)):
+                sj = by_size[j]['size']; rj = by_size[j]['dR']
+                if si + sj > S:
+                    denom = 2 * S - (si + sj)
+                    if denom > 0:
+                        cand = (ri + rj) / denom
+                        if cand > lb_pair:
+                            lb_pair = cand
+
+        # k-bin prefix bound for k in {1..min(gpu_num,4)} using items only
+        lb_k = 0.0
+        sorted_by_size = sorted(items, key=lambda x: x['size'], reverse=True)
+        prefix_sizes = []
+        prefix_rates = []
+        cs = 0.0; cr = 0.0
+        for it in sorted_by_size:
+            cs += it['size']; cr += it['dR']
+            prefix_sizes.append(cs); prefix_rates.append(cr)
+        for k in range(1, min(gpu_num, 4) + 1):
+            threshold = (k - 1) * S
+            idx = -1
+            for t in range(len(prefix_sizes)):
+                if prefix_sizes[t] > threshold:
+                    idx = t
+                    break
+            if idx >= 0:
+                numer = prefix_rates[idx]
+                denom = k * S - prefix_sizes[idx]
+                if denom > 0 and numer > 0:
+                    cand = numer / denom
+                    if cand > lb_k:
+                        lb_k = cand
+
+        lower = max(0.0, lb1, lb2, lb_pair, lb_k)
+        return lower, False, infeasible_single
+
+    lower, infeasible_global, infeasible_single = compute_lower_bound()
+    if infeasible_single or infeasible_global or lower == float('inf'):
+        # Fallback: greedy packing of rate models on top of pre-placed memory-only
+        return _greedy_place_remaining(base_placement, rate_models, S)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            # per-GPU states
+            assign = {i: [] for i in range(gpu_num)}
+            used_mem = [0.0] * gpu_num
+            sum_R = [0.0] * gpu_num
+            K = [T * S] * gpu_num  # KV slack
+=======
+            # per-GPU states seeded by memory-only pre-placement
+            assign = {i: list(base_placement.get(i, [])) for i in range(gpu_num)}
+            used_mem = list(pre_used_mem)
+            sum_R = [0.0] * gpu_num
+            # KV slack based on residual capacity per GPU
+            K = [T * (S - used_mem[i]) for i in range(gpu_num)]  # KV slack
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    T_feas, placement_at_T = find_first_feasible_T(lower)
+    if placement_at_T is None:
+        # As a safety net
+        return _greedy_fallback_kvpr(gpu_num, models, S)
+=======
+    T_feas, placement_at_T = find_first_feasible_T(lower)
+    if placement_at_T is None:
+        # As a safety net: place remaining rate models onto pre-placement
+        return _greedy_place_remaining(base_placement, rate_models, S)
+>>>>>>> REPLACE
+
+</DIFF>

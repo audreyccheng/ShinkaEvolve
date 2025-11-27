@@ -1,0 +1,243 @@
+<NAME>
+vectorized_2item_swap_fix
+</NAME>
+
+<DESCRIPTION>
+Implement vectorized 2-item swap refinement in `balanced_packing`.
+This replaces the 1-item only refinement with a hybrid approach:
+1. First, calculate gains for 1-item swaps between Top-K and Bottom-K packs.
+2. If `groups_per_pack` is within a reasonable range (2 to 32), also calculate gains for 2-item swaps between the absolute heaviest (Top-1) and lightest (Bottom-1) packs.
+3. Compare the gains and execute the best swap type.
+This allows the algorithm to escape local optima where single item swaps cannot improve balance (e.g. replacing two medium items with two others).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Refinement: Top-K / Bottom-K Swap
+    # Increase K to explore more swap opportunities
+    K = min(num_packs, 8)
+
+    for _ in range(50):
+        current_pack_weights = pack_contents.sum(dim=2)  # [B, P]
+
+        vals_top, idx_top = torch.topk(current_pack_weights, k=K, largest=True)
+        vals_bot, idx_bot = torch.topk(current_pack_weights,
+                                       k=K,
+                                       largest=False)
+
+        diff = vals_top[:, 0] - vals_bot[:, 0]
+        active_mask = diff > 1e-4
+        if not active_mask.any():
+            break
+
+        # Gather items
+        gather_top = idx_top.unsqueeze(2).expand(-1, -1, groups_per_pack)
+        gather_bot = idx_bot.unsqueeze(2).expand(-1, -1, groups_per_pack)
+
+        items_top = pack_contents.gather(1, gather_top)  # [B, K, G]
+        items_bot = pack_contents.gather(1, gather_bot)  # [B, K, G]
+
+        # Delta: [B, K, G, K, G]
+        # items_top: [B, K, G, 1, 1]
+        # items_bot: [B, 1, 1, K, G]
+        delta = items_top.unsqueeze(3).unsqueeze(4) - items_bot.unsqueeze(
+            1).unsqueeze(2)
+
+        W_A = vals_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        W_B = vals_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        diff_packs = W_A - W_B
+
+        gain = 2 * delta * (diff_packs - delta)
+
+        p_top_exp = idx_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        p_bot_exp = idx_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        valid_pair = p_top_exp != p_bot_exp
+
+        gain_mask = (gain > 1e-6) & valid_pair
+        gain[~gain_mask] = -float('inf')
+
+        gain_flat = gain.view(refined_batch_size, -1)
+        best_gain, best_flat_idx = gain_flat.max(dim=1)
+
+        do_swap = (best_gain > 1e-6) & active_mask
+        if not do_swap.any():
+            break
+
+        batch_active = ref_row_indices[do_swap]
+        idx_tuple = best_flat_idx[do_swap]
+
+        KG = K * groups_per_pack
+        idx_pair_top = idx_tuple // KG
+        idx_pair_bot = idx_tuple % KG
+
+        k_t = idx_pair_top // groups_per_pack
+        g_t = idx_pair_top % groups_per_pack
+        k_b = idx_pair_bot // groups_per_pack
+        g_b = idx_pair_bot % groups_per_pack
+
+        p_top = idx_top[batch_active, k_t]
+        p_bot = idx_bot[batch_active, k_b]
+
+        val_top = pack_contents[batch_active, p_top, g_t]
+        val_bot = pack_contents[batch_active, p_bot, g_b]
+
+        pack_contents[batch_active, p_top, g_t] = val_bot
+        pack_contents[batch_active, p_bot, g_b] = val_top
+
+        id_top = pack_item_ids[batch_active, p_top, g_t]
+        id_bot = pack_item_ids[batch_active, p_bot, g_b]
+
+        pack_item_ids[batch_active, p_top, g_t] = id_bot
+        pack_item_ids[batch_active, p_bot, g_b] = id_top
+=======
+    # Refinement: Top-K / Bottom-K Swap with Hybrid 1-item and 2-item Moves
+    K = min(num_packs, 4)  # Use smaller K to manage memory
+
+    # Pre-compute for 2-item swaps
+    can_do_pair_swap = (groups_per_pack >= 2) and (groups_per_pack <= 32)
+    if can_do_pair_swap:
+        pair_i, pair_j = torch.triu_indices(groups_per_pack,
+                                            groups_per_pack,
+                                            1,
+                                            device=device)
+        num_pairs = pair_i.shape[0]
+
+    for _ in range(50):
+        current_pack_weights = pack_contents.sum(dim=2)  # [B, P]
+
+        vals_top, idx_top = torch.topk(current_pack_weights, k=K, largest=True)
+        vals_bot, idx_bot = torch.topk(current_pack_weights,
+                                       k=K,
+                                       largest=False)
+
+        diff = vals_top[:, 0] - vals_bot[:, 0]
+        active_mask = diff > 1e-4
+        if not active_mask.any():
+            break
+
+        # --- 1. Evaluate 1-Item Swaps ---
+        gather_top = idx_top.unsqueeze(2).expand(-1, -1, groups_per_pack)
+        gather_bot = idx_bot.unsqueeze(2).expand(-1, -1, groups_per_pack)
+
+        items_top = pack_contents.gather(1, gather_top)  # [B, K, G]
+        items_bot = pack_contents.gather(1, gather_bot)  # [B, K, G]
+
+        # Delta: [B, K, G, K, G]
+        delta_1 = items_top.unsqueeze(3).unsqueeze(4) - items_bot.unsqueeze(
+            1).unsqueeze(2)
+
+        W_A = vals_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        W_B = vals_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        diff_packs_1 = W_A - W_B
+
+        gain_1 = 2 * delta_1 * (diff_packs_1 - delta_1)
+
+        p_top_exp = idx_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        p_bot_exp = idx_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        valid_pair = p_top_exp != p_bot_exp
+
+        gain_1[~valid_pair] = -float('inf')
+        gain_1_flat = gain_1.view(refined_batch_size, -1)
+        best_gain_1, best_idx_1 = gain_1_flat.max(dim=1)
+
+        # --- 2. Evaluate 2-Item Swaps (Top-1 vs Bottom-1) ---
+        best_gain_2 = torch.full_like(best_gain_1, -float('inf'))
+        best_idx_2 = torch.zeros_like(best_idx_1)
+
+        if can_do_pair_swap:
+            # We only check 2-item swaps between best top and best bottom
+            # to save memory/compute.
+            t1_items = pack_contents[ref_row_indices, idx_top[:, 0]]  # [B, G]
+            b1_items = pack_contents[ref_row_indices, idx_bot[:, 0]]  # [B, G]
+
+            # [B, NumPairs]
+            t1_pairs = t1_items[:, pair_i] + t1_items[:, pair_j]
+            b1_pairs = b1_items[:, pair_i] + b1_items[:, pair_j]
+
+            # [B, NumPairs, NumPairs]
+            delta_2 = t1_pairs.unsqueeze(2) - b1_pairs.unsqueeze(1)
+            diff_2 = (vals_top[:, 0] - vals_bot[:, 0]).view(-1, 1, 1)
+
+            gain_2 = 2 * delta_2 * (diff_2 - delta_2)
+
+            # Mask invalid gains
+            gain_2_flat = gain_2.view(refined_batch_size, -1)
+            best_gain_2, best_idx_2 = gain_2_flat.max(dim=1)
+
+        # --- 3. Execute Best Swap ---
+        use_2item = (best_gain_2 > best_gain_1) & (best_gain_2 > 1e-6) & can_do_pair_swap
+        do_swap = (torch.max(best_gain_1, best_gain_2) > 1e-6) & active_mask
+
+        if not do_swap.any():
+            break
+
+        # Execute 1-item swaps
+        mask_1 = do_swap & (~use_2item)
+        if mask_1.any():
+            b_1 = ref_row_indices[mask_1]
+            idx_tuple = best_idx_1[mask_1]
+
+            KG = K * groups_per_pack
+            idx_pair_top = idx_tuple // KG
+            idx_pair_bot = idx_tuple % KG
+
+            k_t = idx_pair_top // groups_per_pack
+            g_t = idx_pair_top % groups_per_pack
+            k_b = idx_pair_bot // groups_per_pack
+            g_b = idx_pair_bot % groups_per_pack
+
+            p_top = idx_top[mask_1, k_t]
+            p_bot = idx_bot[mask_1, k_b]
+
+            val_top = pack_contents[b_1, p_top, g_t]
+            val_bot = pack_contents[b_1, p_bot, g_b]
+
+            pack_contents[b_1, p_top, g_t] = val_bot
+            pack_contents[b_1, p_bot, g_b] = val_top
+
+            id_top = pack_item_ids[b_1, p_top, g_t]
+            id_bot = pack_item_ids[b_1, p_bot, g_b]
+
+            pack_item_ids[b_1, p_top, g_t] = id_bot
+            pack_item_ids[b_1, p_bot, g_b] = id_top
+
+        # Execute 2-item swaps
+        mask_2 = do_swap & use_2item
+        if mask_2.any():
+            b_2 = ref_row_indices[mask_2]
+            idx_tuple_2 = best_idx_2[mask_2]
+
+            idx_pair_t = idx_tuple_2 // num_pairs
+            idx_pair_b = idx_tuple_2 % num_pairs
+
+            p_top_2 = idx_top[mask_2, 0]
+            p_bot_2 = idx_bot[mask_2, 0]
+
+            t_i = pair_i[idx_pair_t]
+            t_j = pair_j[idx_pair_t]
+            b_k = pair_i[idx_pair_b]
+            b_l = pair_j[idx_pair_b]
+
+            # Get values
+            val_t_i = pack_contents[b_2, p_top_2, t_i]
+            val_t_j = pack_contents[b_2, p_top_2, t_j]
+            val_b_k = pack_contents[b_2, p_bot_2, b_k]
+            val_b_l = pack_contents[b_2, p_bot_2, b_l]
+
+            # Perform 2-item swap
+            pack_contents[b_2, p_top_2, t_i] = val_b_k
+            pack_contents[b_2, p_top_2, t_j] = val_b_l
+            pack_contents[b_2, p_bot_2, b_k] = val_t_i
+            pack_contents[b_2, p_bot_2, b_l] = val_t_j
+
+            id_t_i = pack_item_ids[b_2, p_top_2, t_i]
+            id_t_j = pack_item_ids[b_2, p_top_2, t_j]
+            id_b_k = pack_item_ids[b_2, p_bot_2, b_k]
+            id_b_l = pack_item_ids[b_2, p_bot_2, b_l]
+
+            pack_item_ids[b_2, p_top_2, t_i] = id_b_k
+            pack_item_ids[b_2, p_top_2, t_j] = id_b_l
+            pack_item_ids[b_2, p_bot_2, b_k] = id_t_i
+            pack_item_ids[b_2, p_bot_2, b_l] = id_t_j
+>>>>>>> REPLACE
+</DIFF>

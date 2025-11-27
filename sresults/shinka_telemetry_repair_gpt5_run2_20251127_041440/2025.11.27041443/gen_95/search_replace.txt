@@ -1,0 +1,338 @@
+<NAME>
+prescale_and_onesided_trust
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements to boost counter repair accuracy and maintain calibrated confidences:
+
+1) Gentle multiplicative pair-bias prescaling before averaging: For each direction, we compute a small balanced prescale factor s = clamp(sqrt(peer/local), 0.90, 1.10), and use prescaled values only for consensus and k calculations. This reduces ratio bias so the consensus point doesn’t overly favor the louder side while keeping the committed values in the original space.
+
+2) One-sided trust for near-zero vs high peer: When one side is near-zero and the peer is much larger on high-rate links, we copy the larger peer value instead of averaging. This eliminates harmful averaging in clearly asymmetric faults and improves calibration by reflecting larger change magnitudes.
+
+Additionally, I add an ultra-agreement confidence floor: when both directions of a link align very tightly after repair (≤0.3%) and both routers’ residuals are small (≤2%), we raise RX/TX/status confidences to at least 0.995. This better calibrates high-quality repairs without overconfidence on imbalanced routers, since the router penalty is already near 1.0 in these cases.
+
+All changes are guarded by existing magnitude-aware thresholds and absolute guards to avoid over-correction on tiny flows and preserve current behavior elsewhere.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Base thresholds
+    TH_REL_DEFAULT = 0.02   # 2%
+    TH_REL_LOW = 0.05       # 5% for low-rate links
+    TH_ABS_GUARD = 0.5      # 0.5 Mbps absolute guard
+    ABS_GUARD_LOW = 0.3     # 0.3 Mbps absolute guard for low-rate links
+    EPS = 1e-6
+=======
+    # Base thresholds
+    TH_REL_DEFAULT = 0.02   # 2%
+    TH_REL_LOW = 0.05       # 5% for low-rate links
+    TH_ABS_GUARD = 0.5      # 0.5 Mbps absolute guard
+    ABS_GUARD_LOW = 0.3     # 0.3 Mbps absolute guard for low-rate links
+    LOW_RATE_CUTOFF = 10.0  # Mbps threshold for low-rate behavior
+    # One-sided trust (when one side ~0 and peer is high)
+    ONE_SIDED_FRAC = 0.05      # near-zero if smaller side is <= 5% of larger
+    ONE_SIDED_ABS_MULT = 2.0   # require abs diff > 2x guard to trust peer
+    # Prescaling clamp for gentle bias reduction
+    PRESCALE_MIN = 0.90
+    PRESCALE_MAX = 1.10
+    EPS = 1e-6
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Magnitude-aware thresholds with residual-tilted consensus and asymmetric partial averaging
+            # Direction A->B (A.tx vs B.rx)
+            max_ab = max(a_tx, b_rx)
+            thr_rel_ab = TH_REL_LOW if max_ab < 10.0 else TH_REL_DEFAULT
+            guard_ab = ABS_GUARD_LOW if max_ab < 10.0 else TH_ABS_GUARD
+            d_ab = rel_diff(a_tx, b_rx)
+            abs_ab = abs(a_tx - b_rx)
+            partial_upper_ab = (1.6 * thr_rel_ab) if max_ab < 10.0 else (2.0 * thr_rel_ab)
+
+            if (d_ab > thr_rel_ab) and (abs_ab > guard_ab):
+                # Residual-tilted weighted consensus target
+                v = 0.5 * (a_tx + b_rx)
+                resid_a = resid_signed.get(a.get('local_router'), 0.0)
+                if max_ab >= 1.0 and (a_tx - b_rx) != 0.0 and resid_a != 0.0 and (sgn(a_tx - b_rx) == sgn(resid_a)):
+                    gamma = min(0.08, 0.1 * abs(resid_a))
+                    w_a = clamp(0.5 - gamma, 0.2, 0.8)
+                    w_b = 1.0 - w_a
+                    v = w_a * a_tx + w_b * b_rx
+
+                if d_ab <= partial_upper_ab:
+                    # Asymmetric partial averaging: louder side moves more
+                    k_base = (d_ab - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                    k_base = min(1.0, max(0.0, k_base))
+                    if max_ab < 10.0:
+                        k_base = k_base ** 1.2
+                    if a_tx >= b_rx:
+                        loud = a_tx; quiet = b_rx
+                    else:
+                        loud = b_rx; quiet = a_tx
+                    r = (loud - quiet) / max(1.0, loud)
+                    k_loud = min(1.0, max(0.0, k_base * (1.0 + 0.5 * r)))
+                    k_quiet = min(1.0, max(0.0, k_base * (1.0 - 0.5 * r)))
+                    if a_tx >= b_rx:
+                        rep_a_tx = a_tx * (1.0 - k_loud) + v * k_loud
+                        rep_b_rx = b_rx * (1.0 - k_quiet) + v * k_quiet
+                    else:
+                        rep_a_tx = a_tx * (1.0 - k_quiet) + v * k_quiet
+                        rep_b_rx = b_rx * (1.0 - k_loud) + v * k_loud
+                else:
+                    rep_a_tx = v
+                    rep_b_rx = v
+                # Confidence decreases with violation magnitude and change magnitude
+                change_a = abs(rep_a_tx - a_tx) / max(abs(rep_a_tx), abs(a_tx), 1.0)
+                change_b = abs(rep_b_rx - b_rx) / max(abs(rep_b_rx), abs(b_rx), 1.0)
+                conf_base = max(0.0, 1.0 - d_ab)
+                tx_conf_a = min(conf_base, 1.0 - 0.8 * change_a)
+                rx_conf_b = min(conf_base, 1.0 - 0.8 * change_b)
+            else:
+                # Within tolerance: keep values and set strong confidence floors
+                if max_ab >= 10.0 and d_ab <= 0.005:  # 0.5%
+                    conf_floor = 0.99
+                else:
+                    conf_floor = 0.98 if max_ab >= 10.0 else 0.97
+                tx_conf_a = max(tx_conf_a, conf_floor)
+                rx_conf_b = max(rx_conf_b, conf_floor)
+=======
+            # Magnitude-aware thresholds with residual-tilted consensus, prescaling and one-sided trust
+            # Direction A->B (A.tx vs B.rx)
+            max_ab = max(a_tx, b_rx)
+            min_ab = min(a_tx, b_rx)
+            thr_rel_ab = TH_REL_LOW if max_ab < LOW_RATE_CUTOFF else TH_REL_DEFAULT
+            guard_ab = ABS_GUARD_LOW if max_ab < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            d_ab_raw = rel_diff(a_tx, b_rx)
+            d_ab = d_ab_raw  # keep legacy name for downstream status check
+            abs_ab = abs(a_tx - b_rx)
+            partial_upper_ab = (1.6 * thr_rel_ab) if max_ab < LOW_RATE_CUTOFF else (2.0 * thr_rel_ab)
+
+            # Gentle prescaling to reduce ratio bias (used only for consensus/k calculations)
+            s_ab = (max(EPS, b_rx) / max(EPS, a_tx)) ** 0.5
+            s_ab = clamp(s_ab, PRESCALE_MIN, PRESCALE_MAX)
+            a_tx_s = a_tx * s_ab
+            b_rx_s = b_rx / s_ab
+            d_ab_s = rel_diff(a_tx_s, b_rx_s)
+
+            if (d_ab_raw > thr_rel_ab) and (abs_ab > guard_ab):
+                # One-sided trust: when one side is near-zero and peer is high (avoid averaging)
+                if (max_ab >= LOW_RATE_CUTOFF and
+                    min_ab <= ONE_SIDED_FRAC * max_ab and
+                    abs_ab > ONE_SIDED_ABS_MULT * guard_ab):
+                    v_ab = max_ab
+                    rep_a_tx = v_ab
+                    rep_b_rx = v_ab
+                    conf_base = max(0.0, 1.0 - 0.5 * d_ab_raw)
+                    change_a = abs(rep_a_tx - a_tx) / max(abs(rep_a_tx), abs(a_tx), 1.0)
+                    change_b = abs(rep_b_rx - b_rx) / max(abs(rep_b_rx), abs(b_rx), 1.0)
+                    tx_conf_a = min(0.95, max(0.65, conf_base, 1.0 - 0.8 * change_a))
+                    rx_conf_b = min(0.95, max(0.65, conf_base, 1.0 - 0.8 * change_b))
+                else:
+                    # Residual-tilted weighted consensus target (computed on prescaled values)
+                    v = 0.5 * (a_tx_s + b_rx_s)
+                    resid_a = resid_signed.get(a.get('local_router'), 0.0)
+                    if max_ab >= 1.0 and (a_tx_s - b_rx_s) != 0.0 and resid_a != 0.0 and (sgn(a_tx_s - b_rx_s) == sgn(resid_a)):
+                        gamma = min(0.08, 0.1 * abs(resid_a))
+                        w_a = clamp(0.5 - gamma, 0.2, 0.8)
+                        w_b = 1.0 - w_a
+                        v = w_a * a_tx_s + w_b * b_rx_s
+
+                    if d_ab_s <= partial_upper_ab:
+                        # Asymmetric partial averaging: louder side moves more; ramp slightly steeper at low rate
+                        k_base = (d_ab_s - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                        k_base = min(1.0, max(0.0, k_base))
+                        if max_ab < LOW_RATE_CUTOFF:
+                            k_base = k_base ** 1.2
+                        if a_tx_s >= b_rx_s:
+                            loud_s, quiet_s, loud_is_a = a_tx_s, b_rx_s, True
+                        else:
+                            loud_s, quiet_s, loud_is_a = b_rx_s, a_tx_s, False
+                        r = (loud_s - quiet_s) / max(1.0, loud_s)
+                        k_loud = min(1.0, max(0.0, k_base * (1.0 + 0.5 * r)))
+                        k_quiet = min(1.0, max(0.0, k_base * (1.0 - 0.5 * r)))
+                        if loud_is_a:
+                            rep_a_tx = a_tx * (1.0 - k_loud) + v * k_loud
+                            rep_b_rx = b_rx * (1.0 - k_quiet) + v * k_quiet
+                        else:
+                            rep_a_tx = a_tx * (1.0 - k_quiet) + v * k_quiet
+                            rep_b_rx = b_rx * (1.0 - k_loud) + v * k_loud
+                    else:
+                        rep_a_tx = v
+                        rep_b_rx = v
+
+                    # Confidence decreases with raw violation magnitude and applied change
+                    change_a = abs(rep_a_tx - a_tx) / max(abs(rep_a_tx), abs(a_tx), 1.0)
+                    change_b = abs(rep_b_rx - b_rx) / max(abs(rep_b_rx), abs(b_rx), 1.0)
+                    conf_base = max(0.0, 1.0 - d_ab_raw)
+                    tx_conf_a = min(conf_base, 1.0 - 0.8 * change_a)
+                    rx_conf_b = min(conf_base, 1.0 - 0.8 * change_b)
+            else:
+                # Within tolerance: keep values and set strong confidence floors (using raw diff)
+                if max_ab >= LOW_RATE_CUTOFF and d_ab_raw <= 0.005:  # 0.5%
+                    conf_floor = 0.99
+                else:
+                    conf_floor = 0.98 if max_ab >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_a = max(tx_conf_a, conf_floor)
+                rx_conf_b = max(rx_conf_b, conf_floor)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Direction B->A (B.tx vs A.rx)
+            max_ba = max(b_tx, a_rx)
+            thr_rel_ba = TH_REL_LOW if max_ba < 10.0 else TH_REL_DEFAULT
+            guard_ba = ABS_GUARD_LOW if max_ba < 10.0 else TH_ABS_GUARD
+            d_ba = rel_diff(b_tx, a_rx)
+            abs_ba = abs(b_tx - a_rx)
+            partial_upper_ba = (1.6 * thr_rel_ba) if max_ba < 10.0 else (2.0 * thr_rel_ba)
+
+            if (d_ba > thr_rel_ba) and (abs_ba > guard_ba):
+                v2 = 0.5 * (b_tx + a_rx)
+                resid_b = resid_signed.get(b.get('local_router'), 0.0)
+                if max_ba >= 1.0 and (b_tx - a_rx) != 0.0 and resid_b != 0.0 and (sgn(b_tx - a_rx) == sgn(resid_b)):
+                    gamma2 = min(0.08, 0.1 * abs(resid_b))
+                    w_b2 = clamp(0.5 - gamma2, 0.2, 0.8)
+                    w_a2 = 1.0 - w_b2
+                    v2 = w_b2 * b_tx + w_a2 * a_rx
+
+                if d_ba <= partial_upper_ba:
+                    k_base2 = (d_ba - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                    k_base2 = min(1.0, max(0.0, k_base2))
+                    if max_ba < 10.0:
+                        k_base2 = k_base2 ** 1.2
+                    if b_tx >= a_rx:
+                        loud2 = b_tx; quiet2 = a_rx
+                    else:
+                        loud2 = a_rx; quiet2 = b_tx
+                    r2 = (loud2 - quiet2) / max(1.0, loud2)
+                    k_loud2 = min(1.0, max(0.0, k_base2 * (1.0 + 0.5 * r2)))
+                    k_quiet2 = min(1.0, max(0.0, k_base2 * (1.0 - 0.5 * r2)))
+                    if b_tx >= a_rx:
+                        rep_b_tx = b_tx * (1.0 - k_loud2) + v2 * k_loud2
+                        rep_a_rx = a_rx * (1.0 - k_quiet2) + v2 * k_quiet2
+                    else:
+                        rep_b_tx = b_tx * (1.0 - k_quiet2) + v2 * k_quiet2
+                        rep_a_rx = a_rx * (1.0 - k_loud2) + v2 * k_loud2
+                else:
+                    rep_b_tx = v2
+                    rep_a_rx = v2
+                change_b2 = abs(rep_b_tx - b_tx) / max(abs(rep_b_tx), abs(b_tx), 1.0)
+                change_a2 = abs(rep_a_rx - a_rx) / max(abs(rep_a_rx), abs(a_rx), 1.0)
+                conf_base2 = max(0.0, 1.0 - d_ba)
+                tx_conf_b = min(conf_base2, 1.0 - 0.8 * change_b2)
+                rx_conf_a = min(conf_base2, 1.0 - 0.8 * change_a2)
+            else:
+                if max_ba >= 10.0 and d_ba <= 0.005:
+                    conf_floor2 = 0.99
+                else:
+                    conf_floor2 = 0.98 if max_ba >= 10.0 else 0.97
+                tx_conf_b = max(tx_conf_b, conf_floor2)
+                rx_conf_a = max(rx_conf_a, conf_floor2)
+=======
+            # Direction B->A (B.tx vs A.rx)
+            max_ba = max(b_tx, a_rx)
+            min_ba = min(b_tx, a_rx)
+            thr_rel_ba = TH_REL_LOW if max_ba < LOW_RATE_CUTOFF else TH_REL_DEFAULT
+            guard_ba = ABS_GUARD_LOW if max_ba < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            d_ba_raw = rel_diff(b_tx, a_rx)
+            d_ba = d_ba_raw  # keep legacy name for downstream status check
+            abs_ba = abs(b_tx - a_rx)
+            partial_upper_ba = (1.6 * thr_rel_ba) if max_ba < LOW_RATE_CUTOFF else (2.0 * thr_rel_ba)
+
+            # Prescaling (used only for consensus/k calculations)
+            s_ba = (max(EPS, a_rx) / max(EPS, b_tx)) ** 0.5
+            s_ba = clamp(s_ba, PRESCALE_MIN, PRESCALE_MAX)
+            b_tx_s = b_tx * s_ba
+            a_rx_s = a_rx / s_ba
+            d_ba_s = rel_diff(b_tx_s, a_rx_s)
+
+            if (d_ba_raw > thr_rel_ba) and (abs_ba > guard_ba):
+                # One-sided trust for highly asymmetric pairs
+                if (max_ba >= LOW_RATE_CUTOFF and
+                    min_ba <= ONE_SIDED_FRAC * max_ba and
+                    abs_ba > ONE_SIDED_ABS_MULT * guard_ba):
+                    v_ba = max_ba
+                    rep_b_tx = v_ba
+                    rep_a_rx = v_ba
+                    conf_base2 = max(0.0, 1.0 - 0.5 * d_ba_raw)
+                    change_b2 = abs(rep_b_tx - b_tx) / max(abs(rep_b_tx), abs(b_tx), 1.0)
+                    change_a2 = abs(rep_a_rx - a_rx) / max(abs(rep_a_rx), abs(a_rx), 1.0)
+                    tx_conf_b = min(0.95, max(0.65, conf_base2, 1.0 - 0.8 * change_b2))
+                    rx_conf_a = min(0.95, max(0.65, conf_base2, 1.0 - 0.8 * change_a2))
+                else:
+                    v2 = 0.5 * (b_tx_s + a_rx_s)
+                    resid_b = resid_signed.get(b.get('local_router'), 0.0)
+                    if max_ba >= 1.0 and (b_tx_s - a_rx_s) != 0.0 and resid_b != 0.0 and (sgn(b_tx_s - a_rx_s) == sgn(resid_b)):
+                        gamma2 = min(0.08, 0.1 * abs(resid_b))
+                        w_b2 = clamp(0.5 - gamma2, 0.2, 0.8)
+                        w_a2 = 1.0 - w_b2
+                        v2 = w_b2 * b_tx_s + w_a2 * a_rx_s
+
+                    if d_ba_s <= partial_upper_ba:
+                        k_base2 = (d_ba_s - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                        k_base2 = min(1.0, max(0.0, k_base2))
+                        if max_ba < LOW_RATE_CUTOFF:
+                            k_base2 = k_base2 ** 1.2
+                        if b_tx_s >= a_rx_s:
+                            loud2_s, quiet2_s, loud_is_b = b_tx_s, a_rx_s, True
+                        else:
+                            loud2_s, quiet2_s, loud_is_b = a_rx_s, b_tx_s, False
+                        r2 = (loud2_s - quiet2_s) / max(1.0, loud2_s)
+                        k_loud2 = min(1.0, max(0.0, k_base2 * (1.0 + 0.5 * r2)))
+                        k_quiet2 = min(1.0, max(0.0, k_base2 * (1.0 - 0.5 * r2)))
+                        if loud_is_b:
+                            rep_b_tx = b_tx * (1.0 - k_loud2) + v2 * k_loud2
+                            rep_a_rx = a_rx * (1.0 - k_quiet2) + v2 * k_quiet2
+                        else:
+                            rep_b_tx = b_tx * (1.0 - k_quiet2) + v2 * k_quiet2
+                            rep_a_rx = a_rx * (1.0 - k_loud2) + v2 * k_loud2
+                    else:
+                        rep_b_tx = v2
+                        rep_a_rx = v2
+
+                    change_b2 = abs(rep_b_tx - b_tx) / max(abs(rep_b_tx), abs(b_tx), 1.0)
+                    change_a2 = abs(rep_a_rx - a_rx) / max(abs(rep_a_rx), abs(a_rx), 1.0)
+                    conf_base2 = max(0.0, 1.0 - d_ba_raw)
+                    tx_conf_b = min(conf_base2, 1.0 - 0.8 * change_b2)
+                    rx_conf_a = min(conf_base2, 1.0 - 0.8 * change_a2)
+            else:
+                if max_ba >= LOW_RATE_CUTOFF and d_ba_raw <= 0.005:
+                    conf_floor2 = 0.99
+                else:
+                    conf_floor2 = 0.98 if max_ba >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_b = max(tx_conf_b, conf_floor2)
+                rx_conf_a = max(rx_conf_a, conf_floor2)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        status_conf = max(0.0, min(1.0, status_conf * (0.85 + 0.15 * min_penalty)))
+=======
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        status_conf = max(0.0, min(1.0, status_conf * (0.85 + 0.15 * min_penalty)))
+
+        # Ultra-agreement floor: if both directions on this link are tightly aligned post-repair
+        # and both routers have very low residuals, raise confidences to at least 0.995.
+        peer_id = data.get('connected_to')
+        if peer_id and (peer_id in per_if) and (if_id in per_if):
+            try:
+                rep_tx_local = to_float(per_if[if_id]['repaired_tx'])
+                rep_rx_local = to_float(per_if[if_id]['repaired_rx'])
+                rep_rx_peer = to_float(per_if[peer_id]['repaired_rx'])
+                rep_tx_peer = to_float(per_if[peer_id]['repaired_tx'])
+                d1 = rel_diff(rep_tx_local, rep_rx_peer)
+                d2 = rel_diff(rep_tx_peer, rep_rx_local)
+                if (d1 <= 0.003) and (d2 <= 0.003) and (resid_local <= 0.02) and (resid_remote <= 0.02):
+                    tx_conf = max(tx_conf, 0.995)
+                    rx_conf = max(rx_conf, 0.995)
+                    status_conf = max(status_conf, 0.995)
+            except Exception:
+                pass
+>>>>>>> REPLACE
+</DIFF>

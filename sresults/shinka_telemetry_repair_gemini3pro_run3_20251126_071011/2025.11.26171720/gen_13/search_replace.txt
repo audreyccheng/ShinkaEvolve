@@ -1,0 +1,423 @@
+<NAME>
+improve_calibration_and_iterations
+</NAME>
+
+<DESCRIPTION>
+1. Increase iterations to 5 for better convergence.
+2. Adjust confidence initialization: 0.95 for solid links (instead of 1.0) and 0.90 for external links to allow for later correction/penalty.
+3. Improve Bayesian confidence calculation: Use probability * sqrt(likelihood_score) to account for absolute solution quality, ensuring confidence is low if the "winning" solution still results in poor flow conservation.
+4. Add Global Consistency Penalty: Reduce confidence for all interfaces on a router if flow conservation remains violated after convergence (Step 2.5).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Configuration ---
+    SYMMETRY_TOLERANCE = 0.02
+    CONSERVATION_TOLERANCE_PCT = 0.03
+    MIN_SIGNIFICANT_FLOW = 0.5
+    ITERATIONS = 3
+=======
+    # --- Configuration ---
+    SYMMETRY_TOLERANCE = 0.02
+    CONSERVATION_TOLERANCE_PCT = 0.03
+    MIN_SIGNIFICANT_FLOW = 0.5
+    ITERATIONS = 5
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Step 1: Initial Link Assessment ---
+    # Determine which links are 'Solid' (agreeing) and which are 'Suspect'.
+    # For suspect links, generate hypotheses.
+
+    # Store current best estimates for RX and TX flow on every interface
+    # structure: {if_id: {'rx': val, 'tx': val}}
+    current_estimates = {}
+
+    # Store reliability/confidence of these estimates
+    # structure: {if_id: {'rx': conf, 'tx': conf}} (0.0 to 1.0)
+    estimate_confidence = {}
+
+    # Suspect flows to solve: list of (link_key, metric_type ('rx_flow' or 'tx_flow'))
+    # Note: 'rx_flow' for link (A,B) means A->B traffic (A TX, B RX).
+    suspect_flows = []
+
+    for link_key, info in links.items():
+        if1 = info['if1']
+        if2 = info['if2']
+
+        d1 = telemetry[if1]
+        d2 = telemetry[if2] if if2 else {}
+
+        # Analyze Flow IF1 -> IF2 (IF1 TX, IF2 RX)
+        val1_tx = d1.get('tx_rate', 0.0)
+        val2_rx = d2.get('rx_rate', 0.0) if if2 else None
+
+        if if2:
+            # Internal Link: Check Symmetry
+            denom = max(val1_tx, val2_rx, 1.0)
+            diff = abs(val1_tx - val2_rx)
+
+            if diff / denom < SYMMETRY_TOLERANCE:
+                # Consistent
+                consensus = (val1_tx + val2_rx) / 2.0
+                current_estimates[if1] = current_estimates.get(if1, {})
+                current_estimates[if1]['tx'] = consensus
+                current_estimates[if2] = current_estimates.get(if2, {})
+                current_estimates[if2]['rx'] = consensus
+
+                estimate_confidence[if1] = estimate_confidence.get(if1, {})
+                estimate_confidence[if1]['tx'] = 1.0
+                estimate_confidence[if2] = estimate_confidence.get(if2, {})
+                estimate_confidence[if2]['rx'] = 1.0
+            else:
+                # Suspect
+                suspect_flows.append({'key': link_key, 'dir': '1_to_2', 'candidates': [val1_tx, val2_rx]})
+                # Initialize with average but low confidence
+                consensus = (val1_tx + val2_rx) / 2.0
+                current_estimates[if1] = current_estimates.get(if1, {})
+                current_estimates[if1]['tx'] = consensus
+                current_estimates[if2] = current_estimates.get(if2, {})
+                current_estimates[if2]['rx'] = consensus
+
+                estimate_confidence[if1] = estimate_confidence.get(if1, {})
+                estimate_confidence[if1]['tx'] = 0.5
+                estimate_confidence[if2] = estimate_confidence.get(if2, {})
+                estimate_confidence[if2]['rx'] = 0.5
+        else:
+            # External Link: Trust local blindly for now (no peer to contradict)
+            current_estimates[if1] = current_estimates.get(if1, {})
+            current_estimates[if1]['tx'] = val1_tx
+            estimate_confidence[if1] = estimate_confidence.get(if1, {})
+            estimate_confidence[if1]['tx'] = 1.0 # Tentative
+
+        # Analyze Flow IF2 -> IF1 (IF2 TX, IF1 RX)
+        if if2:
+            val2_tx = d2.get('tx_rate', 0.0)
+            val1_rx = d1.get('rx_rate', 0.0)
+
+            denom = max(val2_tx, val1_rx, 1.0)
+            diff = abs(val2_tx - val1_rx)
+
+            if diff / denom < SYMMETRY_TOLERANCE:
+                consensus = (val2_tx + val1_rx) / 2.0
+                current_estimates[if2]['tx'] = consensus
+                current_estimates[if1]['rx'] = consensus
+                estimate_confidence[if2]['tx'] = 1.0
+                estimate_confidence[if1]['rx'] = 1.0
+            else:
+                suspect_flows.append({'key': link_key, 'dir': '2_to_1', 'candidates': [val2_tx, val1_rx]})
+                consensus = (val2_tx + val1_rx) / 2.0
+                current_estimates[if2]['tx'] = consensus
+                current_estimates[if1]['rx'] = consensus
+                estimate_confidence[if2]['tx'] = 0.5
+                estimate_confidence[if1]['rx'] = 0.5
+        else:
+             # External RX
+            val1_rx = d1.get('rx_rate', 0.0)
+            current_estimates[if1]['rx'] = val1_rx
+            estimate_confidence[if1]['rx'] = 1.0
+
+    # --- Step 2: Iterative Bayesian Refinement ---
+
+    # Helper to calculate router imbalance given current estimates
+    def get_router_imbalance(rid):
+        if_list = topology.get(rid, [])
+        total_in = 0.0
+        total_out = 0.0
+        for iid in if_list:
+            total_in += current_estimates.get(iid, {}).get('rx', 0.0)
+            total_out += current_estimates.get(iid, {}).get('tx', 0.0)
+        return total_in - total_out, max(total_in, total_out, 1.0)
+
+    # Iteration loop
+    for _ in range(ITERATIONS):
+        updates = {} # Store updates to apply after full pass
+
+        for flow_prob in suspect_flows:
+            link_key = flow_prob['key']
+            direction = flow_prob['dir']
+            candidates = flow_prob['candidates']
+
+            # Identify interfaces and routers involved
+            info = links[link_key]
+            if direction == '1_to_2':
+                src_if, dst_if = info['if1'], info['if2']
+                val_src, val_dst = candidates[0], candidates[1] # src measured tx, dst measured rx
+            else:
+                src_if, dst_if = info['if2'], info['if1']
+                val_src, val_dst = candidates[0], candidates[1]
+
+            router_src = if_to_router.get(src_if)
+            router_dst = if_to_router.get(dst_if)
+
+            # Evaluate Hypothesis 1: Value is val_src (Local TX measurement)
+            # Evaluate Hypothesis 2: Value is val_dst (Peer RX measurement)
+            # We also consider their average as a fallback hypothesis 3? No, keep it binary for strong signals.
+
+            hyps = [val_src, val_dst]
+            scores = []
+
+            for h_val in hyps:
+                # Probability score based on Gaussian likelihood of imbalance
+
+                # Check Source Router Imbalance if we use h_val for this TX interface
+                # Temporarily replace value in calculation
+                old_tx = current_estimates[src_if]['tx']
+                current_estimates[src_if]['tx'] = h_val
+                imb_src, flow_src = get_router_imbalance(router_src)
+                # Restore
+                current_estimates[src_if]['tx'] = old_tx
+
+                # Check Dest Router Imbalance if we use h_val for this RX interface
+                old_rx = current_estimates[dst_if]['rx']
+                current_estimates[dst_if]['rx'] = h_val
+                imb_dst, flow_dst = get_router_imbalance(router_dst)
+                current_estimates[dst_if]['rx'] = old_rx
+
+                # Likelihood function: P ~ exp(- |imbalance| / sigma)
+                # sigma is tolerance proportional to flow
+                sigma_src = max(flow_src * CONSERVATION_TOLERANCE_PCT, 1.0)
+                sigma_dst = max(flow_dst * CONSERVATION_TOLERANCE_PCT, 1.0)
+
+                score_src = math.exp(-abs(imb_src) / sigma_src)
+                score_dst = math.exp(-abs(imb_dst) / sigma_dst)
+
+                # Combined score (Bayesian update assuming independent router evidence)
+                # We add a small epsilon prior favoring "no change" if both bad,
+                # but here we just multiply.
+                scores.append(score_src * score_dst)
+
+            # Select Winner
+            s1, s2 = scores[0], scores[1]
+            total_s = s1 + s2 + 1e-9
+
+            p1 = s1 / total_s
+            p2 = s2 / total_s
+
+            if p1 > p2:
+                winner_val = val_src
+                # Confidence is probability mass of winner
+                # If p1 ~ 0.5, confidence is low. If p1 ~ 1.0, high.
+                # Map 0.5-1.0 to 0.0-1.0 roughly
+                conf = (p1 - 0.5) * 2.0
+                conf = max(0.0, min(1.0, conf))
+            else:
+                winner_val = val_dst
+                conf = (p2 - 0.5) * 2.0
+                conf = max(0.0, min(1.0, conf))
+
+            # Store update
+            updates[(src_if, 'tx')] = (winner_val, conf)
+            updates[(dst_if, 'rx')] = (winner_val, conf)
+
+        # Apply updates
+        for (if_id, metric), (val, conf) in updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+
+    # --- Step 3: Final Assembly & Status Repair ---
+=======
+    # --- Step 1: Initial Link Assessment ---
+    # Determine which links are 'Solid' (agreeing) and which are 'Suspect'.
+    # For suspect links, generate hypotheses.
+
+    # Store current best estimates for RX and TX flow on every interface
+    # structure: {if_id: {'rx': val, 'tx': val}}
+    current_estimates = {}
+
+    # Store reliability/confidence of these estimates
+    # structure: {if_id: {'rx': conf, 'tx': conf}} (0.0 to 1.0)
+    estimate_confidence = {}
+
+    # Suspect flows to solve: list of (link_key, metric_type ('rx_flow' or 'tx_flow'))
+    # Note: 'rx_flow' for link (A,B) means A->B traffic (A TX, B RX).
+    suspect_flows = []
+
+    for link_key, info in links.items():
+        if1 = info['if1']
+        if2 = info['if2']
+
+        d1 = telemetry[if1]
+        d2 = telemetry[if2] if if2 else {}
+
+        # Analyze Flow IF1 -> IF2 (IF1 TX, IF2 RX)
+        val1_tx = d1.get('tx_rate', 0.0)
+        val2_rx = d2.get('rx_rate', 0.0) if if2 else None
+
+        if if2:
+            # Internal Link: Check Symmetry
+            denom = max(val1_tx, val2_rx, 1.0)
+            diff = abs(val1_tx - val2_rx)
+
+            if diff / denom < SYMMETRY_TOLERANCE:
+                # Consistent
+                consensus = (val1_tx + val2_rx) / 2.0
+                current_estimates[if1] = current_estimates.get(if1, {})
+                current_estimates[if1]['tx'] = consensus
+                current_estimates[if2] = current_estimates.get(if2, {})
+                current_estimates[if2]['rx'] = consensus
+
+                estimate_confidence[if1] = estimate_confidence.get(if1, {})
+                estimate_confidence[if1]['tx'] = 0.95
+                estimate_confidence[if2] = estimate_confidence.get(if2, {})
+                estimate_confidence[if2]['rx'] = 0.95
+            else:
+                # Suspect
+                suspect_flows.append({'key': link_key, 'dir': '1_to_2', 'candidates': [val1_tx, val2_rx]})
+                # Initialize with average but low confidence
+                consensus = (val1_tx + val2_rx) / 2.0
+                current_estimates[if1] = current_estimates.get(if1, {})
+                current_estimates[if1]['tx'] = consensus
+                current_estimates[if2] = current_estimates.get(if2, {})
+                current_estimates[if2]['rx'] = consensus
+
+                estimate_confidence[if1] = estimate_confidence.get(if1, {})
+                estimate_confidence[if1]['tx'] = 0.5
+                estimate_confidence[if2] = estimate_confidence.get(if2, {})
+                estimate_confidence[if2]['rx'] = 0.5
+        else:
+            # External Link: Trust local blindly for now (no peer to contradict)
+            current_estimates[if1] = current_estimates.get(if1, {})
+            current_estimates[if1]['tx'] = val1_tx
+            estimate_confidence[if1] = estimate_confidence.get(if1, {})
+            estimate_confidence[if1]['tx'] = 0.90 # Tentative
+
+        # Analyze Flow IF2 -> IF1 (IF2 TX, IF1 RX)
+        if if2:
+            val2_tx = d2.get('tx_rate', 0.0)
+            val1_rx = d1.get('rx_rate', 0.0)
+
+            denom = max(val2_tx, val1_rx, 1.0)
+            diff = abs(val2_tx - val1_rx)
+
+            if diff / denom < SYMMETRY_TOLERANCE:
+                consensus = (val2_tx + val1_rx) / 2.0
+                current_estimates[if2]['tx'] = consensus
+                current_estimates[if1]['rx'] = consensus
+                estimate_confidence[if2]['tx'] = 0.95
+                estimate_confidence[if1]['rx'] = 0.95
+            else:
+                suspect_flows.append({'key': link_key, 'dir': '2_to_1', 'candidates': [val2_tx, val1_rx]})
+                consensus = (val2_tx + val1_rx) / 2.0
+                current_estimates[if2]['tx'] = consensus
+                current_estimates[if1]['rx'] = consensus
+                estimate_confidence[if2]['tx'] = 0.5
+                estimate_confidence[if1]['rx'] = 0.5
+        else:
+             # External RX
+            val1_rx = d1.get('rx_rate', 0.0)
+            current_estimates[if1]['rx'] = val1_rx
+            estimate_confidence[if1]['rx'] = 0.90
+
+    # --- Step 2: Iterative Bayesian Refinement ---
+
+    # Helper to calculate router imbalance given current estimates
+    def get_router_imbalance(rid):
+        if_list = topology.get(rid, [])
+        total_in = 0.0
+        total_out = 0.0
+        for iid in if_list:
+            total_in += current_estimates.get(iid, {}).get('rx', 0.0)
+            total_out += current_estimates.get(iid, {}).get('tx', 0.0)
+        return total_in - total_out, max(total_in, total_out, 1.0)
+
+    # Iteration loop
+    for _ in range(ITERATIONS):
+        updates = {} # Store updates to apply after full pass
+
+        for flow_prob in suspect_flows:
+            link_key = flow_prob['key']
+            direction = flow_prob['dir']
+            candidates = flow_prob['candidates']
+
+            # Identify interfaces and routers involved
+            info = links[link_key]
+            if direction == '1_to_2':
+                src_if, dst_if = info['if1'], info['if2']
+                val_src, val_dst = candidates[0], candidates[1] # src measured tx, dst measured rx
+            else:
+                src_if, dst_if = info['if2'], info['if1']
+                val_src, val_dst = candidates[0], candidates[1]
+
+            router_src = if_to_router.get(src_if)
+            router_dst = if_to_router.get(dst_if)
+
+            # Evaluate Hypothesis 1: Value is val_src (Local TX measurement)
+            # Evaluate Hypothesis 2: Value is val_dst (Peer RX measurement)
+
+            hyps = [val_src, val_dst]
+            scores = []
+
+            for h_val in hyps:
+                # Probability score based on Gaussian likelihood of imbalance
+
+                # Check Source Router Imbalance if we use h_val for this TX interface
+                # Temporarily replace value in calculation
+                old_tx = current_estimates[src_if]['tx']
+                current_estimates[src_if]['tx'] = h_val
+                imb_src, flow_src = get_router_imbalance(router_src)
+                # Restore
+                current_estimates[src_if]['tx'] = old_tx
+
+                # Check Dest Router Imbalance if we use h_val for this RX interface
+                old_rx = current_estimates[dst_if]['rx']
+                current_estimates[dst_if]['rx'] = h_val
+                imb_dst, flow_dst = get_router_imbalance(router_dst)
+                current_estimates[dst_if]['rx'] = old_rx
+
+                # Likelihood function: P ~ exp(- |imbalance| / sigma)
+                # sigma is tolerance proportional to flow
+                sigma_src = max(flow_src * CONSERVATION_TOLERANCE_PCT, 1.0)
+                sigma_dst = max(flow_dst * CONSERVATION_TOLERANCE_PCT, 1.0)
+
+                score_src = math.exp(-abs(imb_src) / sigma_src) if router_src else 1.0
+                score_dst = math.exp(-abs(imb_dst) / sigma_dst) if router_dst else 1.0
+
+                scores.append(score_src * score_dst)
+
+            # Select Winner
+            s1, s2 = scores[0], scores[1]
+            total_s = s1 + s2 + 1e-9
+
+            p1 = s1 / total_s
+            p2 = s2 / total_s
+
+            if p1 > p2:
+                winner_val = val_src
+                # Confidence combines probability of being right vs alternative (p1)
+                # AND the absolute quality of the fit (s1)
+                # Taking sqrt(s1) to soften the penalty of non-perfect fit
+                conf = p1 * math.sqrt(s1)
+            else:
+                winner_val = val_dst
+                conf = p2 * math.sqrt(s2)
+
+            conf = max(0.01, min(0.99, conf))
+
+            # Store update
+            updates[(src_if, 'tx')] = (winner_val, conf)
+            updates[(dst_if, 'rx')] = (winner_val, conf)
+
+        # Apply updates
+        for (if_id, metric), (val, conf) in updates.items():
+            current_estimates[if_id][metric] = val
+            estimate_confidence[if_id][metric] = conf
+
+    # --- Step 2.5: Global Consistency Penalty ---
+    # Reduce confidence if routers remain imbalanced
+    for r_id in topology:
+        imb, flow = get_router_imbalance(r_id)
+        ratio = abs(imb) / flow
+        if ratio > CONSERVATION_TOLERANCE_PCT:
+            # Penalize factor: 1.0 at tolerance, drops to 0.0 at ~15% imbalance
+            penalty = max(0.0, 1.0 - (ratio - CONSERVATION_TOLERANCE_PCT) * 8.0)
+
+            for i_id in topology[r_id]:
+                if i_id in estimate_confidence:
+                    if 'rx' in estimate_confidence[i_id]:
+                        estimate_confidence[i_id]['rx'] *= penalty
+                    if 'tx' in estimate_confidence[i_id]:
+                        estimate_confidence[i_id]['tx'] *= penalty
+
+    # --- Step 3: Final Assembly & Status Repair ---
+>>>>>>> REPLACE
+</DIFF>

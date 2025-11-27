@@ -1,0 +1,207 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import re
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Repeated Smart Greedy with Local Search.
+    
+    Combines:
+    1. Repeated executions (from prior high-scoring solution) to explore different starting points.
+    2. Conflict-based heuristic filtering (from beam search solution) to shortlist promising candidates.
+    3. Simulator-based cost evaluation (from greedy solution) to pick the best from the shortlist.
+    4. Local search refinement (from prior high-scoring solution) to polish results.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of sequences to generate and compare
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    
+    # --- 1. Pre-process Transaction Conflicts ---
+    # Parse transactions to identify read/write sets for conflict heuristic
+    txn_access_sets = []
+    try:
+        for i in range(workload.num_txns):
+            # Extract transaction string representation safely
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            
+            # Parse operations
+            reads = set()
+            writes = set()
+            matches = re.findall(r'([rw])-(\d+)', txn_str)
+            for op_type, key in matches:
+                key = int(key)
+                if op_type == 'r':
+                    reads.add(key)
+                else:
+                    writes.add(key)
+            txn_access_sets.append((reads, writes))
+    except Exception:
+        # Fallback to empty sets if parsing fails
+        txn_access_sets = [(set(), set()) for _ in range(workload.num_txns)]
+
+    def get_conflict_score(last_txn_idx, candidate_txn_idx):
+        """Estimate conflict cost between last scheduled txn and candidate."""
+        if last_txn_idx == -1: 
+            return 0
+        r1, w1 = txn_access_sets[last_txn_idx]
+        r2, w2 = txn_access_sets[candidate_txn_idx]
+        
+        score = 0
+        # Check overlaps: (R1 & W2), (W1 & R2), (W1 & W2)
+        # We penalize conflicts to encourage scheduling non-conflicting txns consecutively
+        if not r1.isdisjoint(w2): score += 1
+        if not w1.isdisjoint(r2): score += 1
+        if not w1.isdisjoint(w2): score += 2
+        return score
+
+    best_overall_cost = float('inf')
+    best_overall_schedule = []
+    
+    # Heuristic parameters
+    HEURISTIC_CANDIDATES = 6 # Top N cheapest by heuristic to verify with simulator
+
+    # --- 2. Repeated Construction Loop ---
+    for _ in range(num_seqs):
+        remaining = list(range(workload.num_txns))
+        
+        # Random start for diversity
+        start_txn = random.choice(remaining)
+        current_seq = [start_txn]
+        remaining.remove(start_txn)
+        
+        while remaining:
+            last_txn = current_seq[-1]
+            
+            # Smart Candidate Selection:
+            # 1. Shuffle remaining to break ties randomly (essential for diversity across num_seqs)
+            random.shuffle(remaining)
+            
+            # 2. Sort by conflict heuristic (fast)
+            # We want to pick transactions that conflict the least with the current tail
+            remaining.sort(key=lambda t: get_conflict_score(last_txn, t))
+            
+            # 3. Select top candidates for expensive evaluation
+            candidates_to_eval = remaining[:HEURISTIC_CANDIDATES]
+            
+            best_cand = -1
+            min_cand_cost = float('inf')
+            
+            # 4. Evaluate with Simulator
+            for t in candidates_to_eval:
+                test_seq = current_seq + [t]
+                cost = workload.get_opt_seq_cost(test_seq)
+                
+                if cost < min_cand_cost:
+                    min_cand_cost = cost
+                    best_cand = t
+            
+            current_seq.append(best_cand)
+            remaining.remove(best_cand)
+
+        # --- 3. Local Search Refinement ---
+        # Try to improve the constructed schedule by swapping adjacent transactions
+        current_cost = workload.get_opt_seq_cost(current_seq)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(current_seq) - 1):
+                # Swap adjacent
+                current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+                new_cost = workload.get_opt_seq_cost(current_seq)
+                
+                if new_cost < current_cost:
+                    current_cost = new_cost
+                    improved = True
+                else:
+                    # Revert swap
+                    current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+
+        # Update global best
+        if current_cost < best_overall_cost:
+            best_overall_cost = current_cost
+            best_overall_schedule = list(current_seq)
+
+    return best_overall_cost, best_overall_schedule
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+    
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+    
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END

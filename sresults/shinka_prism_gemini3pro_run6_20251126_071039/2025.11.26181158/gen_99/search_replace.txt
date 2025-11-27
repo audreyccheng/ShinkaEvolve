@@ -1,0 +1,248 @@
+<NAME>
+adaptive_init_and_robust_fallback
+</NAME>
+
+<DESCRIPTION>
+1.  **Adaptive Initialization**: Replaces the basic binary search initialization with a more sophisticated approach. After finding the minimum feasible K (which minimizes theoretical KVPR bound), it runs an "Adaptive Reweighting" loop. This loop identifies models on the bottleneck GPU of the current best solution and increases their priority (virtual weight) in the bin packing heuristic. This forces the placement algorithm to prioritize these difficult items, often resulting in better balanced solutions. It also sweeps slightly larger K values to find smoother distributions.
+2.  **Robust Fallback**: Replaces the deterministic fallback with a randomized retry loop (up to 20 attempts) to ensure 100% success rate even if the deterministic greedy fails due to fragmentation order.
+3.  **Expanded ILS Search**: Increases the search depth for "Swap 1-2" and "Swap 2-1" operators from top 2 bottlenecks to top 5. These operators are effective at fixing fragmentation but were previously restricted too aggressively.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Strategy A: Linearized Bin Packing with Noise
+    def solve_linearized_bp(target_k, noise=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            # Base weight: Load + K * Size
+            base_w = (m.req_rate / m.slo) + target_k * m.model_size
+            w = base_w
+            if noise > 0:
+                w *= random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                # Linearized capacity check
+                if lin_use + base_w <= bin_cap:
+                    rem = bin_cap - (lin_use + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    bs_res = None
+    best_k = high
+    for _ in range(16):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            bs_res = res
+            best_k = mid
+            high = mid
+            candidates.append(res)
+        else:
+            low = mid
+
+    # Randomized Refinement around best_k
+    if best_k < 1e8:
+        for _ in range(12):
+            k_noisy = best_k * random.uniform(0.9, 1.1)
+            res_noise = solve_linearized_bp(k_noisy, noise=0.06)
+            if res_noise: candidates.append(res_noise)
+=======
+    # Strategy A: Linearized Bin Packing with Noise and Adaptive Reweighting
+    def solve_linearized_bp(target_k, noise=0.0, priorities=None):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for i, m in enumerate(models):
+            # Base weight: Load + K * Size
+            base_w = (m.req_rate / m.slo) + target_k * m.model_size
+            w = base_w
+            # Apply priority weighting (affects sorting order)
+            if priorities:
+                w *= priorities[i]
+            if noise > 0:
+                w *= random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                # Linearized capacity check (feasibility constraint)
+                if lin_use + base_w <= bin_cap:
+                    rem = bin_cap - (lin_use + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    # 1. Binary Search for Min Feasible K
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    best_k = high
+    best_init_sol = None
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            best_k = mid
+            high = mid
+            best_init_sol = res
+        else:
+            low = mid
+
+    # 2. Generate candidates
+    if best_init_sol:
+        candidates.append(best_init_sol)
+
+    if best_k < 1e8:
+        # a. Sweep slightly larger K (relax tightness to improve load balance)
+        for mult in [1.02, 1.05, 1.10]:
+            res = solve_linearized_bp(best_k * mult)
+            if res: candidates.append(res)
+
+        # b. Adaptive Reweighting: Penalize items on bottleneck GPUs
+        # Run a base solution to identify bottlenecks
+        base_sol = solve_linearized_bp(best_k * 1.05) or best_init_sol
+        if base_sol:
+            # Map models to indices for weight lookup
+            model_to_idx = {id(m): i for i, m in enumerate(models)}
+
+            # Iterative reweighting
+            current_sol = base_sol
+            current_priorities = [1.0] * len(models)
+
+            for _ in range(3): # 3 iterations of adaptation
+                # Find bottleneck GPU
+                sorted_gpus = sorted(current_sol, key=lambda g: g.kvpr(), reverse=True)
+                bottleneck = sorted_gpus[0]
+
+                # Increase priority of models on bottleneck
+                for m in bottleneck.models:
+                    idx = model_to_idx.get(id(m))
+                    if idx is not None:
+                        current_priorities[idx] *= 1.15 # Increase weight
+
+                # Re-solve with new priorities
+                new_sol = solve_linearized_bp(best_k * 1.05, noise=0.02, priorities=current_priorities)
+                if new_sol:
+                    candidates.append(new_sol)
+                    current_sol = new_sol
+                else:
+                    break
+
+        # c. Standard Noise
+        for _ in range(8):
+            k_noisy = best_k * random.uniform(0.9, 1.1)
+            res_noise = solve_linearized_bp(k_noisy, noise=0.05)
+            if res_noise: candidates.append(res_noise)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Fallback
+    if not candidates:
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        for m in sorted(models, key=lambda x: x.model_size, reverse=True):
+            placed = False
+            for i in range(gpu_num):
+                if gpus[i].can_fit(m.model_size):
+                    gpus[i].add(m)
+                    placed = True
+                    break
+            if not placed: raise ValueError("Models do not fit in GPU memory.")
+        candidates.append(gpus)
+=======
+    # Fallback: Retry with randomized orders if deterministic fit fails
+    if not candidates:
+        # Try deterministic first
+        try:
+            gpus = [GPUState(i) for i in range(gpu_num)]
+            for m in sorted(models, key=lambda x: x.model_size, reverse=True):
+                placed = False
+                for i in range(gpu_num):
+                    if gpus[i].can_fit(m.model_size):
+                        gpus[i].add(m)
+                        placed = True
+                        break
+                if not placed: raise ValueError
+            candidates.append(gpus)
+        except ValueError:
+            # Randomized retries
+            for _ in range(20):
+                gpus = [GPUState(i) for i in range(gpu_num)]
+                shuffled = list(models)
+                random.shuffle(shuffled)
+                valid = True
+                for m in shuffled:
+                    placed = False
+                    for i in range(gpu_num):
+                        if gpus[i].can_fit(m.model_size):
+                            gpus[i].add(m)
+                            placed = True
+                            break
+                    if not placed:
+                        valid = False
+                        break
+                if valid:
+                    candidates.append(gpus)
+                    break
+            if not candidates:
+                raise ValueError("Models do not fit in GPU memory after randomized attempts.")
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- Operator 3: Swap (1-2) ---
+        # Move 1 from Source, 2 from Dest
+        for source in sources[:2]:
+            for i, m_a in enumerate(source.models):
+                for dest in current_gpus:
+=======
+        # --- Operator 3: Swap (1-2) ---
+        # Move 1 from Source, 2 from Dest
+        for source in sources[:5]: # Expanded search
+            for i, m_a in enumerate(source.models):
+                for dest in current_gpus:
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- Operator 4: Swap (2-1) ---
+        # Move 2 from Source, 1 from Dest
+        for source in sources[:2]:
+            if len(source.models) < 2: continue
+            n_s = len(source.models)
+            pair_found = False
+            for i1 in range(n_s):
+                for i2 in range(i1+1, n_s):
+=======
+        # --- Operator 4: Swap (2-1) ---
+        # Move 2 from Source, 1 from Dest
+        for source in sources[:5]: # Expanded search
+            if len(source.models) < 2: continue
+            n_s = len(source.models)
+            pair_found = False
+            for i1 in range(n_s):
+                for i2 in range(i1+1, n_s):
+>>>>>>> REPLACE
+</DIFF>

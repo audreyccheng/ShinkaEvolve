@@ -1,0 +1,230 @@
+<NAME>
+residual_tilt_lowrate_asym_partial
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to the pairwise link-repair stage to improve counter repair accuracy while maintaining or improving confidence calibration:
+
+1) Residual-tilted consensus weights: Before pairwise fusion, compute signed flow-conservation residuals per router from the raw telemetry. When a link-direction mismatch’s sign aligns with the local router’s imbalance sign, slightly tilt the consensus weights away from the local endpoint to reduce the router residual. This change is bounded and only applied when both relative and absolute triggers fire.
+
+2) Low-rate–aware guards and ramp shaping: Use a lower absolute guard (0.3 Mbps), a slightly earlier full convergence (1.6×tol), and an exponent 1.2 in the partial-averaging ramp for low-rate pairs. This makes the algorithm more decisive on tiny flows without destabilizing high-rate links.
+
+3) Asymmetric partial averaging: In the partial band, adjust the louder endpoint more aggressively toward the consensus (bounded by the relative loudness), which accelerates convergence when one side dominates.
+
+These upgrades keep all existing success patterns (status handling, confidence floors, share-aware penalties, and micro-adjustment safeguards) unchanged. They should slightly improve counter repair accuracy and preserve our already strong confidence calibration.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    visited_pairs = set()
+
+    # Utility for normalized difference
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(1.0, a, b)
+
+    # Pairwise consensus-and-hardening
+=======
+    # Pre-compute signed router residuals on raw telemetry (for residual-tilted weighting)
+    router_raw_sum_tx: Dict[str, float] = {}
+    router_raw_sum_rx: Dict[str, float] = {}
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        if not lr:
+            continue
+        router_raw_sum_tx[lr] = router_raw_sum_tx.get(lr, 0.0) + float(d.get('tx_rate', 0.0))
+        router_raw_sum_rx[lr] = router_raw_sum_rx.get(lr, 0.0) + float(d.get('rx_rate', 0.0))
+    router_raw_resid: Dict[str, float] = {}
+    for r in set(list(router_raw_sum_tx.keys()) + list(router_raw_sum_rx.keys())):
+        stx = router_raw_sum_tx.get(r, 0.0)
+        srx = router_raw_sum_rx.get(r, 0.0)
+        denom = max(1.0, stx, srx)
+        router_raw_resid[r] = (stx - srx) / denom  # signed (tx - rx)/max
+
+    visited_pairs = set()
+
+    # Utility for normalized difference
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(1.0, a, b)
+
+    # Pairwise consensus-and-hardening
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # a->b hardening
+            if diff_ab > tol_ab:
+                if abs_ab > ABS_GUARD:
+                    # Trust-weighted consensus
+                    consensus_ab = w_a * a_tx + w_b * b_rx
+                    if diff_ab <= 2 * tol_ab:
+                        # Partial averaging near threshold to reduce overcorrection
+                        k = (diff_ab - tol_ab) / max(tol_ab, 1e-9)
+                        new_a_tx = a_tx * (1.0 - k) + consensus_ab * k
+                        new_b_rx = b_rx * (1.0 - k) + consensus_ab * k
+                    else:
+                        # Clear violation: converge fully to consensus
+                        new_a_tx = consensus_ab
+                        new_b_rx = consensus_ab
+                    field_value_adjust[(a_id, 'tx')] = new_a_tx
+                    field_value_adjust[(b_id, 'rx')] = new_b_rx
+                    conf_ab = clamp(1.0 - diff_ab)
+                    field_conf_assign[(a_id, 'tx')] = conf_ab
+                    field_conf_assign[(b_id, 'rx')] = conf_ab
+                else:
+                    # Guard-blocked discrepancy: do not set high floors; downscale confidence instead
+                    field_conf_scale[(a_id, 'tx')] = min(0.9, field_conf_scale.get((a_id, 'tx'), 1.0))
+                    field_conf_scale[(b_id, 'rx')] = min(0.9, field_conf_scale.get((b_id, 'rx'), 1.0))
+            else:
+                # Within tolerance: floor high confidence
+                if max(a_tx, b_rx) >= 10.0 and diff_ab <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(a_id, 'tx')] = max(field_conf_floor.get((a_id, 'tx'), 0.0), floor)
+                field_conf_floor[(b_id, 'rx')] = max(field_conf_floor.get((b_id, 'rx'), 0.0), floor)
+=======
+            # a->b hardening with low-rate guards and residual-tilted weights
+            low_band_ab = max(a_tx, b_rx) < LOW_RATE_CUTOFF
+            abs_guard_ab = 0.3 if low_band_ab else ABS_GUARD
+            full_mult_ab = 1.6 if low_band_ab else 2.0
+            exp_ab = 1.2 if low_band_ab else 1.0
+
+            # Residual-tilted weights: bias away from local residual direction
+            resid_a = router_raw_resid.get(a_data.get('local_router'), 0.0)
+            sign_ab = 1 if (a_tx - b_rx) > 0 else (-1 if (a_tx - b_rx) < 0 else 0)
+            sign_resid_a = 1 if resid_a > 0 else (-1 if resid_a < 0 else 0)
+            if diff_ab > tol_ab and abs_ab > abs_guard_ab and sign_ab * sign_resid_a > 0:
+                gamma = min(0.08, 0.1 * abs(resid_a))
+                w_a_tilt = clamp(w_a - gamma, 0.2, 0.8)
+                w_b_tilt = 1.0 - w_a_tilt
+            else:
+                w_a_tilt, w_b_tilt = w_a, w_b
+
+            if diff_ab > tol_ab:
+                if abs_ab > abs_guard_ab:
+                    # Trust-weighted consensus using tilted weights
+                    consensus_ab = w_a_tilt * a_tx + w_b_tilt * b_rx
+                    if diff_ab <= full_mult_ab * tol_ab:
+                        # Partial averaging with asymmetric movement (move louder side more)
+                        k_raw = (diff_ab - tol_ab) / max(tol_ab, 1e-9)
+                        k = max(0.0, min(1.0, k_raw ** exp_ab))
+                        loud_is_a = a_tx >= b_rx
+                        r_loud = abs(a_tx - b_rx) / max(1.0, max(a_tx, b_rx))
+                        k_loud = clamp(k * (1.0 + 0.5 * r_loud))
+                        k_quiet = clamp(k * (1.0 - 0.5 * r_loud))
+                        if loud_is_a:
+                            new_a_tx = a_tx * (1.0 - k_loud) + consensus_ab * k_loud
+                            new_b_rx = b_rx * (1.0 - k_quiet) + consensus_ab * k_quiet
+                        else:
+                            new_a_tx = a_tx * (1.0 - k_quiet) + consensus_ab * k_quiet
+                            new_b_rx = b_rx * (1.0 - k_loud) + consensus_ab * k_loud
+                    else:
+                        # Clear violation: converge fully to consensus
+                        new_a_tx = consensus_ab
+                        new_b_rx = consensus_ab
+                    field_value_adjust[(a_id, 'tx')] = new_a_tx
+                    field_value_adjust[(b_id, 'rx')] = new_b_rx
+                    conf_ab = clamp(1.0 - diff_ab)
+                    field_conf_assign[(a_id, 'tx')] = conf_ab
+                    field_conf_assign[(b_id, 'rx')] = conf_ab
+                else:
+                    # Guard-blocked discrepancy: do not set high floors; downscale confidence instead
+                    field_conf_scale[(a_id, 'tx')] = min(0.9, field_conf_scale.get((a_id, 'tx'), 1.0))
+                    field_conf_scale[(b_id, 'rx')] = min(0.9, field_conf_scale.get((b_id, 'rx'), 1.0))
+            else:
+                # Within tolerance: floor high confidence
+                if max(a_tx, b_rx) >= 10.0 and diff_ab <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(a_id, 'tx')] = max(field_conf_floor.get((a_id, 'tx'), 0.0), floor)
+                field_conf_floor[(b_id, 'rx')] = max(field_conf_floor.get((b_id, 'rx'), 0.0), floor)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # b->a hardening
+            if diff_ba > tol_ba:
+                if abs_ba > ABS_GUARD:
+                    consensus_ba = w_b * b_tx + w_a * a_rx
+                    if diff_ba <= 2 * tol_ba:
+                        k = (diff_ba - tol_ba) / max(tol_ba, 1e-9)
+                        new_b_tx = b_tx * (1.0 - k) + consensus_ba * k
+                        new_a_rx = a_rx * (1.0 - k) + consensus_ba * k
+                    else:
+                        new_b_tx = consensus_ba
+                        new_a_rx = consensus_ba
+                    field_value_adjust[(b_id, 'tx')] = new_b_tx
+                    field_value_adjust[(a_id, 'rx')] = new_a_rx
+                    conf_ba = clamp(1.0 - diff_ba)
+                    field_conf_assign[(b_id, 'tx')] = conf_ba
+                    field_conf_assign[(a_id, 'rx')] = conf_ba
+                else:
+                    # Guard-blocked discrepancy: do not set high floors; downscale confidence instead
+                    field_conf_scale[(b_id, 'tx')] = min(0.9, field_conf_scale.get((b_id, 'tx'), 1.0))
+                    field_conf_scale[(a_id, 'rx')] = min(0.9, field_conf_scale.get((a_id, 'rx'), 1.0))
+            else:
+                if max(b_tx, a_rx) >= 10.0 and diff_ba <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(b_id, 'tx')] = max(field_conf_floor.get((b_id, 'tx'), 0.0), floor)
+                field_conf_floor[(a_id, 'rx')] = max(field_conf_floor.get((a_id, 'rx'), 0.0), floor)
+=======
+            # b->a hardening with low-rate guards and residual-tilted weights
+            low_band_ba = max(b_tx, a_rx) < LOW_RATE_CUTOFF
+            abs_guard_ba = 0.3 if low_band_ba else ABS_GUARD
+            full_mult_ba = 1.6 if low_band_ba else 2.0
+            exp_ba = 1.2 if low_band_ba else 1.0
+
+            # Residual tilt on b's local router
+            resid_b = router_raw_resid.get(telemetry[b_id].get('local_router'), 0.0)
+            sign_ba = 1 if (b_tx - a_rx) > 0 else (-1 if (b_tx - a_rx) < 0 else 0)
+            sign_resid_b = 1 if resid_b > 0 else (-1 if resid_b < 0 else 0)
+            if diff_ba > tol_ba and abs_ba > abs_guard_ba and sign_ba * sign_resid_b > 0:
+                gamma = min(0.08, 0.1 * abs(resid_b))
+                w_b_tilt = clamp(w_b - gamma, 0.2, 0.8)
+                w_a_tilt2 = 1.0 - w_b_tilt
+            else:
+                w_b_tilt, w_a_tilt2 = w_b, w_a
+
+            if diff_ba > tol_ba:
+                if abs_ba > abs_guard_ba:
+                    consensus_ba = w_b_tilt * b_tx + w_a_tilt2 * a_rx
+                    if diff_ba <= full_mult_ba * tol_ba:
+                        k_raw = (diff_ba - tol_ba) / max(tol_ba, 1e-9)
+                        k = max(0.0, min(1.0, k_raw ** exp_ba))
+                        loud_is_b = b_tx >= a_rx
+                        r_loud = abs(b_tx - a_rx) / max(1.0, max(b_tx, a_rx))
+                        k_loud = clamp(k * (1.0 + 0.5 * r_loud))
+                        k_quiet = clamp(k * (1.0 - 0.5 * r_loud))
+                        if loud_is_b:
+                            new_b_tx = b_tx * (1.0 - k_loud) + consensus_ba * k_loud
+                            new_a_rx = a_rx * (1.0 - k_quiet) + consensus_ba * k_quiet
+                        else:
+                            new_b_tx = b_tx * (1.0 - k_quiet) + consensus_ba * k_quiet
+                            new_a_rx = a_rx * (1.0 - k_loud) + consensus_ba * k_loud
+                    else:
+                        new_b_tx = consensus_ba
+                        new_a_rx = consensus_ba
+                    field_value_adjust[(b_id, 'tx')] = new_b_tx
+                    field_value_adjust[(a_id, 'rx')] = new_a_rx
+                    conf_ba = clamp(1.0 - diff_ba)
+                    field_conf_assign[(b_id, 'tx')] = conf_ba
+                    field_conf_assign[(a_id, 'rx')] = conf_ba
+                else:
+                    # Guard-blocked discrepancy: do not set high floors; downscale confidence instead
+                    field_conf_scale[(b_id, 'tx')] = min(0.9, field_conf_scale.get((b_id, 'tx'), 1.0))
+                    field_conf_scale[(a_id, 'rx')] = min(0.9, field_conf_scale.get((a_id, 'rx'), 1.0))
+            else:
+                if max(b_tx, a_rx) >= 10.0 and diff_ba <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(b_id, 'tx')] = max(field_conf_floor.get((b_id, 'tx'), 0.0), floor)
+                field_conf_floor[(a_id, 'rx')] = max(field_conf_floor.get((a_id, 'rx'), 0.0), floor)
+>>>>>>> REPLACE
+</DIFF>

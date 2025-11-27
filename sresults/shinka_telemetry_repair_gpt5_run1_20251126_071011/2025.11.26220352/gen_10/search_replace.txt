@@ -1,0 +1,165 @@
+<NAME>
+router_symmetry_propagation_weighted_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose improving router-level flow conservation by propagating adjustments across link pairs to preserve link symmetry and calibrating confidence per-interface based on the actual change magnitude.
+
+Today, when a router imbalance is detected, the code uniformly scales either RX or TX for all "up" interfaces on that router. However, scaling only one side breaks link symmetry versus the peer counters and can induce pair residuals that degrade both accuracy and confidence calibration.
+
+The changes:
+- When we scale RX (or TX) at a router, we also update the peer’s TX (or RX) to the same value for up peers on a different router. This maintains R3 (link symmetry) after router-level corrections and leverages redundancy across routers, improving counter repair accuracy.
+- Confidence updates are made per-interface using a penalty informed by the router imbalance, scaling magnitude, and the per-interface relative change. The peer’s counterpart confidence is also updated in a consistent, conservative manner. This improves confidence calibration by avoiding overconfidence on larger edits.
+
+We guard against double-updating in intra-router link cases by only propagating to peers on a different router. The topology is still used to determine router membership; when absent, we fall back to local_router metadata as before.
+
+This targeted change should raise counter_repair_accuracy and confidence_calibration while keeping status performance intact.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for router, if_list in router_ifaces.items():
+        # Consider only interfaces present in telemetry
+        interfaces = [i for i in if_list if i in interim]
+        if not interfaces:
+            continue
+
+        # Compute sums over "up" interfaces
+        sum_tx = 0.0
+        sum_rx = 0.0
+        tx_conf_acc = 0.0
+        rx_conf_acc = 0.0
+        up_count_tx = 0
+        up_count_rx = 0
+        for i in interfaces:
+            if interim[i]['status'] == 'up':
+                sum_tx += max(0.0, interim[i]['tx'])
+                sum_rx += max(0.0, interim[i]['rx'])
+                tx_conf_acc += interim[i]['tx_conf']
+                rx_conf_acc += interim[i]['rx_conf']
+                up_count_tx += 1
+                up_count_rx += 1
+
+        if up_count_tx == 0 or up_count_rx == 0:
+            continue
+
+        # Evaluate flow imbalance
+        imbalance = rel_diff(sum_tx, sum_rx)
+        if imbalance <= HARDENING_THRESHOLD * 2:
+            # Within tolerance; no router-level scaling needed
+            continue
+
+        avg_tx_conf = tx_conf_acc / max(1, up_count_tx)
+        avg_rx_conf = rx_conf_acc / max(1, up_count_rx)
+
+        # Decide which direction to scale: scale the less trusted direction
+        scale_rx = avg_tx_conf >= avg_rx_conf  # if TX more trusted, scale RX to match TX
+        if scale_rx and sum_rx > 0.0:
+            s = sum_tx / sum_rx
+        elif (not scale_rx) and sum_tx > 0.0:
+            s = sum_rx / sum_tx
+        else:
+            s = 1.0
+
+        # Bound scaling to avoid extreme corrections
+        s_bounded = max(0.5, min(2.0, s))
+
+        # Apply scaling and update confidences
+        for i in interfaces:
+            if interim[i]['status'] != 'up':
+                continue
+            if scale_rx:
+                old_val = interim[i]['rx']
+                interim[i]['rx'] = old_val * s_bounded
+                # Confidence drops with imbalance and scaling magnitude
+                interim[i]['rx_conf'] = clamp(min(interim[i]['rx_conf'], 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded))))
+            else:
+                old_val = interim[i]['tx']
+                interim[i]['tx'] = old_val * s_bounded
+                interim[i]['tx_conf'] = clamp(min(interim[i]['tx_conf'], 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded))))
+=======
+    for router, if_list in router_ifaces.items():
+        # Consider only interfaces present in telemetry
+        interfaces = [i for i in if_list if i in interim]
+        if not interfaces:
+            continue
+
+        # Compute sums over "up" interfaces
+        sum_tx = 0.0
+        sum_rx = 0.0
+        tx_conf_acc = 0.0
+        rx_conf_acc = 0.0
+        up_count_tx = 0
+        up_count_rx = 0
+        for i in interfaces:
+            if interim[i]['status'] == 'up':
+                sum_tx += max(0.0, interim[i]['tx'])
+                sum_rx += max(0.0, interim[i]['rx'])
+                tx_conf_acc += interim[i]['tx_conf']
+                rx_conf_acc += interim[i]['rx_conf']
+                up_count_tx += 1
+                up_count_rx += 1
+
+        if up_count_tx == 0 or up_count_rx == 0:
+            continue
+
+        # Evaluate flow imbalance
+        imbalance = rel_diff(sum_tx, sum_rx)
+        if imbalance <= HARDENING_THRESHOLD * 2:
+            # Within tolerance; no router-level scaling needed
+            continue
+
+        avg_tx_conf = tx_conf_acc / max(1, up_count_tx)
+        avg_rx_conf = rx_conf_acc / max(1, up_count_rx)
+
+        # Decide which direction to scale: scale the less trusted direction
+        scale_rx = avg_tx_conf >= avg_rx_conf  # if TX more trusted, scale RX to match TX
+        if scale_rx and sum_rx > 0.0:
+            s = sum_tx / sum_rx
+        elif (not scale_rx) and sum_tx > 0.0:
+            s = sum_rx / sum_tx
+        else:
+            s = 1.0
+
+        # Bound scaling to avoid extreme corrections
+        s_bounded = max(0.5, min(2.0, s))
+
+        # Apply scaling and update confidences, while propagating across the link to preserve symmetry (R3)
+        for i in interfaces:
+            if interim[i]['status'] != 'up':
+                continue
+            if scale_rx:
+                old_val = interim[i]['rx']
+                new_val = old_val * s_bounded
+                interim[i]['rx'] = new_val
+                # Confidence drops with imbalance, scaling magnitude, and per-interface change
+                delta_rel = rel_diff(old_val, new_val)
+                penalty = 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded) + 0.5 * delta_rel)
+                interim[i]['rx_conf'] = clamp(min(interim[i]['rx_conf'], penalty))
+                # Symmetry propagation to peer's TX if peer is up on a different router
+                peer = peer_of.get(i)
+                if peer and (peer in interim) and interim[peer].get('status') == 'up' and interim[peer].get('local_router') != router:
+                    peer_old = interim[peer]['tx']
+                    interim[peer]['tx'] = new_val
+                    # Peer confidence penalty considers same router penalty and its own relative change
+                    peer_delta = rel_diff(peer_old, new_val)
+                    peer_penalty = 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded) + 0.5 * peer_delta)
+                    interim[peer]['tx_conf'] = clamp(min(interim[peer]['tx_conf'], peer_penalty))
+            else:
+                old_val = interim[i]['tx']
+                new_val = old_val * s_bounded
+                interim[i]['tx'] = new_val
+                delta_rel = rel_diff(old_val, new_val)
+                penalty = 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded) + 0.5 * delta_rel)
+                interim[i]['tx_conf'] = clamp(min(interim[i]['tx_conf'], penalty))
+                # Symmetry propagation to peer's RX if peer is up on a different router
+                peer = peer_of.get(i)
+                if peer and (peer in interim) and interim[peer].get('status') == 'up' and interim[peer].get('local_router') != router:
+                    peer_old = interim[peer]['rx']
+                    interim[peer]['rx'] = new_val
+                    peer_delta = rel_diff(peer_old, new_val)
+                    peer_penalty = 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded) + 0.5 * peer_delta)
+                    interim[peer]['rx_conf'] = clamp(min(interim[peer]['rx_conf'], peer_penalty))
+>>>>>>> REPLACE
+
+</DIFF>

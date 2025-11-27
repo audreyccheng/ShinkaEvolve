@@ -1,0 +1,313 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+import math
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Algorithm:
+    1. Initialization: Binary Search on 'K' (Max KVPR target).
+       - Solves a Bin Packing problem where item size depends on K.
+       - Uses multiple sorting heuristics (Linearized Weight, Size, Load) to find valid packing.
+    2. Local Search Refinement:
+       - Iteratively improves the solution by targeting the bottleneck GPU.
+       - Operators: 
+         a. Dual Ruin & Recreate: Redistributes models between the max-load and min-load GPUs.
+         b. Move: Shifts models from bottleneck to other GPUs.
+         c. Swap: Exchanges models to balance load.
+    """
+    
+    # Pre-calculate model properties for efficiency
+    # Items stores: {model, l (load), s (size), id}
+    items = []
+    for i, m in enumerate(models):
+        items.append({
+            'model': m,
+            'l': m.req_rate / m.slo,
+            's': m.model_size,
+            'id': i
+        })
+
+    # --- Phase 1: Initialization via Binary Search on Linearized Constraint ---
+    
+    def try_pack(target_k, item_list):
+        """
+        Attempts to pack items into gpu_num bins satisfying:
+        Sum(L) / (Capacity - Sum(S)) <= K
+        Equivalent to: Sum(L) + K * Sum(S) <= K * Capacity
+        """
+        lin_capacity = target_k * GPU_MEM_SIZE
+        
+        def solve_bf(sorted_items):
+            # State: list of [current_lin_weight, current_size, items_list]
+            bins = [[0.0, 0.0, []] for _ in range(gpu_num)]
+            
+            for item in sorted_items:
+                item_lin = item['l'] + target_k * item['s']
+                item_s = item['s']
+                
+                best_idx = -1
+                min_rem_cap = float('inf')
+                
+                for i in range(gpu_num):
+                    b_lin, b_s, _ = bins[i]
+                    
+                    # Hard memory constraint
+                    if b_s + item_s >= GPU_MEM_SIZE - 1e-6:
+                        continue
+                        
+                    # Linearized constraint check
+                    if b_lin + item_lin <= lin_capacity + 1e-9:
+                        # Best Fit: minimize remaining capacity (tightest fit)
+                        rem = lin_capacity - (b_lin + item_lin)
+                        if rem < min_rem_cap:
+                            min_rem_cap = rem
+                            best_idx = i
+                            
+                if best_idx != -1:
+                    bins[best_idx][0] += item_lin
+                    bins[best_idx][1] += item_s
+                    bins[best_idx][2].append(item['model'])
+                else:
+                    return None
+            return bins
+
+        # Heuristic 1: Sort by Linearized Weight (L + K*S) Descending
+        # Most accurate for the specific target K
+        s1 = sorted(item_list, key=lambda x: x['l'] + target_k * x['s'], reverse=True)
+        res = solve_bf(s1)
+        if res: return res
+        
+        # Heuristic 2: Sort by Size Descending
+        # Good when memory constraints are dominant (high K)
+        s2 = sorted(item_list, key=lambda x: x['s'], reverse=True)
+        res = solve_bf(s2)
+        if res: return res
+        
+        # Heuristic 3: Sort by Load Descending
+        # Good for balancing pure load
+        s3 = sorted(item_list, key=lambda x: x['l'], reverse=True)
+        res = solve_bf(s3)
+        if res: return res
+        
+        return None
+
+    # Binary Search
+    low = 0.0
+    high = 1.0
+    best_init = None
+    
+    # Exponential expansion to find valid upper bound
+    for _ in range(15):
+        if try_pack(high, items):
+            break
+        low = high
+        high *= 2.0
+    else:
+        high = 1e9 # Fallback
+        
+    # Refine K
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = try_pack(mid, items)
+        if res:
+            best_init = res
+            high = mid
+        else:
+            low = mid
+            
+    # Ensure placement exists
+    if best_init is None:
+        best_init = try_pack(high, items)
+        if best_init is None:
+            # Emergency fallback: First Fit Decreasing on Size (ignoring KVPR balance)
+            bins = [[] for _ in range(gpu_num)]
+            bin_s = [0.0] * gpu_num
+            for item in sorted(items, key=lambda x: x['s'], reverse=True):
+                placed = False
+                for i in range(gpu_num):
+                    if bin_s[i] + item['s'] < GPU_MEM_SIZE:
+                        bins[i].append(item['model'])
+                        bin_s[i] += item['s']
+                        placed = True
+                        break
+                if not placed:
+                    # Overfill min bin (should not happen in valid inputs)
+                    idx = min(range(gpu_num), key=lambda i: bin_s[i])
+                    bins[idx].append(item['model'])
+                    bin_s[idx] += item['s']
+            placement = {i: bins[i] for i in range(gpu_num)}
+        else:
+            placement = {i: b[2] for i, b in enumerate(best_init)}
+    else:
+        placement = {i: b[2] for i, b in enumerate(best_init)}
+
+    # --- Phase 2: Local Search Refinement ---
+    
+    def get_kvpr(p_models):
+        sl = sum(m.req_rate / m.slo for m in p_models)
+        ss = sum(m.model_size for m in p_models)
+        if ss >= GPU_MEM_SIZE: return float('inf')
+        if ss == 0: return 0.0 # Empty GPU
+        return sl / (GPU_MEM_SIZE - ss)
+
+    current_kvpr = {g: get_kvpr(placement[g]) for g in range(gpu_num)}
+    
+    # Helper to update internal state
+    def update_gpu(g, new_models):
+        placement[g] = new_models
+        current_kvpr[g] = get_kvpr(new_models)
+
+    # Iterative Improvement
+    for _ in range(200):
+        # Identify Bottleneck and Slack
+        sorted_gpus = sorted(current_kvpr.keys(), key=lambda k: current_kvpr[k], reverse=True)
+        max_g = sorted_gpus[0]
+        max_val = current_kvpr[max_g]
+        
+        if max_val < 1e-9: break
+        
+        min_g = sorted_gpus[-1]
+        improved = False
+        
+        # 1. Dual Ruin & Recreate (Rebalance max_g and min_g)
+        if max_g != min_g:
+            pool = placement[max_g] + placement[min_g]
+            
+            # Strategies to re-partition pool
+            sort_strategies = [
+                lambda m: m.model_size,  # Size Desc
+                lambda m: m.req_rate / m.slo  # Load Desc
+            ]
+            
+            best_local_split = None
+            # Current max over these two is the target to beat
+            current_local_max = max(max_val, current_kvpr[min_g])
+            best_iter_max = current_local_max
+            
+            for key_func in sort_strategies:
+                sorted_pool = sorted(pool, key=key_func, reverse=True)
+                
+                b1 = {'l': 0.0, 's': 0.0, 'm': []}
+                b2 = {'l': 0.0, 's': 0.0, 'm': []}
+                possible = True
+                
+                for m in sorted_pool:
+                    l = m.req_rate / m.slo
+                    s = m.model_size
+                    
+                    # Projections
+                    c1 = float('inf')
+                    if b1['s'] + s < GPU_MEM_SIZE:
+                        c1 = (b1['l'] + l) / (GPU_MEM_SIZE - (b1['s'] + s))
+                        
+                    c2 = float('inf')
+                    if b2['s'] + s < GPU_MEM_SIZE:
+                        c2 = (b2['l'] + l) / (GPU_MEM_SIZE - (b2['s'] + s))
+                    
+                    if c1 == float('inf') and c2 == float('inf'):
+                        possible = False; break
+                        
+                    # Greedy choice: Minimize resulting max of the two bins
+                    # We must consider the current state of the bins
+                    cur_c1 = b1['l'] / (GPU_MEM_SIZE - b1['s']) if b1['s'] < GPU_MEM_SIZE else float('inf')
+                    cur_c2 = b2['l'] / (GPU_MEM_SIZE - b2['s']) if b2['s'] < GPU_MEM_SIZE else float('inf')
+                    
+                    # If we add to 1, max is max(c1, cur_c2)
+                    # If we add to 2, max is max(cur_c1, c2)
+                    if max(c1, cur_c2) < max(cur_c1, c2):
+                        b1['l']+=l; b1['s']+=s; b1['m'].append(m)
+                    else:
+                        b2['l']+=l; b2['s']+=s; b2['m'].append(m)
+                
+                if possible:
+                    fk1 = b1['l']/(GPU_MEM_SIZE - b1['s'])
+                    fk2 = b2['l']/(GPU_MEM_SIZE - b2['s'])
+                    peak = max(fk1, fk2)
+                    
+                    if peak < best_iter_max - 1e-6:
+                        best_iter_max = peak
+                        best_local_split = (b1['m'], b2['m'])
+            
+            if best_local_split:
+                update_gpu(max_g, best_local_split[0])
+                update_gpu(min_g, best_local_split[1])
+                improved = True
+                
+        if improved: continue
+
+        # 2. Move Operator (Shift item from max_g)
+        src_models = placement[max_g]
+        for i, m in enumerate(src_models):
+            m_l = m.req_rate / m.slo
+            m_s = m.model_size
+            
+            # New src state
+            rem_l = sum(x.req_rate/x.slo for x in src_models) - m_l
+            rem_s = sum(x.model_size for x in src_models) - m_s
+            new_src_val = rem_l / (GPU_MEM_SIZE - rem_s)
+            
+            # Try better targets first (lowest KVPR)
+            for tgt_g in reversed(sorted_gpus):
+                if tgt_g == max_g: continue
+                
+                tgt_models = placement[tgt_g]
+                tgt_s = sum(x.model_size for x in tgt_models)
+                
+                if tgt_s + m_s >= GPU_MEM_SIZE: continue
+                
+                tgt_l = sum(x.req_rate/x.slo for x in tgt_models)
+                new_tgt_val = (tgt_l + m_l) / (GPU_MEM_SIZE - (tgt_s + m_s))
+                
+                if max(new_src_val, new_tgt_val) < max_val - 1e-6:
+                    new_src = list(src_models); new_src.pop(i)
+                    new_tgt = list(tgt_models); new_tgt.append(m)
+                    update_gpu(max_g, new_src)
+                    update_gpu(tgt_g, new_tgt)
+                    improved = True
+                    break
+            if improved: break
+        
+        if improved: continue
+
+        # 3. Swap Operator
+        # Try swapping with 3 best candidates
+        candidates = sorted_gpus[-3:]
+        if max_g in candidates: candidates.remove(max_g)
+        
+        for tgt_g in candidates:
+            tgt_models = placement[tgt_g]
+            for i_src, m_src in enumerate(src_models):
+                s_l = m_src.req_rate/m_src.slo; s_s = m_src.model_size
+                for i_tgt, m_tgt in enumerate(tgt_models):
+                    t_l = m_tgt.req_rate/m_tgt.slo; t_s = m_tgt.model_size
+                    
+                    if abs(s_s - t_s) < 0.1 and abs(s_l - t_l) < 0.1: continue
+                    
+                    # Calc new values
+                    ns_l = sum(x.req_rate/x.slo for x in src_models) - s_l + t_l
+                    ns_s = sum(x.model_size for x in src_models) - s_s + t_s
+                    if ns_s >= GPU_MEM_SIZE: continue
+                    val_src = ns_l / (GPU_MEM_SIZE - ns_s)
+                    
+                    nt_l = sum(x.req_rate/x.slo for x in tgt_models) - t_l + s_l
+                    nt_s = sum(x.model_size for x in tgt_models) - t_s + s_s
+                    if nt_s >= GPU_MEM_SIZE: continue
+                    val_tgt = nt_l / (GPU_MEM_SIZE - nt_s)
+                    
+                    if max(val_src, val_tgt) < max_val - 1e-6:
+                        new_src = list(src_models); new_src[i_src] = m_tgt
+                        new_tgt = list(tgt_models); new_tgt[i_tgt] = m_src
+                        update_gpu(max_g, new_src)
+                        update_gpu(tgt_g, new_tgt)
+                        improved = True; break
+                if improved: break
+            if improved: break
+            
+        if not improved: break
+
+    return placement
+# EVOLVE-BLOCK-END

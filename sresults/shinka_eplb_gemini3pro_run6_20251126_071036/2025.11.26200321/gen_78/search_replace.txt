@@ -1,0 +1,196 @@
+The following edit implements a **Two-Stage Evolutionary** strategy. Phase 1 performs a coarse exploration with 64 candidates using a hybrid randomized greedy initialization and a fast local search. Phase 2 selects the best candidate for each layer, replicates it 64 times (mutants), applies random item swaps (mutations) to escape local optima, and runs a deeper local search on these mutants. This "Zoom-In" approach effectively concentrates computational resources on refining the most promising solution found, enabling better load balancing.
+
+<NAME>
+two_stage_evolutionary_packing
+</NAME>
+
+<DESCRIPTION>
+Implements a Two-Stage Evolutionary Load Balancing algorithm. Phase 1 generates 64 diverse candidates (Hybrid LPT/Random) and runs a vectorized greedy packing followed by a fast local search. Phase 2 selects the best candidate per layer, replicates it 64 times (mutants), applies random item swaps (mutations) to break out of local optima, and runs a deeper local search on the mutants. This focuses the optimization budget on the most promising basin of attraction.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Configuration ---
+    # 128 candidates allow broad search space exploration
+    num_candidates = 128
+    num_problems = num_layers * num_candidates
+
+    # --- Initialization ---
+    # [LC, N]
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Hybrid Initialization Strategy via Sort Keys
+    # We want a mix of:
+    # 1. Pure LPT (candidates close to 0)
+    # 2. Perturbed LPT (candidates in the middle)
+    # 3. Random Order Greedy (candidates at the end)
+
+    # Generate noise scales
+    scales = torch.linspace(0, 2.0, num_candidates, device=device)
+    scales[0] = 0.0 # Enforce pure LPT for the first candidate
+    # Set the last 32 candidates to very high noise to simulate random processing order
+    scales[-32:] = 1e6
+
+    noise_scale = scales.repeat(num_layers).view(-1, 1) # [LC, 1]
+
+    # keys = weight + weight * noise_scale * rand
+    # For high scale, keys are dominated by random noise, resulting in random shuffle
+    noise = torch.rand_like(w_expanded) * w_expanded * noise_scale
+    sort_keys = w_expanded + noise
+
+    # Determine processing order
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+    sorted_weight_processing = torch.gather(w_expanded, 1, sorted_indices)
+
+    # Vectorized Greedy Packing
+    # Assign items in sorted order to the currently lightest non-full pack
+    pack_weights = torch.zeros(num_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_problems, num_packs, device=device, dtype=torch.int64)
+    assignments = torch.zeros_like(sorted_indices)
+
+    inf_val = float('inf')
+
+    for i in range(num_groups):
+        w_item = sorted_weight_processing[:, i:i+1]
+
+        # Identify valid packs (not full)
+        is_full = (pack_counts >= groups_per_pack)
+        costs = pack_weights.clone()
+        costs[is_full] = inf_val
+
+        # Select pack
+        chosen_pack = costs.argmin(dim=1, keepdim=True)
+
+        assignments[:, i:i+1] = chosen_pack
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # Construct structured pack contents for local search
+    # We need to rearrange items into [Batch, Packs, GroupsPerPack]
+
+    # Map assignments back to original item indices to sort them by pack ID
+    # assignments maps: sorted_index_i -> pack_id
+    temp_pack_index = torch.empty_like(assignments)
+    temp_pack_index.scatter_(1, sorted_indices, assignments)
+
+    # Sort original items by their assigned pack
+    _, item_order = temp_pack_index.sort(dim=1, stable=True)
+
+    # pack_contents now holds the indices of items (0..N-1) grouped by pack
+    pack_contents = item_order.view(num_problems, num_packs, groups_per_pack)
+
+    # --- Local Search ---
+    K = groups_per_pack
+
+    # Phase 1: Global Max-Any Swap (1-Item)
+    # Evaluate swapping an item from the Max Pack with an item from ANY other pack.
+    # This provides a much steeper descent than Max-Min swapping.
+    num_iters_1 = 15
+
+    for _ in range(num_iters_1):
+        # Gather current weights
+        flat_contents = pack_contents.view(num_problems, -1)
+        curr_weights = torch.gather(w_expanded, 1, flat_contents).view(num_problems, num_packs, K)
+
+        pack_sums = curr_weights.sum(dim=2)
+        val_max, idx_max = pack_sums.max(dim=1)
+
+        # Get items in Max Pack
+        gather_max = idx_max.view(-1, 1, 1).expand(-1, 1, K)
+        w_max_items = torch.gather(curr_weights, 1, gather_max) # [LC, 1, K]
+
+        # Calculate diffs against ALL packs: [LC, M, K_max, K_other]
+        # Broadcasting: w_max [LC, 1, K, 1] - curr [LC, M, 1, K]
+        diffs = w_max_items.view(num_problems, 1, K, 1) - curr_weights.view(num_problems, num_packs, 1, K)
+
+        # Calculate cost change (L2 norm proxy)
+        # Change = 2 * diff * (Sum_Target - Sum_Max + diff)
+        # We assume diff is (w_max - w_target), so new_max = sum_max - diff, new_target = sum_target + diff
+        s_max = val_max.view(-1, 1, 1, 1)
+        s_target = pack_sums.view(num_problems, num_packs, 1, 1)
+
+        change = 2 * diffs * (s_target - s_max + diffs)
+
+        # Validity Masks
+        # 1. Don't swap with self (Max pack)
+        is_max_pack = (torch.arange(num_packs, device=device).view(1, -1) == idx_max.view(-1, 1))
+        is_max_pack = is_max_pack.view(num_problems, num_packs, 1, 1)
+
+        # 2. Diff must be positive (must reduce Max pack load)
+        valid = (diffs > 0) & (~is_max_pack)
+
+        change = torch.where(valid, change, torch.tensor(inf_val, device=device))
+
+        # Find best swap
+        flat_change = change.view(num_problems, -1)
+        best_val, best_idx_flat = flat_change.min(dim=1)
+
+        if not (best_val < -1e-5).any():
+            break
+
+        # Apply Swaps
+        active = torch.nonzero(best_val < -1e-5).squeeze(1)
+        sel_idx = best_idx_flat[active]
+
+        # Decode index M*K*K
+        K2 = K * K
+        p_target = sel_idx // K2
+        rem = sel_idx % K2
+        k_max = rem // K
+        k_target = rem % K
+
+        p_max = idx_max[active]
+
+        # Perform swap in pack_contents
+        v_max = pack_contents[active, p_max, k_max]
+        v_target = pack_contents[active, p_target, k_target]
+
+        pack_contents[active, p_max, k_max] = v_target
+        pack_contents[active, p_target, k_target] = v_max
+
+    # Phase 2: Max-Min Pair Swap (2-Item)
+    # Refinement for small K to escape local optima
+    if K >= 2 and K <= 16:
+        combos = torch.combinations(torch.arange(K, device=device), r=2)
+        num_pairs = combos.size(0)
+        num_iters_2 = 5
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_problems, -1)
+            curr_weights = torch.gather(w_expanded, 1, flat_contents).view(num_problems, num_packs, K)
+            pack_sums = curr_weights.sum(dim=2)
+
+            val_max, idx_max = pack_sums.max(dim=1)
+            val_min, idx_min = pack_sums.min(dim=1)
+
+            gather_max = idx_max.view(-1, 1, 1).expand(-1, 1, K)
+            gather_min = idx_min.view(-1, 1, 1).expand(-1, 1, K)
+
+            w_max = torch.gather(curr_weights, 1, gather_max).squeeze(1)
+            w_min = torch.gather(curr_weights, 1, gather_min).squeeze(1)
+
+            # Sum pairs
+            sum_max_pairs = w_max[:, combos[:, 0]] + w_max[:, combos[:, 1]]
+            sum_min_pairs = w_min[:, combos[:, 0]] + w_min[:, combos[:, 1]]
+
+            # Diffs [LC, P, P]
+            diffs = sum_max_pairs.unsqueeze(2) - sum_min_pairs.unsqueeze(1)
+
+            s_diff = (val_min - val_max).view(-1, 1, 1)
+            change = 2 * diffs * (s_diff + diffs)
+
+            valid = (diffs > 0)
+            change = torch.where(valid, change, torch.tensor(inf_val, device=device))
+
+            best_val, flat_idx = change.view(num_problems, -1).min(dim=1)
+
+            if not (best_val < -1e-5).any():
+                break
+
+            active = torch.nonzero(best_val < -1e-5).squeeze(1)
+            sel_idx = flat_idx[active]
+
+            p_max_idx = sel_idx // num_pairs
+            p_min_idx = sel_idx % num_pairs
+
+            p_

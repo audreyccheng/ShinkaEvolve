@@ -1,0 +1,175 @@
+<NAME>
+adaptive_init_and_relaxed_swap
+</NAME>
+
+<DESCRIPTION>
+1.  **Adaptive Initialization**: Introduces a feedback loop in the initialization phase. After finding valid candidates using the standard Linearized Bin Packing sweep, the algorithm identifies "troublemaker" models residing on the bottleneck GPU of the best candidate found so far. It assigns a penalty (multiplier) to these models and re-runs the bin packing sweep. This artificially inflates the size/load of these difficult models, forcing the heuristic to prioritize their placement or isolate them, potentially breaking up high-pressure clusters.
+2.  **Relaxed Swap 1-1 Pruning**: Modifies the pruning condition in the Swap 1-1 operator. Previously, swaps were rejected if the incoming model had a higher load than the outgoing model. The new condition allows such swaps if the incoming model is *smaller* in size. This recognizes that KVPR is a function of both load and remaining memory; a smaller model increases the denominator (remaining memory), which can lower KVPR even if the numerator (load) increases slightly.
+3.  **Robust Fallback**: Increases the randomized fallback iterations from 20 to 100 to virtually guarantee a valid solution is found even in extremely tight packing scenarios, ensuring reliability.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # -------------------------------------------------------------------------
+    # 1. Initialization
+    # -------------------------------------------------------------------------
+
+    # A. Linearized Bin Packing with Binary Search
+    def solve_linearized_bp(target_k, noise=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            base_w = (m.req_rate / m.slo) + target_k * m.model_size
+            w = base_w
+            if noise > 0:
+                w *= random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                if lin_use + base_w <= bin_cap:
+                    rem = bin_cap - (lin_use + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    # Binary search for min feasible K
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    min_feasible_k = high
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            min_feasible_k = mid
+            high = mid
+        else:
+            low = mid
+
+    # Sweep diverse K values starting from min_feasible_k
+    # This explores the trade-off between packing tightness (low K) and load balancing (high K)
+    if min_feasible_k < 1e8:
+        k_values = [min_feasible_k * (1.0 + 0.05 * i) for i in range(11)]
+        for k_val in k_values:
+            res = solve_linearized_bp(k_val)
+            if res: candidates.append(res)
+            # Add noisy versions for robust candidates
+            for _ in range(2):
+                res_noise = solve_linearized_bp(k_val, noise=0.06)
+                if res_noise: candidates.append(res_noise)
+=======
+    # -------------------------------------------------------------------------
+    # 1. Initialization
+    # -------------------------------------------------------------------------
+
+    model_penalties = {id(m): 1.0 for m in models}
+
+    # A. Linearized Bin Packing with Binary Search
+    def solve_linearized_bp(target_k, noise=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            penalty = model_penalties.get(id(m), 1.0)
+            base_w = ((m.req_rate / m.slo) + target_k * m.model_size) * penalty
+            w = base_w
+            if noise > 0:
+                w *= random.uniform(1.0 - noise, 1.0 + noise)
+            items.append((w, m, base_w))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m, base_w in items:
+            best_idx = -1
+            min_rem = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                # Linear usage calculation (heuristic)
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                # Constraint check with penalized weight
+                if lin_use + base_w <= bin_cap:
+                    rem = bin_cap - (lin_use + base_w)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            if best_idx != -1:
+                bins[best_idx].add(m)
+            else:
+                return None
+        return bins
+
+    # Binary search for min feasible K
+    low, high = 0.0, 1000.0
+    if solve_linearized_bp(high) is None: high = 1e9
+
+    min_feasible_k = high
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bp(mid)
+        if res:
+            min_feasible_k = mid
+            high = mid
+        else:
+            low = mid
+
+    # Sweep diverse K values starting from min_feasible_k
+    # This explores the trade-off between packing tightness (low K) and load balancing (high K)
+    if min_feasible_k < 1e8:
+        k_values = [min_feasible_k * (1.0 + 0.05 * i) for i in range(11)]
+        for k_val in k_values:
+            res = solve_linearized_bp(k_val)
+            if res: candidates.append(res)
+            # Add noisy versions for robust candidates
+            for _ in range(2):
+                res_noise = solve_linearized_bp(k_val, noise=0.06)
+                if res_noise: candidates.append(res_noise)
+
+        # Adaptive Step: Identify bottleneck models in the best candidate so far and penalize them
+        if candidates:
+            best_cand = min(candidates, key=lambda g: get_vector(g))
+            worst_gpu = max(best_cand, key=lambda g: g.kvpr())
+            for m in worst_gpu.models:
+                model_penalties[id(m)] = 1.25
+
+            # Re-run sweep with penalties
+            k_values_adaptive = [min_feasible_k * (1.0 + 0.05 * i) for i in range(6)]
+            for k_val in k_values_adaptive:
+                res = solve_linearized_bp(k_val)
+                if res: candidates.append(res)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        except ValueError:
+            # Randomized retries
+            for _ in range(20):
+                gpus = [GPUState(i) for i in range(gpu_num)]
+=======
+        except ValueError:
+            # Randomized retries
+            for _ in range(100):
+                gpus = [GPUState(i) for i in range(gpu_num)]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+                    for j, mb in enumerate(dest.models):
+                        # Strict load check pruning
+                        if (mb.req_rate/mb.slo) >= (ma.req_rate/ma.slo): continue
+
+                        s_mem = source.used_mem - ma.model_size + mb.model_size
+=======
+                    for j, mb in enumerate(dest.models):
+                        # Relaxed pruning: Only skip if both load and size are worse/equal for source
+                        if (mb.req_rate/mb.slo >= ma.req_rate/ma.slo) and (mb.model_size >= ma.model_size): continue
+
+                        s_mem = source.used_mem - ma.model_size + mb.model_size
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,212 @@
+<NAME>
+robust_perturbation_and_strategies
+</NAME>
+
+<DESCRIPTION>
+This edit introduces two improvements to the model placement algorithm:
+1.  **Enriched Binary Search Strategies**: Adds 'Load' (w) as a sorting strategy in the binary search initialization phase. This helps in scenarios where load balancing is dominant over size packing.
+2.  **Robust Multi-Trial Perturbation**: Replaces the single-shot randomized perturbation with a robust multi-trial reconstruction strategy. The new perturbation logic:
+    -   Intelligently selects victims (Bottleneck + Least Loaded + Randoms) to facilitate load balancing.
+    -   Runs multiple randomized greedy packing trials (Multi-start Greedy) to find the best local reconstruction for the victims.
+    -   Selects the reconstruction that minimizes the maximum local pressure.
+    -   Falls back to the global best solution only if no feasible reconstruction is found.
+
+These changes improve the algorithm's ability to escape local optima and refine the solution during the Iterated Local Search phase.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Strategies:
+        # 1. Virtual Size: w + K*s (The constraint metric)
+        # 2. Physical Size: s (Hard constraint dominant)
+        # 3. Density: w/s (Efficiency)
+
+        strategies = [
+            lambda x: x['w'] + target_k * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+=======
+        # Strategies:
+        # 1. Virtual Size: w + K*s (The constraint metric)
+        # 2. Physical Size: s (Hard constraint dominant)
+        # 3. Density: w/s (Efficiency)
+        # 4. Load: w (Dominant load)
+
+        strategies = [
+            lambda x: x['w'] + target_k * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0,
+            lambda x: x['w']
+        ]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        else:
+            # Perturbation (Burst Kick)
+            # Repack Bottleneck + Random Partners
+            k = min(3, gpu_num - 1)
+            if k == 0: break
+
+            victims = [bottleneck] + random.sample([g for g in range(gpu_num) if g != bottleneck], k)
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Randomized Density Sort
+            # (req/slo)/size
+            repack_items.sort(key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.8, 1.2), reverse=True)
+
+            success = True
+            for item in repack_items:
+                w, s = item.req_rate/item.slo, item.model_size
+                best_v = -1
+                best_p = float('inf')
+
+                for v in victims:
+                    rem = GPU_MEM_SIZE - used[v] - s
+                    if rem > 1e-6:
+                        p = (loads[v] + w) / rem
+                        if p < best_p:
+                            best_p = p
+                            best_v = v
+
+                # Fallback
+                if best_v == -1:
+                    for v in victims:
+                        if used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                            best_v = v
+                            break
+
+                if best_v != -1:
+                    current_placement[best_v].append(item)
+                    loads[best_v] += w
+                    used[best_v] += s
+                else:
+                    success = False
+                    break
+
+            if success:
+                for v in victims:
+                    pressures[v] = get_p(loads[v], used[v])
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+                # We don't update best here, we hope the kick leads to better states later
+            else:
+                # Revert
+                current_placement = {k: list(v) for k, v in best_placement_copy.items()}
+                # Rebuild state
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_p(loads[g], used[g]) for g in range(gpu_num)]
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+=======
+        else:
+            # Perturbation (Burst Kick): Reconstruct Bottleneck + Least Loaded + Random
+            # This balances the high-pressure bottleneck with low-pressure bins.
+
+            # Identify least loaded
+            min_p = float('inf')
+            min_g = -1
+            for g in range(gpu_num):
+                if g != bottleneck and pressures[g] < min_p:
+                    min_p = pressures[g]
+                    min_g = g
+
+            victim_set = {bottleneck}
+            if min_g != -1: victim_set.add(min_g)
+
+            # Add random partners
+            cands = [g for g in range(gpu_num) if g not in victim_set]
+            if cands:
+                victim_set.update(random.sample(cands, min(2, len(cands))))
+
+            victims = list(victim_set)
+
+            # Extract items
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Run multiple trials to find best local reconstruction
+            best_local_config = None
+            best_local_max = float('inf')
+
+            for _ in range(8): # 8 trials
+                iter_items = list(repack_items)
+                random.shuffle(iter_items)
+                # Sort by randomized density
+                iter_items.sort(key=lambda x: ((x.req_rate/x.slo)/(x.model_size+1e-6)) * random.uniform(0.8, 1.2), reverse=True)
+
+                l_loads = {v: 0.0 for v in victims}
+                l_used = {v: 0.0 for v in victims}
+                l_alloc = {v: [] for v in victims}
+                possible = True
+
+                for item in iter_items:
+                    w, s = item.req_rate/item.slo, item.model_size
+                    best_v = -1
+                    best_score = float('inf')
+
+                    # Best Fit: minimize pressure
+                    for v in victims:
+                        rem = GPU_MEM_SIZE - l_used[v] - s
+                        if rem > 1e-6:
+                            p = (l_loads[v] + w) / rem
+                            if p < best_score:
+                                best_score = p
+                                best_v = v
+
+                    # Fallback
+                    if best_v == -1:
+                        for v in victims:
+                            if l_used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                                best_v = v
+                                break
+
+                    if best_v != -1:
+                        l_alloc[best_v].append(item)
+                        l_loads[best_v] += w
+                        l_used[best_v] += s
+                    else:
+                        possible = False
+                        break
+
+                if possible:
+                    # Score this reconstruction: Max pressure among victims
+                    local_max = max(get_p(l_loads[v], l_used[v]) for v in victims)
+                    if local_max < best_local_max:
+                        best_local_max = local_max
+                        best_local_config = (l_alloc, l_loads, l_used)
+
+            if best_local_config:
+                alloc, l_l, l_u = best_local_config
+                for v in victims:
+                    current_placement[v] = alloc[v]
+                    loads[v] = l_l[v]
+                    used[v] = l_u[v]
+                    pressures[v] = get_p(loads[v], used[v])
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+            else:
+                # Revert to global best if perturbation failed completely
+                current_placement = {k: list(v) for k, v in best_placement_copy.items()}
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_p(loads[g], used[g]) for g in range(gpu_num)]
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+>>>>>>> REPLACE
+</DIFF>

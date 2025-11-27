@@ -1,0 +1,122 @@
+<NAME>
+add_uncertainty_weighted_additive_router_pass
+</NAME>
+
+<DESCRIPTION>
+I’m adding an uncertainty-weighted additive redistribution pass at the router level after the existing multiplicative pre-step. This directly targets residual flow conservation imbalances (R1) left after the bounded multiplicative scaling.
+
+Why this helps:
+- The multiplicative step is intentionally conservative (bounded ±15% with tempered alpha), so it often leaves a measurable imbalance. An additive pass can close the remaining gap without over-scaling.
+- We distribute the needed adjustment only in the less-trusted direction (derived from link symmetry residuals), focusing changes where redundant signals disagree most.
+- We weight adjustments by both uncertainty (1 − confidence) and volume share, and cap per-interface additive deltas at ±15% of current value with a small iterative water-filling to respect capacity.
+- We track these additive deltas in the same router_delta_rel stats to calibrate confidence penalties consistently.
+
+This change should improve counter_repair_accuracy by better enforcing R1 while maintaining or improving confidence calibration via controlled caps and penalties.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build values after router pass
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+=======
+    # Uncertainty-weighted additive redistribution (router-level) to further enforce R1
+    for router_id, iface_list in topology.items():
+        # Active, locally up interfaces
+        up_ifaces = [i for i in iface_list if i in telemetry and pre[i]['local_status'] == 'up']
+        if len(up_ifaces) < 2:
+            continue
+
+        sum_rx = sum(post_router[i]['rx'] for i in up_ifaces)
+        sum_tx = sum(post_router[i]['tx'] for i in up_ifaces)
+        total = sum_rx + sum_tx
+        if total <= 1e-6:
+            continue
+
+        imbalance = abs(sum_tx - sum_rx) / max(sum_rx, sum_tx, 1.0)
+        if imbalance <= HARDENING_THRESHOLD:
+            continue
+
+        # Choose direction with lower average link-confidence; tie-break by larger absolute aggregate
+        confs_tx = [max(0.0, 1.0 - pre[i]['tx_link_diff']) for i in up_ifaces]
+        confs_rx = [max(0.0, 1.0 - pre[i]['rx_link_diff']) for i in up_ifaces]
+        avg_conf_tx = sum(confs_tx) / len(confs_tx) if confs_tx else 0.0
+        avg_conf_rx = sum(confs_rx) / len(confs_rx) if confs_rx else 0.0
+
+        dir_to_adj = None
+        if (avg_conf_tx + 0.05) < avg_conf_rx:
+            dir_to_adj = 'tx'
+        elif (avg_conf_rx + 0.05) < avg_conf_tx:
+            dir_to_adj = 'rx'
+        else:
+            dir_to_adj = 'tx' if sum_tx > sum_rx else 'rx'
+
+        # Compute additive need on chosen direction (positive => increase that direction)
+        if dir_to_adj == 'tx':
+            need = sum_rx - sum_tx
+            sum_dir = sum_tx
+        else:
+            need = sum_tx - sum_rx
+            sum_dir = sum_rx
+
+        # Skip tiny needs relative to volume (guard against noise)
+        if abs(need) <= max(1e-6, HARDENING_THRESHOLD * max(sum_rx, sum_tx, 1.0)):
+            continue
+
+        # Build weights and caps: focus on least-trusted and material-volume edges
+        cap_ratio = 0.15  # per-interface absolute delta cap (±15% of current)
+        weights = {}
+        caps = {}
+        values = {}
+        for i in up_ifaces:
+            v = post_router[i][dir_to_adj]
+            values[i] = v
+            conf = max(0.0, 1.0 - (pre[i]['tx_link_diff'] if dir_to_adj == 'tx' else pre[i]['rx_link_diff']))
+            w = 0.6 * (1.0 - conf) + 0.4 * (v / max(sum_dir, 1e-9))
+            if v < 1.0:
+                w *= 0.5  # protect tiny links
+            weights[i] = max(0.0, w)
+            caps[i] = cap_ratio * max(v, 1.0)
+
+        # Iterative water-filling allocation honoring per-interface caps
+        remain = need
+        delta = {i: 0.0 for i in up_ifaces}
+        active = set(i for i in up_ifaces if caps[i] > 0.0)
+        for _ in range(3):
+            if not active or abs(remain) <= 1e-9:
+                break
+            sum_w = sum(weights[i] for i in active)
+            if sum_w <= 0.0:
+                break
+            progress = 0.0
+            for i in list(active):
+                raw = remain * (weights[i] / sum_w)
+                # remaining capacity for this interface
+                cap_rem = caps[i] - abs(delta[i])
+                if cap_rem <= 0.0:
+                    active.discard(i)
+                    continue
+                bounded = clamp(raw, -cap_rem, cap_rem)
+                if abs(bounded) > 0.0:
+                    delta[i] += bounded
+                    progress += abs(bounded)
+            remain = need - sum(delta.values())
+            # Remove saturated
+            for i in list(active):
+                if abs(delta[i]) >= caps[i] * 0.999:
+                    active.discard(i)
+            if progress <= 1e-9:
+                break
+
+        # Apply deltas and track relative movement for confidence calibration
+        for i in up_ifaces:
+            if delta[i] != 0.0:
+                prev = post_router[i][dir_to_adj]
+                post_router[i][dir_to_adj] = max(0.0, prev + delta[i])
+                router_delta_rel[i][dir_to_adj] += abs(delta[i]) / max(prev, 1.0)
+
+    # Build values after router passes
+    post = {i: {'rx': post_router[i]['rx'], 'tx': post_router[i]['tx']} for i in telemetry}
+>>>>>>> REPLACE
+
+</DIFF>

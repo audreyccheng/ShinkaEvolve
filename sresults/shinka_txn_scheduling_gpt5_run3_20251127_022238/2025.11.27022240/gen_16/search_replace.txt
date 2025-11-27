@@ -1,0 +1,316 @@
+<NAME>
+beam_marginal_memo
+</NAME>
+
+<DESCRIPTION>
+I replaced the simple greedy sampler with a time-bounded, memoized beam search guided by marginal extension costs, plus a lightweight local improvement pass. This approach directly optimizes makespan by:
+
+- Memoizing partial prefix costs (cost_cache) and extension costs (delta_cache) to avoid redundant simulator calls and enable wider exploration under a tight time budget.
+- Ranking candidate extensions by marginal cost (Δ) and applying a small lookahead to reduce myopic choices, which better reflects conflict-induced delays between transactions.
+- Maintaining an incumbent best complete schedule for pruning and greedily completing top prefixes to tighten the bound early.
+- Running a quick local search (adjacent swaps and sampled insertions) to fix local inefficiencies caused by conflicts.
+
+The algorithm is adaptive to problem size with conservative beam and branch factors and a per-workload time budget to keep runtime fast, improving makespan quality over the original heuristic that didn’t align with actual schedule cost dynamics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using greedy cost sampling strategy.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of sequences to sample for greedy selection
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    def get_greedy_cost_sampled(num_samples, sample_rate):
+        # greedy with random starting point
+        start_txn = random.randint(0, workload.num_txns - 1)
+        txn_seq = [start_txn]
+        remaining_txns = [x for x in range(0, workload.num_txns)]
+        remaining_txns.remove(start_txn)
+        running_cost = workload.txns[start_txn][0][3]
+
+        for i in range(0, workload.num_txns - 1):
+            min_cost = 100000  # MAX
+            min_relative_cost = 10
+            min_txn = -1
+            holdout_txns = []
+            done = False
+            key_maps = []
+
+            sample = random.random()
+            if sample > sample_rate:
+                idx = random.randint(0, len(remaining_txns) - 1)
+                t = remaining_txns[idx]
+                txn_seq.append(t)
+                remaining_txns.pop(idx)
+                continue
+
+            for j in range(0, num_samples):
+                idx = 0
+                if len(remaining_txns) > 1:
+                    idx = random.randint(0, len(remaining_txns) - 1)
+                else:
+                    done = True
+                t = remaining_txns[idx]
+                holdout_txns.append(remaining_txns.pop(idx))
+
+                txn_len = workload.txns[t][0][3]
+                test_seq = txn_seq.copy()
+                test_seq.append(t)
+                cost = 0
+                cost = workload.get_opt_seq_cost(test_seq)
+                if cost < min_cost:
+                    min_cost = cost
+                    min_txn = t
+                if done:
+                    break
+            assert(min_txn != -1)
+            running_cost = min_cost
+            txn_seq.append(min_txn)
+            holdout_txns.remove(min_txn)
+            remaining_txns.extend(holdout_txns)
+
+        assert len(set(txn_seq)) == workload.num_txns
+
+        overall_cost = workload.get_opt_seq_cost(txn_seq)
+        return overall_cost, txn_seq
+
+    return get_greedy_cost_sampled(10, 1.0)
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Beam + marginal-cost construction with memoization and quick local refinement.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of restarts to try (used as intensity parameter)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    N = workload.num_txns
+    start_time = time.time()
+    # Keep budget conservative to preserve overall combined score
+    time_budget_sec = 0.32 + min(0.18, 0.001 * max(0, N))
+
+    def time_left():
+        return (time.time() - start_time) < time_budget_sec
+
+    # Shared caches per workload call
+    cost_cache = {}
+    delta_cache = {}
+
+    def eval_cost(seq):
+        key = tuple(seq)
+        c = cost_cache.get(key)
+        if c is None:
+            c = workload.get_opt_seq_cost(seq)
+            cost_cache[key] = c
+        return c
+
+    def ext_cost(prefix_tuple, cand):
+        key = (prefix_tuple, cand)
+        c = delta_cache.get(key)
+        if c is None:
+            c = eval_cost(list(prefix_tuple) + [cand])
+            delta_cache[key] = c
+        return c
+
+    # Beam/branch parameters (adaptive with N)
+    beam_width = min(20, max(6, N // 9 if N > 0 else 6))
+    branch_factor = min(14, max(6, N // 12 if N > 0 else 6))
+    lookahead_k = 3
+
+    incumbent_cost = float('inf')
+    incumbent_seq = None
+
+    def greedy_finish(seq, rem_set):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_cost(seq_out)
+        while rem and time_left():
+            prefix = tuple(seq_out)
+            # Sampled candidate pool for speed
+            if len(rem) > branch_factor:
+                cand_pool = random.sample(list(rem), branch_factor)
+            else:
+                cand_pool = list(rem)
+            best_t = None
+            best_c = float('inf')
+            for t in cand_pool:
+                c = ext_cost(prefix, t)
+                if c < best_c:
+                    best_c = c
+                    best_t = t
+            if best_t is None:
+                best_t = cand_pool[0]
+                best_c = ext_cost(prefix, best_t)
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+            # Early prune if no better than incumbent
+            if cur_cost >= incumbent_cost:
+                break
+        return cur_cost, seq_out
+
+    def run_beam():
+        nonlocal incumbent_cost, incumbent_seq
+        all_txns = list(range(N))
+        # Seed beam with best singletons from a random pool
+        pool = random.sample(all_txns, min(len(all_txns), max(beam_width * 2, 8))) if N > 0 else []
+        singles = []
+        for t in pool:
+            if not time_left():
+                break
+            c = eval_cost([t])
+            singles.append((c, [t], set(x for x in all_txns if x != t)))
+        if not singles:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            return eval_cost(seq), seq
+
+        singles.sort(key=lambda x: x[0])
+        beam = singles[:beam_width]
+
+        steps = N - 1
+        for _ in range(steps):
+            if not time_left():
+                break
+            expanded = []
+            for cost_so_far, seq, rem in beam:
+                if not rem:
+                    expanded.append((cost_so_far, seq, rem, cost_so_far))
+                    continue
+                if cost_so_far >= incumbent_cost:
+                    continue
+                rem_list = list(rem)
+                # Pre-select a slightly larger pool and then cut to branch_factor
+                if len(rem_list) > branch_factor * 3:
+                    rem_list = random.sample(rem_list, branch_factor * 3)
+
+                prefix = tuple(seq)
+                scored = []
+                for t in rem_list:
+                    if not time_left():
+                        break
+                    ec = ext_cost(prefix, t)
+                    scored.append((ec - cost_so_far, ec, t))
+                if not scored:
+                    continue
+                scored.sort(key=lambda x: x[0])
+
+                top = scored[:min(branch_factor, len(scored))]
+                for _, ec, t in top:
+                    new_seq = seq + [t]
+                    new_rem = rem.copy()
+                    new_rem.remove(t)
+
+                    # Shallow lookahead: score by best next extension in a small sample
+                    la_score = ec
+                    if new_rem and time_left():
+                        la_pool = list(new_rem)
+                        la_sample = la_pool if len(la_pool) <= lookahead_k else random.sample(la_pool, lookahead_k)
+                        best_la = float('inf')
+                        new_prefix = tuple(new_seq)
+                        for nx in la_sample:
+                            c2 = ext_cost(new_prefix, nx)
+                            if c2 < best_la:
+                                best_la = c2
+                        la_score = min(la_score, best_la)
+                    expanded.append((ec, new_seq, new_rem, la_score))
+
+            if not expanded:
+                break
+
+            # Keep top by lookahead score; carry forward actual prefix cost
+            expanded.sort(key=lambda x: x[3])
+            new_beam = []
+            seen = set()
+            for ec, s, r, _sc in expanded:
+                key = tuple(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                new_beam.append((ec, s, r))
+                if len(new_beam) >= beam_width:
+                    break
+            beam = new_beam
+
+            # Periodically try to complete the best prefix to tighten incumbent
+            if beam and time_left():
+                cand = min(beam, key=lambda x: x[0])
+                c_try, s_try = greedy_finish(cand[1], cand[2])
+                if len(s_try) == N and c_try < incumbent_cost:
+                    incumbent_cost, incumbent_seq = c_try, s_try
+
+        # Greedily finish all prefixes; pick best
+        best_cost_local = incumbent_cost
+        best_seq_local = incumbent_seq
+        for c, s, r in beam:
+            if not time_left():
+                break
+            c2, s2 = greedy_finish(s, r)
+            if len(s2) == N and c2 < best_cost_local:
+                best_cost_local, best_seq_local = c2, s2
+
+        if best_seq_local is None:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            return eval_cost(seq), seq
+        return best_cost_local, best_seq_local
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+    restarts = max(1, int(num_seqs))
+
+    for _ in range(restarts):
+        if not time_left():
+            break
+        cost, seq = run_beam()
+
+        # Lightweight local improvement: adjacent swaps and sampled insertions
+        if time_left():
+            improved = True
+            while improved and time_left():
+                improved = False
+                for i in range(len(seq) - 1):
+                    if not time_left():
+                        break
+                    cand = seq[:]
+                    cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                    c = eval_cost(cand)
+                    if c < cost:
+                        seq, cost = cand, c
+                        improved = True
+
+        if time_left():
+            trials = 40
+            while trials > 0 and time_left():
+                trials -= 1
+                i = random.randrange(len(seq))
+                j = random.randrange(len(seq))
+                if i == j:
+                    continue
+                cand = seq[:]
+                val = cand.pop(i)
+                cand.insert(j, val)
+                c = eval_cost(cand)
+                if c < cost:
+                    seq, cost = cand, c
+
+        if cost < global_best_cost:
+            global_best_cost, global_best_seq = cost, seq
+
+    if global_best_seq is None:
+        global_best_seq = list(range(N))
+        random.shuffle(global_best_seq)
+        global_best_cost = eval_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+>>>>>>> REPLACE
+</DIFF>

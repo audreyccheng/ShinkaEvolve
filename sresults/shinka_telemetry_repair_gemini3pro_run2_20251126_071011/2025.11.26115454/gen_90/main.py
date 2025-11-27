@@ -1,0 +1,309 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair using Symmetric Flow Consensus and Global Imbalance Minimization.
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network telemetry using Symmetric Flow Consensus.
+    
+    Strategy:
+    1. Status Repair: Standard robust inference.
+    2. Rate Repair (Iterative):
+       - Calculate 'Solidity' of local and peer measurements (how well they fit their own routers).
+       - Arbitrate based on Solidity:
+         - If Peer is Solid (matches remote flow) and Self is not, trust Peer.
+         - If Self is Solid and Peer is not, trust Self.
+         - If both Solid but disagree, assume Packet Loss (Trust MAX value usually, or Peer TX).
+       - Enforce Physics: Clamp Phantom Traffic (RX > Peer TX) unless Peer is clearly broken.
+    3. Confidence Calibration:
+       - Penalize confidence based on Residual Imbalance (post-repair).
+       - Reward confidence for Peer Agreement and Solidity.
+    """
+    
+    # --- Configuration ---
+    HARDENING_THRESHOLD = 0.02     # 2% match tolerance
+    PHYSICS_THRESHOLD = 0.005      # 0.5% tolerance for physics violations
+    BASE_NOISE_FLOOR = 10.0        # Minimum Mbps
+    ITERATIONS = 5                 # Convergence count
+    
+    # --- Helper: Dynamic Noise Floor ---
+    def get_noise_floor(rate_a, rate_b=0.0):
+        mx = max(rate_a, rate_b)
+        return max(BASE_NOISE_FLOOR, mx * 0.001)
+
+    # --- Helper: Normalized Error ---
+    def calc_error(v1, v2):
+        nf = get_noise_floor(v1, v2)
+        return abs(v1 - v2) / max(v1, v2, nf)
+
+    # --- Step 1: Initialization ---
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'peer': data.get('connected_to'),
+            'router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'unknown')
+        }
+
+    # --- Step 2: Status Repair ---
+    for if_id, s in state.items():
+        local_traffic = s['rx'] > BASE_NOISE_FLOOR or s['tx'] > BASE_NOISE_FLOOR
+        peer_down = False
+        peer_traffic = False
+        
+        if s['peer'] and s['peer'] in state:
+            p = state[s['peer']]
+            if p['orig_status'] == 'down': peer_down = True
+            if p['orig_rx'] > BASE_NOISE_FLOOR or p['orig_tx'] > BASE_NOISE_FLOOR:
+                peer_traffic = True
+        
+        if local_traffic or peer_traffic:
+            s['status'] = 'up'
+        elif peer_down and not local_traffic:
+            s['status'] = 'down'
+            
+        if s['status'] != 'up':
+            s['rx'] = 0.0
+            s['tx'] = 0.0
+
+    # --- Step 3: Iterative Rate Repair ---
+    for _ in range(ITERATIONS):
+        
+        # 3.1 Calculate Router Imbalances
+        router_stats = {}
+        for r_id, if_ids in topology.items():
+            sum_rx = sum(state[i]['rx'] for i in if_ids if i in state)
+            sum_tx = sum(state[i]['tx'] for i in if_ids if i in state)
+            imb = sum_rx - sum_tx
+            vol = max(sum_rx, sum_tx, BASE_NOISE_FLOOR)
+            router_stats[r_id] = {
+                'imbalance': imb,
+                'quality': max(0.0, 1.0 - (abs(imb) / vol * 10.0))
+            }
+
+        next_values = {}
+
+        for if_id, s in state.items():
+            if s['status'] != 'up':
+                next_values[if_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = s['peer']
+            r_id = s['router']
+            has_peer = peer_id and peer_id in state
+            
+            # --- Flow Analysis ---
+            
+            # Local Flow Targets
+            l_stats = router_stats.get(r_id, {'imbalance': 0.0, 'quality': 0.5})
+            l_target_rx = max(0.0, s['rx'] - l_stats['imbalance'])
+            l_target_tx = max(0.0, s['tx'] + l_stats['imbalance'])
+            
+            # Remote Flow Targets
+            r_quality = 0.5
+            p_target_tx = None 
+            p_target_rx = None
+            
+            if has_peer:
+                pr_id = state[peer_id]['router']
+                if pr_id in router_stats:
+                    r_stats = router_stats[pr_id]
+                    r_quality = r_stats['quality']
+                    p_curr_tx = state[peer_id]['tx']
+                    p_curr_rx = state[peer_id]['rx']
+                    p_target_tx = max(0.0, p_curr_tx + r_stats['imbalance'])
+                    p_target_rx = max(0.0, p_curr_rx - r_stats['imbalance'])
+
+            # --- RX Repair ---
+            val_self = s['rx']
+            val_peer = state[peer_id]['tx'] if has_peer else None
+            
+            final_rx = val_self
+            
+            if val_peer is not None:
+                self_solid = calc_error(val_self, l_target_rx) < HARDENING_THRESHOLD
+                peer_solid = False
+                if p_target_tx is not None:
+                    peer_solid = calc_error(val_peer, p_target_tx) < HARDENING_THRESHOLD
+                
+                # 1. Physics: RX > Peer TX (Phantom)
+                if val_self > val_peer * (1.0 + PHYSICS_THRESHOLD):
+                    if self_solid and not peer_solid and r_quality < 0.5:
+                        final_rx = val_self
+                    else:
+                        final_rx = val_peer
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_rx = (val_self + val_peer) / 2.0
+                # 3. Disagreement
+                else:
+                    if peer_solid and not self_solid: final_rx = val_peer
+                    elif self_solid and not peer_solid: final_rx = val_self
+                    elif peer_solid and self_solid: final_rx = val_peer # Paradox: Trust Peer TX
+                    else:
+                        if r_quality > l_stats['quality'] + 0.1: final_rx = val_peer
+                        elif l_stats['quality'] > r_quality + 0.1: final_rx = val_self
+                        else: final_rx = val_peer
+
+            # --- TX Repair ---
+            val_self = s['tx']
+            val_peer = state[peer_id]['rx'] if has_peer else None
+            
+            final_tx = val_self
+            
+            if val_peer is not None:
+                self_solid = calc_error(val_self, l_target_tx) < HARDENING_THRESHOLD
+                peer_solid = False
+                if p_target_rx is not None:
+                    peer_solid = calc_error(val_peer, p_target_rx) < HARDENING_THRESHOLD
+                
+                # 1. Physics: TX < Peer RX (Impossible)
+                if val_self < val_peer * (1.0 - PHYSICS_THRESHOLD):
+                    if peer_solid and not self_solid and l_stats['quality'] < 0.5:
+                        final_tx = val_peer
+                    else:
+                         if peer_solid: final_tx = val_peer
+                         elif self_solid: final_tx = val_self
+                         else: final_tx = val_peer
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_tx = (val_self + val_peer) / 2.0
+                # 3. Disagreement
+                else:
+                    if self_solid and not peer_solid: final_tx = val_self
+                    elif peer_solid and not self_solid: final_tx = val_peer
+                    elif self_solid and peer_solid: final_tx = val_self # Paradox: Trust Self TX
+                    else:
+                         if l_stats['quality'] > r_quality + 0.1: final_tx = val_self
+                         elif r_quality > l_stats['quality'] + 0.1: final_tx = val_peer
+                         else: final_tx = val_self
+
+            next_values[if_id] = {'rx': final_rx, 'tx': final_tx}
+
+        # Apply updates
+        for if_id, vals in next_values.items():
+            state[if_id]['rx'] = vals['rx']
+            state[if_id]['tx'] = vals['tx']
+
+    # --- Step 4: Confidence Calibration ---
+    result = {}
+    
+    final_quality = {}
+    for r_id, if_ids in topology.items():
+        sum_rx = sum(state[i]['rx'] for i in if_ids if i in state)
+        sum_tx = sum(state[i]['tx'] for i in if_ids if i in state)
+        vol = max(sum_rx, sum_tx, BASE_NOISE_FLOOR)
+        imb_ratio = abs(sum_rx - sum_tx) / vol
+        final_quality[r_id] = {
+            'q': max(0.0, 1.0 - (imb_ratio * 10.0)),
+            'imb_ratio': imb_ratio
+        }
+
+    for if_id, s in state.items():
+        orig_rx = s['orig_rx']
+        orig_tx = s['orig_tx']
+        peer_id = s['peer']
+        has_peer = peer_id and peer_id in state
+        
+        peer_tx = state[peer_id]['tx'] if has_peer else None
+        peer_rx = state[peer_id]['rx'] if has_peer else None
+        
+        r_id = s['router']
+        l_info = final_quality.get(r_id, {'q': 0.5, 'imb_ratio': 0.1})
+
+        def get_conf(final, orig, peer_val):
+            dist = calc_error(final, orig)
+            is_repaired = dist > HARDENING_THRESHOLD
+            matches_peer = False
+            if peer_val is not None and calc_error(final, peer_val) < HARDENING_THRESHOLD:
+                matches_peer = True
+            
+            base = 1.0
+            if is_repaired:
+                if matches_peer: base = 0.90
+                else: base = 0.65
+            else:
+                if peer_val is not None and not matches_peer: base = 0.75
+                else: base = 1.0
+            
+            # Bonus for quality, Penalty for Residual Imbalance
+            score = base + (0.1 * l_info['q']) - (0.5 * l_info['imb_ratio'])
+            return max(0.0, min(1.0, score))
+
+        rx_conf = get_conf(s['rx'], orig_rx, peer_tx)
+        tx_conf = get_conf(s['tx'], orig_tx, peer_rx)
+        
+        st_conf = 1.0
+        if s['status'] != s['orig_status']: st_conf = 0.95
+        
+        result[if_id] = {
+            'rx_rate': (orig_rx, s['rx'], rx_conf),
+            'tx_rate': (orig_tx, s['tx'], tx_conf),
+            'interface_status': (s['orig_status'], s['status'], st_conf),
+            'connected_to': telemetry[if_id].get('connected_to'),
+            'local_router': telemetry[if_id].get('local_router'),
+            'remote_router': telemetry[if_id].get('remote_router')
+        }
+
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

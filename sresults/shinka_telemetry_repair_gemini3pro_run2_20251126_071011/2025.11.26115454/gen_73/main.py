@@ -1,0 +1,412 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Takes interface telemetry data and detects/repairs inconsistencies based on
+network invariants like link symmetry and flow conservation.
+"""
+from typing import Dict, Any, Tuple, List
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repair network interface telemetry by detecting and correcting inconsistencies.
+
+    Core principle: Use network invariants to validate and repair telemetry:
+    1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+    2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+    3. Interface Consistency: Status should be consistent across connected pairs
+
+    Args:
+        telemetry: Dictionary where key is interface_id and value contains:
+            - interface_status: "up" or "down"
+            - rx_rate: receive rate in Mbps
+            - tx_rate: transmit rate in Mbps
+            - connected_to: interface_id this interface connects to
+            - local_router: router_id this interface belongs to
+            - remote_router: router_id on the other side
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary with same structure but telemetry values become tuples of:
+        (original_value, repaired_value, confidence_score)
+        where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+    """
+
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    # Initialize working state
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'rx_conf': 0.5, # Initialize as uncertain
+            'tx_conf': 0.5,
+            'status_conf': 1.0,
+            'orig': data
+        }
+
+    # Pass 1: Status Consensus
+    for if_id, s in state.items():
+        connected_to = s['orig'].get('connected_to')
+        if connected_to and connected_to in state:
+            peer = state[connected_to]
+            # If mismatch, prefer UP if traffic exists
+            if s['status'] != peer['status']:
+                has_traffic = (s['rx'] > 1.0 or s['tx'] > 1.0 or
+                             peer['rx'] > 1.0 or peer['tx'] > 1.0)
+                if has_traffic:
+                    s['status'] = 'up'
+                    s['status_conf'] = 0.9
+                else:
+                    s['status'] = 'down'
+                    s['status_conf'] = 0.9
+
+        # Enforce DOWN means zero rates
+        if s['status'] == 'down':
+            s['rx'] = 0.0
+            s['tx'] = 0.0
+            s['rx_conf'] = 1.0
+            s['tx_conf'] = 1.0
+
+    # Pass 2: Anchor Reliable Links (Pre-pass)
+    # If links are symmetric within tolerance, we trust them.
+    # This provides a stable base for the flow solver.
+    for if_id, s in state.items():
+        if s['status'] == 'down': continue
+        connected_to = s['orig'].get('connected_to')
+        if connected_to and connected_to in state:
+            peer = state[connected_to]
+
+            # Check TX->RX
+            tx = s['tx']
+            prx = peer['rx']
+            denom = max(tx, prx, 1.0)
+            if abs(tx - prx) / denom <= HARDENING_THRESHOLD:
+                avg = (tx + prx) / 2.0
+                s['tx'] = avg
+                peer['rx'] = avg
+                s['tx_conf'] = 1.0
+                peer['rx_conf'] = 1.0
+
+            # Check RX<-TX
+            rx = s['rx']
+            ptx = peer['tx']
+            denom = max(rx, ptx, 1.0)
+            if abs(rx - ptx) / denom <= HARDENING_THRESHOLD:
+                avg = (rx + ptx) / 2.0
+                s['rx'] = avg
+                peer['tx'] = avg
+                s['rx_conf'] = 1.0
+                peer['tx_conf'] = 1.0
+
+    # Pass 3: Rate Repair with Symmetry & Flow Conservation
+
+    # Helper: Calculate router flow imbalance (In - Out)
+    def get_router_imbalance(router_id):
+        if not router_id or router_id not in topology:
+            return None
+        in_sum = 0.0
+        out_sum = 0.0
+        for if_id in topology[router_id]:
+            if if_id in state:
+                in_sum += state[if_id]['rx']
+                out_sum += state[if_id]['tx']
+        return in_sum - out_sum
+
+    # Iterative refinement (Gauss-Seidel style)
+    # Allows flow corrections to propagate through the network
+    ITERATIONS = 5
+    sorted_interfaces = sorted(state.keys())  # Deterministic order
+
+    for iteration in range(ITERATIONS):
+        processed_pairs = set()
+
+        for if_id in sorted_interfaces:
+            s = state[if_id]
+            connected_to = s['orig'].get('connected_to')
+            if not connected_to or connected_to not in state:
+                continue
+
+            pair_id = tuple(sorted([if_id, connected_to]))
+            if pair_id in processed_pairs:
+                continue
+            processed_pairs.add(pair_id)
+
+            peer = state[connected_to]
+
+            if s['status'] == 'down' and peer['status'] == 'down':
+                continue
+
+            # --- 1. Fix Direction A: Local TX -> Peer RX ---
+            # Original measurements as anchors
+            m_tx = float(s['orig'].get('tx_rate', 0.0))
+            m_prx = float(peer['orig'].get('rx_rate', 0.0))
+
+            # Current working values
+            c_tx = s['tx']
+            c_prx = peer['rx']
+
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local)
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Candidate Generation
+            candidates = {c_tx, m_tx, m_prx}
+
+            # Add average if measurements are close
+            if abs(m_tx - m_prx) < max(m_tx, m_prx, 1.0) * HARDENING_THRESHOLD:
+                candidates.add((m_tx + m_prx) / 2.0)
+
+            # Add Flow-Inferred Candidates (Dual-Sided Verification)
+            # Only add a flow candidate if it doesn't worsen the OTHER router's imbalance
+
+            if imb_local is not None:
+                # Value that balances local router: imb + current_out = target_out
+                # here: new_imb = imb_local + c_tx - v = 0 => v = imb_local + c_tx
+                flow_local = max(0.0, imb_local + c_tx)
+
+                # Check impact on remote
+                if imb_remote is not None:
+                    # Remote check: New_Imb = imb_remote - c_prx + flow_local
+                    new_rem_imb = abs(imb_remote - c_prx + flow_local)
+                    curr_rem_imb = abs(imb_remote)
+                    # Allow if improves or maintains within tolerance
+                    if new_rem_imb <= curr_rem_imb + 0.01:
+                        candidates.add(flow_local)
+                else:
+                    # If remote is not in topology, we are free to fix local
+                    candidates.add(flow_local)
+
+            if imb_remote is not None:
+                # Value that balances remote: imb - current_in + v = 0 => v = current_in - imb
+                # here: new_imb = imb_remote - c_prx + v = 0 => v = c_prx - imb_remote
+                flow_remote = max(0.0, c_prx - imb_remote)
+
+                # Check impact on local
+                if imb_local is not None:
+                    new_loc_imb = abs(imb_local + c_tx - flow_remote)
+                    curr_loc_imb = abs(imb_local)
+                    if new_loc_imb <= curr_loc_imb + 0.01:
+                        candidates.add(flow_remote)
+                else:
+                    candidates.add(flow_remote)
+
+            # Selection
+            best_val = c_tx
+            min_cost = float('inf')
+
+            for v in candidates:
+                # Cost Components:
+                # 1. Flow Imbalance (Primary)
+                flow_cost = 0.0
+                if imb_local is not None:
+                    flow_cost += abs(imb_local + c_tx - v)
+                if imb_remote is not None:
+                    flow_cost += abs(imb_remote - c_prx + v)
+
+                # 2. Data Deviation (Secondary - tie breaker and anchor)
+                # Weighted low to allow repairs, but high enough to prevent drift when flow is satisfied
+                data_cost = abs(v - m_tx) + abs(v - m_prx)
+
+                total_cost = flow_cost + 0.01 * data_cost
+
+                if total_cost < min_cost:
+                    min_cost = total_cost
+                    best_val = v
+
+            # Confidence Logic
+            conf = 0.5
+
+            # Calculate final residuals
+            res_local = 0.0
+            if imb_local is not None: res_local = abs(imb_local + c_tx - best_val)
+            res_remote = 0.0
+            if imb_remote is not None: res_remote = abs(imb_remote - c_prx + best_val)
+
+            solid_local = (res_local < max(best_val, 1.0) * HARDENING_THRESHOLD) and (imb_local is not None)
+            solid_remote = (res_remote < max(best_val, 1.0) * HARDENING_THRESHOLD) and (imb_remote is not None)
+
+            meas_agree = abs(m_tx - m_prx) < max(m_tx, m_prx, 1.0) * HARDENING_THRESHOLD
+            matches_data = (abs(best_val - m_tx) < 0.1) or (abs(best_val - m_prx) < 0.1)
+
+            if solid_local and solid_remote:
+                conf = 1.0
+            elif meas_agree and matches_data:
+                conf = 1.0 # Trust the agreement
+            elif solid_local or solid_remote:
+                # If one side is perfectly balanced by this value, and it's compatible...
+                if matches_data:
+                    conf = 0.95
+                else:
+                    # Flow inferred value
+                    conf = 0.9
+            else:
+                # Messy situation
+                conf = 0.5
+
+            s['tx'] = best_val
+            peer['rx'] = best_val
+            s['tx_conf'] = conf
+            peer['rx_conf'] = conf
+
+
+            # --- 2. Fix Direction B: Local RX <- Peer TX ---
+            m_rx = float(s['orig'].get('rx_rate', 0.0))
+            m_ptx = float(peer['orig'].get('tx_rate', 0.0))
+
+            c_rx = s['rx']
+            c_ptx = peer['tx']
+
+            imb_local = get_router_imbalance(r_local)
+            imb_remote = get_router_imbalance(r_remote)
+
+            candidates_b = {c_rx, m_rx, m_ptx}
+            if abs(m_rx - m_ptx) < max(m_rx, m_ptx, 1.0) * HARDENING_THRESHOLD:
+                candidates_b.add((m_rx + m_ptx) / 2.0)
+
+            if imb_local is not None:
+                # New_Imb = Imb - c_rx + v = 0 => v = c_rx - Imb
+                flow_loc = max(0.0, c_rx - imb_local)
+                if imb_remote is not None:
+                    # Remote (TX out): New = Imb + c_ptx - v
+                    new_r = abs(imb_remote + c_ptx - flow_loc)
+                    if new_r <= abs(imb_remote) + 0.01:
+                        candidates_b.add(flow_loc)
+                else:
+                    candidates_b.add(flow_loc)
+
+            if imb_remote is not None:
+                # New_Imb = Imb + c_ptx - v = 0 => v = Imb + c_ptx
+                flow_rem = max(0.0, imb_remote + c_ptx)
+                if imb_local is not None:
+                    new_l = abs(imb_local - c_rx + flow_rem)
+                    if new_l <= abs(imb_local) + 0.01:
+                        candidates_b.add(flow_rem)
+                else:
+                    candidates_b.add(flow_rem)
+
+            best_val_b = c_rx
+            min_cost_b = float('inf')
+
+            for v in candidates_b:
+                flow_cost = 0.0
+                if imb_local is not None:
+                    flow_cost += abs(imb_local - c_rx + v)
+                if imb_remote is not None:
+                    flow_cost += abs(imb_remote + c_ptx - v)
+
+                data_cost = abs(v - m_rx) + abs(v - m_ptx)
+                total_cost = flow_cost + 0.01 * data_cost
+
+                if total_cost < min_cost_b:
+                    min_cost_b = total_cost
+                    best_val_b = v
+
+            conf_b = 0.5
+            res_local = 0.0
+            if imb_local is not None: res_local = abs(imb_local - c_rx + best_val_b)
+            res_remote = 0.0
+            if imb_remote is not None: res_remote = abs(imb_remote + c_ptx - best_val_b)
+
+            solid_local = (res_local < max(best_val_b, 1.0) * HARDENING_THRESHOLD) and (imb_local is not None)
+            solid_remote = (res_remote < max(best_val_b, 1.0) * HARDENING_THRESHOLD) and (imb_remote is not None)
+
+            meas_agree = abs(m_rx - m_ptx) < max(m_rx, m_ptx, 1.0) * HARDENING_THRESHOLD
+            matches_data = (abs(best_val_b - m_rx) < 0.1) or (abs(best_val_b - m_ptx) < 0.1)
+
+            if solid_local and solid_remote:
+                conf_b = 1.0
+            elif meas_agree and matches_data:
+                conf_b = 1.0
+            elif solid_local or solid_remote:
+                if matches_data:
+                    conf_b = 0.95
+                else:
+                    conf_b = 0.9
+            else:
+                conf_b = 0.5
+
+            s['rx'] = best_val_b
+            peer['tx'] = best_val_b
+            s['rx_conf'] = conf_b
+            peer['tx_conf'] = conf_b
+
+    # Assemble result
+    result = {}
+    for if_id, s in state.items():
+        orig = s['orig']
+
+        # If we are very confident about rates, we should be confident about status
+        if s['rx_conf'] > 0.9 and s['tx_conf'] > 0.9:
+            s['status_conf'] = max(s['status_conf'], 0.95)
+
+        result[if_id] = {
+            'rx_rate': (orig.get('rx_rate', 0.0), s['rx'], s['rx_conf']),
+            'tx_rate': (orig.get('tx_rate', 0.0), s['tx'], s['tx_conf']),
+            'interface_status': (orig.get('interface_status', 'unknown'), s['status'], s['status_conf']),
+            'connected_to': orig.get('connected_to'),
+            'local_router': orig.get('local_router'),
+            'remote_router': orig.get('remote_router')
+        }
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

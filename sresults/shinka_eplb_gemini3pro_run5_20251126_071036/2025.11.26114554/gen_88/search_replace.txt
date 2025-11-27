@@ -1,0 +1,450 @@
+<NAME>
+two_pass_reweighting
+</NAME>
+
+<DESCRIPTION>
+Implement a two-pass strategy in `balanced_packing` to improve load balancing.
+1. Run the standard Greedy LPT followed by 1-swap refinement.
+2. Identify the items in the heaviest pack from the first pass and artificially increase their weights by 5%. This creates a biased "guide weight".
+3. Run Greedy LPT using the "guide weight" to generate a structurally different initial partition, then refine it using the *original* weights (1-swap).
+4. Select the better of the two outcomes for each layer.
+5. Apply expensive 2-swap refinement only on the best candidate.
+This strategy helps the algorithm escape local optima where the greedy heuristic packs large items suboptimally, without incurring the high cost of full randomized restarts or running expensive 2-swap multiple times.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses LPT Greedy initialization followed by 1-item and 2-item swap refinements.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Sort weights descending
+    sorted_weight, sorted_indices = weight.float().sort(dim=-1, descending=True)
+
+    # Allocations
+    pack_weights = torch.zeros(num_layers, num_packs, device=device)
+    pack_counts = torch.zeros(num_layers,
+                              num_packs,
+                              dtype=torch.int64,
+                              device=device)
+
+    # Structures for refinement: [Layer, Pack, Slot]
+    pack_contents = torch.zeros(num_layers,
+                                num_packs,
+                                groups_per_pack,
+                                device=device)
+    pack_item_ids = torch.zeros(num_layers,
+                                num_packs,
+                                groups_per_pack,
+                                dtype=torch.int64,
+                                device=device)
+
+    row_idx = torch.arange(num_layers, device=device)
+
+    # Greedy Allocation
+    for i in range(num_groups):
+        w = sorted_weight[:, i]
+
+        # Mask full packs
+        mask = pack_counts < groups_per_pack
+
+        # Select pack with min weight among non-full packs
+        curr_W = pack_weights.clone()
+        curr_W[~mask] = float('inf')
+        selected_pack = torch.argmin(curr_W, dim=1)
+
+        # Get slot index
+        selected_slot = pack_counts[row_idx, selected_pack]
+
+        # Update state
+        pack_weights[row_idx, selected_pack] += w
+        pack_counts[row_idx, selected_pack] += 1
+
+        # Record assignment
+        pack_contents[row_idx, selected_pack, selected_slot] = w
+        pack_item_ids[row_idx, selected_pack,
+                      selected_slot] = sorted_indices[:, i]
+
+    # Refinement Loop
+    # We alternate between 1-swap and 2-swap if needed, or just run 1-swap then 2-swap.
+    # Running 1-swap first clears easy gains.
+
+    def run_1swap(pack_contents, pack_item_ids, max_iter=20):
+        for _ in range(max_iter):
+            p_weights = pack_contents.sum(dim=2)
+            val_max, idx_max = p_weights.max(dim=1)
+            val_min, idx_min = p_weights.min(dim=1)
+            diff = val_max - val_min
+            active = diff > 1e-4
+            if not active.any(): break
+
+            gather_idx_max = idx_max.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            gather_idx_min = idx_min.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            items_max = torch.gather(pack_contents, 1, gather_idx_max).squeeze(1)
+            items_min = torch.gather(pack_contents, 1, gather_idx_min).squeeze(1)
+
+            delta = items_max.unsqueeze(2) - items_min.unsqueeze(1)
+            target = diff.view(-1, 1, 1)
+            improvement = target - (target - 2 * delta).abs()
+
+            imp_flat = improvement.view(num_layers, -1)
+            best_imp, best_idx = imp_flat.max(dim=1)
+            do_swap = (best_imp > 1e-5) & active
+            if not do_swap.any(): break
+
+            layer_indices = torch.where(do_swap)[0]
+            swap_indices = best_idx[layer_indices]
+            u_idx = swap_indices // groups_per_pack
+            v_idx = swap_indices % groups_per_pack
+            p_max_idx = idx_max[layer_indices]
+            p_min_idx = idx_min[layer_indices]
+
+            u_val = pack_contents[layer_indices, p_max_idx, u_idx]
+            v_val = pack_contents[layer_indices, p_min_idx, v_idx]
+            pack_contents[layer_indices, p_max_idx, u_idx] = v_val
+            pack_contents[layer_indices, p_min_idx, v_idx] = u_val
+            u_id = pack_item_ids[layer_indices, p_max_idx, u_idx]
+            v_id = pack_item_ids[layer_indices, p_min_idx, v_idx]
+            pack_item_ids[layer_indices, p_max_idx, u_idx] = v_id
+            pack_item_ids[layer_indices, p_min_idx, v_idx] = u_id
+
+    run_1swap(pack_contents, pack_item_ids, max_iter=20)
+
+    # 2-for-2 Swap Refinement
+    # Only run if 1-swap didn't perfectly solve it and if G >= 2
+    if groups_per_pack >= 2:
+        for _ in range(10): # Expensive, fewer iterations
+            p_weights = pack_contents.sum(dim=2)
+            val_max, idx_max = p_weights.max(dim=1)
+            val_min, idx_min = p_weights.min(dim=1)
+            diff = val_max - val_min
+            active = diff > 1e-4
+            if not active.any(): break
+
+            # [L, G]
+            gather_idx_max = idx_max.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            gather_idx_min = idx_min.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            items_max = torch.gather(pack_contents, 1, gather_idx_max).squeeze(1)
+            items_min = torch.gather(pack_contents, 1, gather_idx_min).squeeze(1)
+
+            # Compute pair sums: [L, G, G]
+            # pairs_max[l, i, j] = item[i] + item[j]
+            pairs_max = items_max.unsqueeze(2) + items_max.unsqueeze(1)
+            pairs_min = items_min.unsqueeze(2) + items_min.unsqueeze(1)
+
+            # Compute deltas: [L, G, G, G, G]
+            # delta[l, i, j, k, m] = pairs_max[l, i, j] - pairs_min[l, k, m]
+
+            delta = pairs_max.unsqueeze(3).unsqueeze(4) - pairs_min.unsqueeze(1).unsqueeze(2)
+
+            target = diff.view(-1, 1, 1, 1, 1)
+            improvement = target - (target - 2 * delta).abs()
+
+            # Mask diagonals (i==j or k==m are invalid pairs)
+            improvement.diagonal(dim1=1, dim2=2).fill_(-float('inf'))
+            improvement.diagonal(dim1=3, dim2=4).fill_(-float('inf'))
+
+            # Reshape to find max
+            imp_flat = improvement.view(num_layers, -1)
+            best_imp, best_idx = imp_flat.max(dim=1)
+
+            do_swap = (best_imp > 1e-5) & active
+            if not do_swap.any(): break
+
+            # Decode indices
+            layer_indices = torch.where(do_swap)[0]
+            flat_indices = best_idx[layer_indices]
+
+            # g^4
+            g = groups_per_pack
+            g2 = g * g
+            g3 = g2 * g
+
+            idx_i = flat_indices // g3
+            rem = flat_indices % g3
+            idx_j = rem // g2
+            rem = rem % g2
+            idx_k = rem // g
+            idx_m = rem % g
+
+            p_max = idx_max[layer_indices]
+            p_min = idx_min[layer_indices]
+
+            # Perform swap
+            # items_max[idx_i] <-> items_min[idx_k]
+            # items_max[idx_j] <-> items_min[idx_m]
+
+            # Extract values
+            val_max_i = pack_contents[layer_indices, p_max, idx_i]
+            val_max_j = pack_contents[layer_indices, p_max, idx_j]
+            val_min_k = pack_contents[layer_indices, p_min, idx_k]
+            val_min_m = pack_contents[layer_indices, p_min, idx_m]
+
+            # Swap values
+            pack_contents[layer_indices, p_max, idx_i] = val_min_k
+            pack_contents[layer_indices, p_max, idx_j] = val_min_m
+            pack_contents[layer_indices, p_min, idx_k] = val_max_i
+            pack_contents[layer_indices, p_min, idx_m] = val_max_j
+
+            # Swap IDs
+            id_max_i = pack_item_ids[layer_indices, p_max, idx_i]
+            id_max_j = pack_item_ids[layer_indices, p_max, idx_j]
+            id_min_k = pack_item_ids[layer_indices, p_min, idx_k]
+            id_min_m = pack_item_ids[layer_indices, p_min, idx_m]
+
+            pack_item_ids[layer_indices, p_max, idx_i] = id_min_k
+            pack_item_ids[layer_indices, p_max, idx_j] = id_min_m
+            pack_item_ids[layer_indices, p_min, idx_k] = id_max_i
+            pack_item_ids[layer_indices, p_min, idx_m] = id_max_j
+
+    # Reconstruct Result
+    pack_index = torch.empty(num_layers,
+                             num_groups,
+                             dtype=torch.int64,
+                             device=device)
+    rank_in_pack = torch.empty(num_layers,
+                               num_groups,
+                               dtype=torch.int64,
+                               device=device)
+
+    flat_item_ids = pack_item_ids.view(num_layers, -1)
+    pack_grid = torch.arange(num_packs, device=device).view(
+        1, -1, 1).expand(num_layers, -1,
+                         groups_per_pack).reshape(num_layers, -1)
+    rank_grid = torch.arange(groups_per_pack, device=device).view(
+        1, 1, -1).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+
+    pack_index.scatter_(1, flat_item_ids, pack_grid)
+    rank_in_pack.scatter_(1, flat_item_ids, rank_grid)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a 2-pass strategy:
+    1. Standard Greedy LPT + Refinement.
+    2. Reweighted Greedy LPT (penalizing heaviest pack items) + Refinement on original weights.
+    Returns the better of the two for each layer, refined further by 2-item swaps.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    original_weight = weight.float()
+
+    def solve_pass(sort_weight, calc_weight):
+        # LPT Sort
+        _, sorted_indices = sort_weight.sort(dim=-1, descending=True)
+        vals = torch.gather(calc_weight, 1, sorted_indices)
+
+        # Init
+        p_weights = torch.zeros(num_layers, num_packs, device=device)
+        p_counts = torch.zeros(num_layers, num_packs, dtype=torch.int64, device=device)
+        p_contents = torch.zeros(num_layers, num_packs, groups_per_pack, device=device)
+        p_ids = torch.zeros(num_layers, num_packs, groups_per_pack, dtype=torch.int64, device=device)
+
+        row_idx = torch.arange(num_layers, device=device)
+
+        # Greedy
+        for i in range(num_groups):
+            w = vals[:, i]
+            mask = p_counts < groups_per_pack
+            curr_w = p_weights.clone()
+            curr_w[~mask] = float('inf')
+            pid = torch.argmin(curr_w, dim=1)
+
+            sid = p_counts[row_idx, pid]
+            p_weights[row_idx, pid] += w
+            p_counts[row_idx, pid] += 1
+            p_contents[row_idx, pid, sid] = w
+            p_ids[row_idx, pid, sid] = sorted_indices[:, i]
+
+        # 1-swap Refinement
+        for _ in range(20):
+            pw = p_contents.sum(dim=2)
+            vmax, imax = pw.max(dim=1)
+            vmin, imin = pw.min(dim=1)
+            diff = vmax - vmin
+            active = diff > 1e-4
+            if not active.any(): break
+
+            gmax = imax.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            gmin = imin.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+
+            item_max = torch.gather(p_contents, 1, gmax).squeeze(1)
+            item_min = torch.gather(p_contents, 1, gmin).squeeze(1)
+
+            delta = item_max.unsqueeze(2) - item_min.unsqueeze(1)
+            target = diff.view(-1, 1, 1)
+            imp = target - (target - 2 * delta).abs()
+
+            best_imp, best_idx = imp.view(num_layers, -1).max(dim=1)
+            do_swap = (best_imp > 1e-5) & active
+            if not do_swap.any(): break
+
+            l = torch.where(do_swap)[0]
+            s = best_idx[l]
+            u = s // groups_per_pack
+            v = s % groups_per_pack
+            pm = imax[l]
+            pn = imin[l]
+
+            vu = p_contents[l, pm, u]
+            vv = p_contents[l, pn, v]
+            p_contents[l, pm, u] = vv
+            p_contents[l, pn, v] = vu
+
+            iu = p_ids[l, pm, u]
+            iv = p_ids[l, pn, v]
+            p_ids[l, pm, u] = iv
+            p_ids[l, pn, v] = iu
+
+        return p_contents, p_ids
+
+    # Pass 1
+    c1, id1 = solve_pass(original_weight, original_weight)
+
+    # Pass 2: Reweight heaviest pack items
+    w1 = c1.sum(dim=2)
+    max_idx = w1.argmax(dim=1)
+    g_idx = max_idx.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+    max_items = torch.gather(id1, 1, g_idx).squeeze(1)
+
+    biased_weight = original_weight.clone()
+    row_idx = torch.arange(num_layers, device=device).unsqueeze(1).expand(-1, groups_per_pack)
+    biased_weight[row_idx, max_items] *= 1.05
+
+    c2, id2 = solve_pass(biased_weight, original_weight)
+
+    # Select best
+    l1 = c1.sum(dim=2).max(dim=1).values
+    l2 = c2.sum(dim=2).max(dim=1).values
+    use2 = l2 < l1
+
+    pack_contents = torch.where(use2.view(-1, 1, 1), c2, c1)
+    pack_item_ids = torch.where(use2.view(-1, 1, 1), id2, id1)
+
+    # 2-swap Refinement (on best result)
+    if groups_per_pack >= 2:
+        for _ in range(10):
+            pw = pack_contents.sum(dim=2)
+            vmax, imax = pw.max(dim=1)
+            vmin, imin = pw.min(dim=1)
+            diff = vmax - vmin
+            active = diff > 1e-4
+            if not active.any(): break
+
+            gmax = imax.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+            gmin = imin.view(-1, 1, 1).expand(-1, 1, groups_per_pack)
+
+            item_max = torch.gather(pack_contents, 1, gmax).squeeze(1)
+            item_min = torch.gather(pack_contents, 1, gmin).squeeze(1)
+
+            pair_max = item_max.unsqueeze(2) + item_max.unsqueeze(1)
+            pair_min = item_min.unsqueeze(2) + item_min.unsqueeze(1)
+
+            delta = pair_max.unsqueeze(3).unsqueeze(4) - pair_min.unsqueeze(1).unsqueeze(2)
+            target = diff.view(-1, 1, 1, 1, 1)
+            imp = target - (target - 2 * delta).abs()
+
+            imp.diagonal(dim1=1, dim2=2).fill_(-float('inf'))
+            imp.diagonal(dim1=3, dim2=4).fill_(-float('inf'))
+
+            best_imp, best_idx = imp.view(num_layers, -1).max(dim=1)
+            do_swap = (best_imp > 1e-5) & active
+            if not do_swap.any(): break
+
+            l = torch.where(do_swap)[0]
+            s = best_idx[l]
+            G = groups_per_pack
+            G2 = G*G
+            G3 = G2*G
+
+            i_idx = s // G3
+            r = s % G3
+            j_idx = r // G2
+            r = r % G2
+            k_idx = r // G
+            m_idx = r % G
+
+            pm = imax[l]
+            pn = imin[l]
+
+            vi = pack_contents[l, pm, i_idx]
+            vj = pack_contents[l, pm, j_idx]
+            vk = pack_contents[l, pn, k_idx]
+            vm = pack_contents[l, pn, m_idx]
+
+            pack_contents[l, pm, i_idx] = vk
+            pack_contents[l, pm, j_idx] = vm
+            pack_contents[l, pn, k_idx] = vi
+            pack_contents[l, pn, m_idx] = vj
+
+            ii = pack_item_ids[l, pm, i_idx]
+            ij = pack_item_ids[l, pm, j_idx]
+            ik = pack_item_ids[l, pn, k_idx]
+            im = pack_item_ids[l, pn, m_idx]
+
+            pack_item_ids[l, pm, i_idx] = ik
+            pack_item_ids[l, pm, j_idx] = im
+            pack_item_ids[l, pn, k_idx] = ii
+            pack_item_ids[l, pn, m_idx] = ij
+
+    # Final Output
+    pack_index = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+    rank_in_pack = torch.empty(num_layers, num_groups, dtype=torch.int64, device=device)
+
+    flat_ids = pack_item_ids.view(num_layers, -1)
+    pack_grid = torch.arange(num_packs, device=device).view(1, -1, 1).expand(num_layers, -1, groups_per_pack).reshape(num_layers, -1)
+    rank_grid = torch.arange(groups_per_pack, device=device).view(1, 1, -1).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+
+    pack_index.scatter_(1, flat_ids, pack_grid)
+    rank_in_pack.scatter_(1, flat_ids, rank_grid)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

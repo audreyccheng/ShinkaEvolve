@@ -1,0 +1,184 @@
+<NAME>
+robust_init_and_kick
+</NAME>
+
+<DESCRIPTION>
+1. Enhance the Heuristic Initialization phase to try multiple sorting strategies (Density, Size, Load) instead of just Density. This increases the likelihood of finding a tighter upper bound and a better initial feasible solution, which aids the Binary Search and Local Search phases.
+2. Upgrade the Perturbation (Burst Kick) mechanism in the Local Search. Instead of a single randomized repack attempt which might fail or produce a high-pressure configuration, the new logic performs multiple randomized trials ("Burst") and selects the best feasible configuration for the victim GPUs. This "Best-of-N" kick is more robust, preserving feasibility while effectively escaping local optima.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Try density sort to get a good upper bound
+    init_res, init_max = pack_heuristic(lambda x: x['d'])
+    if init_res:
+        best_bs_placement = init_res
+        high_bound = init_max
+    else:
+        # Fallback upper bound
+        high_bound = 1000.0
+        best_bs_placement = None
+=======
+    # Try multiple sorts to get a good upper bound and initial solution
+    best_bs_placement = None
+    high_bound = 1000.0
+
+    for key_fn in [lambda x: x['d'], lambda x: x['s'], lambda x: x['w']]:
+        res, max_p = pack_heuristic(key_fn)
+        if res:
+            if max_p < high_bound:
+                high_bound = max_p
+                best_bs_placement = res
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        else:
+            # 4. Perturbation (Burst Kick)
+            # If stuck, destroy packing of Bottleneck + k Random Partners
+            k_partners = min(gpu_num - 1, 3)
+            if k_partners == 0: break
+
+            victims = [bottleneck] + random.sample([g for g in range(gpu_num) if g != bottleneck], k_partners)
+
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Randomized Density Sort
+            # Add noise to density to traverse search space
+            repack_items.sort(key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.85, 1.15), reverse=True)
+
+            # Greedy Repack into Victims
+            success_kick = True
+            for item in repack_items:
+                w, s = item.req_rate / item.slo, item.model_size
+                best_v = -1
+                best_sc = float('inf')
+
+                for v in victims:
+                    if used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                        rem = GPU_MEM_SIZE - used[v] - s
+                        sc = (loads[v] + w) / rem if rem > 1e-6 else (float('inf') if loads[v]+w > 0 else 0)
+                        if sc < best_sc:
+                            best_sc = sc
+                            best_v = v
+
+                if best_v != -1:
+                    current_placement[best_v].append(item)
+                    loads[best_v] += w
+                    used[best_v] += s
+                else:
+                    success_kick = False
+                    break
+
+            if success_kick:
+                for v in victims:
+                    pressures[v] = get_pressure(loads[v], used[v])
+            else:
+                # Kick failed to find feasible packing (unlikely but possible), Revert
+                current_placement = {k: list(v) for k, v in best_global_placement.items()}
+                # Recompute state
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_pressure(loads[g], used[g]) for g in range(gpu_num)]
+=======
+        else:
+            # 4. Perturbation (Burst Kick with Multi-Try)
+            # If stuck, destroy packing of Bottleneck + k Random Partners
+            k_partners = min(gpu_num - 1, 3)
+            if k_partners == 0: break
+
+            # Probabilistically pick partners
+            candidates = [g for g in range(gpu_num) if g != bottleneck]
+            victims = [bottleneck] + random.sample(candidates, k_partners)
+
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = [] # Clear logic container
+
+            # Try multiple randomized packings and pick the best one
+            best_kick_placement = None
+            best_kick_max = float('inf')
+
+            # Trials
+            num_trials = 10
+            found_feasible = False
+
+            for _ in range(num_trials):
+                # Randomized Sort
+                trial_items = list(repack_items)
+                random.shuffle(trial_items)
+                # Sort by Density with noise
+                trial_items.sort(key=lambda x: ((x.req_rate/(x.slo if x.slo > 0 else 1e-6))/(x.model_size+1e-6)) * random.uniform(0.8, 1.2), reverse=True)
+
+                # Temporary structures
+                t_alloc = {v: [] for v in victims}
+                t_l = {v: 0.0 for v in victims}
+                t_u = {v: 0.0 for v in victims}
+                t_possible = True
+
+                for item in trial_items:
+                    w = item.req_rate / item.slo if item.slo > 0 else 0
+                    s = item.model_size
+                    best_v = -1
+                    best_sc = float('inf')
+
+                    # Best Fit
+                    for v in victims:
+                        if t_u[v] + s <= GPU_MEM_SIZE - 1e-6:
+                            rem = GPU_MEM_SIZE - t_u[v] - s
+                            # Metric: Minimize resulting pressure
+                            p = (t_l[v] + w) / rem if rem > 1e-6 else float('inf')
+                            if p < best_sc:
+                                best_sc = p
+                                best_v = v
+
+                    if best_v != -1:
+                        t_alloc[best_v].append(item)
+                        t_l[best_v] += w
+                        t_u[best_v] += s
+                    else:
+                        t_possible = False
+                        break
+
+                if t_possible:
+                    # Evaluate Max Pressure of this configuration
+                    t_max = 0.0
+                    for v in victims:
+                        p = get_pressure(t_l[v], t_u[v])
+                        if p > t_max: t_max = p
+
+                    if t_max < best_kick_max:
+                        best_kick_max = t_max
+                        best_kick_placement = (t_alloc, t_l, t_u)
+                        found_feasible = True
+
+            if found_feasible:
+                # Apply best kick
+                alloc, ls, us = best_kick_placement
+                for v in victims:
+                    current_placement[v] = alloc[v]
+                    loads[v] = ls[v]
+                    used[v] = us[v]
+                    pressures[v] = get_pressure(loads[v], used[v])
+            else:
+                # Revert to global best if kick fails completely
+                current_placement = {k: list(v) for k, v in best_global_placement.items()}
+                # Recompute state
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_pressure(loads[g], used[g]) for g in range(gpu_num)]
+>>>>>>> REPLACE
+</DIFF>

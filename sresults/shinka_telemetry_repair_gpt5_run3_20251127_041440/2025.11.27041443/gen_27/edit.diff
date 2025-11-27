@@ -1,0 +1,768 @@
+--- a/original.py
++++ b/original.py
+@@ -1,311 +1,531 @@
+ # EVOLVE-BLOCK-START
+ """
+-Network telemetry repair algorithm that detects and corrects inconsistencies
+-in network interface telemetry data using topology relationships.
+-
+-Takes interface telemetry data and detects/repairs inconsistencies based on
+-network invariants like link symmetry and flow conservation.
++Bundle-aware consensus projection for network telemetry repair.
++
++Algorithm summary:
++1) Robust link hardening with adaptive tolerance and soft-zero snapping.
++2) Router flow conservation via targeted, confidence-weighted corrections.
++   - Bundle-aware scaling for parallel links (shared factor).
++   - Per-interface clipping ±10% and 60% damping.
++3) Confidence-gap-proportional re-sync on links with scaling guard.
++4) Confidence calibrated from measurement residuals, link residuals, router residuals,
++   plus a scale-factor term and peer smoothing.
++
++Maintains inputs/outputs of the original function.
+ """
+ from typing import Dict, Any, Tuple, List
+ 
+ 
+ def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                              topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+-    """
+-    Repair network interface telemetry by detecting and correcting inconsistencies.
+-
+-    Strategy inspired by Hodor:
+-    1) Signal Collection: use redundant bilateral measurements on links.
+-    2) Signal Hardening: pair-wise hardening via link symmetry (R3) with 2% tolerance.
+-    3) Dynamic Checking: router-level flow conservation (R1) when router has >= 2 interfaces.
+-    Additionally, enforce interface consistency for rates when status is down.
+-
+-    Confidence calibration:
+-    - High confidence when redundant signals agree and small/zero corrections.
+-    - Confidence reduced proportionally to symmetry deviations and applied router-level adjustments.
+-
+-    Note: We intentionally do not flip interface statuses to preserve high status accuracy,
+-    but we reduce status confidence when peers disagree.
+-    """
+-    # Measurement timing tolerance (from Hodor research: ~2%)
+-    HARDENING_THRESHOLD = 0.02
++    # Hyperparameters
++    TAU_H_BASE = 0.02        # ~2% hardening threshold
++    ZERO_EPS = 1e-6
++    ZERO_THRESH = 1.0        # Mbps near-zero threshold
++    DAMP_ROUTER = 0.60       # router damping factor
++    PER_LINK_CLIP = 0.10     # per-interface relative change cap (±10%)
++    BUNDLE_CLIP = 0.15       # bundle shared factor cap (±15%)
++    STRONG_SCALE_GUARD = 0.08  # guard for re-sync when strong router scaling applied
++    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
++    PEER_SMOOTH = 0.10       # 10% peer smoothing
+ 
+     def clamp01(x: float) -> float:
+         return max(0.0, min(1.0, x))
+ 
+-    # Precompute originals
++    def rel_diff(a: float, b: float) -> float:
++        return abs(a - b) / max(1.0, abs(a), abs(b))
++
++    def adaptive_tau(v1: float, v2: float) -> float:
++        # Adaptive symmetry tolerance:
++        # tighter for high rates, looser for low/near-zero or low confidence regions.
++        if v1 >= 100.0 and v2 >= 100.0:
++            return 0.015
++        if v1 < ZERO_THRESH or v2 < ZERO_THRESH:
++            return 0.03
++        return TAU_H_BASE
++
++    # Build basic maps
+     orig_rx: Dict[str, float] = {}
+     orig_tx: Dict[str, float] = {}
+     status: Dict[str, str] = {}
+     peer_of: Dict[str, str] = {}
+-    for if_id, data in telemetry.items():
+-        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+-        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+-        status[if_id] = data.get('interface_status', 'unknown')
+-        peer_of[if_id] = data.get('connected_to')
+-
+-    # Pair hardening: use bilateral agreement to estimate direction rates
+-    hardened_rx: Dict[str, float] = {}
+-    hardened_tx: Dict[str, float] = {}
+-    conf_rx: Dict[str, float] = {}
+-    conf_tx: Dict[str, float] = {}
+-
+-    for if_id, data in telemetry.items():
+-        my_status = status.get(if_id, 'unknown')
+-        my_up = (my_status == 'up')
+-        peer_id = peer_of.get(if_id)
+-        peer_data = telemetry.get(peer_id, {}) if peer_id in telemetry else None
+-        peer_status = peer_data.get('interface_status', 'unknown') if peer_data else 'unknown'
+-        peer_up = (peer_status == 'up')
+-
+-        my_rx = orig_rx[if_id]
+-        my_tx = orig_tx[if_id]
+-        peer_rx = float(peer_data.get('rx_rate', 0.0)) if peer_data else 0.0
+-        peer_tx = float(peer_data.get('tx_rate', 0.0)) if peer_data else 0.0
+-
+-        # Relative diffs for both directions
+-        tx_to_peer_rx_diff = abs(my_tx - peer_rx) / max(1.0, abs(my_tx), abs(peer_rx))
+-        rx_from_peer_tx_diff = abs(my_rx - peer_tx) / max(1.0, abs(my_rx), abs(peer_tx))
+-
+-        # Base hardened values
+-        if my_up and peer_up and peer_data:
+-            # Average redundant signals to reduce measurement noise
+-            hardened_tx_val = 0.5 * (my_tx + peer_rx)
+-            hardened_rx_val = 0.5 * (my_rx + peer_tx)
+-            # Confidence primarily from agreement; boost when within tolerance
+-            base_tx_conf = clamp01(1.0 - tx_to_peer_rx_diff)
+-            base_rx_conf = clamp01(1.0 - rx_from_peer_tx_diff)
+-            # Slight bump when within tolerance to reflect redundancy agreement
+-            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+-                base_tx_conf = clamp01(0.9 + 0.1 * (1.0 - tx_to_peer_rx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+-            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+-                base_rx_conf = clamp01(0.9 + 0.1 * (1.0 - rx_from_peer_tx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+-        else:
+-            # If either endpoint reports down on this link, traffic should be zero on both sides.
+-            if peer_data and (not my_up or not peer_up):
+-                hardened_tx_val = 0.0
+-                hardened_rx_val = 0.0
+-                base_tx_conf = 0.85  # Strong invariant: link down -> zero
+-                base_rx_conf = 0.85
+-            elif my_up:
+-                # Peer missing: rely on local but lower confidence due to lack of redundancy
+-                hardened_tx_val = my_tx
+-                hardened_rx_val = my_rx
+-                base_tx_conf = 0.6
+-                base_rx_conf = 0.6
+-            else:
+-                # Local interface down cannot send/receive
+-                hardened_tx_val = 0.0
+-                hardened_rx_val = 0.0
+-                base_tx_conf = 0.85
+-                base_rx_conf = 0.85
+-
+-        hardened_tx[if_id] = max(0.0, hardened_tx_val)
+-        hardened_rx[if_id] = max(0.0, hardened_rx_val)
+-        conf_tx[if_id] = clamp01(base_tx_conf)
+-        conf_rx[if_id] = clamp01(base_rx_conf)
+-
+-    # Router-level flow conservation (R1) for routers with >= 2 interfaces
+-    # Only adjust when mismatch exceeds tolerance, and adjust the lower-confidence side.
+-    for router_id, if_list in topology.items():
+-        if_list = [i for i in if_list if i in telemetry]
+-        if len(if_list) < 2:
+-            # Avoid over-correcting single-link routers; not enough redundancy
+-            continue
+-
+-        sum_rx = sum(hardened_rx.get(i, 0.0) for i in if_list)
+-        sum_tx = sum(hardened_tx.get(i, 0.0) for i in if_list)
+-        max_sum = max(1.0, sum_rx, sum_tx)
+-        rel_gap = abs(sum_rx - sum_tx) / max_sum
+-
+-        if rel_gap <= HARDENING_THRESHOLD:
+-            continue  # within tolerance
+-
+-        delta = sum_rx - sum_tx  # positive: rx larger than tx
+-        # Aggregate confidences per side
+-        agg_conf_rx = sum(conf_rx.get(i, 0.5) for i in if_list)
+-        agg_conf_tx = sum(conf_tx.get(i, 0.5) for i in if_list)
+-
+-        # Choose side with lower aggregate confidence to adjust
+-        adjust_side = 'rx' if agg_conf_rx < agg_conf_tx else 'tx'
+-
+-        # Build weights: favor larger links and lower-confidence signals
+-        if adjust_side == 'rx':
+-            vals = [hardened_rx.get(i, 0.0) for i in if_list]
+-            confs = [conf_rx.get(i, 0.5) for i in if_list]
+-            # We need sum(new_rx) = sum_tx -> total adjustment = -delta
+-            total_adjust = -delta
+-        else:
+-            vals = [hardened_tx.get(i, 0.0) for i in if_list]
+-            confs = [conf_tx.get(i, 0.5) for i in if_list]
+-            # We need sum(new_tx) = sum_rx -> total adjustment = +delta
+-            total_adjust = delta
+-
+-        weights = []
+-        for v, c in zip(vals, confs):
+-            # Larger v and lower confidence -> larger weight
+-            w = (abs(v) + 1e-6) * (1.0 - clamp01(c)) + 1e-6
+-            weights.append(w)
+-        total_w = sum(weights)
+-        if total_w <= 0:
+-            # Fallback to uniform weights
+-            weights = [1.0 for _ in if_list]
+-            total_w = float(len(if_list))
+-
+-        # Apply distributed adjustments and reduce confidence proportionally to relative change
+-        for idx, if_id in enumerate(if_list):
+-            adj = total_adjust * (weights[idx] / total_w)
+-            if adjust_side == 'rx':
+-                old = hardened_rx[if_id]
+-                new_val = max(0.0, old + adj)
+-                hardened_rx[if_id] = new_val
+-                rel_change = abs(adj) / max(1.0, abs(old) + 1e-9)
+-                conf_rx[if_id] = clamp01(conf_rx[if_id] * (1.0 - rel_change))
+-            else:
+-                old = hardened_tx[if_id]
+-                new_val = max(0.0, old + adj)
+-                hardened_tx[if_id] = new_val
+-                rel_change = abs(adj) / max(1.0, abs(old) + 1e-9)
+-                conf_tx[if_id] = clamp01(conf_tx[if_id] * (1.0 - rel_change))
+-
+-    # Final symmetry touch-up (R3) using confidence-weighted averaging
+-    processed_pairs = set()
++    local_router_of: Dict[str, Any] = {}
++    remote_router_of: Dict[str, Any] = {}
++
++    for iid, d in telemetry.items():
++        orig_rx[iid] = float(d.get('rx_rate', 0.0))
++        orig_tx[iid] = float(d.get('tx_rate', 0.0))
++        status[iid] = d.get('interface_status', 'unknown')
++        ct = d.get('connected_to')
++        peer_of[iid] = ct if ct in telemetry else None
++        local_router_of[iid] = d.get('local_router')
++        remote_router_of[iid] = d.get('remote_router')
++
++    # Build router->interfaces mapping, prefer provided topology
++    router_ifaces: Dict[str, List[str]] = {}
++    if topology:
++        for r, ifs in topology.items():
++            router_ifaces[r] = [i for i in ifs if i in telemetry]
++    else:
++        # Fallback to local_router fields
++        for iid, d in telemetry.items():
++            r = d.get('local_router')
++            if r is not None:
++                router_ifaces.setdefault(r, []).append(iid)
++
++    # Derive missing remote_router via peer's local_router if needed
++    for iid in telemetry:
++        if not remote_router_of.get(iid):
++            p = peer_of.get(iid)
++            if p and p in telemetry:
++                remote_router_of[iid] = telemetry[p].get('local_router')
++
++    # Build link pairs (unique, undirected)
++    link_pairs: List[Tuple[str, str]] = []
++    seen = set()
+     for a in telemetry:
+         b = peer_of.get(a)
+-        if not b or b not in telemetry or (b, a) in processed_pairs or a == b:
+-            continue
+-        processed_pairs.add((a, b))
+-
+-        # If either side is down, force both sides' rates on the link to zero with high confidence
+-        if status.get(a) == 'down' or status.get(b) == 'down':
+-            hardened_tx[a] = 0.0
+-            hardened_rx[a] = 0.0
+-            hardened_tx[b] = 0.0
+-            hardened_rx[b] = 0.0
+-            conf_tx[a] = max(conf_tx.get(a, 0.5), 0.85)
+-            conf_rx[a] = max(conf_rx.get(a, 0.5), 0.85)
+-            conf_tx[b] = max(conf_tx.get(b, 0.5), 0.85)
+-            conf_rx[b] = max(conf_rx.get(b, 0.5), 0.85)
+-            continue
+-
+-        w_tx_a = max(1e-6, conf_tx.get(a, 0.5))
+-        w_rx_b = max(1e-6, conf_rx.get(b, 0.5))
+-        w_rx_a = max(1e-6, conf_rx.get(a, 0.5))
+-        w_tx_b = max(1e-6, conf_tx.get(b, 0.5))
+-
+-        v1_old_a = hardened_tx.get(a, 0.0)
+-        v1_old_b = hardened_rx.get(b, 0.0)
+-        v2_old_a = hardened_rx.get(a, 0.0)
+-        v2_old_b = hardened_tx.get(b, 0.0)
+-
+-        v1 = (w_tx_a * v1_old_a + w_rx_b * v1_old_b) / (w_tx_a + w_rx_b)
+-        v2 = (w_rx_a * v2_old_a + w_tx_b * v2_old_b) / (w_rx_a + w_tx_b)
+-
+-        def rel_change(new, old):
+-            return abs(new - old) / max(1.0, abs(old), abs(new))
+-
+-        r1a = rel_change(v1, v1_old_a)
+-        r1b = rel_change(v1, v1_old_b)
+-        r2a = rel_change(v2, v2_old_a)
+-        r2b = rel_change(v2, v2_old_b)
+-
+-        hardened_tx[a] = v1
+-        hardened_rx[b] = v1
+-        hardened_rx[a] = v2
+-        hardened_tx[b] = v2
+-
+-        conf_tx[a] = clamp01(conf_tx.get(a, 0.5) * (1.0 - 0.5 * r1a))
+-        conf_rx[b] = clamp01(conf_rx.get(b, 0.5) * (1.0 - 0.5 * r1b))
+-        conf_rx[a] = clamp01(conf_rx.get(a, 0.5) * (1.0 - 0.5 * r2a))
+-        conf_tx[b] = clamp01(conf_tx.get(b, 0.5) * (1.0 - 0.5 * r2b))
+-
+-    # Finalize: enforce zero rates on down interfaces, and prepare output
++        if not b or b not in telemetry or a == b:
++            continue
++        if (b, a) in seen or (a, b) in seen:
++            continue
++        seen.add((a, b))
++        link_pairs.append((a, b))
++
++    # Initialize hardened values with originals
++    hardened_rx: Dict[str, float] = {i: max(0.0, orig_rx[i]) for i in telemetry}
++    hardened_tx: Dict[str, float] = {i: max(0.0, orig_tx[i]) for i in telemetry}
++    # Initialize confidences (will be calibrated later)
++    conf_rx: Dict[str, float] = {i: 0.7 for i in telemetry}
++    conf_tx: Dict[str, float] = {i: 0.7 for i in telemetry}
++
++    # Track cumulative router scaling factors for re-sync guard and confidence
++    scaled_rx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
++    scaled_tx_factor: Dict[str, float] = {i: 1.0 for i in telemetry}
++
++    # Stage 1: Robust link hardening with adaptive tolerance and soft-zero
++    for a, b in link_pairs:
++        a_up = (status.get(a) == 'up')
++        b_up = (status.get(b) == 'up')
++        a_rx, a_tx = orig_rx[a], orig_tx[a]
++        b_rx, b_tx = orig_rx[b], orig_tx[b]
++
++        # If either side is down: force both to zero on the link with high confidence
++        if not a_up or not b_up:
++            for i in (a, b):
++                hardened_rx[i] = 0.0
++                hardened_tx[i] = 0.0
++                conf_rx[i] = max(conf_rx[i], 0.85)
++                conf_tx[i] = max(conf_tx[i], 0.85)
++            continue
++
++        # Soft-zero stabilization for near-zero links
++        if max(a_rx, a_tx, b_rx, b_tx) < 2.0 * ZERO_THRESH:
++            for i in (a, b):
++                hardened_rx[i] = 0.0
++                hardened_tx[i] = 0.0
++                conf_rx[i] = max(conf_rx[i], 0.95)
++                conf_tx[i] = max(conf_tx[i], 0.95)
++            continue
++
++        # Direction 1: a.tx vs b.rx
++        d1 = rel_diff(a_tx, b_rx)
++        tau1 = adaptive_tau(a_tx, b_rx)
++        if d1 <= tau1:
++            v1 = 0.5 * (a_tx + b_rx)
++            hardened_tx[a] = v1
++            hardened_rx[b] = v1
++            c1 = clamp01(0.9 + 0.1 * (1.0 - d1 / max(tau1, 1e-12)))
++            conf_tx[a] = max(conf_tx[a], c1)
++            conf_rx[b] = max(conf_rx[b], c1)
++        else:
++            # Pick the observation closer to both sides' own measurements to avoid bias
++            # With two points, robustly choose the one farther from zero and rely on redundancy
++            choice = b_rx if abs(b_rx) >= abs(a_tx) else a_tx
++            hardened_tx[a] = max(0.0, choice)
++            hardened_rx[b] = max(0.0, choice)
++            c1 = clamp01(1.0 - d1)
++            conf_tx[a] = max(conf_tx[a], c1)
++            conf_rx[b] = max(conf_rx[b], c1)
++
++        # Direction 2: a.rx vs b.tx
++        d2 = rel_diff(a_rx, b_tx)
++        tau2 = adaptive_tau(a_rx, b_tx)
++        if d2 <= tau2:
++            v2 = 0.5 * (a_rx + b_tx)
++            hardened_rx[a] = v2
++            hardened_tx[b] = v2
++            c2 = clamp01(0.9 + 0.1 * (1.0 - d2 / max(tau2, 1e-12)))
++            conf_rx[a] = max(conf_rx[a], c2)
++            conf_tx[b] = max(conf_tx[b], c2)
++        else:
++            choice = b_tx if abs(b_tx) >= abs(a_rx) else a_rx
++            hardened_rx[a] = max(0.0, choice)
++            hardened_tx[b] = max(0.0, choice)
++            c2 = clamp01(1.0 - d2)
++            conf_rx[a] = max(conf_rx[a], c2)
++            conf_tx[b] = max(conf_tx[b], c2)
++
++    # Unpaired interfaces: trust local with moderate confidence; zero if down
++    in_pairs = {x for pair in link_pairs for x in pair}
++    for i in telemetry:
++        if i not in in_pairs:
++            if status.get(i) != 'up':
++                hardened_rx[i] = 0.0
++                hardened_tx[i] = 0.0
++                conf_rx[i] = max(conf_rx[i], 0.85)
++                conf_tx[i] = max(conf_tx[i], 0.85)
++            else:
++                hardened_rx[i] = max(0.0, orig_rx[i])
++                hardened_tx[i] = max(0.0, orig_tx[i])
++                conf_rx[i] = max(conf_rx[i], 0.6)
++                conf_tx[i] = max(conf_tx[i], 0.6)
++
++    # Stage 2: Router flow conservation with targeted, bundle-aware corrections
++    for r, ifs in router_ifaces.items():
++        if not ifs:
++            continue
++        up_ifs = [i for i in ifs if status.get(i) == 'up']
++        if len(up_ifs) < 2:
++            continue
++
++        sum_rx = sum(hardened_rx[i] for i in up_ifs)
++        sum_tx = sum(hardened_tx[i] for i in up_ifs)
++        denom = max(1.0, sum_rx, sum_tx)
++        imbalance = (sum_rx - sum_tx)  # positive means rx > tx
++        rel_gap = abs(imbalance) / denom
++
++        # Adaptive router tolerance based on number of active interfaces
++        n_active = len(up_ifs)
++        tau_router = min(0.07, max(0.03, 0.05 * (2.0 / max(2, n_active)) ** 0.5))
++        if rel_gap <= tau_router:
++            continue
++
++        # Choose side with lower aggregate confidence to adjust
++        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
++        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
++        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
++        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
++
++        # Build per-interface values and confidences for the chosen side
++        side_vals = {i: (hardened_rx[i] if adjust_side == 'rx' else hardened_tx[i]) for i in up_ifs}
++        side_confs = {i: (conf_rx[i] if adjust_side == 'rx' else conf_tx[i]) for i in up_ifs}
++
++        # Group interfaces into bundles by (local_router, remote_router)
++        # Determine remote router with fallback via peer's local router
++        bundle_map: Dict[Tuple[Any, Any], List[str]] = {}
++        for i in up_ifs:
++            lr = local_router_of.get(i)
++            rr = remote_router_of.get(i)
++            if not rr:
++                p = peer_of.get(i)
++                if p:
++                    rr = local_router_of.get(p)
++            key = (lr, rr)
++            bundle_map.setdefault(key, []).append(i)
++
++        side_total = sum(side_vals.values())
++        # Identify majority bundles (>=50% of side traffic)
++        majority_bundles = []
++        for key, members in bundle_map.items():
++            s = sum(side_vals[m] for m in members)
++            if side_total > ZERO_EPS and s >= 0.5 * side_total:
++                majority_bundles.append((key, members, s))
++
++        # Build weights for distribution: w_i = (1 - conf) * max(val, ZERO_THRESH)
++        weights = {i: (1.0 - clamp01(side_confs[i])) * max(side_vals[i], ZERO_THRESH) + 1e-9 for i in up_ifs}
++        total_w = sum(weights.values())
++        if total_w <= 0:
++            weights = {i: 1.0 for i in up_ifs}
++            total_w = float(len(up_ifs))
++
++        # Apply bundle-aware scaling if there is a majority bundle; else per-interface adjustments
++        if majority_bundles:
++            # Distribute total_adjust across bundles proportionally to their combined weights
++            # Compute per-bundle weight as sum of member weights
++            bundle_weights: Dict[Tuple[Any, Any], float] = {}
++            for key, members, _ in majority_bundles:
++                bundle_weights[key] = sum(weights[m] for m in members)
++            # Remaining non-majority as one group (per-interface below)
++            major_total_w = sum(bundle_weights.values())
++
++            # First, scale majority bundles with a shared factor per bundle
++            for key, members, s_sum in majority_bundles:
++                w_g = bundle_weights.get(key, 0.0)
++                if major_total_w <= 0 or s_sum <= ZERO_EPS:
++                    continue
++                adj_g = total_adjust * (w_g / total_w)  # use global total_w to preserve proportionality
++                target_sum = max(0.0, s_sum + adj_g)
++                scale_g = target_sum / s_sum
++                # Clip group scale to [0.85, 1.15]
++                scale_g = max(1.0 - BUNDLE_CLIP, min(1.0 + BUNDLE_CLIP, scale_g))
++                for m in members:
++                    old = side_vals[m]
++                    new = max(0.0, scale_g * old)
++                    if adjust_side == 'rx':
++                        if hardened_rx[m] > ZERO_EPS:
++                            scaled_rx_factor[m] *= (new / hardened_rx[m])
++                        hardened_rx[m] = new
++                        # Confidence penalty proportional to relative change
++                        relc = abs(new - old) / max(1.0, abs(old))
++                        conf_rx[m] = clamp01(conf_rx[m] * (1.0 - 0.6 * relc))
++                    else:
++                        if hardened_tx[m] > ZERO_EPS:
++                            scaled_tx_factor[m] *= (new / hardened_tx[m])
++                        hardened_tx[m] = new
++                        relc = abs(new - old) / max(1.0, abs(old))
++                        conf_tx[m] = clamp01(conf_tx[m] * (1.0 - 0.6 * relc))
++
++            # Then, adjust remaining non-majority interfaces individually using leftover weights
++            non_majority = [i for i in up_ifs if all(i not in members for _, members, _ in majority_bundles)]
++            nm_total_w = sum(weights[i] for i in non_majority)
++            if nm_total_w > 0:
++                # Compute remaining adjustment share for non-majority
++                adj_nm = total_adjust * (nm_total_w / total_w)
++                for i in non_majority:
++                    v_old = side_vals[i]
++                    w_i = weights[i] / nm_total_w
++                    adj_i = adj_nm * w_i
++                    # Clip per-interface relative change ±10%
++                    cap = PER_LINK_CLIP * v_old
++                    adj_i = min(max(adj_i, -cap), cap)
++                    v_new = max(0.0, v_old + adj_i)
++                    if adjust_side == 'rx':
++                        if hardened_rx[i] > ZERO_EPS:
++                            scaled_rx_factor[i] *= (v_new / hardened_rx[i])
++                        hardened_rx[i] = v_new
++                        relc = abs(adj_i) / max(1.0, abs(v_old))
++                        conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
++                    else:
++                        if hardened_tx[i] > ZERO_EPS:
++                            scaled_tx_factor[i] *= (v_new / hardened_tx[i])
++                        hardened_tx[i] = v_new
++                        relc = abs(adj_i) / max(1.0, abs(v_old))
++                        conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
++        else:
++            # No dominant bundle: targeted per-interface corrections only
++            for i in up_ifs:
++                v_old = side_vals[i]
++                w_i = weights[i] / total_w
++                adj_i = total_adjust * w_i
++                cap = PER_LINK_CLIP * v_old
++                adj_i = min(max(adj_i, -cap), cap)
++                v_new = max(0.0, v_old + adj_i)
++                if adjust_side == 'rx':
++                    if hardened_rx[i] > ZERO_EPS:
++                        scaled_rx_factor[i] *= (v_new / hardened_rx[i])
++                    hardened_rx[i] = v_new
++                    relc = abs(adj_i) / max(1.0, abs(v_old))
++                    conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
++                else:
++                    if hardened_tx[i] > ZERO_EPS:
++                        scaled_tx_factor[i] *= (v_new / hardened_tx[i])
++                    hardened_tx[i] = v_new
++                    relc = abs(adj_i) / max(1.0, abs(v_old))
++                    conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
++
++    # Stage 3: Confidence-gap-proportional re-sync with scaling guard
++    def nudge_toward_mean(val_lo: float, val_hi: float, frac: float) -> float:
++        target = 0.5 * (val_lo + val_hi)
++        return val_lo + frac * (target - val_lo)
++
++    for a, b in link_pairs:
++        if status.get(a) != 'up' or status.get(b) != 'up':
++            continue
++
++        # Direction 1: a.tx vs b.rx
++        a_tx, b_rx = hardened_tx[a], hardened_rx[b]
++        if max(a_tx, b_rx) > ZERO_EPS:
++            d1 = rel_diff(a_tx, b_rx)
++            tau1 = adaptive_tau(a_tx, b_rx)
++            if d1 > tau1:
++                ca, cb = conf_tx.get(a, 0.6), conf_rx.get(b, 0.6)
++                # Skip if strong router scaling already applied on the target direction
++                if ca >= cb and abs(scaled_rx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
++                    f = min(RESYNC_MAX_F, max(0.0, ca - cb))
++                    if f > 0.0:
++                        old = b_rx
++                        new = max(0.0, nudge_toward_mean(old, a_tx, f))
++                        hardened_rx[b] = new
++                        relc = rel_diff(new, old)
++                        conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.3 * relc))
++                elif cb > ca and abs(scaled_tx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
++                    f = min(RESYNC_MAX_F, max(0.0, cb - ca))
++                    if f > 0.0:
++                        old = a_tx
++                        new = max(0.0, nudge_toward_mean(old, b_rx, f))
++                        hardened_tx[a] = new
++                        relc = rel_diff(new, old)
++                        conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.3 * relc))
++
++        # Direction 2: a.rx vs b.tx
++        a_rx, b_tx = hardened_rx[a], hardened_tx[b]
++        if max(a_rx, b_tx) > ZERO_EPS:
++            d2 = rel_diff(a_rx, b_tx)
++            tau2 = adaptive_tau(a_rx, b_tx)
++            if d2 > tau2:
++                ca, cb = conf_rx.get(a, 0.6), conf_tx.get(b, 0.6)
++                if ca >= cb and abs(scaled_tx_factor.get(b, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
++                    f = min(RESYNC_MAX_F, max(0.0, ca - cb))
++                    if f > 0.0:
++                        old = b_tx
++                        new = max(0.0, nudge_toward_mean(old, a_rx, f))
++                        hardened_tx[b] = new
++                        relc = rel_diff(new, old)
++                        conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.3 * relc))
++                elif cb > ca and abs(scaled_rx_factor.get(a, 1.0) - 1.0) <= STRONG_SCALE_GUARD:
++                    f = min(RESYNC_MAX_F, max(0.0, cb - ca))
++                    if f > 0.0:
++                        old = a_rx
++                        new = max(0.0, nudge_toward_mean(old, b_tx, f))
++                        hardened_rx[a] = new
++                        relc = rel_diff(new, old)
++                        conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.3 * relc))
++
++    # Enforce status down => zero as a final safety
++    for i in telemetry:
++        if status.get(i) != 'up':
++            hardened_rx[i] = 0.0
++            hardened_tx[i] = 0.0
++            conf_rx[i] = max(conf_rx[i], 0.85)
++            conf_tx[i] = max(conf_tx[i], 0.85)
++
++    # Compute router residuals after all adjustments (for confidence calibration)
++    router_residual: Dict[str, float] = {}
++    for r, ifs in router_ifaces.items():
++        up_ifs = [i for i in ifs if i in telemetry]
++        if not up_ifs:
++            router_residual[r] = 0.0
++            continue
++        sum_rx = sum(hardened_rx[i] for i in up_ifs)
++        sum_tx = sum(hardened_tx[i] for i in up_ifs)
++        denom = max(1.0, sum_rx, sum_tx)
++        router_residual[r] = abs(sum_rx - sum_tx) / denom
++
++    # Stage 4: Confidence calibration with scale penalty and peer smoothing
++    def compute_conf(i: str) -> Tuple[float, float]:
++        p = peer_of.get(i)
++        # Measurement residuals
++        r_meas_rx = rel_diff(hardened_rx[i], orig_rx[i])
++        r_meas_tx = rel_diff(hardened_tx[i], orig_tx[i])
++        # Link residuals
++        if p and p in telemetry and status.get(i) == 'up' and status.get(p) == 'up':
++            r_link_rx = rel_diff(hardened_rx[i], hardened_tx[p])
++            r_link_tx = rel_diff(hardened_tx[i], hardened_rx[p])
++        else:
++            r_link_rx = 0.2
++            r_link_tx = 0.2
++        # Router residual
++        rtr = router_residual.get(local_router_of.get(i), 0.0)
++        # Base confidence blend
++        base_rx = 1.0 - (0.55 * r_meas_rx + 0.35 * r_link_rx + 0.10 * rtr)
++        base_tx = 1.0 - (0.55 * r_meas_tx + 0.35 * r_link_tx + 0.10 * rtr)
++        base_rx = clamp01(base_rx)
++        base_tx = clamp01(base_tx)
++
++        # Scale-factor term (penalize big routed adjustments)
++        alpha_rx = abs(scaled_rx_factor.get(i, 1.0) - 1.0)
++        alpha_tx = abs(scaled_tx_factor.get(i, 1.0) - 1.0)
++        scale_term_rx = clamp01(1.0 - min(0.5, alpha_rx))
++        scale_term_tx = clamp01(1.0 - min(0.5, alpha_tx))
++
++        c_rx = clamp01(0.90 * base_rx + 0.10 * scale_term_rx)
++        c_tx = clamp01(0.90 * base_tx + 0.10 * scale_term_tx)
++
++        # If interface is down, zero is a strong invariant; raise confidence floor
++        if status.get(i) != 'up':
++            c_rx = max(c_rx, 0.85)
++            c_tx = max(c_tx, 0.85)
++        return c_rx, c_tx
++
++    # Compute confidences
++    for i in telemetry:
++        cr, ct = compute_conf(i)
++        conf_rx[i], conf_tx[i] = cr, ct
++
++    # Peer smoothing
++    for a, b in link_pairs:
++        if status.get(a) == 'up' and status.get(b) == 'up':
++            conf_tx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[a] + PEER_SMOOTH * conf_rx[b])
++            conf_rx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[b] + PEER_SMOOTH * conf_tx[a])
++            conf_rx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[a] + PEER_SMOOTH * conf_tx[b])
++            conf_tx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[b] + PEER_SMOOTH * conf_rx[a])
++
++    # Assemble final result
+     result: Dict[str, Dict[str, Tuple]] = {}
+-    for if_id, data in telemetry.items():
+-        my_status = status.get(if_id, 'unknown')
+-        my_up = (my_status == 'up')
+-        peer_id = peer_of.get(if_id)
+-        repaired_rx = hardened_rx.get(if_id, 0.0)
+-        repaired_tx = hardened_tx.get(if_id, 0.0)
+-        rx_conf = conf_rx.get(if_id, 0.5)
+-        tx_conf = conf_tx.get(if_id, 0.5)
+-
+-        # Enforce down => zero traffic with strong confidence
+-        if not my_up:
+-            repaired_rx = 0.0
+-            repaired_tx = 0.0
+-            rx_conf = max(rx_conf, 0.8)
+-            tx_conf = max(tx_conf, 0.8)
+-
+-        # Status confidence handling (we do not change statuses)
++    for i, data in telemetry.items():
++        my_status = status.get(i, 'unknown')
++        peer_id = peer_of.get(i)
++        # Status confidence: do not flip, but penalize inconsistent peer or down+nonzero readings
+         status_conf = 1.0
+         if peer_id and peer_id in telemetry:
+-            peer_status = telemetry[peer_id].get('interface_status', 'unknown')
+-            if my_status != peer_status:
+-                status_conf = 0.6  # inconsistent pair statuses
+-
+-        repaired_data: Dict[str, Any] = {}
+-        repaired_data['rx_rate'] = (orig_rx.get(if_id, 0.0), repaired_rx, clamp01(rx_conf))
+-        repaired_data['tx_rate'] = (orig_tx.get(if_id, 0.0), repaired_tx, clamp01(tx_conf))
+-        repaired_data['interface_status'] = (my_status, my_status, status_conf)
++            if telemetry[peer_id].get('interface_status', 'unknown') != my_status:
++                status_conf = 0.6
++        if my_status == 'down' and (orig_rx.get(i, 0.0) > ZERO_EPS or orig_tx.get(i, 0.0) > ZERO_EPS):
++            status_conf = min(status_conf, 0.6)
++
++        repaired: Dict[str, Any] = {}
++        repaired['rx_rate'] = (orig_rx.get(i, 0.0), max(0.0, hardened_rx.get(i, 0.0)), clamp01(conf_rx.get(i, 0.6)))
++        repaired['tx_rate'] = (orig_tx.get(i, 0.0), max(0.0, hardened_tx.get(i, 0.0)), clamp01(conf_tx.get(i, 0.6)))
++        repaired['interface_status'] = (my_status, my_status, status_conf)
+ 
+         # Copy metadata unchanged
+-        repaired_data['connected_to'] = data.get('connected_to')
+-        repaired_data['local_router'] = data.get('local_router')
+-        repaired_data['remote_router'] = data.get('remote_router')
+-
+-        result[if_id] = repaired_data
++        repaired['connected_to'] = data.get('connected_to')
++        repaired['local_router'] = data.get('local_router')
++        repaired['remote_router'] = data.get('remote_router')
++
++        result[i] = repaired
+ 
+     return result
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+     Main entry point that will be called by the evaluator.
+ 
+     Args:
+         telemetry: Network interface telemetry data
+         topology: Dictionary where key is router_id and value contains a list of interface_ids
+ 
+     Returns:
+         Dictionary containing repaired results with confidence scores
+     """
+     return repair_network_telemetry(telemetry, topology)
+ 
+ 
+ if __name__ == "__main__":
+     # Simple test case
+     test_telemetry = {
+         'if1_to_if2': {
+             'interface_status': 'up',
+             'rx_rate': 100.0,
+             'tx_rate': 95.0,
+             'connected_to': 'if2_to_if1',
+             'local_router': 'router1',
+             'remote_router': 'router2'
+         },
+         'if2_to_if1': {
+             'interface_status': 'up',
+             'rx_rate': 95.0,  # Should match if1's TX
+             'tx_rate': 100.0,  # Should match if1's RX
+             'connected_to': 'if1_to_if2',
+             'local_router': 'router2',
+             'remote_router': 'router1'
+         }
+     }
+ 
+     test_topology = {
+         'router1': ['if1_to_if2'],
+         'router2': ['if2_to_if1']
+     }
+ 
+     result = run_repair(test_telemetry, test_topology)
+ 
+     print("Repair results:")
+     for if_id, data in result.items():
+         print(f"\n{if_id}:")
+         print(f"  RX: {data['rx_rate']}")
+         print(f"  TX: {data['tx_rate']}")
+         print(f"  Status: {data['interface_status']}")

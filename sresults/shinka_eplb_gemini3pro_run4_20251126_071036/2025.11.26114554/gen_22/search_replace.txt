@@ -1,0 +1,283 @@
+This modification introduces a **Pairwise Rebalancing (Ruin & Recreate)** phase into the `balanced_packing` algorithm, inspired by Large Neighborhood Search (LNS) strategies.
+
+**Reasoning:**
+The previous algorithm relied on pairwise swaps to balance the load. However, single swaps can get stuck in local optima, especially when strict cardinality constraints (fixed number of items per pack) exist. A single swap might not be able to reduce the heaviest pack's load if it requires a multi-step exchange or if the only improving swap is invalid due to constraints.
+
+The new approach adds a phase that specifically targets the **heaviest** and **lightest** packs. It pools their items together and attempts to redistribute them optimally into two equal-sized bins. This effectively solves a small 2-way partitioning problem (with cardinality constraints). Since the sub-problem size is small, we can use a "Balanced Greedy" heuristic with randomized perturbations to find a distribution that minimizes the difference between these two packs. Minimizing the difference between the global max and global min generally reduces the global max load, converging towards a better balanced state.
+
+We reduce the number of global restarts from 50 to 20 to allocate computational budget for this more intensive refinement phase, aiming for higher quality solutions within the same time constraints.
+
+<NAME>
+pairwise_rebalancing_and_restarts
+</NAME>
+
+<DESCRIPTION>
+1. Reduce `NUM_RESTARTS` from 50 to 20 to allocate budget for more intensive refinement.
+2. Introduce a "Pairwise Rebalancing" phase after the vectorized swap. This phase identifies the heaviest and lightest packs and attempts to redistribute their combined items to minimize the weight difference (and thus the max load). This uses a "balanced greedy" heuristic with randomized perturbations, which is effective for the 2-partition problem.
+3. This targets the specific "bottleneck" (difference between max and min) that simple swaps often fail to resolve due to local optima.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Number of restarts for the randomized heuristic
+    # Increased to 50 as we have computational budget and random greedy is effective
+    NUM_RESTARTS = 50
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+
+        best_max_load = float('inf')
+        best_assignment = None
+
+        for attempt in range(NUM_RESTARTS):
+            # 1. Candidate Generation
+            if attempt == 0:
+                # Deterministic LPT
+                indices = layer_w.argsort(descending=True).tolist()
+            else:
+                # Randomized LPT (Perturbed weights)
+                # Slightly wider noise range for better exploration
+                noise = torch.rand(num_groups) * 0.4 + 0.8  # 0.8 to 1.2
+                indices = (layer_w * noise).argsort(descending=True).tolist()
+
+            # 2. Greedy Construction
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for g_idx in indices:
+                w = layer_w[g_idx].item()
+                # Best fit among non-full packs (min current load)
+                best_p = -1
+                min_w = float('inf')
+
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+
+                packs[best_p].append(g_idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+
+            # 3. Refinement (Local Search)
+            # Try to swap items from the heaviest packs to lighter packs.
+            # We consider top 3 heaviest packs to avoid getting stuck if the max pack cannot swap.
+            for _ in range(25):
+                # Sort packs by weight descending
+                sorted_packs = sorted(range(num_packs), key=lambda x: pack_weights[x], reverse=True)
+
+                improved = False
+
+                # Try to improve the heaviest packs
+                for p_idx in range(min(3, num_packs)):
+                    max_p = sorted_packs[p_idx]
+                    max_w = pack_weights[max_p]
+
+                    best_swap = None
+                    best_gain = 0.0
+
+                    u_nodes = packs[max_p]
+                    w_u = layer_w[u_nodes]
+
+                    for p in range(num_packs):
+                        if p == max_p:
+                            continue
+
+                        w_p = pack_weights[p]
+                        if w_p >= max_w:
+                            continue
+
+                        diff = max_w - w_p
+                        if diff < 1e-6:
+                            continue
+
+                        v_nodes = packs[p]
+                        w_v = layer_w[v_nodes]
+
+                        # Deltas: w_u[i] - w_v[j]
+                        deltas = w_u.unsqueeze(1) - w_v.unsqueeze(0)
+
+                        # Valid swaps: 0 < delta < diff
+                        mask = (deltas > 1e-6) & (deltas < diff)
+                        if not mask.any():
+                            continue
+
+                        # Gain metric: maximize delta * (diff - delta)
+                        gains = deltas * (diff - deltas)
+                        gains = torch.where(mask, gains, -1.0)
+
+                        curr_max_gain, curr_idx = gains.flatten().max(0)
+
+                        if curr_max_gain.item() > best_gain:
+                            best_gain = curr_max_gain.item()
+                            idx = curr_idx.item()
+                            u_idx = idx // len(v_nodes)
+                            v_idx = idx % len(v_nodes)
+                            best_swap = (max_p, p, u_idx, v_idx, deltas.flatten()[idx].item())
+
+                    if best_swap:
+                        p1, p2, u_i, v_i, delta = best_swap
+                        val_u = packs[p1][u_i]
+                        val_v = packs[p2][v_i]
+                        packs[p1][u_i] = val_v
+                        packs[p2][v_i] = val_u
+
+                        pack_weights[p1] -= delta
+                        pack_weights[p2] += delta
+                        improved = True
+                        break # Re-sort and restart logic
+
+                if not improved:
+                    break
+
+            # 4. Evaluation
+=======
+    # Number of restarts for the randomized heuristic
+    NUM_RESTARTS = 20
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+
+        best_max_load = float('inf')
+        best_assignment = None
+
+        for attempt in range(NUM_RESTARTS):
+            # 1. Candidate Generation
+            if attempt == 0:
+                # Deterministic LPT
+                indices = layer_w.argsort(descending=True).tolist()
+            else:
+                # Randomized LPT (Perturbed weights)
+                noise = torch.rand(num_groups) * 0.4 + 0.8  # 0.8 to 1.2
+                indices = (layer_w * noise).argsort(descending=True).tolist()
+
+            # 2. Greedy Construction
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for g_idx in indices:
+                w = layer_w[g_idx].item()
+                # Best fit among non-full packs (min current load)
+                best_p = -1
+                min_w = float('inf')
+
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+
+                packs[best_p].append(g_idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+
+            # 3. Refinement Phase 1: Vectorized 2-Opt (Swap)
+            for _ in range(10):
+                sorted_packs = sorted(range(num_packs), key=lambda x: pack_weights[x], reverse=True)
+                improved = False
+                for p_idx in range(min(3, num_packs)):
+                    max_p = sorted_packs[p_idx]
+                    max_w = pack_weights[max_p]
+                    best_swap = None
+                    best_gain = 0.0
+
+                    u_nodes = packs[max_p]
+                    w_u = layer_w[u_nodes]
+
+                    for p in range(num_packs):
+                        if p == max_p: continue
+                        if pack_weights[p] >= max_w: continue
+
+                        diff = max_w - pack_weights[p]
+                        if diff < 1e-6: continue
+
+                        v_nodes = packs[p]
+                        w_v = layer_w[v_nodes]
+
+                        deltas = w_u.unsqueeze(1) - w_v.unsqueeze(0)
+                        mask = (deltas > 1e-6) & (deltas < diff)
+                        if not mask.any(): continue
+
+                        gains = deltas * (diff - deltas)
+                        gains = torch.where(mask, gains, -1.0)
+                        curr_max_gain, curr_idx = gains.flatten().max(0)
+
+                        if curr_max_gain.item() > best_gain:
+                            best_gain = curr_max_gain.item()
+                            idx = curr_idx.item()
+                            u_idx = idx // len(v_nodes)
+                            v_idx = idx % len(v_nodes)
+                            best_swap = (max_p, p, u_idx, v_idx, deltas.flatten()[idx].item())
+
+                    if best_swap:
+                        p1, p2, u_i, v_i, delta = best_swap
+                        packs[p1][u_i], packs[p2][v_i] = packs[p2][v_i], packs[p1][u_i]
+                        pack_weights[p1] -= delta
+                        pack_weights[p2] += delta
+                        improved = True
+                        break
+                if not improved: break
+
+            # 4. Refinement Phase 2: Pairwise Rebalancing (Ruin & Recreate)
+            # Focus on reducing the gap between heaviest and lightest packs
+            for _ in range(15):
+                max_p = max(range(num_packs), key=pack_weights.__getitem__)
+                min_p = min(range(num_packs), key=pack_weights.__getitem__)
+                if max_p == min_p: break
+
+                diff = pack_weights[max_p] - pack_weights[min_p]
+                if diff < 1e-6: break
+
+                items_pair = packs[max_p] + packs[min_p]
+                # Optimization: Extract weights once
+                w_pair = [(layer_w[idx].item(), idx) for idx in items_pair]
+                w_pair.sort(key=lambda x: x[0], reverse=True)
+
+                best_pair_res = None
+                best_pair_diff = diff
+
+                # Try Deterministic and Randomized Greedy on this pair
+                # 1 Deterministic + 5 Randomized
+                for attempt_pair in range(6):
+                    if attempt_pair > 0:
+                        # Perturb weights for randomization
+                        current_w_pair = [(w * (1.0 + torch.rand(1).item() * 0.1), w, idx) for w, idx in w_pair]
+                        current_w_pair.sort(key=lambda x: x[0], reverse=True)
+                        iter_items = [(w_real, idx) for _, w_real, idx in current_w_pair]
+                    else:
+                        iter_items = w_pair
+
+                    p1_new, p2_new = [], []
+                    w1_new, w2_new = 0.0, 0.0
+
+                    for w_val, idx in iter_items:
+                        if len(p1_new) < groups_per_pack and len(p2_new) < groups_per_pack:
+                            if w1_new < w2_new:
+                                p1_new.append(idx); w1_new += w_val
+                            else:
+                                p2_new.append(idx); w2_new += w_val
+                        elif len(p1_new) < groups_per_pack:
+                            p1_new.append(idx); w1_new += w_val
+                        else:
+                            p2_new.append(idx); w2_new += w_val
+
+                    curr_diff = abs(w1_new - w2_new)
+                    if curr_diff < best_pair_diff - 1e-6:
+                        best_pair_diff = curr_diff
+                        best_pair_res = (p1_new, p2_new, w1_new, w2_new)
+
+                if best_pair_res:
+                    p1_idx, p2_idx, w1_v, w2_v = best_pair_res
+                    packs[max_p] = p1_idx
+                    pack_weights[max_p] = w1_v
+                    packs[min_p] = p2_idx
+                    pack_weights[min_p] = w2_v
+                else:
+                    break
+
+            # 5. Evaluation
+>>>>>>> REPLACE
+</DIFF>

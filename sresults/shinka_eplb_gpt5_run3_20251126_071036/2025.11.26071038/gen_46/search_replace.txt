@@ -1,0 +1,462 @@
+<NAME>
+k2_refine_second_heavy_gpu_stage
+</NAME>
+
+<DESCRIPTION>
+Broaden the bounded refinement to consider the second-heaviest donor pack when refining GPU-stage packing, and select among candidates using predicted global peak while still enforcing a fast local delta-improvement guard. Concretely:
+- Extend the 1x1 swap search to evaluate (heaviest↔lightest), (heaviest↔second-lightest), and (second-heaviest↔lightest) pairs, choosing the candidate that minimizes the new global max (ties broken by new delta). This follows the recommendation to include the second-heaviest donor while keeping the evaluation bounded and CPU-only.
+- Keep the strict-improvement guard based on the (hc, lc) delta to preserve speed and determinism.
+- Enable this broader search only in the diversity-aware GPU packing refinement by adding a consider_second_heavy=True flag there. The base group packing remains lightweight.
+
+This should improve balancedness with negligible runtime impact, adhering to the bounded k=2 search and at most one swap per iteration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _kcandidate_refine_row(
+    weights: torch.Tensor,
+    pack_idx: torch.Tensor,
+    num_packs: int,
+    k: int = 2,
+    max_swaps: int = 1,
+    adaptive_second: bool = False,
+    consider_second_light: bool = False,
+    allow_two_two: bool = False,
+) -> torch.Tensor:
+    """
+    Bounded refinement on a single row.
+
+    - Evaluate up to k x k best 1x1 swaps between the heaviest pack and
+      the lightest pack; optionally include the second-lightest pack too.
+    - Optionally evaluate a single 2x2 exchange (top-2 from heaviest vs bottom-2 from lightest),
+      and apply it only if it strictly reduces the max load more than the best 1x1 swap.
+    - Strict improvement guards; stop early if no improvement.
+
+    weights: [N] float (CPU)
+    pack_idx: [N] int64 (CPU)
+    """
+    if max_swaps <= 0 or num_packs <= 1:
+        return pack_idx
+
+    device = weights.device
+    pack_w = torch.zeros(num_packs, dtype=weights.dtype, device=device)
+    pack_w.scatter_add_(0, pack_idx, weights)
+
+    swaps_done = 0
+    added_adaptive = False
+
+    while swaps_done < max_swaps or (adaptive_second and not added_adaptive):
+        # Identify heaviest; for candidates on light side consider 1 or 2 lightest
+        h = int(torch.argmax(pack_w).item())
+        # Sort ascending loads to get lightest and second-lightest
+        # Keeping it cheap: argsort for num_packs is tiny
+        light_order = torch.argsort(pack_w, descending=False)
+        l0 = int(light_order[0].item())
+        light_candidates = [l0]
+        if consider_second_light and num_packs >= 2:
+            l1 = int(light_order[1].item())
+            if l1 != l0 and l1 != h:
+                light_candidates.append(l1)
+
+        if h in light_candidates and len(light_candidates) == 1:
+            # all packs equal
+            break
+
+        # Base delta against best light candidate at time of evaluation
+        best_choice = None  # (new_delta, hi_idx, lj_idx, chosen_light)
+        base_delta = None
+
+        # precompute heavy indices and weights once
+        heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+        if heavy_idx.numel() == 0:
+            break
+        hw_all = weights[heavy_idx]
+        k_h = min(k, hw_all.numel())
+        topk_hw_vals, topk_pos_h = torch.topk(hw_all, k=k_h, largest=True)
+
+        # Evaluate 1x1 swaps for l0 and (optionally) l1
+        for l in light_candidates:
+            if l == h:
+                continue
+            light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+            if light_idx.numel() == 0:
+                continue
+            lw_all = weights[light_idx]
+            k_l = min(k, lw_all.numel())
+            # bottom-k via -topk
+            bottomk_lw_vals, bottomk_pos_l = torch.topk(-lw_all, k=k_l, largest=True)
+            bottomk_lw = -bottomk_lw_vals
+
+            # current delta
+            delta = float((pack_w[h] - pack_w[l]).item())
+            if delta <= 1e-12:
+                continue
+
+            # all pair deltas
+            diff = topk_hw_vals.unsqueeze(1) - bottomk_lw.unsqueeze(0)  # [k_h, k_l]
+            cand_new_delta = (delta - 2.0 * diff).abs()
+            flat_idx = int(torch.argmin(cand_new_delta).item())
+            ih = flat_idx // k_l
+            jl = flat_idx % k_l
+            best_nd = float(cand_new_delta[ih, jl].item())
+            if base_delta is None or best_nd < base_delta - 0.0:
+                base_delta = best_nd
+                best_choice = (
+                    best_nd,
+                    heavy_idx[topk_pos_h[ih]],
+                    light_idx[bottomk_pos_l[jl]],
+                    l,
+                )
+
+        # Optionally evaluate a single 2x2 exchange against the lightest pack l0 only
+        two_two_applied = False
+        two_two_candidate = None
+        if allow_two_two and hw_all.numel() >= 2:
+            l = l0
+            if l != h:
+                light_idx0 = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+                if light_idx0.numel() >= 2:
+                    # choose top-2 heavy and bottom-2 light
+                    kh2 = min(2, hw_all.numel())
+                    kl2 = min(2, light_idx0.numel())
+                    t_h_vals, t_h_pos = torch.topk(hw_all, k=kh2, largest=True)
+                    lw0 = weights[light_idx0]
+                    b_l_vals, b_l_pos = torch.topk(-lw0, k=kl2, largest=True)
+                    b_l_vals = -b_l_vals
+
+                    # total weight difference exchanged
+                    delta0 = float((pack_w[h] - pack_w[l]).item())
+                    sum_h = float(t_h_vals.sum().item())
+                    sum_l = float(b_l_vals.sum().item())
+                    new_delta_22 = abs(delta0 - 2.0 * (sum_h - sum_l))
+                    two_two_candidate = (new_delta_22, t_h_pos, b_l_pos, l)
+
+        # Decide: apply 2x2 only if strictly better than 1x1 best
+        applied = False
+        if two_two_candidate is not None:
+            nd22, hpos22, lpos22, l22 = two_two_candidate
+            if base_delta is None or nd22 + 1e-12 < base_delta:
+                # commit 2x2
+                # map local positions to global indices
+                hi1 = heavy_idx[hpos22[0]]
+                lj1 = torch.nonzero(pack_idx == l22, as_tuple=False).squeeze(1)[lpos22[0]]
+                if hpos22.numel() >= 2 and lpos22.numel() >= 2:
+                    hi2 = heavy_idx[hpos22[1]]
+                    lj2 = torch.nonzero(pack_idx == l22, as_tuple=False).squeeze(1)[lpos22[1]]
+                else:
+                    hi2 = None
+                    lj2 = None
+
+                # perform swaps
+                wi1 = float(weights[hi1].item())
+                wj1 = float(weights[lj1].item())
+                pack_idx[hi1] = l22
+                pack_idx[lj1] = h
+                pack_w[h] = pack_w[h] - wi1 + wj1
+                pack_w[l22] = pack_w[l22] - wj1 + wi1
+
+                if hi2 is not None and lj2 is not None:
+                    wi2 = float(weights[hi2].item())
+                    wj2 = float(weights[lj2].item())
+                    pack_idx[hi2] = l22
+                    pack_idx[lj2] = h
+                    pack_w[h] = pack_w[h] - wi2 + wj2
+                    pack_w[l22] = pack_w[l22] - wj2 + wi2
+
+                swaps_done += 1
+                applied = True
+                two_two_applied = True
+
+        if not applied and best_choice is not None:
+            best_nd, hi, lj, lsel = best_choice
+            # verify strict improvement w.r.t. the chosen light pack
+            delta_sel = float((pack_w[h] - pack_w[lsel]).item())
+            if best_nd + 1e-12 < delta_sel:
+                wi = float(weights[hi].item())
+                wj = float(weights[lj].item())
+                pack_idx[hi] = lsel
+                pack_idx[lj] = h
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[lsel] = pack_w[lsel] - wj + wi
+                swaps_done += 1
+
+                # allow an extra attempt if the improvement is shallow (<20%)
+                if adaptive_second and not added_adaptive:
+                    improve_ratio = 1.0 - (best_nd / max(delta_sel, 1e-12))
+                    if improve_ratio < 0.20:
+                        added_adaptive = True
+                continue
+            else:
+                break
+        elif applied and two_two_applied:
+            # Completed a 2x2 swap; optionally allow another if adaptive is enabled
+            if not adaptive_second:
+                continue
+            else:
+                # If improvement shallow, allow one extra attempt
+                # Recompute current h/l delta to estimate improvement ratio
+                h2 = int(torch.argmax(pack_w).item())
+                l2 = int(torch.argmin(pack_w).item())
+                delta2 = float((pack_w[h2] - pack_w[l2]).item())
+                # We don't have old delta easily; just allow a single extra step when adaptive is on.
+                if not added_adaptive:
+                    added_adaptive = True
+                continue
+        else:
+            # no improving move
+            break
+
+    return pack_idx
+=======
+def _kcandidate_refine_row(
+    weights: torch.Tensor,
+    pack_idx: torch.Tensor,
+    num_packs: int,
+    k: int = 2,
+    max_swaps: int = 1,
+    adaptive_second: bool = False,
+    consider_second_light: bool = False,
+    consider_second_heavy: bool = False,
+    allow_two_two: bool = False,
+) -> torch.Tensor:
+    """
+    Bounded refinement on a single row.
+
+    - Evaluate up to k x k best 1x1 swaps between:
+        (heaviest ↔ lightest), (heaviest ↔ second-lightest if enabled),
+        and optionally (second-heaviest ↔ lightest).
+      Choose the candidate that minimizes the predicted new global max
+      (tie-broken by the induced new delta).
+    - Optionally evaluate a single 2x2 exchange (top-2 from heaviest vs bottom-2 from lightest),
+      and apply it only if it strictly reduces the max load more than the best 1x1 swap.
+    - Strict improvement guards; stop early if no improvement.
+
+    weights: [N] float (CPU)
+    pack_idx: [N] int64 (CPU)
+    """
+    if max_swaps <= 0 or num_packs <= 1:
+        return pack_idx
+
+    device = weights.device
+    pack_w = torch.zeros(num_packs, dtype=weights.dtype, device=device)
+    pack_w.scatter_add_(0, pack_idx, weights)
+
+    swaps_done = 0
+    added_adaptive = False
+
+    while swaps_done < max_swaps or (adaptive_second and not added_adaptive):
+        # Identify heavy and light candidates
+        heavy_order = torch.argsort(pack_w, descending=True)
+        h0 = int(heavy_order[0].item())
+        h_cands = [h0]
+        if consider_second_heavy and num_packs >= 2:
+            h1 = int(heavy_order[1].item())
+            if h1 != h0:
+                h_cands.append(h1)
+
+        light_order = torch.argsort(pack_w, descending=False)
+        l0 = int(light_order[0].item())
+        light_cands_main = [l0]
+        if consider_second_light and num_packs >= 2:
+            l1 = int(light_order[1].item())
+            if l1 != l0 and l1 != h0:
+                light_cands_main.append(l1)
+
+        # Prepare heavy and light index caches for reuse (heaviest and lightest)
+        heavy_idx0 = torch.nonzero(pack_idx == h0, as_tuple=False).squeeze(1)
+        if heavy_idx0.numel() == 0:
+            break
+        hw_all0 = weights[heavy_idx0]
+        k_h0 = min(k, hw_all0.numel())
+        topk_hw_vals0, topk_pos_h0 = torch.topk(hw_all0, k=k_h0, largest=True)
+
+        light_idx0 = torch.nonzero(pack_idx == l0, as_tuple=False).squeeze(1)
+        lw_all0 = weights[light_idx0] if light_idx0.numel() > 0 else None
+
+        # Track best 1x1 by predicted new global peak; tie-break by new delta
+        cur_peak = float(pack_w.max().item())
+        best_choice = None  # (cand_peak, new_delta, hi_idx, lj_idx, chosen_light, chosen_heavy)
+
+        # Evaluate for each heavy candidate
+        for hc in h_cands:
+            # heavy indices/values
+            if hc == h0:
+                topk_hw_vals = topk_hw_vals0
+                topk_pos_h = topk_pos_h0
+                heavy_idx = heavy_idx0
+            else:
+                heavy_idx = torch.nonzero(pack_idx == hc, as_tuple=False).squeeze(1)
+                if heavy_idx.numel() == 0:
+                    continue
+                hw_all = weights[heavy_idx]
+                k_h = min(k, hw_all.numel())
+                topk_hw_vals, topk_pos_h = torch.topk(hw_all, k=k_h, largest=True)
+
+            # choose light candidates: full set for h0, only lightest for h1
+            use_lights = light_cands_main if hc == h0 else [l0]
+            for lc in use_lights:
+                if lc == hc:
+                    continue
+                # light indices/values
+                if lc == l0 and lw_all0 is not None:
+                    lw_all = lw_all0
+                    light_idx = light_idx0
+                else:
+                    light_idx = torch.nonzero(pack_idx == lc, as_tuple=False).squeeze(1)
+                    if light_idx.numel() == 0:
+                        continue
+                    lw_all = weights[light_idx]
+
+                k_l = min(k, lw_all.numel())
+                if k_l == 0 or topk_hw_vals.numel() == 0:
+                    continue
+
+                # bottom-k via -topk
+                bottomk_lw_vals, bottomk_pos_l = torch.topk(-lw_all, k=k_l, largest=True)
+                bottomk_lw = -bottomk_lw_vals
+
+                # current delta and guard
+                delta = float((pack_w[hc] - pack_w[lc]).item())
+                if delta <= 1e-12:
+                    continue
+
+                # Evaluate all pairs
+                diff = topk_hw_vals.unsqueeze(1) - bottomk_lw.unsqueeze(0)  # [k_h, k_l]
+                cand_new_delta = (delta - 2.0 * diff).abs()
+                flat_idx = int(torch.argmin(cand_new_delta).item())
+                ih = flat_idx // k_l
+                jl = flat_idx % k_l
+                best_nd = float(cand_new_delta[ih, jl].item())
+
+                # Predict new global peak for this specific pair
+                wi = float(topk_hw_vals[ih].item())
+                wj = float(bottomk_lw[jl].item())
+                new_h = float(pack_w[hc].item()) - wi + wj
+                new_l = float(pack_w[lc].item()) - wj + wi
+                if num_packs > 2:
+                    mask = torch.ones(num_packs, dtype=torch.bool, device=pack_w.device)
+                    mask[hc] = False
+                    mask[lc] = False
+                    other_max = float(pack_w[mask].max().item()) if mask.any() else float('-inf')
+                else:
+                    other_max = float('-inf')
+                cand_peak = max(other_max, new_h, new_l)
+
+                if best_choice is None or cand_peak < best_choice[0] - 1e-12 or (
+                    abs(cand_peak - best_choice[0]) <= 1e-12 and best_nd < best_choice[1] - 0.0
+                ):
+                    hi_idx = heavy_idx[topk_pos_h[ih]]
+                    lj_idx = light_idx[bottomk_pos_l[jl]]
+                    best_choice = (cand_peak, best_nd, hi_idx, lj_idx, lc, hc)
+
+        # Optionally evaluate a single 2x2 exchange against (h0, l0) only
+        two_two_applied = False
+        two_two_candidate = None
+        if allow_two_two and hw_all0.numel() >= 2 and l0 != h0 and light_idx0.numel() >= 2:
+            kh2 = min(2, hw_all0.numel())
+            kl2 = min(2, light_idx0.numel())
+            t_h_vals, t_h_pos = torch.topk(hw_all0, k=kh2, largest=True)
+            lw0 = weights[light_idx0]
+            b_l_vals, b_l_pos = torch.topk(-lw0, k=kl2, largest=True)
+            b_l_vals = -b_l_vals
+
+            delta0 = float((pack_w[h0] - pack_w[l0]).item())
+            sum_h = float(t_h_vals.sum().item())
+            sum_l = float(b_l_vals.sum().item())
+            new_delta_22 = abs(delta0 - 2.0 * (sum_h - sum_l))
+            two_two_candidate = (new_delta_22, t_h_pos, b_l_pos, l0, h0,)
+
+        # Decide: apply 2x2 only if strictly better than best 1x1's new-delta
+        applied = False
+        base_delta = None if best_choice is None else best_choice[1]
+        if two_two_candidate is not None:
+            nd22, hpos22, lpos22, l22, h22 = two_two_candidate
+            if base_delta is None or nd22 + 1e-12 < base_delta:
+                # commit 2x2 using heaviest pack h0 and lightest l0
+                hi1 = heavy_idx0[hpos22[0]]
+                lj1 = light_idx0[lpos22[0]]
+                wi1 = float(weights[hi1].item())
+                wj1 = float(weights[lj1].item())
+                pack_idx[hi1] = l22
+                pack_idx[lj1] = h22
+                pack_w[h22] = pack_w[h22] - wi1 + wj1
+                pack_w[l22] = pack_w[l22] - wj1 + wi1
+
+                if hpos22.numel() >= 2 and lpos22.numel() >= 2:
+                    hi2 = heavy_idx0[hpos22[1]]
+                    lj2 = light_idx0[lpos22[1]]
+                    wi2 = float(weights[hi2].item())
+                    wj2 = float(weights[lj2].item())
+                    pack_idx[hi2] = l22
+                    pack_idx[lj2] = h22
+                    pack_w[h22] = pack_w[h22] - wi2 + wj2
+                    pack_w[l22] = pack_w[l22] - wj2 + wi2
+
+                swaps_done += 1
+                applied = True
+                two_two_applied = True
+
+        if not applied and best_choice is not None:
+            cand_peak, best_nd, hi, lj, lsel, hsel = best_choice
+            # verify strict improvement w.r.t. the chosen (hsel, lsel) delta
+            delta_sel = float((pack_w[hsel] - pack_w[lsel]).item())
+            if best_nd + 1e-12 < delta_sel:
+                wi = float(weights[hi].item())
+                wj = float(weights[lj].item())
+                pack_idx[hi] = lsel
+                pack_idx[lj] = hsel
+                pack_w[hsel] = pack_w[hsel] - wi + wj
+                pack_w[lsel] = pack_w[lsel] - wj + wi
+                swaps_done += 1
+
+                # allow an extra attempt if the improvement is shallow (<20%)
+                if adaptive_second and not added_adaptive:
+                    improve_ratio = 1.0 - (best_nd / max(delta_sel, 1e-12))
+                    if improve_ratio < 0.20:
+                        added_adaptive = True
+                continue
+            else:
+                break
+        elif applied and two_two_applied:
+            # Completed a 2x2 swap; optionally allow another if adaptive is enabled
+            if not adaptive_second:
+                continue
+            else:
+                if not added_adaptive:
+                    added_adaptive = True
+                continue
+        else:
+            # no improving move
+            break
+
+    return pack_idx
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        pidx = _kcandidate_refine_row(
+            w,
+            pidx,
+            num_packs,
+            k=2,
+            max_swaps=int(steps),
+            adaptive_second=True,
+            consider_second_light=True,
+            allow_two_two=True,
+        )
+=======
+        pidx = _kcandidate_refine_row(
+            w,
+            pidx,
+            num_packs,
+            k=2,
+            max_swaps=int(steps),
+            adaptive_second=True,
+            consider_second_light=True,
+            consider_second_heavy=True,
+            allow_two_two=True,
+        )
+>>>>>>> REPLACE
+
+</DIFF>

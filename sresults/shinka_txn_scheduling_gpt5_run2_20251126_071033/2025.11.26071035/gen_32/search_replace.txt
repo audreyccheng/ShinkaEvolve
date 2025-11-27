@@ -1,0 +1,256 @@
+<NAME>
+adaptive_lookahead_beam_and_vnd_order
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to reduce makespan:
+
+1) Adaptive lookahead scoring in the beam expansion: Instead of ranking expansions only by immediate cost and regret, I compute a sampled one-step lookahead cost (best second insertion from remaining transactions) and blend it with the immediate cost. The blend is regret-aware: if the dispersion (spread) of second-best costs in the layer is high relative to the median regret, we use a 50/50 mix; otherwise we use 80/20 in favor of immediate cost. Near the endgame, I also expand the beam and increase the diversity quota to avoid myopic convergence. This directly addresses the search suggestion to use regret-aware lookahead and endgame diversification.
+
+2) VND neighborhood order and sampling precision: I switch VND to prioritize stronger Or-opt block relocations (3,2,1) before adjacent swaps, which is more effective in resolving conflict chains, and make insertion position sampling exhaustive for small sequences (<=12) to improve move accuracy.
+
+These changes keep runtime reasonable (sampling small second-step candidates), better reflect true makespan impact through lookahead, and improve local search depth with more powerful early moves. The modifications are isolated to the beam selection, position sampling, and VND order, preserving the rest of the pipeline.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def position_samples(seq_len):
+        if seq_len <= 1:
+            return [0, seq_len]
+        pos_set = {0, seq_len, seq_len // 2}
+        # Add a few random internal positions
+        for _ in range(min(k_pos_sample, seq_len + 1)):
+            pos_set.add(random.randint(0, seq_len))
+        # Keep deterministic ordering for caching benefits
+        return sorted(pos_set)
+=======
+    def position_samples(seq_len):
+        if seq_len <= 1:
+            return [0, seq_len]
+        # For small sequences, evaluate all positions for accuracy
+        if seq_len <= 12:
+            return list(range(seq_len + 1))
+        pos_set = {0, seq_len, seq_len // 2}
+        # Add a few random internal positions
+        for _ in range(min(k_pos_sample, seq_len + 1)):
+            pos_set.add(random.randint(0, seq_len))
+        # Keep deterministic ordering for caching benefits
+        return sorted(pos_set)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            expansions = list(exp_map.values())
+            if not expansions:
+                break
+
+            # Rank expansions by best insertion cost primarily, then by regret (higher first)
+            expansions.sort(key=lambda x: (x[2], -x[3]))
+
+            # Next beam selection with regret quota and suffix diversity
+            next_beam = []
+            seen_suffix = set()
+            # helper to form suffix diversity key
+            def suffix_key(s):
+                if not s:
+                    return ()
+                if suffix_div_k <= 0:
+                    return (s[-1],)
+                k = min(len(s), suffix_div_k)
+                return tuple(s[-k:])
+
+            # Primary selection by cost
+            for seq, rem, cost, regret, t in expansions:
+                sk = suffix_key(seq)
+                if sk in seen_suffix:
+                    continue
+                seen_suffix.add(sk)
+                next_beam.append((seq, rem, cost))
+                if len(next_beam) >= local_beam_width:
+                    break
+
+            # If beam not full, add regret-high candidates not already selected
+            if len(next_beam) < local_beam_width:
+                quota = max(1, int(regret_quota_ratio * local_beam_width))
+                # pick from top by regret (already sorted by cost then regret)
+                # so create a separate list sorted by regret desc
+                by_regret = sorted(expansions, key=lambda x: (-x[3], x[2]))
+                for seq, rem, cost, regret, t in by_regret:
+                    if len(next_beam) >= local_beam_width or quota <= 0:
+                        break
+                    sk = suffix_key(seq)
+                    if sk in seen_suffix:
+                        continue
+                    seen_suffix.add(sk)
+                    next_beam.append((seq, rem, cost))
+                    quota -= 1
+
+            if not next_beam:
+                # Fallback: keep best expansions
+                next_beam = [(seq, rem, cost) for seq, rem, cost, _, _ in expansions[:local_beam_width]]
+
+            beam = next_beam
+=======
+            expansions = list(exp_map.values())
+            if not expansions:
+                break
+
+            # Compute adaptive lookahead score using sampled second insertion
+            # Derive approximate "second-best" costs via (best + regret) for dispersion
+            layer_second_costs = []
+            layer_regrets = []
+            for _seq, _rem, _best_c, _regret, _t in expansions:
+                second_c_est = _best_c + (_regret if _regret is not None else 0.0)
+                layer_second_costs.append(second_c_est)
+                layer_regrets.append(_regret if _regret is not None else 0.0)
+            if layer_regrets:
+                sorted_regs = sorted(layer_regrets)
+                mid = len(sorted_regs) // 2
+                tau = (sorted_regs[mid] if len(sorted_regs) % 2 == 1
+                       else 0.5 * (sorted_regs[mid - 1] + sorted_regs[mid]))
+            else:
+                tau = 0.0
+            spread = (max(layer_second_costs) - min(layer_second_costs)) if layer_second_costs else 0.0
+            w_cost = 0.5 if spread > tau else 0.8
+
+            # Sample size for second lookahead
+            k2 = min(6, max(3, 1 + num_seqs // 2))
+
+            scored = []
+            for new_seq, new_rem, best_c, regret, t in expansions:
+                # Lookahead by inserting one more txn (sampled)
+                if not new_rem:
+                    c2_look = best_c
+                else:
+                    cand2 = list(new_rem)
+                    if len(cand2) > k2:
+                        cand2 = random.sample(cand2, k2)
+                    c2_look = float('inf')
+                    pos2 = position_samples(len(new_seq))
+                    for t2 in cand2:
+                        b2, p2, _s2 = evaluate_best_two_positions(new_seq, t2, pos2)
+                        if b2 < c2_look:
+                            c2_look = b2
+                    if c2_look == float('inf'):
+                        c2_look = best_c
+                score = w_cost * best_c + (1.0 - w_cost) * c2_look
+                scored.append((score, new_seq, new_rem, best_c, regret, t))
+
+            # Sort by blended score, then by immediate cost, then by higher regret
+            scored.sort(key=lambda x: (x[0], x[3], -x[4]))
+
+            # Dynamic beam width and regret quota near endgame
+            rem_lengths = [len(r) for _, _, r, _, _, _ in scored]
+            min_rem = min(rem_lengths) if rem_lengths else 0
+            bw = local_beam_width + 2 if min_rem <= 2 * local_beam_width else local_beam_width
+            rq = max(1, int(0.4 * bw)) if min_rem <= 2 * local_beam_width else max(1, int(regret_quota_ratio * bw))
+            k_main = max(1, bw - rq)
+
+            # Next beam selection with suffix diversity
+            next_beam = []
+            seen_suffix = set()
+            def suffix_key(s):
+                if not s:
+                    return ()
+                if suffix_div_k <= 0:
+                    return (s[-1],)
+                k = min(len(s), suffix_div_k)
+                return tuple(s[-k:])
+
+            # Fill main portion by score
+            for _, seq, rem, cost, regret, t in scored:
+                sk = suffix_key(seq)
+                if sk in seen_suffix:
+                    continue
+                seen_suffix.add(sk)
+                next_beam.append((seq, rem, cost))
+                if len(next_beam) >= k_main:
+                    break
+
+            # Fill regret-diversity portion
+            if len(next_beam) < bw:
+                by_regret = sorted(scored, key=lambda x: (-x[4], x[3], x[0]))
+                for _, seq, rem, cost, regret, t in by_regret:
+                    if len(next_beam) >= bw or rq <= 0:
+                        break
+                    sk = suffix_key(seq)
+                    if sk in seen_suffix:
+                        continue
+                    seen_suffix.add(sk)
+                    next_beam.append((seq, rem, cost))
+                    rq -= 1
+
+            if not next_beam:
+                # Fallback: keep best scored
+                next_beam = [(seq, rem, cost) for _, seq, rem, cost, _, _ in scored[:bw]]
+
+            beam = next_beam
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        improved = True
+        while improved:
+            improved = False
+
+            # 1) Adjacent swaps
+            best_seq, best_cost, did = try_adjacent_swap(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+
+            # 2) Or-opt block sizes 1, 2, 3
+            for k in (1, 2, 3):
+                best_seq, best_cost, did = try_oropt(best_seq, best_cost, k)
+                if did:
+                    improved = True
+                    break
+            if improved:
+                continue
+
+            # 3) Sampled non-adjacent swaps
+            best_seq, best_cost, did = try_pair_swaps(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+
+            # 4) Segment reversals
+            best_seq, best_cost, did = try_segment_reverse(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+=======
+        improved = True
+        while improved:
+            improved = False
+
+            # 1) Or-opt block sizes 3, 2, 1 (strong relocations first)
+            for k in (3, 2, 1):
+                best_seq, best_cost, did = try_oropt(best_seq, best_cost, k)
+                if did:
+                    improved = True
+                    break
+            if improved:
+                continue
+
+            # 2) Adjacent swaps
+            best_seq, best_cost, did = try_adjacent_swap(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+
+            # 3) Sampled non-adjacent swaps
+            best_seq, best_cost, did = try_pair_swaps(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+
+            # 4) Segment reversals
+            best_seq, best_cost, did = try_segment_reverse(best_seq, best_cost)
+            if did:
+                improved = True
+                continue
+>>>>>>> REPLACE
+</DIFF>

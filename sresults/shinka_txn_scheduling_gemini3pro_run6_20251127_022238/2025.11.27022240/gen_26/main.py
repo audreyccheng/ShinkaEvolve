@@ -1,0 +1,311 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+try:
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+except Exception as e:
+    # Allow execution to proceed if modules are already in path or mock environment
+    pass
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Conflict-Aware Beam Search and Targeted Heavy-Item Refinement.
+    
+    Args:
+        workload: Workload object
+        num_seqs: Budget parameter (influences beam width)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+    
+    num_txns = workload.num_txns
+
+    # --- 1. METRIC PRECOMPUTATION ---
+    # We need Duration and Conflict Degree for each transaction
+    txn_durations = {}
+    txn_conflict_degrees = {t: 0 for t in range(num_txns)}
+    txn_rw_sets = {}
+
+    # Extract info
+    for t in range(num_txns):
+        # Duration
+        try:
+            # txns[t][0][3] is duration
+            duration = workload.txns[t][0][3]
+        except:
+            duration = 1.0
+        txn_durations[t] = duration
+        
+        # RW Sets
+        reads = set()
+        writes = set()
+        try:
+            ops_str = workload.txns[t][0][1]
+            if isinstance(ops_str, str):
+                for op in ops_str.split():
+                    if '-' in op:
+                        parts = op.split('-')
+                        if len(parts) == 2:
+                            op_type, key = parts
+                            if op_type == 'r': reads.add(key)
+                            elif op_type == 'w': writes.add(key)
+        except:
+            pass
+        txn_rw_sets[t] = (reads, writes)
+
+    # Compute Conflict Degree (Count of overlapping txns)
+    # This identifies "high contention" nodes
+    # Optimization: Only compute if N is reasonable (< 500)
+    if num_txns < 500:
+        for i in range(num_txns):
+            r1, w1 = txn_rw_sets[i]
+            # Quick set checks
+            # Conflict if: W1 n W2 != 0 OR W1 n R2 != 0 OR R1 n W2 != 0
+            # i.e., W1 intersects (W2 U R2) OR R1 intersects W2
+            # Combined: (W1 & (W2|R2)) | (R1 & W2)
+            degree = 0
+            for j in range(num_txns):
+                if i == j: continue
+                r2, w2 = txn_rw_sets[j]
+                
+                # Check conflicts
+                if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+                    degree += 1
+            txn_conflict_degrees[i] = degree
+
+    # Normalize metrics for weights
+    # Weight = Duration * (1 + NormalizedConflict)
+    # We want to pick items that are Long AND Conflicting
+    weights = []
+    max_degree = max(txn_conflict_degrees.values()) if txn_conflict_degrees else 1
+    if max_degree == 0: max_degree = 1
+    
+    selection_weights = {}
+    for t in range(num_txns):
+        # Boost weight by conflict degree
+        conflict_factor = 1.0 + (txn_conflict_degrees[t] / max_degree)
+        w = txn_durations[t] * conflict_factor
+        selection_weights[t] = w
+
+    # --- 2. BEAM SEARCH CONSTRUCTION ---
+    
+    BEAM_WIDTH = max(8, int(num_seqs))
+    
+    # Beam State: (cost, schedule_list, remaining_list)
+    beam = [(0, [], list(range(num_txns)))]
+    
+    for _ in range(num_txns):
+        candidates_pool = []
+        
+        for p_cost, p_sched, p_remain in beam:
+            # Candidate Selection Strategy
+            next_candidates = set()
+            
+            # 1. Tail Optimization
+            if len(p_remain) <= 20:
+                next_candidates.update(p_remain)
+            else:
+                # 2. Weighted Sampling
+                # Sample based on Conflict*Duration
+                local_weights = [selection_weights[t] for t in p_remain]
+                
+                # Take top deterministic (greedy on heuristic)
+                # This ensures we don't miss the absolute "heaviest" bottleneck
+                # Zip remaining with weights, sort, take top 2
+                sorted_by_weight = sorted(zip(p_remain, local_weights), key=lambda x: x[1], reverse=True)
+                next_candidates.add(sorted_by_weight[0][0])
+                if len(sorted_by_weight) > 1:
+                    next_candidates.add(sorted_by_weight[1][0])
+                
+                # Probabilistic sampling from the rest
+                samples = random.choices(p_remain, weights=local_weights, k=5)
+                next_candidates.update(samples)
+                
+                # Pure Random for diversity
+                next_candidates.update(random.sample(p_remain, min(len(p_remain), 2)))
+            
+            # Evaluate candidates
+            for cand in next_candidates:
+                new_sched = p_sched + [cand]
+                cost = workload.get_opt_seq_cost(new_sched)
+                
+                # Pruning Metric: (Cost, -ConflictDegree, -Duration)
+                # Primary: Minimize Cost
+                # Tie-break 1: Prefer clearing high-conflict items (unlocks more future parallelism)
+                # Tie-break 2: Prefer clearing long items
+                metric = (cost, -txn_conflict_degrees[cand], -txn_durations[cand])
+                
+                new_remain = list(p_remain)
+                new_remain.remove(cand)
+                
+                candidates_pool.append((metric, new_sched, new_remain))
+        
+        # Selection
+        candidates_pool.sort(key=lambda x: x[0])
+        beam = [(x[0][0], x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH]]
+
+    # Extract best
+    best_state = beam[0]
+    current_cost = best_state[0]
+    current_schedule = best_state[1]
+    
+    # --- 3. REFINEMENT: TARGETED HEAVY-ITEM INSERTION ---
+    # Identify "Heavy" items (Top 10% by duration)
+    # These often determine the critical path. Try to optimize their position locally.
+    
+    sorted_txns_by_dur = sorted(range(num_txns), key=lambda t: txn_durations[t], reverse=True)
+    heavy_txns = sorted_txns_by_dur[:max(5, num_txns // 10)]
+    
+    # Map from txn_id to current index for quick lookup
+    # Actually simpler to just scan schedule
+    
+    for txn in heavy_txns:
+        # Find where it is
+        try:
+            curr_idx = current_schedule.index(txn)
+        except ValueError:
+            continue
+            
+        # Try moving it in a window [-8, +8]
+        # We don't want to move it too far as construction was likely decent
+        window = 8
+        start_pos = max(0, curr_idx - window)
+        end_pos = min(num_txns, curr_idx + window + 1)
+        
+        best_local_cost = current_cost
+        best_local_sched = None
+        
+        # Remove txn
+        base_sched = current_schedule[:curr_idx] + current_schedule[curr_idx+1:]
+        
+        # Test positions
+        # Iterate outward from current pos? Or just range. Range is fine.
+        for pos in range(start_pos, end_pos):
+            if pos == curr_idx: continue
+            
+            test_sched = list(base_sched)
+            test_sched.insert(pos, txn)
+            c = workload.get_opt_seq_cost(test_sched)
+            
+            if c < best_local_cost:
+                best_local_cost = c
+                best_local_sched = test_sched
+        
+        if best_local_sched:
+            current_cost = best_local_cost
+            current_schedule = best_local_sched
+
+    # --- 4. REFINEMENT: STOCHASTIC HILL CLIMBING ---
+    # Standard cleanup for the rest
+    search_steps = 500
+    no_improv_limit = 100
+    no_improv = 0
+    
+    for _ in range(search_steps):
+        if no_improv >= no_improv_limit:
+            break
+            
+        neighbor = list(current_schedule)
+        
+        # 70% Shift, 30% Swap
+        if random.random() < 0.7:
+            # Shift
+            src = random.randint(0, num_txns - 1)
+            dst = random.randint(0, num_txns - 1)
+            if src == dst: continue
+            txn = neighbor.pop(src)
+            neighbor.insert(dst, txn)
+        else:
+            # Swap
+            i = random.randint(0, num_txns - 1)
+            j = random.randint(0, num_txns - 1)
+            if i == j: continue
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+            
+        new_cost = workload.get_opt_seq_cost(neighbor)
+        
+        if new_cost < current_cost:
+            current_cost = new_cost
+            current_schedule = neighbor
+            no_improv = 0
+        else:
+            no_improv += 1
+
+    return current_cost, current_schedule
+
+
+def get_random_costs():
+    """Evaluate scheduling algorithm on three different workloads."""
+    start_time = time.time()
+    
+    # Beam budget
+    num_seqs = 10
+    
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, num_seqs)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, num_seqs)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, num_seqs)
+    
+    total_makespan = makespan1 + makespan2 + makespan3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

@@ -1,0 +1,303 @@
+# EVOLVE-BLOCK-START
+"""
+Dual Perspective Consensus Repair
+Advanced telemetry repair using bidirectional flow constraints and residual synthesis.
+"""
+from typing import Dict, Any, Tuple, List
+import collections
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    # --- Constants ---
+    TOLERANCE = 0.02          # 2% symmetry tolerance
+    FLOW_TOLERANCE = 0.05     # 5% flow conservation tolerance
+    MIN_ACTIVITY = 0.05       # Threshold for significant traffic
+    UNVERIFIED_COST = 0.05    # Penalty score for unverifiable routers
+
+    # --- 1. Initialization ---
+    state = {}
+    router_map = collections.defaultdict(list)
+    verifiable_routers = set()
+    
+    # Build topology map
+    for rid, if_list in topology.items():
+        router_map[rid] = if_list
+        if all(if_id in telemetry for if_id in if_list):
+            verifiable_routers.add(rid)
+            
+    # Initialize state
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'down'),
+            'orig_rx': float(data.get('rx_rate', 0.0)),
+            'orig_tx': float(data.get('tx_rate', 0.0)),
+            'orig_status': data.get('interface_status', 'down'),
+            'local_router': data.get('local_router'),
+            'connected_to': data.get('connected_to'),
+            'remote_router': data.get('remote_router')
+        }
+
+    # --- 2. Status Repair ---
+    status_conf = {}
+    
+    for if_id, s in state.items():
+        orig = s['orig_status']
+        peer_id = s['connected_to']
+        
+        # Determine activity
+        local_act = (s['rx'] > MIN_ACTIVITY) or (s['tx'] > MIN_ACTIVITY)
+        peer_act = False
+        peer_st = 'unknown'
+        
+        if peer_id and peer_id in state:
+            p = state[peer_id]
+            peer_act = (p['rx'] > MIN_ACTIVITY) or (p['tx'] > MIN_ACTIVITY)
+            peer_st = p['status']
+            
+        final_st = orig
+        conf = 1.0
+        
+        if local_act or peer_act:
+            final_st = 'up'
+            if orig == 'down': conf = 0.95
+        elif orig == 'up' and peer_st == 'down':
+            final_st = 'down'
+            conf = 0.8
+        elif orig != peer_st:
+            final_st = 'down'
+            conf = 0.7
+            
+        state[if_id]['status'] = final_st
+        status_conf[if_id] = conf
+        
+        # Zero out down interfaces
+        if final_st == 'down':
+            state[if_id]['rx'] = 0.0
+            state[if_id]['tx'] = 0.0
+
+    # --- 3. Rate Repair (Dual Perspective Consensus) ---
+    
+    def get_residual(rid, if_exclude, field):
+        """Calculates value needed to balance the router."""
+        if rid not in verifiable_routers: return None
+        
+        sum_in = 0.0
+        sum_out = 0.0
+        for iface in router_map[rid]:
+            if iface == if_exclude: continue
+            sum_in += state[iface]['rx']
+            sum_out += state[iface]['tx']
+            
+        # If solving for Rx (Input), we need Sum(Out) - Sum(In_others)
+        val = sum_out - sum_in if field == 'rx' else sum_in - sum_out
+        return max(0.0, val)
+
+    def get_flow_score(rid, if_target, field, val):
+        """Calculates consistency score (lower is better)."""
+        if rid not in verifiable_routers:
+            return UNVERIFIED_COST
+            
+        sum_in = 0.0
+        sum_out = 0.0
+        for iface in router_map[rid]:
+            r = val if (iface == if_target and field == 'rx') else state[iface]['rx']
+            t = val if (iface == if_target and field == 'tx') else state[iface]['tx']
+            sum_in += r
+            sum_out += t
+            
+        diff = abs(sum_in - sum_out)
+        denom = max(sum_in, sum_out, 1.0)
+        return min(diff / denom, 1.0) # Cap error at 1.0
+
+    # Run passes
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+            
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+            
+            # Identify Link Components: Local(Tx) -> Remote(Rx)
+            cand_tx = s['tx']
+            cand_rx = state[peer_id]['rx']
+            
+            # Gather Candidates
+            candidates = [cand_tx, cand_rx]
+            
+            # Add Residuals (Synthetic candidates)
+            res_tx = get_residual(s['local_router'], if_id, 'tx')
+            if res_tx is not None and res_tx > MIN_ACTIVITY: candidates.append(res_tx)
+            
+            res_rx = get_residual(s['remote_router'], peer_id, 'rx')
+            if res_rx is not None and res_rx > MIN_ACTIVITY: candidates.append(res_rx)
+            
+            # Filter unique candidates
+            unique_cands = []
+            for c in candidates:
+                if not any(abs(c - x) < 1e-4 for x in unique_cands):
+                    unique_cands.append(c)
+            
+            # Scoring
+            best_val = cand_tx
+            best_score = float('inf')
+            
+            if len(unique_cands) == 1:
+                best_val = unique_cands[0]
+            else:
+                max_cand = max(unique_cands) if unique_cands else 0.0
+                
+                for val in unique_cands:
+                    # Score from Local perspective (as Tx)
+                    s1 = get_flow_score(s['local_router'], if_id, 'tx', val)
+                    # Score from Remote perspective (as Rx)
+                    s2 = get_flow_score(s['remote_router'], peer_id, 'rx', val)
+                    
+                    score = s1 + s2
+                    
+                    # Penalize zero if active alternatives exist
+                    if val < MIN_ACTIVITY and max_cand > MIN_ACTIVITY:
+                        score += 0.5
+                        
+                    if score < best_score:
+                        best_score = score
+                        best_val = val
+            
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+
+    # --- 4. Confidence Calibration ---
+    result = {}
+    
+    # Calculate final router health
+    router_health = {}
+    for rid in verifiable_routers:
+        si = sum(state[iface]['rx'] for iface in router_map[rid])
+        so = sum(state[iface]['tx'] for iface in router_map[rid])
+        err = abs(si - so) / max(si, so, 1.0)
+        router_health[rid] = err
+
+    for if_id, data in telemetry.items():
+        s = state[if_id]
+        rid = data.get('local_router')
+        peer_id = data.get('connected_to')
+        rem_rid = data.get('remote_router')
+        
+        orig_rx, final_rx = data.get('rx_rate', 0.0), s['rx']
+        orig_tx, final_tx = data.get('tx_rate', 0.0), s['tx']
+        
+        def get_conf(orig, final, field):
+            # 1. Verification
+            l_err = router_health.get(rid)
+            l_ver = (l_err is not None and l_err < FLOW_TOLERANCE)
+            
+            r_err = router_health.get(rem_rid)
+            r_ver = (r_err is not None and r_err < FLOW_TOLERANCE)
+            
+            # 2. Peer Consistency
+            peer_consistent = True
+            if peer_id and peer_id in state:
+                p_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - p_val) > max(final, p_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+            
+            # 3. Change Analysis
+            changed = abs(orig - final) > 0.001
+            smoothed = changed and (abs(orig - final) < max(orig * 0.05, 0.1))
+            
+            # Base Confidence Logic
+            if not changed:
+                if l_ver and r_ver: conf = 1.0
+                elif l_ver: conf = 0.98
+                elif r_ver: conf = 0.95
+                elif not peer_consistent: conf = 0.7 # Conflict ignored
+                else: conf = 0.9
+            elif smoothed:
+                conf = 0.95
+            else:
+                # Significant Change
+                if l_ver and r_ver: conf = 0.98
+                elif l_ver: conf = 0.95
+                elif r_ver: conf = 0.90
+                elif orig < MIN_ACTIVITY and final > MIN_ACTIVITY: conf = 0.85
+                else: conf = 0.6
+            
+            # Penalty: If router is verified "Broken" (high error), trust is lower
+            if l_err is not None and l_err >= FLOW_TOLERANCE:
+                conf *= 0.8
+                
+            return conf
+
+        rx_c = get_conf(orig_rx, final_rx, 'rx')
+        tx_c = get_conf(orig_tx, final_tx, 'tx')
+        st_c = status_conf.get(if_id, 1.0)
+        
+        # Sanity check for Down state
+        if s['status'] == 'down':
+             if final_rx > 1.0 or final_tx > 1.0:
+                 rx_c = 0.0
+                 tx_c = 0.0
+        
+        result[if_id] = {
+            'rx_rate': (orig_rx, final_rx, rx_c),
+            'tx_rate': (orig_tx, final_tx, tx_c),
+            'interface_status': (s['orig_status'], s['status'], st_c),
+            'connected_to': peer_id,
+            'local_router': rid,
+            'remote_router': rem_rid
+        }
+        
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

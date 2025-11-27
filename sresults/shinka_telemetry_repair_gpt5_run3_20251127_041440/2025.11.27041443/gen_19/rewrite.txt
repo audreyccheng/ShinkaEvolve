@@ -1,0 +1,441 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm with targeted router corrections, bundle-aware scaling,
+adaptive tolerances, and confidence-gap re-sync.
+
+It validates and repairs telemetry based on:
+- Link symmetry (R3): my_tx ≈ their_rx and my_rx ≈ their_tx
+- Router flow conservation (R1): Σ(incoming) = Σ(outgoing) per router
+- Interface consistency: down links carry zero traffic
+
+It uses the provided topology to group interfaces per router and to detect bundles.
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Parameters
+    TAU_H_BASE = 0.02        # baseline link tolerance (~2%)
+    TAU_H_LOW = 0.03         # tolerance for low-rate/low-confidence
+    TAU_H_HIGH = 0.015       # tolerance for high-rate/high-confidence
+    ZERO_THRESH = 0.5        # Mbps: activity threshold and soft-zero helper
+    DAMP_ROUTER = 0.60       # move 60% toward router balance per iteration
+    SCALE_CLIP = 0.10        # per-direction scaling cap [+/-10%]
+    BUNDLE_DOM_THRESH = 0.55 # dominant bundle threshold (fraction of side traffic)
+    SCALE_GUARD_STRONG = 0.08  # skip re-sync if a direction had strong router scaling
+
+    def clamp01(x: float) -> float:
+        return max(0.0, min(1.0, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(1.0, abs(a), abs(b))
+
+    def tau_h_adaptive(v1: float, v2: float, c1: float, c2: float) -> float:
+        lo_rate = (min(abs(v1), abs(v2)) < 1.0)
+        hi_rate = (min(abs(v1), abs(v2)) > 100.0)
+        lo_conf = (min(c1, c2) < 0.7)
+        hi_conf = (min(c1, c2) >= 0.8)
+        if hi_rate and hi_conf:
+            return TAU_H_HIGH
+        if lo_rate or lo_conf:
+            return TAU_H_LOW
+        return TAU_H_BASE
+
+    def is_near_zero_link(a_rx: float, a_tx: float, b_rx: float, b_tx: float) -> bool:
+        thr = 2.0 * ZERO_THRESH
+        return (abs(a_rx) < thr and abs(a_tx) < thr and abs(b_rx) < thr and abs(b_tx) < thr)
+
+    # Collect originals and peers
+    orig_rx: Dict[str, float] = {}
+    orig_tx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+        status[if_id] = data.get('interface_status', 'unknown')
+        peer = data.get('connected_to')
+        peer_of[if_id] = peer if (peer in telemetry) else None
+
+    # Build router membership from topology (preferred), fallback to local_router
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        for r, ifs in topology.items():
+            router_ifaces[r] = [i for i in ifs if i in telemetry]
+    else:
+        # Fallback: use local_router fields
+        for iid, data in telemetry.items():
+            r = data.get('local_router')
+            router_ifaces.setdefault(r, []).append(iid)
+
+    # Initialize hardened values and confidences
+    hardened_rx: Dict[str, float] = {i: max(0.0, v) for i, v in orig_rx.items()}
+    hardened_tx: Dict[str, float] = {i: max(0.0, v) for i, v in orig_tx.items()}
+    conf_rx: Dict[str, float] = {i: 0.7 for i in telemetry}
+    conf_tx: Dict[str, float] = {i: 0.7 for i in telemetry}
+
+    # Track scaling magnitudes applied at router stage per direction
+    last_scale_rx: Dict[str, float] = {i: 0.0 for i in telemetry}
+    last_scale_tx: Dict[str, float] = {i: 0.0 for i in telemetry}
+
+    # Stage 1: Pairwise hardening with adaptive tolerance and soft-zero
+    processed_pairs = set()
+    for a in telemetry:
+        b = peer_of.get(a)
+        if not b or b not in telemetry or (b, a) in processed_pairs or a == b:
+            continue
+        processed_pairs.add((a, b))
+        a_up = (status.get(a) == 'up')
+        b_up = (status.get(b) == 'up')
+
+        a_rx0, a_tx0 = orig_rx[a], orig_tx[a]
+        b_rx0, b_tx0 = orig_rx[b], orig_tx[b]
+
+        # If either is down or both sides are quiescent, force zero
+        if not a_up or not b_up or is_near_zero_link(a_rx0, a_tx0, b_rx0, b_tx0):
+            hardened_rx[a] = 0.0
+            hardened_tx[a] = 0.0
+            hardened_rx[b] = 0.0
+            hardened_tx[b] = 0.0
+            # High confidence due to strong invariants
+            base = 0.95 if (a_up and b_up and is_near_zero_link(a_rx0, a_tx0, b_rx0, b_tx0)) else 0.85
+            conf_rx[a] = max(conf_rx[a], base)
+            conf_tx[a] = max(conf_tx[a], base)
+            conf_rx[b] = max(conf_rx[b], base)
+            conf_tx[b] = max(conf_tx[b], base)
+            continue
+
+        # Direction 1: a.tx vs b.rx
+        d1 = rel_diff(a_tx0, b_rx0)
+        tau1 = tau_h_adaptive(a_tx0, b_rx0, conf_tx.get(a, 0.7), conf_rx.get(b, 0.7))
+        if d1 <= tau1:
+            v1 = 0.5 * (a_tx0 + b_rx0)
+        else:
+            v1 = b_rx0  # trust redundant counter when out of tolerance
+        hardened_tx[a] = max(0.0, v1)
+        hardened_rx[b] = max(0.0, v1)
+        c1 = clamp01(0.9 + 0.1 * (1.0 - min(1.0, d1 / max(tau1, 1e-12)))) if d1 <= tau1 else clamp01(1.0 - d1)
+        conf_tx[a] = max(conf_tx[a], c1)
+        conf_rx[b] = max(conf_rx[b], c1)
+
+        # Direction 2: a.rx vs b.tx
+        d2 = rel_diff(a_rx0, b_tx0)
+        tau2 = tau_h_adaptive(a_rx0, b_tx0, conf_rx.get(a, 0.7), conf_tx.get(b, 0.7))
+        if d2 <= tau2:
+            v2 = 0.5 * (a_rx0 + b_tx0)
+        else:
+            v2 = b_tx0
+        hardened_rx[a] = max(0.0, v2)
+        hardened_tx[b] = max(0.0, v2)
+        c2 = clamp01(0.9 + 0.1 * (1.0 - min(1.0, d2 / max(tau2, 1e-12)))) if d2 <= tau2 else clamp01(1.0 - d2)
+        conf_rx[a] = max(conf_rx[a], c2)
+        conf_tx[b] = max(conf_tx[b], c2)
+
+    # Handle interfaces that weren't paired (missing peer)
+    in_any_pair = set([x for p in processed_pairs for x in p])
+    for i in telemetry:
+        if i in in_any_pair:
+            continue
+        if status.get(i) != 'up':
+            hardened_rx[i] = 0.0
+            hardened_tx[i] = 0.0
+            conf_rx[i] = max(conf_rx[i], 0.85)
+            conf_tx[i] = max(conf_tx[i], 0.85)
+        else:
+            # No redundancy; keep local values with moderate confidence
+            hardened_rx[i] = max(0.0, orig_rx[i])
+            hardened_tx[i] = max(0.0, orig_tx[i])
+            conf_rx[i] = max(conf_rx[i], 0.6)
+            conf_tx[i] = max(conf_tx[i], 0.6)
+
+    # Stage 2: Router-level flow conservation with targeted correction and bundle-aware scaling
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        rel_gap = abs(sum_rx - sum_tx) / denom
+
+        # Adaptive router tolerance
+        n_active = sum(1 for i in up_ifs if (hardened_rx[i] >= ZERO_THRESH or hardened_tx[i] >= ZERO_THRESH))
+        tau_router = min(0.07, max(0.03, 0.05 * math.sqrt(2.0 / max(2, n_active))))
+
+        if rel_gap <= tau_router:
+            continue
+
+        delta = sum_rx - sum_tx  # positive => rx larger than tx
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+
+        if adjust_side == 'rx':
+            vals = {i: hardened_rx[i] for i in up_ifs}
+            confs = {i: conf_rx[i] for i in up_ifs}
+            desired_total_change = -delta  # need to reduce rx if delta > 0, or increase if delta < 0
+        else:
+            vals = {i: hardened_tx[i] for i in up_ifs}
+            confs = {i: conf_tx[i] for i in up_ifs}
+            desired_total_change = delta
+
+        # Consider only active interfaces on the adjusted side
+        active = [i for i, v in vals.items() if v >= ZERO_THRESH]
+        if not active:
+            active = list(vals.keys())
+
+        weights = {}
+        for i in active:
+            v = max(vals[i], ZERO_THRESH)
+            c = clamp01(confs.get(i, 0.6))
+            weights[i] = (1.0 - c) * v + 1e-6
+        sum_w = sum(weights.values())
+        if sum_w <= 0.0:
+            continue
+
+        # Apply a damped correction
+        eff_total_change = DAMP_ROUTER * desired_total_change
+
+        # Compute per-interface scale factors (clipped)
+        side_total = sum(vals[i] for i in active) or 1.0
+        # Precompute tentative scales
+        tentative_scales: Dict[str, float] = {}
+        for i in active:
+            v = max(vals[i], ZERO_THRESH)
+            adj_i = eff_total_change * (weights[i] / sum_w)
+            s_i = 1.0 + adj_i / v
+            s_i = max(1.0 - SCALE_CLIP, min(1.0 + SCALE_CLIP, s_i))
+            tentative_scales[i] = s_i
+
+        # Bundle-aware harmonization for dominant bundles
+        # Group by remote_router for links at this router on the adjusted side
+        # Use provided topology/local metadata to find remote routers
+        remote_map = {}
+        for i in active:
+            rr = telemetry[i].get('remote_router')
+            remote_map.setdefault(rr, []).append(i)
+        side_sum = sum(vals[i] for i in active)
+        for rr, members in remote_map.items():
+            group_sum = sum(vals[i] for i in members)
+            if len(members) >= 2 and side_sum > 0 and (group_sum / side_sum) >= BUNDLE_DOM_THRESH:
+                # Weighted average scale for the group
+                s_group_num = sum(tentative_scales[i] * vals[i] for i in members)
+                s_group_den = max(1e-6, sum(vals[i] for i in members))
+                s_group = s_group_num / s_group_den
+                s_group = max(1.0 - SCALE_CLIP, min(1.0 + SCALE_CLIP, s_group))
+                for i in members:
+                    tentative_scales[i] = s_group
+
+        # Apply scales and update confidences and scale records
+        for i in active:
+            s_i = tentative_scales[i]
+            if adjust_side == 'rx':
+                old = hardened_rx[i]
+                hardened_rx[i] = max(0.0, old * s_i)
+                # Confidence penalty proportional to used clip fraction
+                conf_rx[i] = clamp01(conf_rx[i] * (1.0 - abs(s_i - 1.0) / SCALE_CLIP))
+                last_scale_rx[i] = max(last_scale_rx[i], abs(s_i - 1.0))
+            else:
+                old = hardened_tx[i]
+                hardened_tx[i] = max(0.0, old * s_i)
+                conf_tx[i] = clamp01(conf_tx[i] * (1.0 - abs(s_i - 1.0) / SCALE_CLIP))
+                last_scale_tx[i] = max(last_scale_tx[i], abs(s_i - 1.0))
+
+    # Stage 2.5: Confidence-gap-proportional post-projection re-sync with guard
+    for a in telemetry:
+        b = peer_of.get(a)
+        if not b or b not in telemetry or a == b:
+            continue
+        if status.get(a) != 'up' or status.get(b) != 'up':
+            continue
+        # Skip near-zero links
+        if is_near_zero_link(hardened_rx[a], hardened_tx[a], hardened_rx[b], hardened_tx[b]):
+            continue
+
+        # Direction 1: a.tx vs b.rx
+        v_a = hardened_tx[a]
+        v_b = hardened_rx[b]
+        d = rel_diff(v_a, v_b)
+        tau = tau_h_adaptive(v_a, v_b, conf_tx.get(a, 0.7), conf_rx.get(b, 0.7))
+        if d > tau:
+            conf_high = max(conf_tx.get(a, 0.7), conf_rx.get(b, 0.7))
+            conf_low = min(conf_tx.get(a, 0.7), conf_rx.get(b, 0.7))
+            f = min(0.4, max(0.0, conf_high - conf_low))
+            m = 0.5 * (v_a + v_b)
+            if conf_tx.get(a, 0.7) < conf_rx.get(b, 0.7):
+                # Adjust a.tx if not strongly scaled earlier
+                if last_scale_tx.get(a, 0.0) <= SCALE_GUARD_STRONG:
+                    new_v = v_a + f * (m - v_a)
+                    hardened_tx[a] = max(0.0, new_v)
+                    # Confidence penalty according to movement
+                    move_rel = rel_diff(new_v, v_a)
+                    conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.5 * move_rel))
+            else:
+                if last_scale_rx.get(b, 0.0) <= SCALE_GUARD_STRONG:
+                    new_v = v_b + f * (m - v_b)
+                    hardened_rx[b] = max(0.0, new_v)
+                    move_rel = rel_diff(new_v, v_b)
+                    conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.5 * move_rel))
+
+        # Direction 2: a.rx vs b.tx
+        v_a = hardened_rx[a]
+        v_b = hardened_tx[b]
+        d = rel_diff(v_a, v_b)
+        tau = tau_h_adaptive(v_a, v_b, conf_rx.get(a, 0.7), conf_tx.get(b, 0.7))
+        if d > tau:
+            conf_high = max(conf_rx.get(a, 0.7), conf_tx.get(b, 0.7))
+            conf_low = min(conf_rx.get(a, 0.7), conf_tx.get(b, 0.7))
+            f = min(0.4, max(0.0, conf_high - conf_low))
+            m = 0.5 * (v_a + v_b)
+            if conf_rx.get(a, 0.7) < conf_tx.get(b, 0.7):
+                if last_scale_rx.get(a, 0.0) <= SCALE_GUARD_STRONG:
+                    new_v = v_a + f * (m - v_a)
+                    hardened_rx[a] = max(0.0, new_v)
+                    move_rel = rel_diff(new_v, v_a)
+                    conf_rx[a] = clamp01(conf_rx[a] * (1.0 - 0.5 * move_rel))
+            else:
+                if last_scale_tx.get(b, 0.0) <= SCALE_GUARD_STRONG:
+                    new_v = v_b + f * (m - v_b)
+                    hardened_tx[b] = max(0.0, new_v)
+                    move_rel = rel_diff(new_v, v_b)
+                    conf_tx[b] = clamp01(conf_tx[b] * (1.0 - 0.5 * move_rel))
+
+    # Stage 3: Confidence calibration with residuals, scale penalty, and peer smoothing
+    # Compute per-router residuals after all adjustments
+    router_residual: Dict[str, float] = {}
+    iface_router: Dict[str, str] = {}
+    for r, ifs in router_ifaces.items():
+        for i in ifs:
+            iface_router[i] = r
+        if not ifs:
+            router_residual[r] = 0.0
+            continue
+        srx = sum(hardened_rx[i] for i in ifs)
+        stx = sum(hardened_tx[i] for i in ifs)
+        router_residual[r] = abs(srx - stx) / max(1.0, srx, stx)
+
+    # Residual-based cap + scale-factor penalty + peer smoothing
+    for i in telemetry:
+        # Measurement residuals
+        r_meas_rx = rel_diff(hardened_rx[i], orig_rx[i])
+        r_meas_tx = rel_diff(hardened_tx[i], orig_tx[i])
+        # Link residuals
+        p = peer_of.get(i)
+        if p:
+            r_link_rx = rel_diff(hardened_rx[i], hardened_tx[p])
+            r_link_tx = rel_diff(hardened_tx[i], hardened_rx[p])
+        else:
+            r_link_rx = 0.2
+            r_link_tx = 0.2
+        # Router residual
+        rtr = router_residual.get(iface_router.get(i, ""), 0.0)
+        # Cap current confidences by residual blends
+        cap_rx = 1.0 - (0.50 * r_meas_rx + 0.30 * r_link_rx + 0.20 * rtr)
+        cap_tx = 1.0 - (0.50 * r_meas_tx + 0.30 * r_link_tx + 0.20 * rtr)
+        cap_rx = clamp01(cap_rx)
+        cap_tx = clamp01(cap_tx)
+        conf_rx[i] = clamp01(min(conf_rx.get(i, 0.6), cap_rx))
+        conf_tx[i] = clamp01(min(conf_tx.get(i, 0.6), cap_tx))
+        # Scale-factor soft penalty (10% weight)
+        scale_term_rx = clamp01(1.0 - min(0.5, last_scale_rx.get(i, 0.0)))
+        scale_term_tx = clamp01(1.0 - min(0.5, last_scale_tx.get(i, 0.0)))
+        conf_rx[i] = clamp01(0.90 * conf_rx[i] + 0.10 * scale_term_rx)
+        conf_tx[i] = clamp01(0.90 * conf_tx[i] + 0.10 * scale_term_tx)
+
+    # Peer smoothing 10% between opposite counters when both ends are up
+    for i in telemetry:
+        p = peer_of.get(i)
+        if not p or status.get(i) != 'up' or status.get(p) != 'up':
+            continue
+        # harmonize a.tx with b.rx and a.rx with b.tx
+        conf_tx[i] = clamp01(0.90 * conf_tx[i] + 0.10 * conf_rx.get(p, conf_tx[i]))
+        conf_rx[i] = clamp01(0.90 * conf_rx[i] + 0.10 * conf_tx.get(p, conf_rx[i]))
+
+    # Finalization: enforce down => zero traffic and build output
+    result: Dict[str, Dict[str, Tuple]] = {}
+    for i, data in telemetry.items():
+        up = (status.get(i) == 'up')
+        if not up:
+            hardened_rx[i] = 0.0
+            hardened_tx[i] = 0.0
+            conf_rx[i] = max(conf_rx[i], 0.85)
+            conf_tx[i] = max(conf_tx[i], 0.85)
+
+    for i, data in telemetry.items():
+        connected_to = data.get('connected_to')
+        my_status = status.get(i, 'unknown')
+
+        # Status confidence: penalize status mismatch with peer or traffic on down
+        status_conf = 1.0
+        if connected_to and connected_to in telemetry:
+            if my_status != telemetry[connected_to].get('interface_status', 'unknown'):
+                status_conf = 0.6
+        if my_status == 'down' and (orig_rx.get(i, 0.0) > ZERO_THRESH or orig_tx.get(i, 0.0) > ZERO_THRESH):
+            status_conf = min(status_conf, 0.6)
+
+        repaired = {
+            'rx_rate': (orig_rx.get(i, 0.0), hardened_rx.get(i, 0.0), clamp01(conf_rx.get(i, 0.6))),
+            'tx_rate': (orig_tx.get(i, 0.0), hardened_tx.get(i, 0.0), clamp01(conf_tx.get(i, 0.6))),
+            'interface_status': (my_status, my_status, status_conf),
+            # Copy metadata unchanged
+            'connected_to': connected_to,
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+        }
+        result[i] = repaired
+
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

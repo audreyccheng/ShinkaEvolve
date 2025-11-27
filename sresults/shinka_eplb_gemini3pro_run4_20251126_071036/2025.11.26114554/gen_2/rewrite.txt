@@ -1,0 +1,327 @@
+# EVOLVE-BLOCK-START
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module implements the core rearrangement algorithm using a vectorized
+Sort-and-Zigzag approach for high efficiency and load balance.
+"""
+
+import torch
+
+
+def vectorized_zigzag_pack(weight: torch.Tensor, num_bins: int) -> torch.Tensor:
+    """
+    Pack items into bins such that each bin has exactly N/M items, utilizing
+    a zigzag pattern on sorted weights to balance load.
+    
+    Parameters:
+        weight: [Batch, N] or [N] tensor of weights.
+        num_bins: Number of bins to pack into.
+        
+    Returns:
+        pack_ids: [Batch, N] tensor of bin indices for each item.
+    """
+    is_batched = weight.dim() == 2
+    if not is_batched:
+        weight = weight.unsqueeze(0)
+    
+    batch_size, num_items = weight.shape
+    assert num_items % num_bins == 0
+    items_per_bin = num_items // num_bins
+    
+    # Sort weights descending
+    sort_idx = weight.argsort(dim=-1, descending=True)
+    
+    # Create zigzag bin indices:
+    # Row 0: 0, 1, ..., M-1
+    # Row 1: M-1, ..., 0
+    # ...
+    # This ensures heavy items are distributed, and paired with light items.
+    # Shape: [items_per_bin, num_bins]
+    base_indices = torch.arange(num_bins, device=weight.device)
+    rows = torch.arange(items_per_bin, device=weight.device).unsqueeze(1)
+    
+    # Create the pattern grid
+    pattern = base_indices.repeat(items_per_bin, 1)
+    # Reverse odd rows
+    mask = (rows % 2 == 1)
+    pattern[mask.squeeze()] = pattern[mask.squeeze()].flip(1)
+    
+    # Flatten pattern to match sorted items: [items_per_bin * num_bins]
+    pattern = pattern.flatten() # [N]
+    
+    # Expand to batch dimension
+    pattern = pattern.unsqueeze(0).expand(batch_size, -1)
+    
+    # Scatter back to original positions
+    pack_ids = torch.empty_like(sort_idx)
+    pack_ids.scatter_(1, sort_idx, pattern)
+    
+    if not is_batched:
+        pack_ids = pack_ids.squeeze(0)
+        
+    return pack_ids
+
+
+def vectorized_proportional_replicate(
+    weight: torch.Tensor, 
+    total_slots: int
+) -> torch.Tensor:
+    """
+    Determine the number of replicas for each expert using proportional allocation
+    to minimize max load per replica.
+    
+    Parameters:
+        weight: [Batch, N_experts]
+        total_slots: Total number of physical replicas available.
+        
+    Returns:
+        counts: [Batch, N_experts] number of replicas per expert.
+    """
+    batch_size, num_experts = weight.shape
+    device = weight.device
+    
+    # Ideal proportional allocation
+    total_weight = weight.sum(dim=1, keepdim=True) + 1e-6
+    target_counts = (weight / total_weight) * total_slots
+    
+    # Initial floor counts, ensure at least 1
+    counts = target_counts.floor().long()
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    
+    # Calculate remainder to distribute
+    current_sum = counts.sum(dim=1)
+    diff = total_slots - current_sum # [Batch]
+    
+    # We need to add `diff` items. To vectorise, we find the max possible diff
+    # and use masking. However, `diff` is typically small.
+    # We assign extra slots to experts with the largest `fractional_part`
+    # or largest `weight/count` gain. 
+    # Using `target - floor` (largest remainder) is standard and fast.
+    
+    fractional_part = target_counts - counts.float()
+    
+    # We need to add exactly `diff[b]` items to batch `b`.
+    # Sort fractional parts descending
+    sorted_frac, sorted_indices = fractional_part.sort(dim=1, descending=True)
+    
+    # Create a mask for top-k items where k varies per batch
+    range_idx = torch.arange(num_experts, device=device).unsqueeze(0)
+    mask = range_idx < diff.unsqueeze(1) # [Batch, N_experts]
+    
+    # Scatter the additions back
+    to_add = torch.zeros_like(counts)
+    to_add.scatter_add_(1, sorted_indices, mask.long())
+    
+    counts += to_add
+    return counts
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer using vectorized Sort-and-Zigzag.
+
+    Parameters:
+        weight: [layers, num_logical_experts]
+        num_replicas: number of physical experts
+        num_groups: number of expert groups
+        num_nodes: number of server nodes
+        num_gpus: number of GPUs
+
+    Returns:
+        phy2log: [layers, num_replicas]
+        log2phy: [layers, num_logical_experts, max_replicas]
+        logcnt: [layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
+    device = weight.device
+    
+    # Ensure inputs are standard tensors
+    weight = weight.float()
+
+    # Derived constants
+    group_size = num_logical_experts // num_groups
+    groups_per_node = num_groups // num_nodes
+    experts_per_node = num_logical_experts // num_nodes
+    replicas_per_node = num_replicas // num_nodes
+    gpus_per_node = num_gpus // num_nodes
+    replicas_per_gpu = num_replicas // num_gpus
+
+    # --- Step 1: Pack Groups to Nodes ---
+    # Calculate weight per group: [Layers, Groups]
+    weight_reshaped = weight.view(num_layers, num_groups, group_size)
+    group_weights = weight_reshaped.sum(dim=2)
+    
+    # Assign groups to nodes using Zigzag packing: [Layers, Groups]
+    # Values are node indices 0..num_nodes-1
+    group_to_node = vectorized_zigzag_pack(group_weights, num_nodes)
+    
+    # Sort logical experts so that experts assigned to Node 0 come first, etc.
+    # We sort groups by their assigned node.
+    # argsort gives indices of groups: [Layers, Groups]
+    group_sort_idx = group_to_node.argsort(dim=1)
+    
+    # Expand group indices to expert indices
+    # expert_sort_idx: [Layers, Experts]
+    # Maps: Index i in sorted array corresponds to expert `expert_sort_idx[..., i]`
+    base_expert_idx = torch.arange(group_size, device=device).unsqueeze(0).unsqueeze(0)
+    expert_sort_idx = (group_sort_idx.unsqueeze(-1) * group_size + base_expert_idx).reshape(num_layers, -1)
+    
+    # Permute weights to align with nodes: [Layers, Experts]
+    sorted_weight = weight.gather(1, expert_sort_idx)
+    
+    # --- Step 2: Replicate and Pack per Node ---
+    # View as [Layers * Nodes, Experts_Per_Node] to batch process all nodes
+    node_weights = sorted_weight.view(-1, experts_per_node)
+    
+    # Calculate replica counts for each expert within the node context
+    # counts: [Layers * Nodes, Experts_Per_Node]
+    node_expert_counts = vectorized_proportional_replicate(node_weights, replicas_per_node)
+    
+    # Expand weights to replicas for packing
+    # Since repeat_interleave is not batched in a way that preserves 2D structure 
+    # if output lengths differ (they don't here, sum is fixed), we flatten.
+    # We need to track the logical rank of each replica (0, 1, 2...)
+    # We perform expansion on CPU/GPU by constructing indices
+    
+    flat_counts = node_expert_counts.flatten() # [L*N*E_per_node]
+    total_replicas_flat = flat_counts.sum()
+    assert total_replicas_flat == num_layers * num_replicas
+    
+    # Construct expansion indices
+    # We want to repeat the weights and keep track of original indices
+    # Since every row sums to `replicas_per_node`, we can reshape results later.
+    
+    # Create repeat indices
+    # [0, 0, (count[0] times), 1, 1, ...]
+    repeat_idx = torch.repeat_interleave(
+        torch.arange(node_weights.numel(), device=device), 
+        flat_counts
+    )
+    
+    # Get physical weights: [L*N*Replica_Per_Node]
+    phy_weights_flat = node_weights.flatten()[repeat_idx]
+    # Divide weight by count to get load per replica
+    phy_weights_flat = phy_weights_flat / flat_counts[repeat_idx]
+    
+    # Reshape back to batch: [L*N, Replicas_Per_Node]
+    phy_weights = phy_weights_flat.view(-1, replicas_per_node)
+    
+    # Generate Rank: 0..k-1 for each expert
+    # We can do this by: cumsum(ones) - cumsum(ones distinct expert) reset
+    # A cleaner way using standard ops:
+    # Use the fact that we are expanding.
+    # We can compute rank by creating a counter that resets.
+    # Using a loop for rank generation is acceptable as it is O(max_replicas) or using simple kernel.
+    # Given max_replicas is small, we can assume a small max rank or use a clever differential.
+    # Or simply:
+    ones = torch.ones_like(repeat_idx)
+    # This is slightly expensive to fully vectorize "rank within group" without custom kernel or loop.
+    # However, we can recover ranks later or compute now.
+    # Let's compute ranks now.
+    # cumsum reset mechanism:
+    expert_boundaries = torch.cumsum(flat_counts, 0)
+    expert_starts = torch.cat([torch.tensor([0], device=device), expert_boundaries[:-1]])
+    # Range of all output indices
+    range_indices = torch.arange(repeat_idx.shape[0], device=device)
+    # The start index for the expert of the current replica
+    my_start = expert_starts[repeat_idx]
+    ranks_flat = range_indices - my_start
+    
+    # --- Step 3: Pack Physical Replicas to GPUs ---
+    # Assign replicas to GPUs within the node using Zigzag
+    # gpu_assignments: [L*N, Replicas_Per_Node]. Values 0..gpus_per_node-1
+    gpu_assignments = vectorized_zigzag_pack(phy_weights, gpus_per_node)
+    
+    # We now have:
+    # 1. The original logical expert ID (via expert_sort_idx + repeat_idx)
+    # 2. The assigned GPU (gpu_assignments)
+    # We need to produce `phy2log` where physical experts are ordered 0..P-1.
+    # Usually physical experts are indexed by (Node, GPU, Slot).
+    # We need to sort our replicas so that they are grouped by GPU.
+    
+    # Sort indices based on GPU assignment to put them in correct physical order
+    # sort key = gpu_id
+    # We do this per row (per node processing unit)
+    gpu_sort_idx = gpu_assignments.argsort(dim=1) # [L*N, Replicas_Per_Node]
+    
+    # Gather the logical expert info in physical order
+    # Reconstruct logical IDs relative to the sorted node-list
+    # node_expert_indices are 0..Experts_per_node-1
+    node_expert_indices = repeat_idx.view(-1, replicas_per_node) % experts_per_node
+    phy_expert_ids_in_node = node_expert_indices.gather(1, gpu_sort_idx)
+    
+    # Gather ranks
+    ranks = ranks_flat.view(-1, replicas_per_node).gather(1, gpu_sort_idx)
+    
+    # Now map back to global logical IDs
+    # expert_sort_idx: [Layers, Experts] -> view [L*N, Experts_per_node]
+    global_sort_map = expert_sort_idx.view(-1, experts_per_node)
+    
+    # ph2log_flat: [L*N, Replicas_Per_Node]
+    phy2log_flat = global_sort_map.gather(1, phy_expert_ids_in_node)
+    
+    # Reshape to [Layers, Num_Replicas]
+    phy2log = phy2log_flat.view(num_layers, num_replicas)
+    
+    # --- Step 4: Construct log2phy and logcnt ---
+    # logcnt: [Layers, Experts]. We calculated node_expert_counts.
+    # We need to scatter it back to original order.
+    logcnt = torch.zeros_like(weight, dtype=torch.long)
+    logcnt.scatter_(1, expert_sort_idx, node_expert_counts.view(num_layers, -1))
+    
+    # log2phy: [Layers, Experts, Max_Replicas]
+    # We have phy2log (Logical ID at Physical Slot P).
+    # We need: For Logical ID L, what are the Physical Slots?
+    # Physical Slot Index is implicit in phy2log's column index.
+    physical_indices = torch.arange(num_replicas, device=device).expand(num_layers, num_replicas)
+    
+    # We also have the ranks corresponding to these physical slots (reshaped)
+    phy_ranks = ranks.view(num_layers, num_replicas)
+    
+    num_redundant = num_replicas - num_logical_experts
+    max_replicas = num_redundant + 1 # Worst case bound, usually smaller but safer
+    
+    # Initialize with -1
+    log2phy = torch.full((num_layers, num_logical_experts, max_replicas), -1, dtype=torch.long, device=device)
+    
+    # Scatter physical indices into log2phy
+    # Index: [Layer, LogicalID, Rank] = PhysicalID
+    # We need to flatten to scatter effectively
+    
+    # Flat indices for scatter:
+    # layer_offset = layer * (num_logical * max_replicas)
+    # expert_offset = logical_id * max_replicas
+    # rank_offset = rank
+    
+    flat_log2phy = log2phy.view(-1)
+    
+    layer_ids = torch.arange(num_layers, device=device).unsqueeze(1).expand_as(phy2log)
+    
+    scatter_indices = (layer_ids * (num_logical_experts * max_replicas) + 
+                       phy2log * max_replicas + 
+                       phy_ranks).view(-1)
+    
+    # Valid mask for scatter (though all should be valid if max_replicas is sufficient)
+    # In extreme skew, an expert might get > max_replicas if not capped.
+    # Our proportional logic doesn't strictly cap, but unlikely to exceed 2-3x avg.
+    # We clamp indices to avoid OOB just in case.
+    if scatter_indices.max() >= flat_log2phy.numel():
+        # This implies max_replicas calculated above is too small for the distribution
+        # Resize log2phy if needed or clamp. 
+        # Given the problem constraints, we stick to the provided buffer size heuristic
+        # or expand. Here we assume max_replicas is sufficient as per original code.
+        pass
+
+    flat_log2phy.scatter_(0, scatter_indices, physical_indices.reshape(-1))
+    log2phy = flat_log2phy.view(num_layers, num_logical_experts, max_replicas)
+    
+    return phy2log, log2phy, logcnt
+
+# EVOLVE-BLOCK-END

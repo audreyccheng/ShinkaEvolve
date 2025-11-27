@@ -1,0 +1,355 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads
+Enhanced with GRASP-style randomized best-insertion and local search refinement.
+"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    GRASP-style scheduler: multi-start randomized best-insertion + local search.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Number of randomized restarts
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+    all_txns = list(range(n))
+
+    # Parameter configuration (adaptive by workload size and effort)
+    if n <= 50:
+        CAND_SAMPLE_BASE = 10     # candidate txn per step
+        POS_SAMPLE_LIMIT = None   # evaluate all insertion positions
+        MAX_LS_PASSES = 3         # local search passes for adjacent swaps
+        RELOC_TRIES = max(8, n // 2)
+    else:
+        CAND_SAMPLE_BASE = 8
+        POS_SAMPLE_LIMIT = 15     # cap insertion positions evaluated
+        MAX_LS_PASSES = 2
+        RELOC_TRIES = max(12, n // 3)
+
+    # Scale relocations slightly with search effort
+    RELOC_TRIES = int(RELOC_TRIES * max(1.0, min(2.0, 0.5 + 0.1 * num_seqs)))
+
+    JITTER = 2  # small random variation in candidate set size
+
+    # Cost cache for partial prefixes to avoid redundant evaluations
+    cost_cache = {}
+
+    def eval_cost(seq):
+        key = tuple(seq)
+        if key in cost_cache:
+            return cost_cache[key]
+        c = workload.get_opt_seq_cost(list(seq))
+        cost_cache[key] = c
+        return c
+
+    def sample_positions(seq_len):
+        # Return list of positions [0..seq_len] where insertion can occur
+        if POS_SAMPLE_LIMIT is None or seq_len + 1 <= (POS_SAMPLE_LIMIT or (seq_len + 1)):
+            return list(range(seq_len + 1))
+        # Sample positions but always include ends to preserve global structure
+        num_to_sample = max(2, min(POS_SAMPLE_LIMIT, seq_len + 1))
+        mandatory = {0, seq_len}
+        # Available interior positions
+        interior = list(range(1, seq_len))
+        if len(interior) <= num_to_sample - 2:
+            chosen = set(interior)
+        else:
+            chosen = set(random.sample(interior, num_to_sample - 2))
+        chosen.update(mandatory)
+        return sorted(chosen)
+
+    def best_insertion_for_txn(current_seq, txn, current_best):
+        """
+        Try inserting txn into multiple positions in current_seq.
+        Returns (best_cost, best_pos). current_best is the best known cost to allow pruning.
+        """
+        seq_len = len(current_seq)
+        best_cost = float('inf')
+        best_pos = 0
+        positions = sample_positions(seq_len)
+        for pos in positions:
+            # Build candidate sequence with insertion
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                best_cost = cost
+                best_pos = pos
+        return best_cost, best_pos
+
+    def construct_sequence():
+        """
+        Randomized best-insertion construction with RCL (restricted candidate list).
+        """
+        # Seed with a random start transaction; quickly choose a good second insertion
+        remaining = all_txns.copy()
+        random_start = random.randint(0, n - 1)
+        seq = [random_start]
+        remaining.remove(random_start)
+        curr_cost = eval_cost(seq)
+
+        # Optionally add a second txn by testing a small candidate set thoroughly
+        if remaining:
+            k = min(6, len(remaining))
+            candidates = random.sample(remaining, k)
+            pair_eval = []
+            for t in candidates:
+                for pos in [0, 1]:
+                    cand = seq.copy()
+                    cand.insert(pos, t)
+                    cost = eval_cost(cand)
+                    pair_eval.append((cost, t, pos))
+            if pair_eval:
+                pair_eval.sort(key=lambda x: x[0])
+                # Small RCL for the second placement
+                rcl_size = min(3, len(pair_eval))
+                chosen_cost, chosen_txn, chosen_pos = random.choice(pair_eval[:rcl_size])
+                seq.insert(chosen_pos, chosen_txn)
+                remaining.remove(chosen_txn)
+                curr_cost = chosen_cost
+
+        # Build the rest using sampled candidates and best insertion positions
+        while remaining:
+            # Adaptive candidate sample size with small randomness to diversify
+            dynamic_base = CAND_SAMPLE_BASE
+            cand_size = min(len(remaining), max(3, dynamic_base + random.randint(-JITTER, JITTER)))
+            candidates = random.sample(remaining, cand_size)
+
+            step_evals = []
+            best_step_cost = float('inf')
+
+            for t in candidates:
+                cost_t, pos_t = best_insertion_for_txn(seq, t, best_step_cost)
+                step_evals.append((cost_t, t, pos_t))
+                if cost_t < best_step_cost:
+                    best_step_cost = cost_t
+
+            # Restricted Candidate List: choose randomly among top few to balance greediness and diversity
+            if step_evals:
+                step_evals.sort(key=lambda x: x[0])
+                rcl_size = max(1, min(3, len(step_evals)//2))  # top-k
+                chosen_cost, chosen_txn, chosen_pos = random.choice(step_evals[:rcl_size])
+                seq.insert(chosen_pos, chosen_txn)
+                curr_cost = chosen_cost
+                remaining.remove(chosen_txn)
+            else:
+                # Fallback: append a random remaining txn
+                t = random.choice(remaining)
+                seq.append(t)
+                curr_cost = eval_cost(seq)
+                remaining.remove(t)
+
+        return seq, curr_cost
+
+    def local_search_adjacent_swaps(seq, curr_cost):
+        """
+        Perform multiple passes of adjacent swap hill-climbing.
+        """
+        improved = True
+        passes = 0
+        best_seq = seq
+        best_cost = curr_cost
+
+        while improved and passes < MAX_LS_PASSES:
+            improved = False
+            passes += 1
+            i = 0
+            # One pass left-to-right
+            while i < len(best_seq) - 1:
+                cand = best_seq.copy()
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_cost(cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand
+                    improved = True
+                i += 1
+        return best_seq, best_cost
+
+    def local_search_best_reinsert(seq, curr_cost, max_rounds=2):
+        """
+        Deterministic best-improving reinsertion: for each index, reinsert txn at best position.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        rounds = 0
+
+        if len(best_seq) <= 2:
+            return best_seq, best_cost
+
+        while rounds < max_rounds:
+            improved = False
+            rounds += 1
+            idx = 0
+            while idx < len(best_seq):
+                t = best_seq[idx]
+                base = best_seq[:idx] + best_seq[idx + 1:]
+                positions = sample_positions(len(base))
+                move_best_cost = best_cost
+                move_best_pos = None
+                for pos in positions:
+                    cand = base.copy()
+                    cand.insert(pos, t)
+                    c = eval_cost(cand)
+                    if c < move_best_cost:
+                        move_best_cost = c
+                        move_best_pos = pos
+                if move_best_pos is not None:
+                    best_seq = base
+                    best_seq.insert(move_best_pos, t)
+                    best_cost = move_best_cost
+                    improved = True
+                    # do not increment idx; re-evaluate around changed neighborhood
+                else:
+                    idx += 1
+            if not improved:
+                break
+        return best_seq, best_cost
+
+    def local_search_relocations(seq, curr_cost):
+        """
+        Random relocation: remove at index i and reinsert at j if improves.
+        """
+        best_seq = seq
+        best_cost = curr_cost
+        trials = 0
+        # Early exit if trivial
+        if len(seq) <= 2:
+            return best_seq, best_cost
+
+        while trials < RELOC_TRIES:
+            i = random.randint(0, len(best_seq) - 1)
+            j = random.randint(0, len(best_seq) - 1)
+            if i == j:
+                trials += 1
+                continue
+            cand = best_seq.copy()
+            t = cand.pop(i)
+            # Adjust j if removal shifts indices
+            if j > i:
+                j -= 1
+            cand.insert(j, t)
+            c = eval_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+                trials = 0  # reset on improvement
+            else:
+                trials += 1
+        return best_seq, best_cost
+
+    # Multi-start GRASP
+    global_best_seq = None
+    global_best_cost = float('inf')
+
+    for _ in range(max(1, num_seqs)):
+        seq, cost = construct_sequence()
+        # Local search refinement: reinsertion, then adjacent swaps, then random relocations
+        seq, cost = local_search_best_reinsert(seq, cost, max_rounds=2)
+        seq, cost = local_search_adjacent_swaps(seq, cost)
+        seq, cost = local_search_relocations(seq, cost)
+        # Final polish with a quick adjacent pass
+        seq, cost = local_search_adjacent_swaps(seq, cost)
+
+        if cost < global_best_cost:
+            global_best_cost = cost
+            global_best_seq = seq
+
+    # Safety checks
+    assert global_best_seq is not None
+    assert len(global_best_seq) == n
+    assert len(set(global_best_seq)) == n
+
+    return global_best_cost, global_best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

@@ -1,0 +1,196 @@
+<NAME>
+optimize_beam_ils_polish
+</NAME>
+
+<DESCRIPTION>
+1. Beam Search: Revert GAMMA_END to 1.0 (from 0.8) to maintain parallelism pressure. Introduce dynamic quadratic efficiency bonus (decaying from 6.0 to 2.0) to aggressively target parallel structures early in construction.
+2. ILS Polish: Switch from hybrid LPT/Reverse to alternating LPT (Big Rocks) and SPT (Sand) ordering. This strategy better optimizes gap filling (SPT) after structural settling (LPT). Increase pass limit to 25 to ensure convergence, relying on 'Early Exit' optimization for performance.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    BEAM_WIDTH = max(16, int(num_seqs * 2.5))
+    GAMMA_START = 1.8
+    GAMMA_END = 0.8  # Allow slightly more packing pressure at the end
+
+    # Seed beam with top LPT and some randoms
+    seeds = set(lpt_indices[:BEAM_WIDTH])
+=======
+    BEAM_WIDTH = max(16, int(num_seqs * 2.5))
+    GAMMA_START = 1.8
+    GAMMA_END = 1.0
+
+    # Dynamic Bonus Factors
+    BONUS_START = 6.0
+    BONUS_END = 2.0
+
+    # Seed beam with top LPT and some randoms
+    seeds = set(lpt_indices[:BEAM_WIDTH])
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Construction Loop
+    for step in range(num_txns - 1):
+        # Linear Gamma Decay
+        progress = (step + 1) / max(1, num_txns - 1)
+        current_gamma = GAMMA_START - (progress * (GAMMA_START - GAMMA_END))
+
+        candidates = []
+        for parent in beam:
+            rem_list = list(parent['rem'])
+            if not rem_list: continue
+
+            # Candidate Selection: Smart LPT + Random
+            to_eval = set()
+
+            # 1. Top LPT available
+            lpt_count = 0
+            for t in lpt_indices:
+                if t in parent['rem']:
+                    to_eval.add(t)
+                    lpt_count += 1
+                    if lpt_count >= 6: break
+
+            # 2. Random diversity
+            if len(rem_list) > len(to_eval):
+                pool = [x for x in rem_list if x not in to_eval]
+                count = min(len(pool), 6)
+                to_eval.update(random.sample(pool, count))
+
+            parent_cost = parent['cost']
+            parent_work = parent['work']
+
+            for t in to_eval:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent_work + txn_lengths[t]
+
+                # Base Score
+                new_score = new_cost - (current_gamma * new_work)
+
+                # Continuous Efficiency Bonus
+                delta = new_cost - parent_cost
+                t_len = txn_lengths[t]
+
+                if t_len > 1e-6:
+                    # efficiency 1.0 = perfect parallel (delta=0)
+                    # efficiency 0.0 = sequential (delta=t_len)
+                    efficiency = max(0.0, (t_len - delta) / t_len)
+
+                    # Quadratic bonus for efficiency > 1%
+                    if efficiency > 0.01:
+                        bonus = t_len * 3.0 * (efficiency ** 2)
+                        new_score -= bonus
+
+                new_rem = parent['rem'].copy()
+=======
+    # Construction Loop
+    for step in range(num_txns - 1):
+        # Linear Gamma Decay
+        progress = (step + 1) / max(1, num_txns - 1)
+        current_gamma = GAMMA_START - (progress * (GAMMA_START - GAMMA_END))
+        current_bonus = BONUS_START - (progress * (BONUS_START - BONUS_END))
+
+        candidates = []
+        for parent in beam:
+            rem_list = list(parent['rem'])
+            if not rem_list: continue
+
+            # Candidate Selection: Smart LPT + Random
+            to_eval = set()
+
+            # 1. Top LPT available
+            lpt_count = 0
+            for t in lpt_indices:
+                if t in parent['rem']:
+                    to_eval.add(t)
+                    lpt_count += 1
+                    if lpt_count >= 6: break
+
+            # 2. Random diversity
+            if len(rem_list) > len(to_eval):
+                pool = [x for x in rem_list if x not in to_eval]
+                count = min(len(pool), 6)
+                to_eval.update(random.sample(pool, count))
+
+            parent_cost = parent['cost']
+            parent_work = parent['work']
+
+            for t in to_eval:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent_work + txn_lengths[t]
+
+                # Base Score
+                new_score = new_cost - (current_gamma * new_work)
+
+                # Continuous Efficiency Bonus
+                delta = new_cost - parent_cost
+                t_len = txn_lengths[t]
+
+                if t_len > 1e-6:
+                    # efficiency 1.0 = perfect parallel (delta=0)
+                    # efficiency 0.0 = sequential (delta=t_len)
+                    efficiency = max(0.0, (t_len - delta) / t_len)
+
+                    # Dynamic Quadratic bonus
+                    if efficiency > 0.01:
+                        bonus = t_len * current_bonus * (efficiency ** 2)
+                        new_score -= bonus
+
+                new_rem = parent['rem'].copy()
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # D. Hybrid Convergent Polish (Gap Repair)
+        # Scan entire schedule, try to move every transaction to its optimal position.
+
+        should_polish = (current_cost <= best_cost * 1.05) or (random.random() < 0.25)
+
+        if should_polish and num_txns > 1:
+            improved = True
+            passes = 0
+            # Higher pass limit for convergence
+            MAX_PASSES = 10
+            if num_txns < 40: MAX_PASSES = 15
+
+            while improved and passes < MAX_PASSES:
+                improved = False
+                passes += 1
+
+                # Order Selection:
+                # Primarily LPT to settle Big Rocks.
+                # Every 3rd pass, try Reverse Order to optimize Tail/Makespan.
+                if passes % 3 == 0:
+                    txns_to_check = list(reversed(current_schedule))
+                else:
+                    txns_to_check = sorted(current_schedule, key=lambda t: txn_lengths.get(t, 0), reverse=True)
+
+                for txn in txns_to_check:
+=======
+        # D. Alternating LPT/SPT Polish (Rocks & Sand)
+        # Iteratively optimize schedule by moving transactions.
+        # Alternating between LPT (moving big rocks) and SPT (filling gaps with sand)
+        # creates a more robust packing structure.
+
+        should_polish = (current_cost <= best_cost * 1.05) or (random.random() < 0.25)
+
+        if should_polish and num_txns > 1:
+            improved = True
+            passes = 0
+            # Unbounded passes allowed effectively, limited by convergence
+            MAX_PASSES = 25
+
+            while improved and passes < MAX_PASSES:
+                improved = False
+                passes += 1
+
+                # Alternating Sort Order:
+                # Odd passes: LPT (Big Rocks) - Optimize structural placement
+                # Even passes: SPT (Sand) - Optimize gap filling
+                if passes % 2 == 1:
+                    txns_to_check = sorted(current_schedule, key=lambda t: txn_lengths.get(t, 0), reverse=True)
+                else:
+                    txns_to_check = sorted(current_schedule, key=lambda t: txn_lengths.get(t, 0), reverse=False)
+
+                for txn in txns_to_check:
+>>>>>>> REPLACE
+</DIFF>

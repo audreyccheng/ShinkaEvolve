@@ -1,0 +1,120 @@
+To improve the performance of the Expert Parallelism Load Balancer (EPLB), I propose refining the `balanced_packing` function. The current implementation uses a simple greedy algorithm (assigning the heaviest items to the lightest available packs). While reasonable, this can get stuck in local optima.
+
+I propose adding a **swap-based refinement step** after the initial greedy packing. This iterative process identifies the heaviest and lightest packs and attempts to swap items between them to reduce the load difference (variance). By effectively performing a local search, we can achieve a much tighter load balance.
+
+Additionally, I optimize the memory access pattern by moving the `weight` tensor to the CPU once before processing. The original code accesses GPU tensor elements inside a Python loop, which incurs significant overhead. Moving it to CPU upfront ensures the algorithm remains fast while significantly boosting the `balancedness_score`.
+
+<NAME>
+optimize_balanced_packing_with_swap
+</NAME>
+
+<DESCRIPTION>
+Optimizes `balanced_packing` by:
+1. Moving weights to CPU to minimize tensor overhead during iterative packing.
+2. Replacing the purely greedy strategy with a Greedy + Swap Refinement strategy. The greedy step gives a good initialization, and the swap step iteratively exchanges items between the most loaded and least loaded packs to reduce variance. This provides a better load balance (Combined Score improvement) with minimal computational cost.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+
+    # Optimization: Move weights to CPU to avoid slow element-wise GPU access
+    weight_cpu = weight.to("cpu", dtype=torch.float32)
+
+    for i in range(num_layers):
+        pack_weights = [0.0] * num_packs
+        current_packs = [[] for _ in range(num_packs)]
+        row_weight = weight_cpu[i]
+
+        # 1. Greedy packing
+        for group in indices[i].tolist():
+            w = row_weight[group].item()
+            best_pack = -1
+            min_val = float('inf')
+            # Find the least loaded pack that has space
+            for p in range(num_packs):
+                if len(current_packs[p]) < groups_per_pack:
+                    if pack_weights[p] < min_val:
+                        min_val = pack_weights[p]
+                        best_pack = p
+            current_packs[best_pack].append(group)
+            pack_weights[best_pack] += w
+
+        # 2. Refinement: Swap items between max-load and min-load packs
+        for _ in range(20):
+            min_p = min(range(num_packs), key=pack_weights.__getitem__)
+            max_p = max(range(num_packs), key=pack_weights.__getitem__)
+
+            if min_p == max_p:
+                break
+
+            diff = pack_weights[max_p] - pack_weights[min_p]
+            if diff < 1e-6:
+                break
+
+            best_swap = None
+            target = diff / 2.0
+            found_swap = False
+
+            # Try to swap item u from max_p with item v from min_p
+            # We look for a swap that reduces the diff (i.e., w_u > w_v)
+            for idx_u, u in enumerate(current_packs[max_p]):
+                w_u = row_weight[u].item()
+                for idx_v, v in enumerate(current_packs[min_p]):
+                    w_v = row_weight[v].item()
+
+                    delta = w_u - w_v
+                    if 0 < delta < diff:
+                        gap = abs(delta - target)
+                        if best_swap is None or gap < best_swap[0]:
+                            best_swap = (gap, idx_u, idx_v, delta)
+                            found_swap = True
+
+            if found_swap:
+                _, idx_u, idx_v, delta = best_swap
+                u = current_packs[max_p][idx_u]
+                v = current_packs[min_p][idx_v]
+
+                current_packs[max_p][idx_u] = v
+                current_packs[min_p][idx_v] = u
+                pack_weights[max_p] -= delta
+                pack_weights[min_p] += delta
+            else:
+                break
+
+        # 3. Fill result tensors
+        for p in range(num_packs):
+            for r, g in enumerate(current_packs[p]):
+                pack_index[i, g] = p
+                rank_in_pack[i, g] = r
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

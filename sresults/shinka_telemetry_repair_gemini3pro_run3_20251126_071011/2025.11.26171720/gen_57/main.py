@@ -1,0 +1,410 @@
+# EVOLVE-BLOCK-START
+from typing import Dict, Any, Tuple, List
+import math
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repairs network telemetry using a Momentum-Based Bayesian Conservation Solver.
+    
+    Algorithm:
+    1.  **Anchoring**: Identifies consistent internal links (Symmetry) and locks them as anchors.
+    2.  **Hypothesis Generation**: For suspect and external links, generates candidates:
+        - Measured values (local/peer)
+        - Zero flow (phantom traffic detection)
+        - Implied values (derived from router conservation balance)
+    3.  **Iterative Solver**: Solves for flow rates by maximizing the joint probability of 
+        router balance (Flow Conservation) and measurement fidelity (Priors). 
+        Uses momentum to converge stably.
+    4.  **Calibrated Confidence**: Confidence is the product of the hypothesis probability 
+        (Decision Certainty) and the final router goodness-of-fit (Physical Consistency).
+    """
+    
+    # --- Configuration ---
+    # Tolerances
+    SYM_ABS_TOL = 1.0           # 1 Mbps absolute diff allowed
+    SYM_REL_TOL = 0.02          # 2% relative diff allowed
+    MIN_SIG_FLOW = 0.5          # Threshold for "UP" status
+    ITERATIONS = 5              # Solver steps
+    MOMENTUM = 0.5              # Update smoothing (0.0 = no change, 1.0 = instant)
+    
+    # --- Helper Structures ---
+    if_to_router = {}
+    for r_id, if_list in topology.items():
+        for i_id in if_list:
+            if_to_router[i_id] = r_id
+            
+    # State Containers
+    # estimates: Current best guess for flow rates
+    estimates = {} 
+    # certainty: Probability of the chosen candidate (0.0-1.0)
+    certainty = {} 
+    
+    # Initialize state
+    for if_id, data in telemetry.items():
+        estimates[if_id] = {
+            'rx': data.get('rx_rate', 0.0),
+            'tx': data.get('tx_rate', 0.0)
+        }
+        certainty[if_id] = {'rx': 0.5, 'tx': 0.5}
+
+    # --- Step 1: Link Classification & Anchoring ---
+    
+    processed_links = set()
+    internal_anchors = set() # Set of (if_id, metric) that are trusted
+    suspect_tasks = []       # List of tasks for the solver
+    
+    def is_symmetric(v1, v2):
+        diff = abs(v1 - v2)
+        denom = max(v1, v2, 1.0)
+        # Consistent if within absolute tolerance OR relative tolerance
+        return (diff < SYM_ABS_TOL) or ((diff / denom) < SYM_REL_TOL)
+
+    for if_id, data in telemetry.items():
+        if if_id in processed_links: continue
+        
+        peer_id = data.get('connected_to')
+        
+        if peer_id and peer_id in telemetry:
+            # Internal Link
+            processed_links.add(if_id)
+            processed_links.add(peer_id)
+            
+            # Forward: IF_TX -> PEER_RX
+            tx_val = estimates[if_id]['tx']
+            rx_val = estimates[peer_id]['rx']
+            
+            if is_symmetric(tx_val, rx_val):
+                # Anchor: Average and Trust
+                avg = (tx_val + rx_val) / 2.0
+                estimates[if_id]['tx'] = avg
+                estimates[peer_id]['rx'] = avg
+                internal_anchors.add((if_id, 'tx'))
+                internal_anchors.add((peer_id, 'rx'))
+                certainty[if_id]['tx'] = 0.99
+                certainty[peer_id]['rx'] = 0.99
+            else:
+                # Suspect: Add to solver
+                suspect_tasks.append({
+                    'type': 'internal',
+                    'src': if_id, 'dst': peer_id,
+                    'meas_src': tx_val, 'meas_dst': rx_val
+                })
+                
+            # Backward: PEER_TX -> IF_RX
+            tx_val = estimates[peer_id]['tx']
+            rx_val = estimates[if_id]['rx']
+            
+            if is_symmetric(tx_val, rx_val):
+                avg = (tx_val + rx_val) / 2.0
+                estimates[peer_id]['tx'] = avg
+                estimates[if_id]['rx'] = avg
+                internal_anchors.add((peer_id, 'tx'))
+                internal_anchors.add((if_id, 'rx'))
+                certainty[peer_id]['tx'] = 0.99
+                certainty[if_id]['rx'] = 0.99
+            else:
+                suspect_tasks.append({
+                    'type': 'internal',
+                    'src': peer_id, 'dst': if_id,
+                    'meas_src': tx_val, 'meas_dst': rx_val
+                })
+        else:
+            # External/Edge Link
+            processed_links.add(if_id)
+            # Add both directions as separate external tasks
+            suspect_tasks.append({
+                'type': 'external', 'if_id': if_id, 'metric': 'tx',
+                'meas': estimates[if_id]['tx']
+            })
+            suspect_tasks.append({
+                'type': 'external', 'if_id': if_id, 'metric': 'rx',
+                'meas': estimates[if_id]['rx']
+            })
+
+    # --- Step 2: Iterative Momentum Solver ---
+    
+    def get_router_state(rid):
+        """Returns (imbalance, max_flow) for a router."""
+        if rid not in topology: return 0.0, 1.0
+        t_in, t_out = 0.0, 0.0
+        max_f = 0.0
+        for iid in topology[rid]:
+            if iid in estimates:
+                r, t = estimates[iid]['rx'], estimates[iid]['tx']
+                t_in += r
+                t_out += t
+                max_f = max(max_f, r, t)
+        return (t_in - t_out), max(max_f, 1.0)
+
+    def get_sigma(flow):
+        """
+        Hybrid Noise Model:
+        - Low flow: Floor of 1.0
+        - Mid flow: Poisson-like sqrt(flow)
+        - High flow: Linear percentage (2%)
+        """
+        return max(flow * 0.02, 0.5 * math.sqrt(flow), 1.0)
+
+    for _ in range(ITERATIONS):
+        batch_updates = [] # Store (if_id, metric, val, prob)
+        
+        for task in suspect_tasks:
+            
+            if task['type'] == 'internal':
+                # Resolving disagreement between Src TX and Dst RX
+                src, dst = task['src'], task['dst']
+                r_src = if_to_router.get(src)
+                r_dst = if_to_router.get(dst)
+                
+                # Candidates: Source Meas, Dest Meas, Zero
+                cands = sorted(list(set([task['meas_src'], task['meas_dst'], 0.0])))
+                
+                # Snapshot current state
+                curr_tx = estimates[src]['tx']
+                curr_rx = estimates[dst]['rx']
+                
+                scores = []
+                for val in cands:
+                    # Apply Hypothesis
+                    estimates[src]['tx'] = val
+                    estimates[dst]['rx'] = val
+                    
+                    # Evaluate Router Balance (Likelihood)
+                    imb_s, flow_s = get_router_state(r_src)
+                    imb_d, flow_d = get_router_state(r_dst)
+                    
+                    sig_s = get_sigma(flow_s)
+                    sig_d = get_sigma(flow_d)
+                    
+                    p_src = math.exp(-abs(imb_s) / sig_s) if r_src else 1.0
+                    p_dst = math.exp(-abs(imb_d) / sig_d) if r_dst else 1.0
+                    
+                    # Prior: Penalize 0.0 if measurements are very high (unless strong evidence)
+                    prior = 1.0
+                    if val == 0.0:
+                        max_m = max(task['meas_src'], task['meas_dst'])
+                        if max_m > 10.0: prior = 0.01
+                        elif max_m > 1.0: prior = 0.5
+                        
+                    scores.append(p_src * p_dst * prior)
+                
+                # Revert
+                estimates[src]['tx'] = curr_tx
+                estimates[dst]['rx'] = curr_rx
+                
+                # Select Winner
+                total_score = sum(scores) + 1e-20
+                probs = [s / total_score for s in scores]
+                best_idx = scores.index(max(scores))
+                
+                win_val = cands[best_idx]
+                win_prob = probs[best_idx]
+                
+                batch_updates.append((src, 'tx', win_val, win_prob))
+                batch_updates.append((dst, 'rx', win_val, win_prob))
+                
+            elif task['type'] == 'external':
+                # Resolving edge link with no peer
+                if_id = task['if_id']
+                metric = task['metric']
+                rid = if_to_router.get(if_id)
+                meas = task['meas']
+                
+                curr_val = estimates[if_id][metric]
+                
+                # Generate "Implied" Candidate
+                # The value that would perfectly balance the router given OTHER flows
+                imb, flow = get_router_state(rid)
+                # Imb = In - Out
+                # If metric is RX (In): New_In = Old_In - Imb
+                # If metric is TX (Out): New_Out = Old_Out + Imb
+                if metric == 'rx': implied = curr_val - imb
+                else: implied = curr_val + imb
+                implied = max(0.0, implied)
+                
+                cands = sorted(list(set([meas, implied, 0.0])))
+                scores = []
+                
+                for val in cands:
+                    estimates[if_id][metric] = val
+                    imb_n, flow_n = get_router_state(rid)
+                    sig = get_sigma(flow_n)
+                    
+                    # Likelihood: How well does this value balance the router?
+                    lik = math.exp(-abs(imb_n) / sig) if rid else 1.0
+                    
+                    # Prior: Trust measurement moderately
+                    # Sigma for prior: 5% of measurement + floor
+                    sig_meas = max(meas * 0.05, 5.0)
+                    prior = math.exp(-abs(val - meas) / sig_meas)
+                    
+                    # Penalty for 0.0 if meas is high
+                    if val == 0.0 and meas > 10.0: prior *= 0.01
+                    
+                    scores.append(lik * prior)
+                    
+                estimates[if_id][metric] = curr_val
+                
+                total_score = sum(scores) + 1e-20
+                probs = [s / total_score for s in scores]
+                best_idx = scores.index(max(scores))
+                
+                win_val = cands[best_idx]
+                win_prob = probs[best_idx]
+                
+                batch_updates.append((if_id, metric, win_val, win_prob))
+                
+        # Apply Updates with Momentum
+        for if_id, metric, val, prob in batch_updates:
+            old_val = estimates[if_id][metric]
+            # Soft update
+            new_val = (old_val * (1 - MOMENTUM)) + (val * MOMENTUM)
+            estimates[if_id][metric] = new_val
+            certainty[if_id][metric] = prob
+
+    # --- Step 3: Confidence & Status Inference ---
+    
+    result = {}
+    
+    # Calculate final router fitness for confidence scaling
+    router_fitness = {}
+    for r_id in topology:
+        imb, flow = get_router_state(r_id)
+        sig = get_sigma(flow)
+        # 0.0 to 1.0 score of how balanced the router is
+        router_fitness[r_id] = math.exp(-abs(imb) / sig)
+        
+    for if_id, data in telemetry.items():
+        orig_rx = data.get('rx_rate', 0.0)
+        orig_tx = data.get('tx_rate', 0.0)
+        orig_st = data.get('interface_status', 'unknown')
+        
+        rep_rx = estimates[if_id]['rx']
+        rep_tx = estimates[if_id]['tx']
+        
+        rid = if_to_router.get(if_id)
+        r_fit = router_fitness.get(rid, 0.8) # Default high for unknown router
+        
+        # Calculate Final Confidence
+        # Conf = P(Selection) * P(Physical_Fit)
+        
+        def get_conf(metric, rep_val, orig_val):
+            # If anchored, we are highly confident
+            if (if_id, metric) in internal_anchors:
+                return 0.98
+            
+            # Base confidence from solver selection probability
+            prob_choice = certainty[if_id][metric]
+            
+            # Scale by physical fitness of the router
+            # If we made a choice that leaves router unbalanced, conf drops
+            final_conf = prob_choice * r_fit
+            
+            # If we changed the value significantly, we should be less confident 
+            # unless the fit is near-perfect
+            if abs(rep_val - orig_val) > max(orig_val * 0.1, 1.0):
+                 final_conf *= 0.9
+            
+            return max(0.01, min(0.99, final_conf))
+
+        conf_rx = get_conf('rx', rep_rx, orig_rx)
+        conf_tx = get_conf('tx', rep_tx, orig_tx)
+        
+        # Status Logic
+        peer_id = data.get('connected_to')
+        peer_st = 'unknown'
+        if peer_id and peer_id in telemetry:
+            peer_st = telemetry[peer_id].get('interface_status', 'unknown')
+            
+        has_traffic = (rep_rx > MIN_SIG_FLOW) or (rep_tx > MIN_SIG_FLOW)
+        
+        rep_st = orig_st
+        conf_st = 1.0
+        
+        if has_traffic:
+            rep_st = 'up'
+            if orig_st != 'up':
+                # Overturning status requires traffic confidence
+                conf_st = (conf_rx + conf_tx) / 2.0
+        elif peer_st == 'down':
+            rep_st = 'down'
+            if orig_st != 'down':
+                conf_st = 0.95
+        elif orig_st == 'up' and not has_traffic:
+            # Idle case. 
+            # If peer is UP, assume Idle (UP). 
+            # If peer is Unknown, assume Idle (UP).
+            rep_st = 'up'
+            
+        # Consistency Enforcement
+        if rep_st == 'down':
+            rep_rx = 0.0
+            rep_tx = 0.0
+            # If we are confident it's down, we are confident rates are 0
+            conf_rx = max(conf_rx, conf_st)
+            conf_tx = max(conf_tx, conf_st)
+            
+        # Output Construction
+        entry = {
+            'rx_rate': (orig_rx, rep_rx, conf_rx),
+            'tx_rate': (orig_tx, rep_tx, conf_tx),
+            'interface_status': (orig_st, rep_st, conf_st)
+        }
+        for k in ['connected_to', 'local_router', 'remote_router']:
+            if k in data: entry[k] = data[k]
+        result[if_id] = entry
+        
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+    
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+    
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+    
+    result = run_repair(test_telemetry, test_topology)
+    
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")
+

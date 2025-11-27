@@ -1,0 +1,179 @@
+<NAME>
+bundle_finishing_pass
+</NAME>
+
+<DESCRIPTION>
+I propose adding a conservation-preserving bundle finishing pass that gently re-aligns parallel links between the same router pair after the router projection and soft-zero stabilization (Stage 2.5). This pass computes per-link residuals e_i = tx_local − peer_rx across a bundle, subtracts the bundle median residual to avoid bias, and applies small zero-sum corrections Δ_i with per-link clipping (±3%) weighted toward low-confidence/high-rate links. Corrections are applied on tx[a] and the opposite on rx[b] to keep both routers’ totals unchanged, so router flow conservation is preserved. Gain is scaled by how far the average mismatch exceeds the adaptive symmetry tolerance, ensuring safety and stability.
+
+Rationale:
+- Improves link symmetry (R3) across parallel links without disturbing router conservation (R1).
+- Targets corrections to less reliable measurements with weights and small caps, aiding calibration.
+- Zero-sum ensures no change to router totals, so it does not undo the router balancing from Stage 2.
+- Mild confidence adjustments reflect actual movement, improving confidence calibration.
+
+Additionally, I introduced two new hyperparameters:
+- BUNDLE_FINISH_CLIP = 0.03 for per-link micro alignment cap.
+- BUNDLE_FINISH_GAIN_MAX = 0.25 for gain ceiling in bundle finishing.
+
+These changes are minimal, safe, and directly aimed at improving counter accuracy and confidence calibration in multi-link bundles where residual asymmetries can persist after the main corrections.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Hyperparameters
+    TAU_H_BASE = 0.02        # ~2% hardening threshold
+    ZERO_EPS = 1e-6
+    ZERO_THRESH = 1.0        # Mbps near-zero threshold
+    DAMP_ROUTER = 0.60       # router damping factor
+    PER_LINK_CLIP = 0.10     # per-interface relative change cap (±10%)
+    BUNDLE_CLIP = 0.15       # bundle shared factor cap (±15%)
+    STRONG_SCALE_GUARD = 0.08  # guard for re-sync when strong router scaling applied
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+    WEIGHT_FOCUS = 0.70      # focus router correction on lowest-confidence 70% weight
+    DOMINANCE_CAP = 0.50     # cap any single interface's weight share to ≤50% in a pass
+    INTRA_BUNDLE_CLIP = 0.05 # ±5% intra-bundle smoothing cap (used in soft-zero stage if needed)
+    CLIP_HIT_PENALTY = 0.95  # confidence penalty multiplier when clipping/strong scaling hit
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+=======
+    # Hyperparameters
+    TAU_H_BASE = 0.02        # ~2% hardening threshold
+    ZERO_EPS = 1e-6
+    ZERO_THRESH = 1.0        # Mbps near-zero threshold
+    DAMP_ROUTER = 0.60       # router damping factor
+    PER_LINK_CLIP = 0.10     # per-interface relative change cap (±10%)
+    BUNDLE_CLIP = 0.15       # bundle shared factor cap (±15%)
+    STRONG_SCALE_GUARD = 0.08  # guard for re-sync when strong router scaling applied
+    RESYNC_MAX_F = 0.40      # max one-sided nudge toward mean
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+    WEIGHT_FOCUS = 0.70      # focus router correction on lowest-confidence 70% weight
+    DOMINANCE_CAP = 0.50     # cap any single interface's weight share to ≤50% in a pass
+    INTRA_BUNDLE_CLIP = 0.05 # ±5% intra-bundle smoothing cap (used in soft-zero stage if needed)
+    CLIP_HIT_PENALTY = 0.95  # confidence penalty multiplier when clipping/strong scaling hit
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+    BUNDLE_FINISH_CLIP = 0.03   # ±3% micro alignment cap in bundle finishing
+    BUNDLE_FINISH_GAIN_MAX = 0.25  # max gain for bundle finishing pass
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 3: Confidence-gap-proportional re-sync with scaling guard and router-imbalance attenuation
+=======
+    # Stage 2.6: Conservation-preserving bundle finishing pass (parallel-link residual alignment)
+    # For each oriented router pair (ra -> rb), compute residuals e = tx[a] - rx[b] on all links,
+    # subtract the median residual, and apply small zero-sum corrections with per-link clip.
+    bundle_map_links: Dict[Tuple[Any, Any], List[Tuple[str, str]]] = {}
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            ra = local_router_of.get(a)
+            rb = local_router_of.get(b)
+            bundle_map_links.setdefault((ra, rb), []).append((a, b))
+
+    def _median(vals: List[float]) -> float:
+        s = sorted(vals)
+        n = len(s)
+        if n == 0:
+            return 0.0
+        if n % 2 == 1:
+            return s[n // 2]
+        return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+    for (ra, rb), pairs in bundle_map_links.items():
+        if len(pairs) < 2:
+            continue
+
+        e_list: List[float] = []
+        w_list: List[float] = []
+        idx_list: List[int] = []
+        rd_list: List[float] = []
+        tau_list: List[float] = []
+        caps: List[float] = []
+
+        for idx, (a, b) in enumerate(pairs):
+            v_tx = hardened_tx[a]
+            v_pr = hardened_rx[b]
+            # Skip near-zero links to avoid sign flips
+            if max(v_tx, v_pr) < ZERO_THRESH:
+                continue
+            e = v_tx - v_pr
+            # Weight toward low-confidence/high-rate directions
+            cdir = 0.5 * (clamp01(conf_tx.get(a, 0.7)) + clamp01(conf_rx.get(b, 0.7)))
+            w = (1.0 - cdir) * max(v_tx, ZERO_THRESH) + 1e-12
+            e_list.append(e)
+            w_list.append(w)
+            idx_list.append(idx)
+            rd_list.append(rel_diff(v_tx, v_pr))
+            tau_list.append(adaptive_tau(v_tx, v_pr))
+            caps.append(BUNDLE_FINISH_CLIP * max(v_tx, ZERO_THRESH))
+
+        n = len(e_list)
+        if n < 2:
+            continue
+
+        e_med = _median(e_list)
+        r = [e - e_med for e in e_list]
+
+        mean_rd = sum(rd_list) / n
+        mean_tau = sum(tau_list) / n
+        gap_norm = max(0.0, (mean_rd - mean_tau) / max(mean_tau, 1e-9))
+        gamma = min(BUNDLE_FINISH_GAIN_MAX, 0.4 * gap_norm)
+        if gamma <= 1e-12:
+            continue
+
+        # Proposed per-link deltas with per-link caps
+        deltas = []
+        for ri, cap in zip(r, caps):
+            d = -gamma * ri
+            if d > cap:
+                d = cap
+            elif d < -cap:
+                d = -cap
+            deltas.append(d)
+
+        # Zero-sum rebalance over non-clipped links using weights
+        sum_delta = sum(deltas)
+        if abs(sum_delta) > 1e-9:
+            free_idx = [k for k, (d, cap) in enumerate(zip(deltas, caps)) if abs(d) < cap - 1e-12]
+            sw = sum(w_list[k] for k in free_idx)
+            if sw > 0.0:
+                for k in free_idx:
+                    adj = sum_delta * (w_list[k] / sw)
+                    new_d = deltas[k] - adj
+                    # Respect caps after rebalance
+                    if new_d > caps[k]:
+                        new_d = caps[k]
+                    elif new_d < -caps[k]:
+                        new_d = -caps[k]
+                    deltas[k] = new_d
+
+        # Apply deltas to tx[a] and opposite to rx[b], preserving router totals
+        for local_idx, delta in enumerate(deltas):
+            a, b = pairs[idx_list[local_idx]]
+            if delta == 0.0:
+                continue
+            prev_tx = hardened_tx[a]
+            prev_rx = hardened_rx[b]
+            new_tx = max(0.0, prev_tx + delta)
+            new_rx = max(0.0, prev_rx - delta)
+
+            # Update scale factors for confidence calibration and scaling guards
+            if prev_tx > ZERO_EPS:
+                scaled_tx_factor[a] *= (new_tx / prev_tx)
+            if prev_rx > ZERO_EPS:
+                scaled_rx_factor[b] *= (new_rx / prev_rx)
+
+            hardened_tx[a] = new_tx
+            hardened_rx[b] = new_rx
+
+            # Mild confidence penalties proportional to movement
+            if prev_tx > ZERO_EPS:
+                relc_tx = rel_diff(new_tx, prev_tx)
+                conf_tx[a] = clamp01(conf_tx[a] * (1.0 - 0.2 * relc_tx))
+            if prev_rx > ZERO_EPS:
+                relc_rx = rel_diff(new_rx, prev_rx)
+                conf_rx[b] = clamp01(conf_rx[b] * (1.0 - 0.2 * relc_rx))
+
+    # Stage 3: Confidence-gap-proportional re-sync with scaling guard and router-imbalance attenuation
+>>>>>>> REPLACE
+</DIFF>

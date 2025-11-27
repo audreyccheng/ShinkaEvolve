@@ -1,0 +1,215 @@
+<NAME>
+noisy_sort_and_localsearch
+</NAME>
+
+<DESCRIPTION>
+1. Replace random shuffling in `check_placement` with "Noisy Sorting". Instead of completely randomizing the order, we sort items by `(w + K*s) * random_noise`. This maintains the general "Best Fit" ordering (which is very effective) while exploring the neighborhood of the optimal order to escape local optima. This converges faster and to better solutions than blind shuffling.
+2. Add a `local_optimize` phase (Hill Climbing) at the end of the algorithm. This post-processes the best solution found by binary search, using move and swap operations to specifically reduce the load on the bottleneck GPU. This is crucial for minimizing the maximum KVPR.
+3. Add a hyperbolic sort key `w / (GPU_MEM_SIZE - s)` to the deterministic strategies, which prioritizes items that would have high KVPR if placed alone.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 1. Deterministic Strategies
+        # Sort keys (descending)
+        strategies = [
+            lambda x: x['w'] + k_target * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / (x['s'] + 1e-9)
+        ]
+
+        for key in strategies:
+            res = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # 2. Randomized Strategies (Shuffle + Best Fit)
+        rng = random.Random(42)
+        indices = list(range(len(items)))
+        for _ in range(50):
+            rng.shuffle(indices)
+            res = try_pack([items[i] for i in indices])
+            if res: return res
+=======
+        # 1. Deterministic Strategies
+        # Sort keys (descending)
+        strategies = [
+            lambda x: x['w'] + k_target * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / (x['s'] + 1e-9),
+            lambda x: x['w'] / (GPU_MEM_SIZE - x['s'] + 1e-9)
+        ]
+
+        for key in strategies:
+            res = try_pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # 2. Randomized Strategies (Noisy Heuristic)
+        # Use a noisy version of the linearized cost to explore neighborhood of the best heuristic
+        rng = random.Random(42 + int(k_target))
+        base_key = lambda x: x['w'] + k_target * x['s']
+        for _ in range(25):
+            # Perturb the sort key with multiplicative noise
+            noisy_items = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+            res = try_pack(noisy_items)
+            if res: return res
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Binary Search Loop
+    for _ in range(30):
+        mid = (low + high) / 2
+        result = check_placement(mid)
+        if result is not None:
+            best_placement = result
+
+            # Refine high bound using the actual max KVPR of the valid solution
+            actual_max = 0.0
+            for gpu_p in best_placement.values():
+                w_sum = sum(m.req_rate / m.slo for m in gpu_p)
+                s_sum = sum(m.model_size for m in gpu_p)
+                rem = GPU_MEM_SIZE - s_sum
+                if rem > 1e-9:
+                    val = w_sum / rem
+                elif w_sum > 0:
+                    val = float('inf')
+                else:
+                    val = 0.0
+                if val > actual_max:
+                    actual_max = val
+
+            high = min(mid, actual_max)
+        else:
+            low = mid
+
+    return best_placement
+=======
+    # Binary Search Loop
+    for _ in range(30):
+        mid = (low + high) / 2
+        result = check_placement(mid)
+        if result is not None:
+            best_placement = result
+
+            # Refine high bound using the actual max KVPR of the valid solution
+            actual_max = 0.0
+            for gpu_p in best_placement.values():
+                w_sum = sum(m.req_rate / m.slo for m in gpu_p)
+                s_sum = sum(m.model_size for m in gpu_p)
+                rem = GPU_MEM_SIZE - s_sum
+                if rem > 1e-9:
+                    val = w_sum / rem
+                elif w_sum > 0:
+                    val = float('inf')
+                else:
+                    val = 0.0
+                if val > actual_max:
+                    actual_max = val
+
+            high = min(mid, actual_max)
+        else:
+            low = mid
+
+    # --- Local Search Optimization (Hill Climbing) ---
+    def calc_kvpr(w, s):
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-9:
+            return float('inf') if w > 1e-9 else 0.0
+        return w / rem
+
+    gpu_states = []
+    for i in range(gpu_num):
+        p = best_placement[i]
+        w = sum(m.req_rate / m.slo for m in p)
+        s = sum(m.model_size for m in p)
+        gpu_states.append({'w': w, 's': s, 'models': list(p)})
+
+    # Iterative improvement
+    for _ in range(150):
+        # Find bottleneck
+        max_k = -1.0
+        src_idx = -1
+        for i in range(gpu_num):
+            k = calc_kvpr(gpu_states[i]['w'], gpu_states[i]['s'])
+            if k > max_k:
+                max_k = k
+                src_idx = i
+
+        if max_k <= 1e-9: break
+
+        improved = False
+        src = gpu_states[src_idx]
+
+        # 1. Try Move (Src -> Dst)
+        for i, m in enumerate(src['models']):
+            m_w = m.req_rate / m.slo
+            m_s = m.model_size
+
+            ns_w = src['w'] - m_w
+            ns_s = src['s'] - m_s
+            ns_k = calc_kvpr(ns_w, ns_s)
+
+            if ns_k >= max_k - 1e-9: continue
+
+            for dst_idx in range(gpu_num):
+                if dst_idx == src_idx: continue
+                dst = gpu_states[dst_idx]
+
+                if dst['s'] + m_s > GPU_MEM_SIZE: continue
+                nd_k = calc_kvpr(dst['w'] + m_w, dst['s'] + m_s)
+
+                if nd_k < max_k - 1e-9:
+                    src['models'].pop(i)
+                    src['w'], src['s'] = ns_w, ns_s
+
+                    dst['models'].append(m)
+                    dst['w'] += m_w
+                    dst['s'] += m_s
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # 2. Try Swap (Src <-> Dst)
+        for i, m1 in enumerate(src['models']):
+            m1_w = m1.req_rate / m1.slo
+            m1_s = m1.model_size
+
+            for dst_idx in range(gpu_num):
+                if dst_idx == src_idx: continue
+                dst = gpu_states[dst_idx]
+
+                if calc_kvpr(dst['w'], dst['s']) > max_k * 0.95: continue
+
+                for j, m2 in enumerate(dst['models']):
+                    m2_w = m2.req_rate / m2.slo
+                    m2_s = m2.model_size
+
+                    ns_s = src['s'] - m1_s + m2_s
+                    if ns_s > GPU_MEM_SIZE: continue
+                    ns_w = src['w'] - m1_w + m2_w
+
+                    nd_s = dst['s'] - m2_s + m1_s
+                    if nd_s > GPU_MEM_SIZE: continue
+                    nd_w = dst['w'] - m2_w + m1_w
+
+                    ns_k = calc_kvpr(ns_w, ns_s)
+                    nd_k = calc_kvpr(nd_w, nd_s)
+
+                    if max(ns_k, nd_k) < max_k - 1e-9:
+                        src['models'][i] = m2
+                        src['w'], src['s'] = ns_w, ns_s
+
+                        dst['models'][j] = m1
+                        dst['w'], dst['s'] = nd_w, nd_s
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if not improved: break
+
+    return {i: gpu_states[i]['models'] for i in range(gpu_num)}
+>>>>>>> REPLACE
+</DIFF>

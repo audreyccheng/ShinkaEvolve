@@ -1,0 +1,455 @@
+<NAME>
+partial_averaging_and_dangling_micro_adjust
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements aligned with the research principles to improve counter accuracy and confidence calibration:
+
+1) Pairwise partial averaging with magnitude-aware gating:
+   - For each connected pair, evaluate per-direction symmetry with the existing 2% hardening tolerance, a 5% tolerance below 10 Mbps, and a 0.5 Mbps absolute guard.
+   - If the disagreement just exceeds tolerance (T < diff ≤ 2T), apply partial averaging with k = (diff − T) / T toward the per-direction average; beyond 2T use full averaging. This softens corrections near the boundary while fully fixing clear violations.
+   - When within tolerance, set strong confidence floors: 0.99 for high-rate with ≤0.5% disagreement; otherwise 0.98. Confidence for repaired directions uses 1 − diff to reflect correction magnitude.
+   - Adjustments are decided once per link and applied consistently to both endpoints to avoid double-corrections.
+
+2) Micro-adjustments for dominating dangling interfaces:
+   - After initial repairs, compute router-level flow conservation residuals. For routers with large imbalance, if an unpaired, up interface contributes >50% of the router’s absolute imbalance, nudge only its larger counter toward reducing the imbalance by up to 2% (α = min(0.02, 0.5 × residual_fraction)).
+   - Slightly increase the adjusted counter’s confidence to reflect alignment with conservation while preserving conservative calibration. Then recompute residuals and apply the existing direction-aware penalties.
+
+These changes are small, scoped, and maintain the original structure while leveraging both link symmetry and flow conservation more effectively. They aim to improve counter repairs and tune confidence calibration without harming status accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    result = {}
+
+    # First pass: collect all measurements and check link symmetry
+    link_symmetry_violations = {}
+
+    for interface_id, data in telemetry.items():
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Check link symmetry if connected interface exists
+        if connected_to and connected_to in telemetry:
+            peer_data = telemetry[connected_to]
+            peer_rx = peer_data.get('rx_rate', 0.0)
+            peer_tx = peer_data.get('tx_rate', 0.0)
+
+            # My TX should match their RX (within tolerance)
+            tx_rx_diff = abs(tx_rate - peer_rx) / max(tx_rate, peer_rx, 1.0)
+            # My RX should match their TX (within tolerance)
+            rx_tx_diff = abs(rx_rate - peer_tx) / max(rx_rate, peer_tx, 1.0)
+
+            link_symmetry_violations[interface_id] = {
+                'tx_rx_diff': tx_rx_diff,
+                'rx_tx_diff': rx_tx_diff,
+                'peer_rx': peer_rx,
+                'peer_tx': peer_tx
+            }
+
+    # Second pass: repair using redundant signals
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Default: no repair, high confidence
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        # Peer snapshot for redundancy use
+        peer_status = None
+        peer_rx = None
+        peer_tx = None
+        if connected_to and connected_to in telemetry:
+            peer = telemetry[connected_to]
+            peer_status = peer.get('interface_status', 'unknown')
+            peer_rx = peer.get('rx_rate', 0.0)
+            peer_tx = peer.get('tx_rate', 0.0)
+
+        # Enforce interface consistency: if either side is down, set effective down and zero rates
+        if interface_status == 'down' or (peer_status == 'down' if peer_status is not None else False):
+            both_down = (interface_status == 'down' and (peer_status == 'down' if peer_status is not None else False))
+            repaired_status = 'down'
+            repaired_rx = 0.0
+            repaired_tx = 0.0
+            status_confidence = 0.95 if both_down else 0.7
+            rx_confidence = status_confidence
+            tx_confidence = status_confidence
+        else:
+            # Use magnitude-aware symmetry check with absolute guard
+            if connected_to and connected_to in telemetry:
+                # RX should match peer's TX
+                abs_diff_rx = abs(float(rx_rate) - float(peer_tx))
+                max_pair_rx = max(1.0, float(rx_rate), float(peer_tx))
+                rel_diff_rx = abs_diff_rx / max_pair_rx
+                tol_rx = 0.05 if max(float(rx_rate), float(peer_tx)) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+                if rel_diff_rx > tol_rx and abs_diff_rx > ABS_GUARD:
+                    repaired_rx = float(peer_tx)
+                    rx_confidence = max(0.0, 1.0 - rel_diff_rx)
+                # TX should match peer's RX
+                abs_diff_tx = abs(float(tx_rate) - float(peer_rx))
+                max_pair_tx = max(1.0, float(tx_rate), float(peer_rx))
+                rel_diff_tx = abs_diff_tx / max_pair_tx
+                tol_tx = 0.05 if max(float(tx_rate), float(peer_rx)) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+                if rel_diff_tx > tol_tx and abs_diff_tx > ABS_GUARD:
+                    repaired_tx = float(peer_rx)
+                    tx_confidence = max(0.0, 1.0 - rel_diff_tx)
+                # If statuses differ (but neither side is down), reduce status confidence
+                if interface_status != peer_status:
+                    status_confidence = 0.6
+            else:
+                # No redundancy: keep values but slightly lower confidence
+                rx_confidence = min(rx_confidence, 0.95)
+                tx_confidence = min(tx_confidence, 0.95)
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+=======
+    result = {}
+
+    # Build peer mapping
+    peers: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        peers[if_id] = peer if peer in telemetry else None
+
+    # Plan pairwise adjustments to avoid inconsistent per-side changes
+    # field_value_adjust[(if_id, 'tx'|'rx')] = new_value
+    field_value_adjust: Dict[Tuple[str, str], float] = {}
+    # field_conf_assign[(if_id, dir)] = confidence if we actively changed value
+    field_conf_assign: Dict[Tuple[str, str], float] = {}
+    # field_conf_floor provides high-confidence floors for in-tolerance agreements
+    field_conf_floor: Dict[Tuple[str, str], float] = {}
+
+    visited_pairs = set()
+
+    # Helper for relative difference
+    def rel_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(1.0, a, b)
+
+    # Compute pair-level per-direction adjustments
+    for a_id, a_data in telemetry.items():
+        b_id = peers.get(a_id)
+        if not b_id:
+            continue
+        # process each undirected link once
+        key = tuple(sorted([a_id, b_id]))
+        if key in visited_pairs:
+            continue
+        visited_pairs.add(key)
+
+        b_data = telemetry[b_id]
+
+        sa = a_data.get('interface_status', 'unknown')
+        sb = b_data.get('interface_status', 'unknown')
+
+        a_tx = float(a_data.get('tx_rate', 0.0))
+        a_rx = float(a_data.get('rx_rate', 0.0))
+        b_tx = float(b_data.get('tx_rate', 0.0))
+        b_rx = float(b_data.get('rx_rate', 0.0))
+
+        # Only attempt counter fusion if both are not explicitly down; down logic handled later
+        if sa != 'down' and sb != 'down':
+            # Direction a->b: a_tx vs b_rx
+            abs_ab = abs(a_tx - b_rx)
+            max_ab = max(1.0, a_tx, b_rx)
+            diff_ab = abs_ab / max_ab
+            tol_ab = 0.05 if max(a_tx, b_rx) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+
+            if diff_ab > tol_ab and abs_ab > ABS_GUARD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+                if diff_ab <= 2 * tol_ab:
+                    # Partial averaging near threshold
+                    k = (diff_ab - tol_ab) / max(tol_ab, 1e-9)
+                    new_a_tx = a_tx * (1.0 - k) + avg_ab * k
+                    new_b_rx = b_rx * (1.0 - k) + avg_ab * k
+                else:
+                    # Full averaging for clear violations
+                    new_a_tx = avg_ab
+                    new_b_rx = avg_ab
+                field_value_adjust[(a_id, 'tx')] = new_a_tx
+                field_value_adjust[(b_id, 'rx')] = new_b_rx
+                # Confidence aligned with disagreement magnitude
+                conf_ab = clamp(1.0 - diff_ab)
+                field_conf_assign[(a_id, 'tx')] = conf_ab
+                field_conf_assign[(b_id, 'rx')] = conf_ab
+            else:
+                # Within tolerance: set strong confidence floors
+                if max(a_tx, b_rx) >= 10.0 and diff_ab <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(a_id, 'tx')] = max(field_conf_floor.get((a_id, 'tx'), 0.0), floor)
+                field_conf_floor[(b_id, 'rx')] = max(field_conf_floor.get((b_id, 'rx'), 0.0), floor)
+
+            # Direction b->a: b_tx vs a_rx
+            abs_ba = abs(b_tx - a_rx)
+            max_ba = max(1.0, b_tx, a_rx)
+            diff_ba = abs_ba / max_ba
+            tol_ba = 0.05 if max(b_tx, a_rx) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+
+            if diff_ba > tol_ba and abs_ba > ABS_GUARD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+                if diff_ba <= 2 * tol_ba:
+                    k = (diff_ba - tol_ba) / max(tol_ba, 1e-9)
+                    new_b_tx = b_tx * (1.0 - k) + avg_ba * k
+                    new_a_rx = a_rx * (1.0 - k) + avg_ba * k
+                else:
+                    new_b_tx = avg_ba
+                    new_a_rx = avg_ba
+                field_value_adjust[(b_id, 'tx')] = new_b_tx
+                field_value_adjust[(a_id, 'rx')] = new_a_rx
+                conf_ba = clamp(1.0 - diff_ba)
+                field_conf_assign[(b_id, 'tx')] = conf_ba
+                field_conf_assign[(a_id, 'rx')] = conf_ba
+            else:
+                if max(b_tx, a_rx) >= 10.0 and diff_ba <= 0.005:
+                    floor = 0.99
+                else:
+                    floor = 0.98
+                field_conf_floor[(b_id, 'tx')] = max(field_conf_floor.get((b_id, 'tx'), 0.0), floor)
+                field_conf_floor[(a_id, 'rx')] = max(field_conf_floor.get((a_id, 'rx'), 0.0), floor)
+
+    # Second pass: repair using planned adjustments and assign calibrated confidences
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = float(data.get('rx_rate', 0.0))
+        tx_rate = float(data.get('tx_rate', 0.0))
+        connected_to = data.get('connected_to')
+
+        # Default: identity repair with high initial confidence; floors/penalties adjust later
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        # Peer snapshot for redundancy use
+        peer_status = None
+        if connected_to and connected_to in telemetry:
+            peer = telemetry[connected_to]
+            peer_status = peer.get('interface_status', 'unknown')
+
+        # Enforce interface consistency: if either side is down, set effective down and zero rates
+        if interface_status == 'down' or (peer_status == 'down' if peer_status is not None else False):
+            both_down = (interface_status == 'down' and (peer_status == 'down' if peer_status is not None else False))
+            repaired_status = 'down'
+            repaired_rx = 0.0
+            repaired_tx = 0.0
+            status_confidence = 0.95 if both_down else 0.7
+            rx_confidence = status_confidence
+            tx_confidence = status_confidence
+        else:
+            # Apply pairwise planned adjustments if available
+            if (interface_id, 'rx') in field_value_adjust:
+                repaired_rx = float(field_value_adjust[(interface_id, 'rx')])
+                rx_confidence = min(rx_confidence, field_conf_assign.get((interface_id, 'rx'), rx_confidence))
+                rx_confidence = field_conf_assign.get((interface_id, 'rx'), rx_confidence)
+            if (interface_id, 'tx') in field_value_adjust:
+                repaired_tx = float(field_value_adjust[(interface_id, 'tx')])
+                tx_confidence = min(tx_confidence, field_conf_assign.get((interface_id, 'tx'), tx_confidence))
+                tx_confidence = field_conf_assign.get((interface_id, 'tx'), tx_confidence)
+
+            # If statuses differ (but neither side is down), reduce status confidence moderately
+            if connected_to and connected_to in telemetry:
+                peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+                if interface_status != peer_status:
+                    status_confidence = 0.6
+
+            # Apply confidence floors for in-tolerance agreements
+            rx_floor = field_conf_floor.get((interface_id, 'rx'))
+            tx_floor = field_conf_floor.get((interface_id, 'tx'))
+            if rx_floor is not None:
+                rx_confidence = max(rx_confidence, rx_floor)
+            if tx_floor is not None:
+                tx_confidence = max(tx_confidence, tx_floor)
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, clamp(rx_confidence))
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, clamp(tx_confidence))
+        repaired_data['interface_status'] = (interface_status, repaired_status, clamp(status_confidence))
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Router-level flow conservation: direction-aware confidence attenuation
+    # Build router->interfaces mapping (prefer topology, augment with telemetry hints)
+    router_ifaces: Dict[str, List[str]] = {r: list(if_list) for r, if_list in topology.items()}
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        if lr:
+            router_ifaces.setdefault(lr, [])
+            if if_id not in router_ifaces[lr]:
+                router_ifaces[lr].append(if_id)
+        rr = d.get('remote_router')
+        if rr and rr not in router_ifaces:
+            router_ifaces[rr] = []
+    # Compute per-router residual mismatch from repaired values
+    router_resid: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_resid[r] = abs(sum_tx - sum_rx) / denom
+    # Apply direction-aware penalties with gentle floor
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        resid_local = router_resid.get(lr, 0.0)
+        resid_remote = router_resid.get(rr, 0.0)
+        penalty_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.7, 1.0)
+        penalty_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.7, 1.0)
+        orx, rrx, rc = result[if_id]['rx_rate']
+        otx, rtx, tc = result[if_id]['tx_rate']
+        result[if_id]['rx_rate'] = (orx, rrx, clamp(rc * penalty_rx))
+        result[if_id]['tx_rate'] = (otx, rtx, clamp(tc * penalty_tx))
+
+    return result
+=======
+    # Router-level flow conservation: micro-adjustments on dominating dangling interfaces
+    # Build router->interfaces mapping (prefer topology, augment with telemetry hints)
+    router_ifaces: Dict[str, List[str]] = {r: list(if_list) for r, if_list in topology.items()}
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        if lr:
+            router_ifaces.setdefault(lr, [])
+            if if_id not in router_ifaces[lr]:
+                router_ifaces[lr].append(if_id)
+        rr = d.get('remote_router')
+        if rr and rr not in router_ifaces:
+            router_ifaces[rr] = []
+
+    # Compute initial per-router sums and residuals to target micro-adjustments
+    router_sums: Dict[str, Tuple[float, float]] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        router_sums[r] = (sum_tx, sum_rx)
+
+    # Apply tightly scoped micro-adjustments only on dominating dangling interfaces
+    for r, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_sums.get(r, (0.0, 0.0))
+        imbalance = sum_tx - sum_rx
+        abs_imb = abs(imbalance)
+        if abs_imb <= 0.0:
+            continue  # already balanced
+
+        denom = max(1.0, sum_tx, sum_rx)
+        resid_frac = abs_imb / denom
+        # Candidate interfaces: unpaired and up
+        candidates = []
+        for if_id in if_list:
+            if if_id not in result:
+                continue
+            # unpaired if connected_to missing or not in telemetry
+            connected_to = result[if_id].get('connected_to')
+            is_unpaired = not connected_to or connected_to not in telemetry
+            status = result[if_id]['interface_status'][1]
+            if is_unpaired and status == 'up':
+                txv = float(result[if_id]['tx_rate'][1])
+                rxv = float(result[if_id]['rx_rate'][1])
+                contrib = abs(txv - rxv)
+                candidates.append((contrib, if_id, txv, rxv))
+
+        if not candidates:
+            continue
+
+        # Pick dominating candidate
+        candidates.sort(reverse=True)
+        top_contrib, top_if, txv, rxv = candidates[0]
+        if top_contrib < 0.5 * abs_imb:
+            continue  # not dominating enough
+
+        # Compute nudge magnitude capped at 2%
+        alpha = min(0.02, 0.5 * resid_frac)
+        if alpha <= 0.0:
+            continue
+
+        # Adjust only the larger counter toward reducing router imbalance
+        orx, rrx, rc = result[top_if]['rx_rate']
+        otx, rtx, tc = result[top_if]['tx_rate']
+
+        if imbalance > 0:
+            # sum_tx > sum_rx: decrease tx or increase rx
+            if rtx >= rrx:
+                new_tx = rtx * (1.0 - alpha)
+                result[top_if]['tx_rate'] = (otx, new_tx, clamp(tc + 0.05 * (alpha / 0.02)))
+            else:
+                new_rx = rrx * (1.0 + alpha)
+                result[top_if]['rx_rate'] = (orx, new_rx, clamp(rc + 0.05 * (alpha / 0.02)))
+        else:
+            # sum_tx < sum_rx: decrease rx or increase tx
+            if rrx >= rtx:
+                new_rx = rrx * (1.0 - alpha)
+                result[top_if]['rx_rate'] = (orx, new_rx, clamp(rc + 0.05 * (alpha / 0.02)))
+            else:
+                new_tx = rtx * (1.0 + alpha)
+                result[top_if]['tx_rate'] = (otx, new_tx, clamp(tc + 0.05 * (alpha / 0.02)))
+
+    # Recompute per-router residual mismatch from possibly adjusted values
+    router_resid: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_resid[r] = abs(sum_tx - sum_rx) / denom
+
+    # Apply direction-aware penalties with gentle floor
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        resid_local = router_resid.get(lr, 0.0)
+        resid_remote = router_resid.get(rr, 0.0)
+        penalty_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.7, 1.0)
+        penalty_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.7, 1.0)
+        orx, rrx, rc = result[if_id]['rx_rate']
+        otx, rtx, tc = result[if_id]['tx_rate']
+        result[if_id]['rx_rate'] = (orx, rrx, clamp(rc * penalty_rx))
+        result[if_id]['tx_rate'] = (otx, rtx, clamp(tc * penalty_tx))
+
+    return result
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,241 @@
+<NAME>
+pairwise_link_reconciliation
+</NAME>
+
+<DESCRIPTION>
+I propose adding a third “link reconciliation” pass after router-level flow conservation scaling. The issue with the current algorithm is that router-level scaling can reintroduce asymmetry across a physical link (my_tx vs their_rx and my_rx vs their_tx), which degrades counter accuracy. To address this, we:
+
+- Compute initial post-scaling values for each interface.
+- For each connected, up-up link, if the post-scaling asymmetry exceeds the hardening threshold, reconcile the pair by adjusting only the more suspicious side to match the other.
+- Suspicion is computed per direction, combining link residuals from the hardening phase with router-level signals: magnitude of the applied scaling and router imbalance.
+- This preserves flow conservation on the less suspicious router while enforcing link symmetry, improving counter accuracy without overly perturbing good data.
+- Confidence is then computed using residuals after reconciliation, with existing change penalties and router factors retained for calibration.
+
+This approach leverages redundant signals (peer counters and router aggregates) per the research principles, improves counter accuracy, and keeps confidence scores aligned with actual repair quality.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Assemble final results with calibrated confidence
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    for iface, data in telemetry.items():
+        local_status = pre[iface]['local_status']
+        peer_status = pre[iface]['peer_status']
+        had_peer = pre[iface]['had_peer']
+        rx_orig = float(max(0.0, data.get('rx_rate', 0.0)))
+        tx_orig = float(max(0.0, data.get('tx_rate', 0.0)))
+
+        # Apply router scaling
+        rx_repaired = pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0)
+        tx_repaired = pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0)
+
+        # Confidence components based on post-repair residuals
+        peer_id = peers.get(iface)
+        if had_peer and peer_id in pre and local_status == 'up' and (peer_status == 'up'):
+            peer_tx_after = pre[peer_id]['pre_tx'] * scale_tx.get(peer_id, 1.0)
+            peer_rx_after = pre[peer_id]['pre_rx'] * scale_rx.get(peer_id, 1.0)
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            rx_link_conf = max(0.0, 1.0 - rx_resid)
+            tx_link_conf = max(0.0, 1.0 - tx_resid)
+        elif local_status == 'down':
+            # When locally down and we zeroed, high confidence if zeroed
+            rx_link_conf = 0.85 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.85 if tx_repaired == 0.0 else 0.5
+        else:
+            # No reliable peer information
+            rx_link_conf = 0.6
+            tx_link_conf = 0.6
+
+        # Router imbalance factor
+        router_id = data.get('local_router')
+        imbalance = router_imbalance.get(router_id, 0.0)
+        router_factor = max(0.2, 1.0 - imbalance)
+
+        # Change penalty: reduce confidence for large changes from original
+        rx_change = rel_diff(rx_orig, rx_repaired)
+        tx_change = rel_diff(tx_orig, tx_repaired)
+        rx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, tx_change))
+
+        rx_confidence = max(0.0, min(1.0, rx_link_conf * router_factor * rx_change_factor))
+        tx_confidence = max(0.0, min(1.0, tx_link_conf * router_factor * tx_change_factor))
+
+        # Status confidence adjustments (we keep status unchanged unless egregious)
+        status_confidence = 1.0
+        repaired_status = data.get('interface_status', 'unknown')
+
+        # If statuses differ across the link, reduce confidence
+        peer_id = peers.get(iface)
+        if peer_id and peer_id in telemetry:
+            peer_status_raw = str(telemetry[peer_id].get('interface_status', 'unknown')).lower()
+            if peer_status_raw not in ('up', 'down'):
+                peer_status_raw = 'up'
+            if str(repaired_status).lower() != peer_status_raw:
+                status_confidence = min(status_confidence, 0.5)
+
+        # If interface reports down but had non-zero original counters, lower status confidence
+        if str(repaired_status).lower() == 'down' and (rx_orig > 0.0 or tx_orig > 0.0):
+            status_confidence = min(status_confidence, 0.6)
+
+        # Ensure down interfaces have zero repaired rates
+        if str(repaired_status).lower() == 'down':
+            rx_repaired = 0.0
+            tx_repaired = 0.0
+
+        # Build output
+        repaired_entry: Dict[str, Tuple] = {}
+        repaired_entry['rx_rate'] = (rx_orig, rx_repaired, rx_confidence)
+        repaired_entry['tx_rate'] = (tx_orig, tx_repaired, tx_confidence)
+        repaired_entry['interface_status'] = (data.get('interface_status', 'unknown'), repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_entry['connected_to'] = data.get('connected_to')
+        repaired_entry['local_router'] = data.get('local_router')
+        repaired_entry['remote_router'] = data.get('remote_router')
+
+        result[iface] = repaired_entry
+
+    return result
+=======
+    # Third pass: pairwise link reconciliation to enforce link symmetry post router scaling
+    # Build post-scaled values
+    post: Dict[str, Dict[str, float]] = {}
+    for iface in telemetry:
+        post[iface] = {
+            'rx': pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0),
+            'tx': pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0),
+        }
+
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Both sides must be locally up to trust counters for reconciliation
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Compute current residuals
+        tx_pair_resid = rel_diff(post[iface]['tx'], post[peer_id]['rx'])
+        rx_pair_resid = rel_diff(post[iface]['rx'], post[peer_id]['tx'])
+
+        # Suspicion metrics combine link residuals and router-level signals
+        def susp(ifc: str, kind: str) -> float:
+            router_id_local = telemetry.get(ifc, {}).get('local_router')
+            imb = router_imbalance.get(router_id_local, 0.0)
+            if kind == 'tx':
+                return pre[ifc]['tx_link_diff'] + 0.5 * abs(scale_tx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+            else:
+                return pre[ifc]['rx_link_diff'] + 0.5 * abs(scale_rx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+
+        # Reconcile A.tx <-> B.rx if needed
+        if tx_pair_resid > HARDENING_THRESHOLD:
+            a_tx_s = susp(iface, 'tx')
+            b_rx_s = susp(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                # Adjust the more suspicious side to match its peer
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx if needed
+        if rx_pair_resid > HARDENING_THRESHOLD:
+            a_rx_s = susp(iface, 'rx')
+            b_tx_s = susp(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+
+    # Assemble final results with calibrated confidence (based on post-reconciliation values)
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    for iface, data in telemetry.items():
+        local_status = pre[iface]['local_status']
+        peer_status = pre[iface]['peer_status']
+        had_peer = pre[iface]['had_peer']
+        rx_orig = float(max(0.0, data.get('rx_rate', 0.0)))
+        tx_orig = float(max(0.0, data.get('tx_rate', 0.0)))
+
+        rx_repaired = post[iface]['rx']
+        tx_repaired = post[iface]['tx']
+
+        # Confidence components based on post-repair residuals
+        peer_id = peers.get(iface)
+        if had_peer and peer_id in pre and local_status == 'up' and (peer_status == 'up'):
+            peer_tx_after = post[peer_id]['tx']
+            peer_rx_after = post[peer_id]['rx']
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            rx_link_conf = max(0.0, 1.0 - rx_resid)
+            tx_link_conf = max(0.0, 1.0 - tx_resid)
+        elif local_status == 'down':
+            # When locally down and we zeroed, high confidence if zeroed
+            rx_link_conf = 0.85 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.85 if tx_repaired == 0.0 else 0.5
+        else:
+            # No reliable peer information
+            rx_link_conf = 0.6
+            tx_link_conf = 0.6
+
+        # Router imbalance factor
+        router_id = data.get('local_router')
+        imbalance = router_imbalance.get(router_id, 0.0)
+        router_factor = max(0.2, 1.0 - imbalance)
+
+        # Change penalty: reduce confidence for large changes from original
+        rx_change = rel_diff(rx_orig, rx_repaired)
+        tx_change = rel_diff(tx_orig, tx_repaired)
+        rx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, rx_change))
+        tx_change_factor = max(0.2, 1.0 - 0.5 * min(1.0, tx_change))
+
+        rx_confidence = max(0.0, min(1.0, rx_link_conf * router_factor * rx_change_factor))
+        tx_confidence = max(0.0, min(1.0, tx_link_conf * router_factor * tx_change_factor))
+
+        # Status confidence adjustments (we keep status unchanged unless egregious)
+        status_confidence = 1.0
+        repaired_status = data.get('interface_status', 'unknown')
+
+        # If statuses differ across the link, reduce confidence
+        peer_id = peers.get(iface)
+        if peer_id and peer_id in telemetry:
+            peer_status_raw = str(telemetry[peer_id].get('interface_status', 'unknown')).lower()
+            if peer_status_raw not in ('up', 'down'):
+                peer_status_raw = 'up'
+            if str(repaired_status).lower() != peer_status_raw:
+                status_confidence = min(status_confidence, 0.5)
+
+        # If interface reports down but had non-zero original counters, lower status confidence
+        if str(repaired_status).lower() == 'down' and (rx_orig > 0.0 or tx_orig > 0.0):
+            status_confidence = min(status_confidence, 0.6)
+
+        # Ensure down interfaces have zero repaired rates
+        if str(repaired_status).lower() == 'down':
+            rx_repaired = 0.0
+            tx_repaired = 0.0
+
+        # Build output
+        repaired_entry: Dict[str, Tuple] = {}
+        repaired_entry['rx_rate'] = (rx_orig, rx_repaired, rx_confidence)
+        repaired_entry['tx_rate'] = (tx_orig, tx_repaired, tx_confidence)
+        repaired_entry['interface_status'] = (data.get('interface_status', 'unknown'), repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_entry['connected_to'] = data.get('connected_to')
+        repaired_entry['local_router'] = data.get('local_router')
+        repaired_entry['remote_router'] = data.get('remote_router')
+
+        result[iface] = repaired_entry
+
+    return result
+>>>>>>> REPLACE
+
+</DIFF>

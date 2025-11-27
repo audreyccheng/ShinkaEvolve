@@ -1,0 +1,221 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+try:
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+except Exception as e:
+    # Allow execution to proceed if modules are already in path or mock environment
+    pass
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Stochastic Beam Search followed by Local Search.
+    
+    Strategy:
+    1. Beam Search Construction:
+       - Maintains 'BEAM_WIDTH' parallel partial schedules.
+       - Expands schedules by one transaction at a time.
+       - Candidate Selection:
+         - Uses weighted sampling (weight = txn duration) to favor LPT (Longest Processing Time).
+         - Uses exhaustive search when few transactions remain (Tail Optimization).
+       - Pruning: Keeps the top K schedules based on (Makespan, -LastTxnDuration).
+    2. Local Search Refinement:
+       - Takes the best schedule from the beam.
+       - Applies Shift (Insertion) and Swap operators to tighten the schedule.
+
+    Args:
+        workload: Workload object
+        num_seqs: Used to determine the Beam Width (computational budget)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+    
+    # 1. Metric Precomputation (Duration Heuristic)
+    # Long transactions are harder to schedule, so we track them to prioritize or tie-break
+    txn_metrics = {}
+    try:
+        for t in range(workload.num_txns):
+            # Access duration from the transaction structure
+            # Structure assumed: txns[t] -> list of sequences -> [0] -> [3] is duration
+            duration = workload.txns[t][0][3]
+            txn_metrics[t] = duration
+    except (IndexError, AttributeError, TypeError):
+        # Fallback
+        for t in range(workload.num_txns):
+            txn_metrics[t] = 1.0
+
+    # 2. Beam Search Initialization
+    # Beam Width scales with the budget (num_seqs), usually around 10
+    BEAM_WIDTH = max(4, int(num_seqs))
+    
+    # Beam State: (current_cost, schedule_list, remaining_indices_list)
+    # Start with one empty state
+    current_beam = [(0, [], list(range(workload.num_txns)))]
+    
+    # 3. Construction Loop
+    # Iterate until all transactions are scheduled
+    for _ in range(workload.num_txns):
+        candidates_pool = []
+        
+        # Expand each path in the current beam
+        for parent_cost, parent_sched, parent_remaining in current_beam:
+            
+            # Determine candidates to check
+            next_candidates = set()
+            
+            # OPTIMIZATION: Exhaustive Tail
+            # If the problem size is small, check all possibilities to ensure optimal packing at the end
+            if len(parent_remaining) <= 20:
+                next_candidates.update(parent_remaining)
+            else:
+                # OPTIMIZATION: Weighted Probabilistic Sampling
+                # Check a subset of candidates, prioritizing those with long durations
+                weights = [txn_metrics[t] for t in parent_remaining]
+                
+                # Sample k items based on weights
+                # k=6 provides a good balance of exploration vs speed
+                samples = random.choices(parent_remaining, weights=weights, k=6)
+                next_candidates.update(samples)
+                
+                # Diversity: Add pure random candidates to ensure we don't miss small, easy-to-fit items
+                random_samples = random.sample(parent_remaining, min(len(parent_remaining), 2))
+                next_candidates.update(random_samples)
+            
+            # Evaluate all selected candidates
+            for txn_idx in next_candidates:
+                new_sched = parent_sched + [txn_idx]
+                
+                # Calculate cost (Makespan)
+                # Note: get_opt_seq_cost computes cost of the full sequence passed
+                new_cost = workload.get_opt_seq_cost(new_sched)
+                
+                # Score Metric for Sorting: (Cost, -Duration)
+                # Primary: Minimize Cost.
+                # Secondary: Maximize Duration of the added transaction.
+                # Reasoning: If two transactions result in the same makespan increase, 
+                # prefer the longer one as it "fills" the available parallelism better.
+                sort_metric = (new_cost, -txn_metrics.get(txn_idx, 0))
+                
+                # Construct new remaining list
+                new_remaining = list(parent_remaining)
+                new_remaining.remove(txn_idx)
+                
+                candidates_pool.append((sort_metric, new_sched, new_remaining))
+        
+        # Pruning: Select best candidates for next iteration
+        # Sort by metric (Lowest Cost, then Heaviest Txn)
+        candidates_pool.sort(key=lambda x: x[0])
+        
+        # Keep top BEAM_WIDTH states
+        # We store just the data needed for the next step
+        current_beam = [ (x[0][0], x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH] ]
+    
+    # 4. Extract Best Constructed Schedule
+    best_beam_state = current_beam[0]
+    current_cost = best_beam_state[0]
+    current_schedule = best_beam_state[1]
+    
+    # 5. Local Search Refinement
+    # Apply Shift (mostly) and Swap operators to improve the result
+    search_steps = 800
+    no_improv_limit = 150
+    no_improv = 0
+    
+    for _ in range(search_steps):
+        if no_improv >= no_improv_limit:
+            break
+            
+        neighbor = list(current_schedule)
+        
+        # Operator Selection: 80% Shift, 20% Swap
+        if random.random() < 0.8:
+            # Shift (Insert) Operator
+            src = random.randint(0, len(neighbor) - 1)
+            dst = random.randint(0, len(neighbor) - 1)
+            if src == dst:
+                continue
+            txn = neighbor.pop(src)
+            neighbor.insert(dst, txn)
+        else:
+            # Swap Operator
+            i = random.randint(0, len(neighbor) - 1)
+            j = random.randint(0, len(neighbor) - 1)
+            if i == j:
+                continue
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+            
+        new_cost = workload.get_opt_seq_cost(neighbor)
+        
+        if new_cost < current_cost:
+            current_cost = new_cost
+            current_schedule = neighbor
+            no_improv = 0
+        else:
+            no_improv += 1
+            
+    return current_cost, current_schedule
+
+
+def get_random_costs():
+    """Evaluate scheduling algorithm on three different workloads."""
+    start_time = time.time()
+    
+    # Beam width parameter passed as num_seqs
+    num_seqs = 10
+    
+    # Process workloads
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, num_seqs)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, num_seqs)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, num_seqs)
+    
+    total_makespan = makespan1 + makespan2 + makespan3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+# EVOLVE-BLOCK-END

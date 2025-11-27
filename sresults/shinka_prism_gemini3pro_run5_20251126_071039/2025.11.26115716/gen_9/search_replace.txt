@@ -1,0 +1,119 @@
+<NAME>
+projected_kvpr_load_sort
+</NAME>
+
+<DESCRIPTION>
+I propose changing the placement algorithm to minimize the *projected* (resultant) KVPR rather than the *current* KVPR. Minimizing current KVPR only looks at the state before placement, which can lead to placing a large or high-load model on a GPU that looks "cool" but has insufficient capacity to absorb the new model without a massive pressure spike. Projected KVPR explicitly calculates the KVPR *after* the hypothetical placement and minimizes that, which directly optimizes the target metric (minimizing the maximum KVPR).
+
+Additionally, I refine the sorting strategy. While sorting by `req_rate/slo` (load) is effective (as seen in the current program's performance), adding `model_size` as a secondary sorting key ensures that among models with similar load, we place larger ones first. This helps avoid memory fragmentation and ensures large models are placed when GPUs have maximum available capacity, further mitigating pressure spikes.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+
+    # Greedy KVPR-minimizing placement based on Algorithm 1 (without τ check)
+    # 1) Sort models by r_j / s_j in descending order
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU that minimizes current KVPR while fitting in memory
+    for model in sorted_models:
+        best_idx = None
+        best_ratio = float('inf')
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= shared_kv[gpu_id] and shared_kv[gpu_id] > 0:
+                current_ratio = weighted_req_rate[gpu_id] / shared_kv[gpu_id]
+                if current_ratio < best_ratio:
+                    best_ratio = current_ratio
+                    best_idx = gpu_id
+
+        # Failure: if no GPU can fit, raise an error instead of overcommitting
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += model.req_rate / model.slo
+        shared_kv[best_idx] -= model.model_size
+
+    return placement
+=======
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+
+    # Greedy KVPR-minimizing placement
+    # 1) Sort models by r_j / s_j descending (high load first).
+    #    Secondary sort by model_size descending (large items first).
+    sorted_models = sorted(models, key=lambda m: (m.req_rate / m.slo, m.model_size), reverse=True)
+
+    # 2) Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    shared_kv = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]   # sum of r_j / s_j per GPU
+
+    # 3) Assign each model to the GPU that minimizes *resultant* KVPR
+    for model in sorted_models:
+        best_idx = None
+        best_kvpr = float('inf')
+
+        w_m = model.req_rate / model.slo
+        z_m = model.model_size
+
+        # Try to find a GPU where the model fits and leaves some memory (>0)
+        for gpu_id in range(gpu_num):
+            remaining_mem = shared_kv[gpu_id] - z_m
+            if remaining_mem > 0:
+                # Calculate projected KVPR: (current_load + new_load) / remaining_mem
+                new_kvpr = (weighted_req_rate[gpu_id] + w_m) / remaining_mem
+                if new_kvpr < best_kvpr:
+                    best_kvpr = new_kvpr
+                    best_idx = gpu_id
+
+        # Fallback: if no GPU has >0 remaining memory, try exact fit (remaining == 0)
+        if best_idx is None:
+            for gpu_id in range(gpu_num):
+                if shared_kv[gpu_id] >= z_m:
+                    best_idx = gpu_id
+                    break
+
+        # Failure: if no GPU can fit, raise an error
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {shared_kv}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += w_m
+        shared_kv[best_idx] -= z_m
+
+    return placement
+>>>>>>> REPLACE
+</DIFF>

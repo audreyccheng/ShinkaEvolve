@@ -1,0 +1,290 @@
+<NAME>
+add_residual_helper
+</NAME>
+
+<DESCRIPTION>
+Adds a `get_residual` helper function alongside `get_flow_error`. This function calculates the exact traffic value required on a specific interface to perfectly balance a verifiable router. This enables the "Residual Synthesis" capability, allowing the algorithm to hypothesize traffic values that aren't present in the raw telemetry (e.g., repairing double-dead links where both ends report zero but connected routers imply flow).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Helper: Flow Error Calculation ---
+    def get_flow_error(rid, if_target=None, field=None, value=None):
+        """
+        Calculates the relative flow error (imbalance) for a router.
+        Optionally allows substituting a speculative value for one interface.
+        """
+        if rid not in verifiable_routers:
+            return None
+
+        sum_rx, sum_tx = 0.0, 0.0
+        for iface in router_map[rid]:
+            # Use speculative value if this is the target interface
+            if iface == if_target:
+                r = value if field == 'rx' else state[iface]['rx']
+                t = value if field == 'tx' else state[iface]['tx']
+            else:
+                r = state[iface]['rx']
+                t = state[iface]['tx']
+            sum_rx += r
+            sum_tx += t
+
+        diff = abs(sum_rx - sum_tx)
+        denom = max(sum_rx, sum_tx, 1.0)
+        return diff / denom
+
+    # --- 2. Status Repair ---
+=======
+    # --- Helper: Flow Calculations ---
+    def get_flow_error(rid, if_target=None, field=None, value=None):
+        """
+        Calculates the relative flow error (imbalance) for a router.
+        Optionally allows substituting a speculative value for one interface.
+        """
+        if rid not in verifiable_routers:
+            return None
+
+        sum_rx, sum_tx = 0.0, 0.0
+        for iface in router_map[rid]:
+            # Use speculative value if this is the target interface
+            if iface == if_target:
+                r = value if field == 'rx' else state[iface]['rx']
+                t = value if field == 'tx' else state[iface]['tx']
+            else:
+                r = state[iface]['rx']
+                t = state[iface]['tx']
+            sum_rx += r
+            sum_tx += t
+
+        diff = abs(sum_rx - sum_tx)
+        denom = max(sum_rx, sum_tx, 1.0)
+        return diff / denom
+
+    def get_residual(rid, if_target, field):
+        """
+        Calculates the value required to perfectly balance a verifiable router.
+        Returns None if router is not verifiable or if the implied value is negative.
+        """
+        if rid not in verifiable_routers:
+            return None
+
+        sum_in, sum_out = 0.0, 0.0
+        for iface in router_map[rid]:
+            r = state[iface]['rx']
+            t = state[iface]['tx']
+
+            # Exclude the target interface component
+            if iface == if_target:
+                if field == 'rx': r = 0.0
+                else: t = 0.0
+
+            sum_in += r
+            sum_out += t
+
+        # Balance: In == Out
+        # if field == 'rx' (solving for input): val = TotalOut - OtherIn
+        if field == 'rx':
+            val = sum_out - sum_in
+        # if field == 'tx' (solving for output): val = TotalIn - OtherOut
+        else:
+            val = sum_in - sum_out
+
+        if val < 0: return 0.0
+        return val
+
+    # --- 2. Status Repair ---
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+improve_rate_repair_logic
+</NAME>
+
+<DESCRIPTION>
+Completely refactors the Rate Repair loop to:
+1. Synthesize candidate values using `get_residual`, allowing recovery from "double-dead" links.
+2. Use continuous scoring (`min(err, 1.0)`) instead of discrete voting buckets, providing finer gradients for selecting the best traffic value.
+3. Apply a weighted penalty (0.25) to zero values when a plausible non-zero candidate exists, preferring active traffic if flow conservation allows.
+4. Smooth results by averaging if the best candidate is very close to the mean of the original measurements.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            mag = max(val_tx, val_rx, 1.0)
+
+            if diff < max(mag * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = (val_tx + val_rx) / 2.0
+            else:
+                # Disagreement: Resolve conflict using Flow Conservation constraints
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # Calculate errors if we chose TX value
+                err_local_tx = get_flow_error(rid_local, if_id, 'tx', val_tx)
+                err_remote_tx = get_flow_error(rid_remote, peer_id, 'rx', val_tx)
+
+                # Calculate errors if we chose RX value
+                err_local_rx = get_flow_error(rid_local, if_id, 'tx', val_rx)
+                err_remote_rx = get_flow_error(rid_remote, peer_id, 'rx', val_rx)
+
+                # Scoring (Lower is better)
+                # 0.0 = Verified Good, 0.5 = Unverifiable, 1.0 = Verified Bad
+                def get_vote(err):
+                    if err is None: return 0.5
+                    if err < FLOW_TOLERANCE: return 0.0
+                    return 1.0
+
+                score_tx = get_vote(err_local_tx) + get_vote(err_remote_tx)
+                score_rx = get_vote(err_local_rx) + get_vote(err_remote_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                if val_tx < MIN_ACTIVITY and val_rx > MIN_ACTIVITY: score_tx += 0.4
+                if val_rx < MIN_ACTIVITY and val_tx > MIN_ACTIVITY: score_rx += 0.4
+
+                # Selection
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = (val_tx + val_rx) / 2.0 # Tie -> Average
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+=======
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            rid_local = s['local_router']
+            rid_remote = s['remote_router']
+
+            # 1. Gather Candidates
+            candidates = [val_tx, val_rx]
+
+            # Try to synthesize values from flow conservation (Residuals)
+            res_tx = get_residual(rid_local, if_id, 'tx')
+            if res_tx is not None and res_tx > MIN_ACTIVITY:
+                candidates.append(res_tx)
+
+            res_rx = get_residual(rid_remote, peer_id, 'rx')
+            if res_rx is not None and res_rx > MIN_ACTIVITY:
+                candidates.append(res_rx)
+
+            # Deduplicate
+            unique_cands = []
+            for c in candidates:
+                if not any(abs(c - u) < 1e-4 for u in unique_cands):
+                    unique_cands.append(c)
+
+            # 2. Evaluate Candidates
+            best_val = val_tx
+            best_score = float('inf')
+
+            for cand in unique_cands:
+                # Calculate system-wide error for this candidate
+                err_local = get_flow_error(rid_local, if_id, 'tx', cand)
+                err_remote = get_flow_error(rid_remote, peer_id, 'rx', cand)
+
+                # Continuous Scoring: penalize error directly
+                def get_score(err):
+                    if err is None: return 0.05 # Small penalty for uncertainty
+                    return min(err, 1.0)
+
+                score = get_score(err_local) + get_score(err_remote)
+
+                # Heuristic: Penalize zero if a non-zero candidate is plausible
+                if cand < MIN_ACTIVITY and max(unique_cands) > MIN_ACTIVITY:
+                    score += 0.25
+
+                if score < best_score:
+                    best_score = score
+                    best_val = cand
+
+            # Symmetry Preservation:
+            # If the best value is very close to average of originals, use average for smoothing
+            avg_orig = (val_tx + val_rx) / 2.0
+            if abs(best_val - avg_orig) < max(avg_orig * TOLERANCE, MIN_ACTIVITY):
+                best_val = avg_orig
+
+            # Update state immediately
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+refine_confidence_logic
+</NAME>
+
+<DESCRIPTION>
+Refines confidence calibration by:
+1. Lowering confidence for repairs that are only verified by the remote router (0.90 -> 0.85), as remote verification is a weaker signal than local verification.
+2. Scaling confidence for heuristic "Dead Counter" repairs based on the magnitude of the traffic recovered. Recovering a large flow (>5 Mbps) warrants higher confidence (0.85) than a marginal one (0.75), improving calibration accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Significant Correction
+            if local_verified and remote_verified:
+                return 0.98 # Validated by both ends
+            if local_verified:
+                return 0.95 # Validated by local math
+            if remote_verified:
+                return 0.90 # Validated by remote math
+
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85
+
+            # Total guess / forced agreement
+            return 0.6
+=======
+            # Significant Correction
+            if local_verified and remote_verified:
+                return 0.98 # Validated by both ends
+            if local_verified:
+                return 0.95 # Validated by local math
+            if remote_verified:
+                return 0.85 # Validated by remote math (weaker signal)
+
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                # Scale confidence by magnitude (SNR)
+                if final > 5.0: return 0.85
+                return 0.75
+
+            # Total guess / forced agreement
+            return 0.6
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,202 @@
+<NAME>
+zero_rates_for_down_links
+</NAME>
+<DESCRIPTION>
+In the Status Repair phase, if an interface is determined to be 'down', explicitly set its rx and tx rates to 0.0 in the working state. This prevents "ghost traffic" (non-zero rates on down interfaces) from propagating during the subsequent rate consensus phase, improving counter repair accuracy.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+        elif orig_status != peer_status:
+            # We stick to original but with low confidence
+            conf = 0.5
+
+        state[if_id]['status'] = new_status
+        status_conf_map[if_id] = conf
+=======
+        elif orig_status != peer_status:
+            # We stick to original but with low confidence
+            conf = 0.5
+
+        state[if_id]['status'] = new_status
+        status_conf_map[if_id] = conf
+
+        # If we are confident the link is DOWN, force rates to zero
+        # This prevents "ghost traffic" from confusing the rate consensus
+        if new_status == 'down':
+            state[if_id]['rx'] = 0.0
+            state[if_id]['tx'] = 0.0
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+residual_error_confidence_calibration
+</NAME>
+<DESCRIPTION>
+Replace the final result generation and confidence calibration logic with a more sophisticated approach.
+1. Calculate residual flow errors for all verifiable routers after repairs.
+2. Penalize confidence scores if the local router still violates flow conservation (indicating unresolved errors).
+3. Adjust base confidence based on whether the value was changed, if it was verified by flow, and if there was an initial conflict with the peer.
+This improves confidence calibration by acknowledging uncertainty when the network state is not fully consistent.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+    # --- 4. Final Result Generation & Confidence Calibration ---
+    result = {}
+
+    for if_id, data in telemetry.items():
+        # Get Final Values
+        final_rx = state[if_id]['rx']
+        final_tx = state[if_id]['tx']
+        final_st = state[if_id]['status']
+
+        orig_rx = data.get('rx_rate', 0.0)
+        orig_tx = data.get('tx_rate', 0.0)
+        orig_st = data.get('interface_status', 'unknown')
+
+        # -- Calibrate Confidence --
+
+        def get_rate_confidence(orig, final, field):
+            # 1. Did we change the value?
+            if abs(orig - final) < 0.001:
+                return 1.0 # High confidence in original/unchanged data
+
+            # 2. If changed, was it verified by flow?
+            rid = data.get('local_router')
+            flow_err = calc_flow_error(rid, if_id, field, final)
+
+            if flow_err is not None and flow_err < FLOW_TOLERANCE:
+                return 0.95 # Very high confidence: Mathematics supports this
+
+            # 3. Was it a "Dead Counter" repair (0 -> Non-Zero)?
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.8 # Moderately high: 0 is a common error mode
+
+            # 4. Fallback
+            return 0.6 # Low confidence: Changed based on peer but no verification
+
+        rx_conf = get_rate_confidence(orig_rx, final_rx, 'rx')
+        tx_conf = get_rate_confidence(orig_tx, final_tx, 'tx')
+        st_conf = status_conf_map.get(if_id, 1.0)
+
+        # Sanity Check: If Down but Traffic, lower confidence
+        if final_st == 'down' and (final_rx > 1.0 or final_tx > 1.0):
+            rx_conf *= 0.5
+            tx_conf *= 0.5
+            st_conf *= 0.5
+
+        # Construct Output Tuple
+        res_entry = {
+            'rx_rate': (orig_rx, final_rx, rx_conf),
+            'tx_rate': (orig_tx, final_tx, tx_conf),
+            'interface_status': (orig_st, final_st, st_conf),
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router')
+        }
+        result[if_id] = res_entry
+
+    return result
+=======
+    # --- 4. Final Result Generation & Confidence Calibration ---
+
+    # Pre-calculate residual flow errors for verifiable routers
+    final_flow_errors = {}
+    for rid in verifiable_routers:
+        sum_rx = sum(state[iface]['rx'] for iface in router_interfaces[rid])
+        sum_tx = sum(state[iface]['tx'] for iface in router_interfaces[rid])
+        # Avoid division by zero
+        denom = max(sum_rx, sum_tx, 1.0)
+        final_flow_errors[rid] = abs(sum_rx - sum_tx) / denom
+
+    result = {}
+
+    for if_id, data in telemetry.items():
+        # Get Final Values
+        final_rx = state[if_id]['rx']
+        final_tx = state[if_id]['tx']
+        final_st = state[if_id]['status']
+
+        orig_rx = data.get('rx_rate', 0.0)
+        orig_tx = data.get('tx_rate', 0.0)
+        orig_st = data.get('interface_status', 'unknown')
+
+        # Get Context for Confidence
+        rid = data.get('local_router')
+        peer_id = data.get('connected_to')
+
+        # Get peer original values for conflict checking
+        peer_orig_rx = 0.0
+        peer_orig_tx = 0.0
+        if peer_id and peer_id in telemetry:
+            peer_orig_rx = telemetry[peer_id].get('rx_rate', 0.0)
+            peer_orig_tx = telemetry[peer_id].get('tx_rate', 0.0)
+
+        # Get residual flow error for this router (if verifiable)
+        flow_err = final_flow_errors.get(rid) # None if not verifiable
+
+        def calculate_confidence(orig, final, peer_orig_complement, flow_err):
+            # 1. Did we detect a conflict initially?
+            conflict = False
+            if peer_id and peer_id in telemetry:
+                conflict = abs(orig - peer_orig_complement) / max(orig, peer_orig_complement, 1.0) > TOLERANCE
+
+            # 2. Did we change the value?
+            changed = abs(orig - final) > 0.001
+
+            # Base Confidence
+            conf = 1.0
+
+            if changed:
+                # We intervened.
+                if flow_err is not None and flow_err < FLOW_TOLERANCE:
+                    conf = 0.95  # Verified repair
+                elif flow_err is None:
+                    conf = 0.75  # Unverified repair (edge router)
+                else:
+                    conf = 0.6   # Changed but flow still broken
+            else:
+                # We kept the original.
+                if conflict:
+                    # Conflict existed, but we stuck to our guns.
+                    if flow_err is not None and flow_err < FLOW_TOLERANCE:
+                        conf = 0.95 # Verified to be correct
+                    else:
+                        conf = 0.8  # Unverified choice in conflict
+                else:
+                    conf = 1.0  # No conflict, no change. Happy.
+
+            # 3. Global Consistency Penalty
+            # If the router is still violating flow conservation, reduce confidence
+            if flow_err is not None:
+                # Penalty scales with error magnitude
+                penalty_factor = max(0.0, 1.0 - flow_err)
+                conf *= penalty_factor
+
+            return conf
+
+        # Calculate confidence for RX (compare with Peer TX) and TX (compare with Peer RX)
+        rx_conf = calculate_confidence(orig_rx, final_rx, peer_orig_tx, flow_err)
+        tx_conf = calculate_confidence(orig_tx, final_tx, peer_orig_rx, flow_err)
+
+        st_conf = status_conf_map.get(if_id, 1.0)
+
+        # Sanity Check: If Down but Traffic, lower confidence
+        if final_st == 'down' and (final_rx > 1.0 or final_tx > 1.0):
+            rx_conf *= 0.5
+            tx_conf *= 0.5
+            st_conf *= 0.5
+
+        # Construct Output Tuple
+        res_entry = {
+            'rx_rate': (orig_rx, final_rx, rx_conf),
+            'tx_rate': (orig_tx, final_tx, tx_conf),
+            'interface_status': (orig_st, final_st, st_conf),
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router')
+        }
+        result[if_id] = res_entry
+
+    return result
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,296 @@
+<NAME>
+implement_flow_conservation_logic
+</NAME>
+
+<DESCRIPTION>
+I am replacing the heuristic-based repair with a physics-based repair algorithm. The new approach:
+1. Validates and repairs interface status based on traffic presence.
+2. Uses "Flow Conservation" (Kirchhoff's Current Law for networks) as a tie-breaker when link symmetry is violated.
+3. If `A.tx` and `B.rx` disagree, it checks which value minimizes the flow imbalance (Sum(In) - Sum(Out)) at the respective routers.
+4. Assigns high confidence (0.9) when flow conservation confirms a value, and low confidence (0.5) only when ambiguous.
+This directly addresses the calibration metric by providing justified confidence scores, and improves accuracy by using network-wide constraints.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    result = {}
+
+    # First pass: collect all measurements and check link symmetry
+    link_symmetry_violations = {}
+
+    for interface_id, data in telemetry.items():
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Check link symmetry if connected interface exists
+        if connected_to and connected_to in telemetry:
+            peer_data = telemetry[connected_to]
+            peer_rx = peer_data.get('rx_rate', 0.0)
+            peer_tx = peer_data.get('tx_rate', 0.0)
+
+            # My TX should match their RX (within tolerance)
+            tx_rx_diff = abs(tx_rate - peer_rx) / max(tx_rate, peer_rx, 1.0)
+            # My RX should match their TX (within tolerance)
+            rx_tx_diff = abs(rx_rate - peer_tx) / max(rx_rate, peer_tx, 1.0)
+
+            link_symmetry_violations[interface_id] = {
+                'tx_rx_diff': tx_rx_diff,
+                'rx_tx_diff': rx_tx_diff,
+                'peer_rx': peer_rx,
+                'peer_tx': peer_tx
+            }
+
+    # Second pass: repair using redundant signals
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Default: no repair, high confidence
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        # Check for issues and attempt repair
+        if interface_id in link_symmetry_violations:
+            violations = link_symmetry_violations[interface_id]
+
+            # Repair RX rate if link symmetry is violated
+            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's TX as more reliable signal
+                repaired_rx = violations['peer_tx']
+                # Confidence decreases with magnitude of violation
+                rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+
+            # Repair TX rate if link symmetry is violated
+            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's RX as more reliable signal
+                repaired_tx = violations['peer_rx']
+                # Confidence decreases with magnitude of violation
+                tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+
+        # Check status consistency
+        if connected_to and connected_to in telemetry:
+            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+            # If statuses don't match, lower confidence
+            if interface_status != peer_status:
+                status_confidence = 0.5
+                # If interface is down but has non-zero rates, that's suspicious
+                if interface_status == 'down' and (rx_rate > 0 or tx_rate > 0):
+                    repaired_rx = 0.0
+                    repaired_tx = 0.0
+                    rx_confidence = 0.3
+                    tx_confidence = 0.3
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+
+    return result
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    # Initialize working state
+    state = {}
+    for if_id, data in telemetry.items():
+        state[if_id] = {
+            'rx': float(data.get('rx_rate', 0.0)),
+            'tx': float(data.get('tx_rate', 0.0)),
+            'status': data.get('interface_status', 'unknown'),
+            'rx_conf': 1.0,
+            'tx_conf': 1.0,
+            'status_conf': 1.0,
+            'orig': data
+        }
+
+    # Pass 1: Status Consensus
+    for if_id, s in state.items():
+        connected_to = s['orig'].get('connected_to')
+        if connected_to and connected_to in state:
+            peer = state[connected_to]
+            # If mismatch, prefer UP if traffic exists
+            if s['status'] != peer['status']:
+                has_traffic = (s['rx'] > 1.0 or s['tx'] > 1.0 or
+                             peer['rx'] > 1.0 or peer['tx'] > 1.0)
+                if has_traffic:
+                    s['status'] = 'up'
+                    s['status_conf'] = 0.8
+                else:
+                    s['status'] = 'down'
+                    s['status_conf'] = 0.8
+
+        # Enforce DOWN means zero rates
+        if s['status'] == 'down':
+            s['rx'] = 0.0
+            s['tx'] = 0.0
+            s['rx_conf'] = 1.0
+            s['tx_conf'] = 1.0
+
+    # Pass 2: Rate Repair with Symmetry & Flow Conservation
+
+    # Helper: Calculate router flow imbalance (In - Out)
+    def get_router_imbalance(router_id):
+        if not router_id or router_id not in topology:
+            return None
+        in_sum = 0.0
+        out_sum = 0.0
+        for if_id in topology[router_id]:
+            if if_id in state:
+                in_sum += state[if_id]['rx']
+                out_sum += state[if_id]['tx']
+        return in_sum - out_sum
+
+    # Iterate over links to fix symmetry
+    processed_pairs = set()
+    for if_id, s in state.items():
+        connected_to = s['orig'].get('connected_to')
+        if not connected_to or connected_to not in state:
+            continue
+
+        pair_id = tuple(sorted([if_id, connected_to]))
+        if pair_id in processed_pairs:
+            continue
+        processed_pairs.add(pair_id)
+
+        peer = state[connected_to]
+
+        # Skip if both down
+        if s['status'] == 'down' and peer['status'] == 'down':
+            continue
+
+        # 1. Fix TX vs Peer RX
+        tx_val = s['tx']
+        peer_rx_val = peer['rx']
+        denom = max(tx_val, peer_rx_val, 1.0)
+
+        if abs(tx_val - peer_rx_val) / denom > HARDENING_THRESHOLD:
+            # Symmetry violation. Use Flow Conservation to decide.
+            # Local router (source of tx)
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local)
+
+            # Remote router (dest of rx)
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Cost function: |NewImbalanceLocal| + |NewImbalanceRemote|
+            # Target rate v.
+            # NewImbLocal(v) = (In - Out) + tx_val - v  (we replace tx_val with v in Out sum)
+            # NewImbRemote(v) = (In - Out) - peer_rx_val + v (we replace peer_rx_val with v in In sum)
+
+            def score_candidate(v):
+                score = 0.0
+                if imb_local is not None:
+                    score += abs(imb_local + tx_val - v)
+                if imb_remote is not None:
+                    score += abs(imb_remote - peer_rx_val + v)
+                return score
+
+            score_tx = score_candidate(tx_val)
+            score_peer_rx = score_candidate(peer_rx_val)
+
+            if score_tx < score_peer_rx and (imb_local is not None or imb_remote is not None):
+                # Trust TX
+                peer['rx'] = tx_val
+                peer['rx_conf'] = 0.9
+                s['tx_conf'] = 1.0
+            elif score_peer_rx < score_tx and (imb_local is not None or imb_remote is not None):
+                # Trust Peer RX
+                s['tx'] = peer_rx_val
+                s['tx_conf'] = 0.9
+                peer['rx_conf'] = 1.0
+            else:
+                # Ambiguous or no topology info -> average
+                avg = (tx_val + peer_rx_val) / 2.0
+                s['tx'] = avg
+                peer['rx'] = avg
+                s['tx_conf'] = 0.5
+                peer['rx_conf'] = 0.5
+        else:
+             s['tx_conf'] = 1.0
+             peer['rx_conf'] = 1.0
+
+        # 2. Fix RX vs Peer TX
+        rx_val = s['rx']
+        peer_tx_val = peer['tx']
+        denom = max(rx_val, peer_tx_val, 1.0)
+
+        if abs(rx_val - peer_tx_val) / denom > HARDENING_THRESHOLD:
+            # Symmetry violation
+            r_local = s['orig'].get('local_router')
+            imb_local = get_router_imbalance(r_local)
+
+            r_remote = peer['orig'].get('local_router')
+            imb_remote = get_router_imbalance(r_remote)
+
+            # Target rate v.
+            # NewImbLocal(v) = (In - Out) - rx_val + v  (we replace rx_val with v in In sum)
+            # NewImbRemote(v) = (In - Out) + peer_tx_val - v (we replace peer_tx_val with v in Out sum)
+
+            def score_candidate_rx(v):
+                score = 0.0
+                if imb_local is not None:
+                    score += abs(imb_local - rx_val + v)
+                if imb_remote is not None:
+                    score += abs(imb_remote + peer_tx_val - v)
+                return score
+
+            score_rx = score_candidate_rx(rx_val)
+            score_peer_tx = score_candidate_rx(peer_tx_val)
+
+            if score_rx < score_peer_tx and (imb_local is not None or imb_remote is not None):
+                # Trust RX
+                peer['tx'] = rx_val
+                peer['tx_conf'] = 0.9
+                s['rx_conf'] = 1.0
+            elif score_peer_tx < score_rx and (imb_local is not None or imb_remote is not None):
+                # Trust Peer TX
+                s['rx'] = peer_tx_val
+                s['rx_conf'] = 0.9
+                peer['tx_conf'] = 1.0
+            else:
+                avg = (rx_val + peer_tx_val) / 2.0
+                s['rx'] = avg
+                peer['tx'] = avg
+                s['rx_conf'] = 0.5
+                peer['tx_conf'] = 0.5
+        else:
+            s['rx_conf'] = 1.0
+            peer['tx_conf'] = 1.0
+
+    # Assemble result
+    result = {}
+    for if_id, s in state.items():
+        orig = s['orig']
+        result[if_id] = {
+            'rx_rate': (orig.get('rx_rate', 0.0), s['rx'], s['rx_conf']),
+            'tx_rate': (orig.get('tx_rate', 0.0), s['tx'], s['tx_conf']),
+            'interface_status': (orig.get('interface_status', 'unknown'), s['status'], s['status_conf']),
+            'connected_to': orig.get('connected_to'),
+            'local_router': orig.get('local_router'),
+            'remote_router': orig.get('remote_router')
+        }
+
+    return result
+>>>>>>> REPLACE
+</DIFF>

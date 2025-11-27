@@ -1,0 +1,205 @@
+<NAME>
+parametric_bsearch_bfd
+</NAME>
+
+<DESCRIPTION>
+Introduce a parametric binary search with best-fit-decreasing bin packing under a transformed capacity model to directly minimize the maximum KVPR across GPUs. For a target KVPR T, each model gets a weight w = (req_rate/slo) + T * model_size, and each GPU a capacity C = T * GPU_MEM_SIZE. An assignment feasible under these weights guarantees both memory feasibility and KVPR ≤ T. The change:
+- Keeps existing multi-order greedy + local improvement to get a strong initial upper bound on KVPR.
+- Adds a binary search over T, using best-fit-decreasing placement by these weights to find a tighter assignment with a proven monotonic feasibility property.
+- Uses safe lower bounds and fallback behavior to maintain robustness.
+This should reduce the maximum KVPR further while keeping the implementation simple and efficient.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    best_placement = None
+    best_max_kvpr = float('inf')
+
+    for make_order in orderings:
+        try:
+            ordered = make_order(models)
+            placement, rem_mem, sum_r_over_s = greedy_assign(ordered)
+            # Refine with local improvements
+            placement, rem_mem, sum_r_over_s = improve(placement, rem_mem, sum_r_over_s)
+            # Evaluate
+            kvprs = [kvpr(sum_r_over_s[i], rem_mem[i]) for i in range(gpu_num)]
+            cand_max = max(kvprs) if kvprs else 0.0
+            if cand_max < best_max_kvpr:
+                best_max_kvpr = cand_max
+                best_placement = placement
+        except ValueError:
+            # This ordering couldn't place all models due to per-GPU memory constraints
+            continue
+
+    if best_placement is None:
+        # Fall back to an error consistent with greedy behavior
+        # Try a final simple size-desc heuristic to produce a clearer error state
+        ordered = sorted(models, key=lambda m: m.model_size, reverse=True)
+        # This will raise ValueError if infeasible
+        best_placement, _, _ = greedy_assign(ordered)
+
+    return best_placement
+=======
+    best_placement = None
+    best_max_kvpr = float('inf')
+
+    for make_order in orderings:
+        try:
+            ordered = make_order(models)
+            placement, rem_mem, sum_r_over_s = greedy_assign(ordered)
+            # Refine with local improvements
+            placement, rem_mem, sum_r_over_s = improve(placement, rem_mem, sum_r_over_s)
+            # Evaluate
+            kvprs = [kvpr(sum_r_over_s[i], rem_mem[i]) for i in range(gpu_num)]
+            cand_max = max(kvprs) if kvprs else 0.0
+            if cand_max < best_max_kvpr:
+                best_max_kvpr = cand_max
+                best_placement = placement
+        except ValueError:
+            # This ordering couldn't place all models due to per-GPU memory constraints
+            continue
+
+    if best_placement is None:
+        # Fall back to an error consistent with greedy behavior
+        # Try a final simple size-desc heuristic to produce a clearer error state
+        ordered = sorted(models, key=lambda m: m.model_size, reverse=True)
+        # This will raise ValueError if infeasible
+        best_placement, _, _ = greedy_assign(ordered)
+
+    # Parametric search to further minimize the max KVPR using the transformed capacity model:
+    # For a target T, each item weight is w = dR + T * size, each GPU capacity is C = T * GPU_MEM_SIZE.
+    # Feasibility under these weights implies KVPR <= T and memory <= GPU_MEM_SIZE on each GPU.
+    def max_kvpr_of(placement_dict):
+        max_v = 0.0
+        for gid in range(gpu_num):
+            bucket = placement_dict.get(gid, [])
+            R = 0.0
+            used = 0.0
+            for m in bucket:
+                R += (m.req_rate / m.slo)
+                used += m.model_size
+            v = kvpr(R, GPU_MEM_SIZE - used)
+            if v > max_v:
+                max_v = v
+        return max_v
+
+    def bfd_assign_for_T(T):
+        # Best-Fit-Decreasing by transformed weights for target T
+        eps = 1e-12
+        capacity = T * GPU_MEM_SIZE
+        # If T is negative, no feasible placement unless all req rates are zero
+        if capacity < -eps:
+            return None
+        # Build items with weights
+        items = []
+        for idx, m in enumerate(models):
+            dR = m.req_rate / m.slo
+            w = dR + T * m.model_size
+            # If T == 0 and dR > 0, weight positive; if T == 0 and dR == 0, weight 0.
+            # All weights must be non-negative for monotonicity; if w < 0 due to negative T clamp to 0
+            if w < 0:
+                w = 0.0
+            items.append((w, dR, m.model_size, idx, m))
+        # Sort by weight descending
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        used_w = [0.0 for _ in range(gpu_num)]
+        bins_R = [0.0 for _ in range(gpu_num)]
+        bins_used_mem = [0.0 for _ in range(gpu_num)]
+        assign = {i: [] for i in range(gpu_num)}
+
+        for w, dR, sz, _, m in items:
+            best_bin = None
+            best_after = float('inf')
+            for gid in range(gpu_num):
+                nw = used_w[gid] + w
+                if nw <= capacity + 1e-9:  # allow tiny slack
+                    # Best-fit: choose the bin with minimal leftover after placement
+                    if nw < best_after:
+                        best_after = nw
+                        best_bin = gid
+            if best_bin is None:
+                return None
+            used_w[best_bin] += w
+            bins_R[best_bin] += dR
+            bins_used_mem[best_bin] += sz
+            assign[best_bin].append(m)
+
+        # Validate KVPR and memory constraints
+        for gid in range(gpu_num):
+            if bins_used_mem[gid] - GPU_MEM_SIZE > 1e-6:
+                return None
+            rem = GPU_MEM_SIZE - bins_used_mem[gid]
+            if rem <= 0:
+                return None
+            if (bins_R[gid] / rem) - T > 1e-6:
+                return None
+        return assign
+
+    # Compute bounds for binary search
+    S = GPU_MEM_SIZE
+    total_R = sum((m.req_rate / m.slo) for m in models)
+    total_size = sum(m.model_size for m in models)
+
+    # Lower bound 1: any single model placed alone implies T >= dR / (S - size)
+    lb1 = 0.0
+    infeasible_single = False
+    for m in models:
+        dR = m.req_rate / m.slo
+        denom = S - m.model_size
+        if denom <= 0:
+            if dR > 0:
+                infeasible_single = True
+            continue
+        if dR > 0:
+            cand = dR / denom
+            if cand > lb1:
+                lb1 = cand
+
+    # Lower bound 2: global bound from total weights at T across GPUs
+    denom2 = gpu_num * S - total_size
+    if denom2 <= 0 and total_R > 0:
+        # Not enough aggregate memory to leave any KV space
+        # Keep best found placement (greedy must have raised earlier if impossible)
+        return best_placement
+    lb2 = 0.0 if denom2 <= 0 else (total_R / denom2) if total_R > 0 else 0.0
+
+    lower = lb1 if lb1 > lb2 else lb2
+    if infeasible_single:
+        # No finite T can bound KVPR if a model fully occupies a GPU with positive demand
+        return best_placement
+
+    # Upper bound from the best heuristic placement we already computed
+    hi = max_kvpr_of(best_placement)
+    if not (hi < float('inf')):
+        # If heuristic produced infinite KVPR, skip parametric refinement
+        return best_placement
+
+    # Binary search to tighten T
+    best_bsearch_placement = best_placement
+    best_bsearch_T = hi
+    lo = max(0.0, lower)
+    # Ensure lo <= hi
+    if lo > hi:
+        lo = hi
+
+    for _ in range(32):  # sufficient precision
+        mid = (lo + hi) / 2.0
+        cand_place = bfd_assign_for_T(mid)
+        if cand_place is not None:
+            # Feasible: try lower T
+            hi = mid
+            best_bsearch_placement = cand_place
+            best_bsearch_T = mid
+        else:
+            lo = mid
+
+    # Verify and adopt if better
+    final_T = max_kvpr_of(best_bsearch_placement)
+    if final_T + 1e-12 < best_max_kvpr:
+        return best_bsearch_placement
+
+    return best_placement
+>>>>>>> REPLACE
+
+</DIFF>

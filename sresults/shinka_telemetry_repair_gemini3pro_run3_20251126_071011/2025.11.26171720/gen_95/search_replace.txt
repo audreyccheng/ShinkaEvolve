@@ -1,0 +1,158 @@
+To improve the performance of the network telemetry repair algorithm, I propose two changes centered around **Dynamic Implied Candidates** and a **Sigmoid Zero-Flow Prior**.
+
+### 1. Dynamic Implied Candidates (Internal Flows)
+Currently, internal flows only evaluate the provided measurements (and potentially their mean/zero) as candidates. If both measurements on a link are corrupted (e.g., both report 100Mbps, but the routers at both ends require 50Mbps to balance), the solver lacks a candidate to represent the "true" flow.
+
+I will modify the internal flow logic to calculate **Implied Candidates** (`imp_s` and `imp_d`) derived from the conservation imbalance at the source and destination routers. These candidates represent "what the flow *should* be" to balance each router.
+-   **Prior Logic**: I will adjust the prior probability calculation to support these new candidates. If a hypothesis aligns with an implied candidate, it receives a prior boost proportional to that router's reliability (`anchor_strength`). This ensures that we only trust "inferred" values if the router suggesting them is trustworthy (consistent with its other links).
+-   This turns the algorithm from a simple selector into a constraint solver that can discover unmeasured values.
+
+### 2. Sigmoid Zero-Flow Prior
+The previous "phantom flow" check used a simple exponential decay (`math.exp(-meas/3.0)`). I will replace this with a sigmoid function (`1.0 / (1.0 + math.exp(0.5 * (val - 5.0)))`).
+-   This provides a clearer "soft threshold" around 5.0 Mbps.
+-   Below 5 Mbps, the prior for the flow being zero (noise) remains high.
+-   Above 5 Mbps, it drops off more steeply, preventing the algorithm from incorrectly zeroing out significant traffic.
+
+These changes are applied to both internal and external flow logic where appropriate.
+
+<NAME>
+dynamic_implied_candidates
+</NAME>
+<DESCRIPTION>
+Introduces dynamic "Implied Candidates" for internal flows, allowing the algorithm to hypothesize values derived purely from flow conservation (balancing the router) in addition to measurements. Updates the prior logic to trust these derived candidates based on router reliability. Also replaces the zero-flow prior with a sigmoid function for better noise classification.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+            # --- Internal Flow Logic ---
+            if flow['type'] == 'internal':
+                src, dst = flow['src'], flow['dst']
+                r_src = if_to_router.get(src)
+                r_dst = if_to_router.get(dst)
+
+                rel_src = router_anchor_strength.get(r_src, 0.5)
+                rel_dst = router_anchor_strength.get(r_dst, 0.5)
+
+                cands = [c for c in flow['cands'] if c >= 0]
+                if len(cands) == 2:
+                    v1, v2 = cands
+                    if abs(v1-v2) < max(v1,v2)*0.3 + 10.0:
+                        cands.append((v1+v2)/2.0)
+
+                hyps = sorted(list(set(cands + [0.0])))
+                curr_tx = estimates[src]['tx']
+                curr_rx = estimates[dst]['rx']
+
+                scores = []
+                for h in hyps:
+                    estimates[src]['tx'] = h
+                    estimates[dst]['rx'] = h
+
+                    imb_s, flow_s = get_router_state(r_src)
+                    score_s = math.exp(-abs(imb_s)/calc_sigma(flow_s, rel_src)) if r_src else 1.0
+
+                    imb_d, flow_d = get_router_state(r_dst)
+                    score_d = math.exp(-abs(imb_d)/calc_sigma(flow_d, rel_dst)) if r_dst else 1.0
+
+                    prior = 1.0
+                    if h == 0.0:
+                        s_src = flow.get('status_src')
+                        s_dst = flow.get('status_dst')
+                        if s_src == 'down' or s_dst == 'down': prior = 0.99
+                        else:
+                             # Continuous decay: High measurement -> low prior for 0.0 hypothesis
+                             m_val = max(flow['cands'])
+                             prior = math.exp(-m_val / 3.0)
+                    else:
+                        dist = min([abs(h - c) for c in flow['cands']])
+                        prior = math.exp(-dist / max(h*0.05, 1.0))
+
+                    scores.append(score_s * score_d * prior)
+
+                estimates[src]['tx'] = curr_tx
+                estimates[dst]['rx'] = curr_rx
+=======
+            # --- Internal Flow Logic ---
+            if flow['type'] == 'internal':
+                src, dst = flow['src'], flow['dst']
+                r_src = if_to_router.get(src)
+                r_dst = if_to_router.get(dst)
+
+                rel_src = router_anchor_strength.get(r_src, 0.5)
+                rel_dst = router_anchor_strength.get(r_dst, 0.5)
+
+                cands = [c for c in flow['cands'] if c >= 0]
+
+                # Dynamic Implied Candidates: What values would balance the routers?
+                # Only trust these if the router is somewhat reliable
+                imb_s, _ = get_router_state(r_src)
+                imp_s = max(0.0, estimates[src]['tx'] + imb_s)
+
+                imb_d, _ = get_router_state(r_dst)
+                imp_d = max(0.0, estimates[dst]['rx'] - imb_d)
+
+                hyps = sorted(list(set(cands + [imp_s, imp_d, 0.0])))
+                curr_tx = estimates[src]['tx']
+                curr_rx = estimates[dst]['rx']
+
+                scores = []
+                for h in hyps:
+                    estimates[src]['tx'] = h
+                    estimates[dst]['rx'] = h
+
+                    imb_s, flow_s = get_router_state(r_src)
+                    score_s = math.exp(-abs(imb_s)/calc_sigma(flow_s, rel_src)) if r_src else 1.0
+
+                    imb_d, flow_d = get_router_state(r_dst)
+                    score_d = math.exp(-abs(imb_d)/calc_sigma(flow_d, rel_dst)) if r_dst else 1.0
+
+                    prior = 1.0
+                    if h == 0.0:
+                        s_src = flow.get('status_src')
+                        s_dst = flow.get('status_dst')
+                        if s_src == 'down' or s_dst == 'down': prior = 0.99
+                        else:
+                             m_val = max(flow['cands'])
+                             # Sigmoid decay: 0.5 prob at 5.0 Mbps
+                             prior = 1.0 / (1.0 + math.exp(0.5 * (m_val - 5.0)))
+                    else:
+                        # Prior based on supporting evidence (Measurement or Conservation)
+                        p_meas = 0.0
+                        if cands:
+                            dist = min([abs(h - c) for c in cands])
+                            p_meas = math.exp(-dist / max(h*0.05, 1.0))
+
+                        p_cons = 0.0
+                        # Check if this hypothesis aligns with conservation suggestions
+                        if abs(h - imp_s) < 1e-4:
+                            p_cons = max(p_cons, 0.2 + 0.7 * rel_src)
+                        if abs(h - imp_d) < 1e-4:
+                            p_cons = max(p_cons, 0.2 + 0.7 * rel_dst)
+
+                        prior = max(p_meas, p_cons)
+
+                    scores.append(score_s * score_d * prior)
+
+                estimates[src]['tx'] = curr_tx
+                estimates[dst]['rx'] = curr_rx
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+external_sigmoid_prior
+</NAME>
+<DESCRIPTION>
+Updates the external flow zero-hypothesis prior to use the same sigmoid decay function as the internal flow logic, ensuring consistent handling of "phantom" traffic detection across link types.
+</DESCRIPTION>
+<DIFF>
+<<<<<<< SEARCH
+                    prior = 1.0
+                    if h == 0.0:
+                        if stat == 'down': prior = 0.99
+                        else: prior = math.exp(-meas / 3.0)
+=======
+                    prior = 1.0
+                    if h == 0.0:
+                        if stat == 'down': prior = 0.99
+                        else: prior = 1.0 / (1.0 + math.exp(0.5 * (meas - 5.0)))
+>>>>>>> REPLACE
+</DIFF>

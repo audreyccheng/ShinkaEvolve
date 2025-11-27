@@ -1,0 +1,189 @@
+<NAME>
+router_aware_pairwise_tiebreak
+</NAME>
+
+<DESCRIPTION>
+I propose enhancing the pair-wise hardening step with a router-aware tie-breaker that uses flow conservation (R1) as an extra signal to decide which side’s measurement to trust when bilateral link symmetry (R3) deviates beyond the 2% tolerance.
+
+Rationale:
+- When my_tx and peer_rx differ significantly, always snapping to the peer may select the wrong value if the peer is corrupted. We can leverage router-level flow conservation on the two adjacent routers to decide which candidate (local vs peer) better restores Σ incoming = Σ outgoing at both routers.
+- This preserves R3 while improving counter accuracy by selecting measurements that also satisfy R1 locally, leading to a globally more consistent state.
+- Confidence calibration remains consistent; we keep the existing confidence derivation untouched to preserve the good confidence calibration performance.
+
+Implementation details:
+- Build interface->router mapping from topology (fallback to local_router) and compute base router sums of rx and tx from original telemetry.
+- In the pairwise hardening block, when deviations exceed the tolerance, choose between local and peer measurement by evaluating which option yields lower combined flow imbalance across the two routers.
+- All other stages (router-level adjustment, final symmetry, down-enforcement) remain the same.
+
+This change should improve counter_repair_accuracy while maintaining strong confidence calibration and status accuracy.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Precompute originals
+    orig_rx: Dict[str, float] = {}
+    orig_tx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+        status[if_id] = data.get('interface_status', 'unknown')
+        peer_of[if_id] = data.get('connected_to')
+=======
+    # Precompute originals
+    orig_rx: Dict[str, float] = {}
+    orig_tx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    peer_of: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_rx[if_id] = float(data.get('rx_rate', 0.0))
+        orig_tx[if_id] = float(data.get('tx_rate', 0.0))
+        status[if_id] = data.get('interface_status', 'unknown')
+        peer_of[if_id] = data.get('connected_to')
+
+    # Build interface->router mapping using topology when available (fallback to local_router)
+    router_of: Dict[str, str] = {}
+    if topology:
+        for r, ifs in topology.items():
+            for iid in ifs:
+                if iid in telemetry:
+                    router_of[iid] = r
+    for iid, data in telemetry.items():
+        if iid not in router_of:
+            lr = data.get('local_router')
+            if lr is not None:
+                router_of[iid] = lr
+
+    # Baseline per-router sums from original measurements (used as router-level tie-breaker in pair hardening)
+    base_sum_rx: Dict[str, float] = {}
+    base_sum_tx: Dict[str, float] = {}
+    for iid in telemetry:
+        r = router_of.get(iid)
+        if not r:
+            continue
+        base_sum_rx[r] = base_sum_rx.get(r, 0.0) + orig_rx.get(iid, 0.0)
+        base_sum_tx[r] = base_sum_tx.get(r, 0.0) + orig_tx.get(iid, 0.0)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Base hardened values
+        if my_up and peer_up and peer_data:
+            # Directional hardening with tolerance:
+            # - If within tolerance, average to reduce noise.
+            # - If beyond tolerance, trust the peer's redundant counter for that direction.
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                hardened_tx_val = 0.5 * (my_tx + peer_rx)
+            else:
+                hardened_tx_val = peer_rx
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                hardened_rx_val = 0.5 * (my_rx + peer_tx)
+            else:
+                hardened_rx_val = peer_tx
+
+            # Confidence primarily from agreement; boost when within tolerance
+            base_tx_conf = clamp01(1.0 - tx_to_peer_rx_diff)
+            base_rx_conf = clamp01(1.0 - rx_from_peer_tx_diff)
+            # Slight bump when within tolerance to reflect redundancy agreement
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                base_tx_conf = clamp01(0.92 + 0.08 * (1.0 - tx_to_peer_rx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                base_rx_conf = clamp01(0.92 + 0.08 * (1.0 - rx_from_peer_tx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+        else:
+            # If either endpoint reports down on this link, traffic should be zero on both sides.
+            if peer_data and (not my_up or not peer_up):
+                hardened_tx_val = 0.0
+                hardened_rx_val = 0.0
+                base_tx_conf = 0.85  # Strong invariant: link down -> zero
+                base_rx_conf = 0.85
+            elif my_up:
+                # Peer missing: rely on local but lower confidence due to lack of redundancy
+                hardened_tx_val = my_tx
+                hardened_rx_val = my_rx
+                base_tx_conf = 0.6
+                base_rx_conf = 0.6
+            else:
+                # Local interface down cannot send/receive
+                hardened_tx_val = 0.0
+                hardened_rx_val = 0.0
+                base_tx_conf = 0.85
+                base_rx_conf = 0.85
+=======
+        # Base hardened values
+        if my_up and peer_up and peer_data:
+            # Directional hardening with tolerance:
+            # - If within tolerance, average to reduce noise.
+            # - If beyond tolerance, choose the value (local vs peer) that best improves router R1 across both routers.
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                hardened_tx_val = 0.5 * (my_tx + peer_rx)
+            else:
+                chosen_tx = peer_rx
+                ra = router_of.get(if_id) if 'router_of' in locals() else None
+                rb = router_of.get(peer_id) if 'router_of' in locals() else None
+                if ra in base_sum_rx and rb in base_sum_rx:
+                    def rimb(srx: float, stx: float) -> float:
+                        denom = max(1.0, abs(srx), abs(stx))
+                        return abs(srx - stx) / denom
+                    # Option Local: keep my_tx on A, and set B.rx = my_tx (symmetry)
+                    sum_tx_ra_L = base_sum_tx[ra] - my_tx + my_tx  # unchanged
+                    sum_rx_rb_L = base_sum_rx[rb] - peer_rx + my_tx
+                    imb_L = rimb(base_sum_rx[ra], sum_tx_ra_L) + rimb(sum_rx_rb_L, base_sum_tx[rb])
+                    # Option Peer: use peer_rx
+                    sum_tx_ra_P = base_sum_tx[ra] - my_tx + peer_rx
+                    sum_rx_rb_P = base_sum_rx[rb] - peer_rx + peer_rx  # unchanged
+                    imb_P = rimb(base_sum_rx[ra], sum_tx_ra_P) + rimb(sum_rx_rb_P, base_sum_tx[rb])
+                    chosen_tx = my_tx if imb_L <= imb_P else peer_rx
+                hardened_tx_val = chosen_tx
+
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                hardened_rx_val = 0.5 * (my_rx + peer_tx)
+            else:
+                chosen_rx = peer_tx
+                ra = router_of.get(if_id) if 'router_of' in locals() else None
+                rb = router_of.get(peer_id) if 'router_of' in locals() else None
+                if ra in base_sum_rx and rb in base_sum_rx:
+                    def rimb(srx: float, stx: float) -> float:
+                        denom = max(1.0, abs(srx), abs(stx))
+                        return abs(srx - stx) / denom
+                    # Option Local: keep my_rx on A, and set B.tx = my_rx (symmetry)
+                    sum_rx_ra_L = base_sum_rx[ra] - my_rx + my_rx  # unchanged
+                    sum_tx_rb_L = base_sum_tx[rb] - peer_tx + my_rx
+                    imb_L = rimb(sum_rx_ra_L, base_sum_tx[ra]) + rimb(base_sum_rx[rb], sum_tx_rb_L)
+                    # Option Peer: use peer_tx
+                    sum_rx_ra_P = base_sum_rx[ra] - my_rx + peer_tx
+                    sum_tx_rb_P = base_sum_tx[rb] - peer_tx + peer_tx  # unchanged
+                    imb_P = rimb(sum_rx_ra_P, base_sum_tx[ra]) + rimb(base_sum_rx[rb], sum_tx_rb_P)
+                    chosen_rx = my_rx if imb_L <= imb_P else peer_tx
+                hardened_rx_val = chosen_rx
+
+            # Confidence primarily from agreement; boost when within tolerance
+            base_tx_conf = clamp01(1.0 - tx_to_peer_rx_diff)
+            base_rx_conf = clamp01(1.0 - rx_from_peer_tx_diff)
+            # Slight bump when within tolerance to reflect redundancy agreement
+            if tx_to_peer_rx_diff <= HARDENING_THRESHOLD:
+                base_tx_conf = clamp01(0.92 + 0.08 * (1.0 - tx_to_peer_rx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+            if rx_from_peer_tx_diff <= HARDENING_THRESHOLD:
+                base_rx_conf = clamp01(0.92 + 0.08 * (1.0 - rx_from_peer_tx_diff / max(HARDENING_THRESHOLD, 1e-9)))
+        else:
+            # If either endpoint reports down on this link, traffic should be zero on both sides.
+            if peer_data and (not my_up or not peer_up):
+                hardened_tx_val = 0.0
+                hardened_rx_val = 0.0
+                base_tx_conf = 0.85  # Strong invariant: link down -> zero
+                base_rx_conf = 0.85
+            elif my_up:
+                # Peer missing: rely on local but lower confidence due to lack of redundancy
+                hardened_tx_val = my_tx
+                hardened_rx_val = my_rx
+                base_tx_conf = 0.6
+                base_rx_conf = 0.6
+            else:
+                # Local interface down cannot send/receive
+                hardened_tx_val = 0.0
+                hardened_rx_val = 0.0
+                base_tx_conf = 0.85
+                base_rx_conf = 0.85
+>>>>>>> REPLACE
+</DIFF>

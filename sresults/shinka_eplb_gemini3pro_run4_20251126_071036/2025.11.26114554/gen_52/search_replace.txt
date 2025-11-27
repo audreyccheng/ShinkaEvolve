@@ -1,0 +1,238 @@
+The current algorithm uses a combination of randomized greedy construction and post-processing refinement steps. The refinement steps include a vectorized pairwise 1-item swap and a 3-way cyclic swap. However, the pairwise swap is limited to moving a single item between packs. If the optimal move requires swapping multiple small items for one large item (or simply reshuffling the contents of two packs entirely), the current 1-item swap logic will fail to find it.
+
+To address this, we replace the limited pairwise swap and cyclic swap logic with a more powerful **Iterative Pairwise Rebalancing** strategy. This strategy repeatedly selects the heaviest pack and pairs it with the lightest pack (and occasionally random packs). It then pools all items from the chosen pair and attempts to re-partition them into two balanced packs using a randomized greedy heuristic (LPT with restarts). This effectively solves the 2-partition problem for the selected pair, allowing for multi-item moves and deeper local optimization.
+
+This change targets Recommendation 3 ("Optimal Two-Bin Repartitioning") by implementing a robust heuristic solver for the two-bin subproblem, which is computationally efficient given the small number of items per pack.
+
+<NAME>
+pairwise_rebalance_refinement
+</NAME>
+
+<DESCRIPTION>
+Replace the limited 1-item Vectorized Swap and Cyclic Swap with a robust "Pairwise Rebalancing" strategy.
+This strategy selects the heaviest pack and pairs it with the lightest (and random others). It pools the items from both packs and re-partitions them using a randomized greedy solver (LPT with noise). This allows moving multiple items between packs to escape local optima that single swaps cannot.
+This effectively implements Recommendation 3 (Optimal Two-Bin Repartitioning) using a heuristic solver suitable for the varying problem sizes.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 2. Refinement: Pairwise Swaps + 3-Way Cyclic Swaps
+        for _ in range(NUM_SWAP_ITER):
+            # Identify max pack
+            max_p = max(range(num_packs), key=lambda x: pack_weights[x])
+            max_w = pack_weights[max_p]
+
+            u_nodes = packs[max_p]
+            w_u = layer_w[u_nodes]
+
+            # Vectorized Pairwise Swap
+            best_swap = None
+            best_gain = 0.0
+
+            for p in range(num_packs):
+                if p == max_p: continue
+
+                diff = max_w - pack_weights[p]
+                if diff < 1e-6: continue
+
+                v_nodes = packs[p]
+                w_v = layer_w[v_nodes]
+
+                # deltas[i, j] = w_u[i] - w_v[j]
+                deltas = w_u.unsqueeze(1) - w_v.unsqueeze(0)
+                mask = (deltas > 1e-6) & (deltas < diff)
+
+                if not mask.any(): continue
+
+                # Gain: maximize delta * (diff - delta)
+                gains = deltas * (diff - deltas)
+                gains = torch.where(mask, gains, -1.0)
+
+                curr_max, curr_argmax = gains.reshape(-1).max(0)
+                if curr_max.item() > best_gain:
+                    best_gain = curr_max.item()
+                    idx = curr_argmax.item()
+                    best_swap = (max_p, p, idx // len(v_nodes), idx % len(v_nodes), deltas.reshape(-1)[idx].item())
+
+            if best_swap:
+                p1, p2, i1, i2, delta = best_swap
+                val1 = packs[p1][i1]
+                val2 = packs[p2][i2]
+                packs[p1][i1] = val2
+                packs[p2][i2] = val1
+                pack_weights[p1] -= delta
+                pack_weights[p2] += delta
+                continue # If swap succeeded, reiterate from top
+
+            # 3-Way Cyclic Swap: A (Max) -> B -> C -> A
+            if num_packs < 3: break
+
+            improved_cycle = False
+            # Sort packs by weight to pick targets (B and C)
+            sorted_packs = sorted(range(num_packs), key=lambda x: pack_weights[x], reverse=True)
+            # Try 5 lightest packs as candidates for B and C
+            candidates = sorted_packs[-5:]
+
+            for p_b in candidates:
+                if p_b == max_p: continue
+                for p_c in candidates:
+                    if p_c == max_p or p_c == p_b: continue
+
+                    nodes_a = packs[max_p]
+                    nodes_b = packs[p_b]
+                    nodes_c = packs[p_c]
+
+                    w_a_vals = [w_list[x] for x in nodes_a]
+                    w_b_vals = [w_list[x] for x in nodes_b]
+                    w_c_vals = [w_list[x] for x in nodes_c]
+
+                    curr_w_a = pack_weights[max_p]
+                    curr_w_b = pack_weights[p_b]
+                    curr_w_c = pack_weights[p_c]
+
+                    best_cycle = None
+                    best_cycle_gain = 0.0
+
+                    # Iterate items to find best cycle
+                    # Cycle: A(i) -> B, B(j) -> C, C(k) -> A
+                    for idx_a, val_a in enumerate(w_a_vals):
+                        for idx_b, val_b in enumerate(w_b_vals):
+                            # Ensure B doesn't blow up
+                            if curr_w_b + val_a - val_b >= curr_w_a - 1e-6: continue
+
+                            for idx_c, val_c in enumerate(w_c_vals):
+                                # Ensure A reduces
+                                gain_a = val_a - val_c
+                                if gain_a <= 1e-6: continue
+
+                                # Ensure C doesn't blow up
+                                if curr_w_c + val_b - val_c >= curr_w_a - 1e-6: continue
+
+                                if gain_a > best_cycle_gain:
+                                    best_cycle_gain = gain_a
+                                    best_cycle = (idx_a, idx_b, idx_c, val_a, val_b, val_c)
+
+                    if best_cycle:
+                        ia, ib, ic, va, vb, vc = best_cycle
+                        # Perform Cycle
+                        item_a = packs[max_p][ia]
+                        item_b = packs[p_b][ib]
+                        item_c = packs[p_c][ic]
+
+                        packs[max_p][ia] = item_c
+                        packs[p_b][ib] = item_a
+                        packs[p_c][ic] = item_b
+
+                        pack_weights[max_p] += (vc - va)
+                        pack_weights[p_b] += (va - vb)
+                        pack_weights[p_c] += (vb - vc)
+
+                        improved_cycle = True
+                        break # Break inner C loop
+                if improved_cycle: break # Break inner B loop
+
+            if not improved_cycle:
+                break
+=======
+        # 2. Refinement: Pairwise Rebalancing (Heavier Pack vs Others)
+        # We try to rebalance the heaviest pack with the lightest pack (and random others).
+        # We pool items from both and re-partition them using randomized greedy.
+
+        NUM_PAIRWISE_ITER = 30
+        for _ in range(NUM_PAIRWISE_ITER):
+            # Identify packs sorted by weight
+            sorted_by_w = sorted(range(num_packs), key=lambda x: pack_weights[x])
+            max_p = sorted_by_w[-1]
+            min_p = sorted_by_w[0]
+
+            if pack_weights[max_p] - pack_weights[min_p] < 1e-6:
+                break
+
+            # Candidates to pair with max_p: Min pack, and maybe a random one
+            candidates = [min_p]
+            if num_packs > 2:
+                # Add a few random candidates to help escape local optima
+                for _ in range(2):
+                    r = random.randint(0, num_packs - 1)
+                    if r != max_p and r not in candidates:
+                        candidates.append(r)
+
+            improved_any = False
+            for other_p in candidates:
+                # Current max of the pair
+                old_pair_max = max(pack_weights[max_p], pack_weights[other_p])
+                old_pair_ss = pack_weights[max_p]**2 + pack_weights[other_p]**2
+
+                items = packs[max_p] + packs[other_p]
+
+                # Try to re-partition items into two sets of size groups_per_pack
+                best_split = None
+                best_split_max = old_pair_max
+                best_split_ss = old_pair_ss
+
+                # Strategies: Deterministic LPT, then Randomized LPTs
+                # Pre-sort items LPT
+                items_desc = sorted(items, key=lambda x: w_list[x], reverse=True)
+
+                # Small sub-problem restarts
+                SUB_RESTARTS = 20
+
+                for attempt in range(SUB_RESTARTS):
+                    if attempt == 0:
+                        current_items = items_desc
+                    else:
+                        # Perturbed weights
+                        noise = [random.uniform(0.85, 1.15) for _ in range(len(items))]
+                        # Sort by perturbed weight
+                        current_items = sorted(items, key=lambda x: w_list[x] * noise[items.index(x)], reverse=True)
+
+                    # Greedy Fill for 2 bins
+                    bin_a = []
+                    bin_b = []
+                    w_a = 0.0
+                    w_b = 0.0
+
+                    for item in current_items:
+                        w = w_list[item]
+                        # Put in lighter bin if space allows
+                        can_a = len(bin_a) < groups_per_pack
+                        can_b = len(bin_b) < groups_per_pack
+
+                        if can_a and can_b:
+                            if w_a < w_b:
+                                bin_a.append(item); w_a += w
+                            else:
+                                bin_b.append(item); w_b += w
+                        elif can_a:
+                            bin_a.append(item); w_a += w
+                        elif can_b:
+                            bin_b.append(item); w_b += w
+                        else:
+                            # Should not happen if sizes match
+                            pass
+
+                    cur_max = max(w_a, w_b)
+                    cur_ss = w_a**2 + w_b**2
+
+                    if cur_max < best_split_max - 1e-6:
+                        best_split_max = cur_max
+                        best_split_ss = cur_ss
+                        best_split = (bin_a, bin_b, w_a, w_b)
+                    elif abs(cur_max - best_split_max) < 1e-6 and cur_ss < best_split_ss - 1e-6:
+                        best_split_max = cur_max
+                        best_split_ss = cur_ss
+                        best_split = (bin_a, bin_b, w_a, w_b)
+
+                if best_split:
+                    packs[max_p] = best_split[0]
+                    packs[other_p] = best_split[1]
+                    pack_weights[max_p] = best_split[2]
+                    pack_weights[other_p] = best_split[3]
+                    improved_any = True
+                    break # Restart outer loop to identify new max
+
+            if not improved_any:
+                break
+>>>>>>> REPLACE
+
+</DIFF>

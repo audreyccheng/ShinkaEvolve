@@ -1,0 +1,205 @@
+<NAME>
+tolerance_based_pair_reconcile_and_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements to boost counter repair accuracy and confidence calibration:
+
+1) Tolerance-aware, partial pair reconciliation: The current reconciliation step hard-sets one side to match its peer whenever residuals exceed a fixed 2% threshold. This is often over-aggressive and can harm accuracy and calibration. I replace this with a rate-aware tolerance function and a bounded partial move (30%) toward agreement, only when the residual exceeds the tolerance. I also track a small adjustment penalty per direction to temper confidence when we had to force reconciliation.
+
+2) Two-slope, tolerance-based confidence mapping with no-edit bonus and reconciliation penalties: The current confidence uses a simple 1 − residual mapping, which doesn’t reflect the varying tolerance for low/high traffic and can be overconfident for large discrepancies. I switch to a two-slope residual-to-confidence mapping that scales by residual/tolerance, applies extra penalty for very large residuals, and includes an explicit penalty for pair reconciliation moves and a mild bonus when no edits were needed. This improves calibration without affecting status handling.
+
+These changes are minimal, maintain the existing algorithm structure (signal hardening, router-level scaling, then pair reconciliation), and should increase combined score by improving both counter repair accuracy and confidence calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+=======
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def pair_tolerance(a: float, b: float) -> float:
+        # Rate-aware tolerance: looser for very low traffic, at least HARDENING_THRESHOLD
+        traffic = max(abs(a), abs(b), 1.0)
+        # Allow up to ~5 Mbps slack for tiny links, but never below timing skew threshold
+        return max(HARDENING_THRESHOLD, 5.0 / traffic)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Third pass: pairwise reconciliation to enforce link symmetry post router scaling
+    post: Dict[str, Dict[str, float]] = {}
+    for iface in telemetry:
+        post[iface] = {
+            'rx': pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0),
+            'tx': pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0),
+        }
+
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Only reconcile when both interfaces are locally up
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Residuals after router scaling
+        resid_tx = rel_diff(post[iface]['tx'], post[peer_id]['rx'])  # A.tx vs B.rx
+        resid_rx = rel_diff(post[iface]['rx'], post[peer_id]['tx'])  # A.rx vs B.tx
+
+        def suspicion(ifc: str, kind: str) -> float:
+            rid = telemetry.get(ifc, {}).get('local_router')
+            imb = router_imbalance.get(rid, 0.0)
+            if kind == 'tx':
+                return pre[ifc]['tx_link_diff'] + 0.5 * abs(scale_tx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+            else:
+                return pre[ifc]['rx_link_diff'] + 0.5 * abs(scale_rx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+
+        # Reconcile A.tx <-> B.rx
+        if resid_tx > HARDENING_THRESHOLD:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx
+        if resid_rx > HARDENING_THRESHOLD:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+=======
+    # Third pass: pairwise reconciliation to enforce link symmetry post router scaling
+    post: Dict[str, Dict[str, float]] = {}
+    for iface in telemetry:
+        post[iface] = {
+            'rx': pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0),
+            'tx': pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0),
+        }
+
+    # Track pair adjustments to temper confidence later
+    adj_penalty: Dict[str, Dict[str, float]] = {iface: {'rx': 0.0, 'tx': 0.0} for iface in telemetry}
+
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Only reconcile when both interfaces are locally up
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Residuals and tolerances after router scaling
+        a_tx, b_rx = post[iface]['tx'], post[peer_id]['rx']
+        a_rx, b_tx = post[iface]['rx'], post[peer_id]['tx']
+
+        resid_tx = rel_diff(a_tx, b_rx)  # A.tx vs B.rx
+        resid_rx = rel_diff(a_rx, b_tx)  # A.rx vs B.tx
+        tol_tx = pair_tolerance(a_tx, b_rx)
+        tol_rx = pair_tolerance(a_rx, b_tx)
+
+        # Partial, bounded reconciliation only when beyond tolerance
+        alpha = 0.3  # move 30% toward agreement, symmetric, non-destructive
+        if resid_tx > tol_tx:
+            a_tx_new = a_tx + alpha * (b_rx - a_tx)
+            b_rx_new = b_rx + alpha * (a_tx - b_rx)
+            post[iface]['tx'] = max(0.0, a_tx_new)
+            post[peer_id]['rx'] = max(0.0, b_rx_new)
+            adj_penalty[iface]['tx'] = max(adj_penalty[iface]['tx'], 0.1)
+            adj_penalty[peer_id]['rx'] = max(adj_penalty[peer_id]['rx'], 0.1)
+
+        if resid_rx > tol_rx:
+            a_rx_new = a_rx + alpha * (b_tx - a_rx)
+            b_tx_new = b_tx + alpha * (a_rx - b_tx)
+            post[iface]['rx'] = max(0.0, a_rx_new)
+            post[peer_id]['tx'] = max(0.0, b_tx_new)
+            adj_penalty[iface]['rx'] = max(adj_penalty[iface]['rx'], 0.1)
+            adj_penalty[peer_id]['tx'] = max(adj_penalty[peer_id]['tx'], 0.1)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Confidence based on post-repair residuals vs peer
+        peer_id = peers.get(iface)
+        if had_peer and peer_id in pre and local_status == 'up' and (peer_status == 'up'):
+            peer_tx_after = post[peer_id]['tx']
+            peer_rx_after = post[peer_id]['rx']
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            rx_link_conf = max(0.0, 1.0 - rx_resid)
+            tx_link_conf = max(0.0, 1.0 - tx_resid)
+        elif norm_status(repaired_status) == 'down':
+            rx_link_conf = 0.9 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.9 if tx_repaired == 0.0 else 0.5
+        else:
+            rx_link_conf = 0.6
+            tx_link_conf = 0.6
+=======
+        # Confidence based on post-repair residuals vs peer (tolerance-aware two-slope mapping)
+        peer_id = peers.get(iface)
+        if had_peer and peer_id in pre and local_status == 'up' and (peer_status == 'up'):
+            peer_tx_after = post[peer_id]['tx']
+            peer_rx_after = post[peer_id]['rx']
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            rx_tol = pair_tolerance(rx_repaired, peer_tx_after)
+            tx_tol = pair_tolerance(tx_repaired, peer_rx_after)
+
+            def two_slope_conf(resid: float, tol: float) -> float:
+                x = resid / max(tol, 1e-9)
+                # Primary slope: within 5x tolerance maps down to 0
+                conf = 1.0 - min(1.0, x / 5.0)
+                # Extra penalty for egregious residuals > 3x tolerance
+                if x > 3.0:
+                    conf -= 0.1 * ((x - 3.0) / 2.0)
+                return max(0.0, min(1.0, conf))
+
+            rx_link_conf = two_slope_conf(rx_resid, rx_tol)
+            tx_link_conf = two_slope_conf(tx_resid, tx_tol)
+
+            # Apply reconciliation penalties to confidence
+            rx_link_conf *= (1.0 - min(0.2, adj_penalty.get(iface, {}).get('rx', 0.0)))
+            tx_link_conf *= (1.0 - min(0.2, adj_penalty.get(iface, {}).get('tx', 0.0)))
+
+            # No-edit bonus when we didn't touch original measurement and are within tolerance
+            if abs(rx_repaired - rx_orig) < 1e-6 and (rx_resid / max(rx_tol, 1e-9)) <= 1.0:
+                rx_link_conf = min(1.0, rx_link_conf + 0.05)
+            if abs(tx_repaired - tx_orig) < 1e-6 and (tx_resid / max(tx_tol, 1e-9)) <= 1.0:
+                tx_link_conf = min(1.0, tx_link_conf + 0.05)
+
+        elif norm_status(repaired_status) == 'down':
+            rx_link_conf = 0.9 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.9 if tx_repaired == 0.0 else 0.5
+        else:
+            # No reliable peer information; modest default with a small no-edit bonus
+            no_edit_rx = abs(rx_repaired - rx_orig) < 1e-6
+            no_edit_tx = abs(tx_repaired - tx_orig) < 1e-6
+            rx_link_conf = 0.7 if no_edit_rx else 0.6
+            tx_link_conf = 0.7 if no_edit_tx else 0.6
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,331 @@
+<NAME>
+targeted_router_and_confidence_smoothing
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to increase counter accuracy and improve confidence calibration without destabilizing previously good repairs:
+
+1) Targeted router correction on outliers: Replace uniform router-wide scaling with weighted per-interface adjustments applied only to the lower-confidence side. We compute weights w_i = (1 - conf_i) * rate_i for active interfaces, allocate the correction proportionally, and apply damped, clipped per-interface scale factors. This preserves flow conservation while avoiding unnecessary changes on high-confidence links.
+
+2) Confidence-gap-proportional link re-sync with low-rate guard: In the post-projection re-sync stage, adjust only the lower-confidence side by a fraction f = min(0.4, conf_high - conf_low) toward the pair mean and only when traffic is non-trivial. This reduces overcorrection and improves calibration.
+
+3) Confidence calibration upgrades: Incorporate a scale-factor penalty in the final confidence blend so large adjustments reduce confidence. Then add a final peer-residual based smoothing pass (70/30 with 1 - mismatch) when both ends are up. These changes align the confidence scores more closely with actual repair quality, reducing overconfidence and underconfidence.
+
+These edits are localized to Stage 2, Stage 2.5, the confidence blending in the result assembly, and a small final touch-up before returning results. The overall algorithm and interfaces remain unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for router, if_list in router_ifaces.items():
+        # Ignore trivial routers
+        if len(if_list) <= 1:
+            router_imbalance_before[router] = 0.0
+            continue
+
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        mismatch = rel_diff(sum_tx, sum_rx)
+        router_imbalance_before[router] = mismatch
+
+        if max(sum_tx, sum_rx) < EPS:
+            continue  # nothing to project
+
+        if mismatch > TAU_ROUTER:
+            # Choose side with lower aggregate link confidence to adjust
+            c_tx_total = sum(conf_tx_link.get(i, 0.5) for i in if_list)
+            c_rx_total = sum(conf_rx_link.get(i, 0.5) for i in if_list)
+            adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+
+            if adjust_side == "tx" and sum_tx > 0:
+                alpha = sum_rx / max(sum_tx, EPS)
+                # Clip and damp scaling to avoid overcorrection
+                alpha = max(0.85, min(1.15, alpha))
+                alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                for i in if_list:
+                    hard_tx[i] *= alpha_eff
+                    scaled_tx_factor[i] *= alpha_eff
+                    penalty = clamp01(abs(alpha_eff - 1.0))
+                    conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+            elif adjust_side == "rx" and sum_rx > 0:
+                alpha = sum_tx / max(sum_rx, EPS)
+                alpha = max(0.85, min(1.15, alpha))
+                alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                for i in if_list:
+                    hard_rx[i] *= alpha_eff
+                    scaled_rx_factor[i] *= alpha_eff
+                    penalty = clamp01(abs(alpha_eff - 1.0))
+                    conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+=======
+    for router, if_list in router_ifaces.items():
+        # Ignore trivial routers
+        if len(if_list) <= 1:
+            router_imbalance_before[router] = 0.0
+            continue
+
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        mismatch = rel_diff(sum_tx, sum_rx)
+        router_imbalance_before[router] = mismatch
+
+        if max(sum_tx, sum_rx) < EPS:
+            continue  # nothing to project
+
+        if mismatch > TAU_ROUTER:
+            # Choose side with lower aggregate link confidence to adjust
+            c_tx_total = sum(conf_tx_link.get(i, 0.5) for i in if_list)
+            c_rx_total = sum(conf_rx_link.get(i, 0.5) for i in if_list)
+            adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+
+            if adjust_side == "tx" and sum_tx > 0:
+                # Targeted scaling on low-confidence, active interfaces
+                vals = [hard_tx.get(i, 0.0) for i in if_list]
+                confs = [conf_tx_link.get(i, 0.6) for i in if_list]
+                weights = []
+                for v, c in zip(vals, confs):
+                    # Lower confidence and larger rate => more adjustable
+                    w = max(0.0, (1.0 - clamp01(c)) * (v if v >= ZERO_THRESH else 0.0))
+                    weights.append(w)
+                denom = sum(v * w for v, w in zip(vals, weights))
+                target = sum_rx
+                current = sum_tx
+                delta = target - current
+                if denom < EPS:
+                    # Fallback to uniform damped scaling
+                    alpha = target / max(current, EPS)
+                    alpha = max(0.85, min(1.15, alpha))
+                    alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                    for i in if_list:
+                        hard_tx[i] *= alpha_eff
+                        scaled_tx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                else:
+                    k = delta / denom
+                    for idx, i in enumerate(if_list):
+                        v = vals[idx]
+                        w = weights[idx]
+                        if v < EPS or w <= 0.0:
+                            continue
+                        # Damped, clipped per-interface scaling
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(1.10, scale_i))
+                        hard_tx[i] = v * scale_i
+                        scaled_tx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+            elif adjust_side == "rx" and sum_rx > 0:
+                vals = [hard_rx.get(i, 0.0) for i in if_list]
+                confs = [conf_rx_link.get(i, 0.6) for i in if_list]
+                weights = []
+                for v, c in zip(vals, confs):
+                    w = max(0.0, (1.0 - clamp01(c)) * (v if v >= ZERO_THRESH else 0.0))
+                    weights.append(w)
+                denom = sum(v * w for v, w in zip(vals, weights))
+                target = sum_tx
+                current = sum_rx
+                delta = target - current
+                if denom < EPS:
+                    alpha = target / max(current, EPS)
+                    alpha = max(0.85, min(1.15, alpha))
+                    alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                    for i in if_list:
+                        hard_rx[i] *= alpha_eff
+                        scaled_rx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                else:
+                    k = delta / denom
+                    for idx, i in enumerate(if_list):
+                        v = vals[idx]
+                        w = weights[idx]
+                        if v < EPS or w <= 0.0:
+                            continue
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(1.10, scale_i))
+                        hard_rx[i] = v * scale_i
+                        scaled_rx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2.5: Post-projection gentle link re-sync (only adjust lower-confidence side)
+    for a, data in telemetry.items():
+        b = peers.get(a)
+        if not b or a > b:
+            # Process each pair once; ensure deterministic order by a > b check
+            continue
+        # Compare my_tx[a] vs their_rx[b], and my_rx[a] vs their_tx[b]
+        # a->b direction
+        tx_a = hard_tx.get(a, 0.0)
+        rx_b = hard_rx.get(b, 0.0)
+        diff_ab = rel_diff(tx_a, rx_b)
+        if diff_ab > TAU_H:
+            mean_ab = 0.5 * (tx_a + rx_b)
+            ca = conf_tx_link.get(a, 0.6)
+            cb = conf_rx_link.get(b, 0.6)
+            if ca < cb:
+                # Nudge lower-confidence side toward mean
+                hard_tx[a] = 0.5 * mean_ab + 0.5 * hard_tx[a]
+                conf_tx_link[a] *= 0.95
+            elif cb < ca:
+                hard_rx[b] = 0.5 * mean_ab + 0.5 * hard_rx[b]
+                conf_rx_link[b] *= 0.95
+            else:
+                # Both similar confidence and low: set both to mean cautiously
+                if ca < 0.7:
+                    hard_tx[a] = mean_ab
+                    hard_rx[b] = mean_ab
+                    conf_tx_link[a] *= 0.93
+                    conf_rx_link[b] *= 0.93
+        # b->a direction
+        tx_b = hard_tx.get(b, 0.0)
+        rx_a = hard_rx.get(a, 0.0)
+        diff_ba = rel_diff(tx_b, rx_a)
+        if diff_ba > TAU_H:
+            mean_ba = 0.5 * (tx_b + rx_a)
+            cb_tx = conf_tx_link.get(b, 0.6)
+            ca_rx = conf_rx_link.get(a, 0.6)
+            if cb_tx < ca_rx:
+                hard_tx[b] = 0.5 * mean_ba + 0.5 * hard_tx[b]
+                conf_tx_link[b] *= 0.95
+            elif ca_rx < cb_tx:
+                hard_rx[a] = 0.5 * mean_ba + 0.5 * hard_rx[a]
+                conf_rx_link[a] *= 0.95
+            else:
+                if cb_tx < 0.7:
+                    hard_tx[b] = mean_ba
+                    hard_rx[a] = mean_ba
+                    conf_tx_link[b] *= 0.93
+                    conf_rx_link[a] *= 0.93
+=======
+    # Stage 2.5: Post-projection gentle link re-sync (only adjust lower-confidence side)
+    for a, data in telemetry.items():
+        b = peers.get(a)
+        if not b or a > b:
+            # Process each pair once; ensure deterministic order by a > b check
+            continue
+        # Compare my_tx[a] vs their_rx[b], and my_rx[a] vs their_tx[b]
+        # a->b direction
+        tx_a = hard_tx.get(a, 0.0)
+        rx_b = hard_rx.get(b, 0.0)
+        diff_ab = rel_diff(tx_a, rx_b)
+        if diff_ab > TAU_H and max(tx_a, rx_b) >= ZERO_THRESH:
+            mean_ab = 0.5 * (tx_a + rx_b)
+            ca = conf_tx_link.get(a, 0.6)
+            cb = conf_rx_link.get(b, 0.6)
+            if ca < cb:
+                # Nudge lower-confidence side proportionally to confidence gap
+                f = min(0.4, max(0.0, cb - ca))
+                hard_tx[a] = (1.0 - f) * tx_a + f * mean_ab
+                conf_tx_link[a] *= 0.95
+            elif cb < ca:
+                f = min(0.4, max(0.0, ca - cb))
+                hard_rx[b] = (1.0 - f) * rx_b + f * mean_ab
+                conf_rx_link[b] *= 0.95
+            else:
+                # Both similar confidence and low: small cautious nudge toward mean
+                if ca < 0.7:
+                    f = 0.15
+                    hard_tx[a] = (1.0 - f) * tx_a + f * mean_ab
+                    hard_rx[b] = (1.0 - f) * rx_b + f * mean_ab
+                    conf_tx_link[a] *= 0.93
+                    conf_rx_link[b] *= 0.93
+        # b->a direction
+        tx_b = hard_tx.get(b, 0.0)
+        rx_a = hard_rx.get(a, 0.0)
+        diff_ba = rel_diff(tx_b, rx_a)
+        if diff_ba > TAU_H and max(tx_b, rx_a) >= ZERO_THRESH:
+            mean_ba = 0.5 * (tx_b + rx_a)
+            cb_tx = conf_tx_link.get(b, 0.6)
+            ca_rx = conf_rx_link.get(a, 0.6)
+            if cb_tx < ca_rx:
+                f = min(0.4, max(0.0, ca_rx - cb_tx))
+                hard_tx[b] = (1.0 - f) * tx_b + f * mean_ba
+                conf_tx_link[b] *= 0.95
+            elif ca_rx < cb_tx:
+                f = min(0.4, max(0.0, cb_tx - ca_rx))
+                hard_rx[a] = (1.0 - f) * rx_a + f * mean_ba
+                conf_rx_link[a] *= 0.95
+            else:
+                if cb_tx < 0.7:
+                    f = 0.15
+                    hard_tx[b] = (1.0 - f) * tx_b + f * mean_ba
+                    hard_rx[a] = (1.0 - f) * rx_a + f * mean_ba
+                    conf_tx_link[b] *= 0.93
+                    conf_rx_link[a] *= 0.93
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Blend confidence components with emphasis on final invariant satisfaction
+        conf_tx_final = clamp01(
+            0.25 * base_tx_conf +
+            0.20 * red_tx +
+            0.30 * fin_sym_tx +
+            0.15 * ch_tx +
+            0.10 * router_factor_after
+        )
+        conf_rx_final = clamp01(
+            0.25 * base_rx_conf +
+            0.20 * red_rx +
+            0.30 * fin_sym_rx +
+            0.15 * ch_rx +
+            0.10 * router_factor_after
+        )
+=======
+        # Blend confidence components with emphasis on final invariant satisfaction and scale penalty
+        scale_tx_term = clamp01(1.0 - min(0.5, abs(scaled_tx_factor.get(if_id, 1.0) - 1.0)))
+        scale_rx_term = clamp01(1.0 - min(0.5, abs(scaled_rx_factor.get(if_id, 1.0) - 1.0)))
+        conf_tx_final = clamp01(
+            0.23 * base_tx_conf +
+            0.20 * red_tx +
+            0.27 * fin_sym_tx +
+            0.10 * ch_tx +
+            0.10 * router_factor_after +
+            0.10 * scale_tx_term
+        )
+        conf_rx_final = clamp01(
+            0.23 * base_rx_conf +
+            0.20 * red_rx +
+            0.27 * fin_sym_rx +
+            0.10 * ch_rx +
+            0.10 * router_factor_after +
+            0.10 * scale_rx_term
+        )
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    return result
+=======
+    # Final confidence touch-up: incorporate final symmetry residuals.
+    # Only adjust when both ends are up to avoid inflating confidence for downed links.
+    for i, data in telemetry.items():
+        peer = data.get('connected_to')
+        if not isinstance(peer, str) or peer not in telemetry or i not in result or peer not in result:
+            continue
+        if result[i]['interface_status'][1] != 'up' or result[peer]['interface_status'][1] != 'up':
+            continue
+        mis_tx = rel_diff(safe_rate(result[i]['tx_rate'][1]), safe_rate(result[peer]['rx_rate'][1]))
+        mis_rx = rel_diff(safe_rate(result[i]['rx_rate'][1]), safe_rate(result[peer]['tx_rate'][1]))
+        old_tx_c = clamp01(result[i]['tx_rate'][2])
+        old_rx_c = clamp01(result[i]['rx_rate'][2])
+        result[i]['tx_rate'] = (
+            result[i]['tx_rate'][0],
+            result[i]['tx_rate'][1],
+            clamp01(0.70 * old_tx_c + 0.30 * clamp01(1.0 - mis_tx))
+        )
+        result[i]['rx_rate'] = (
+            result[i]['rx_rate'][0],
+            result[i]['rx_rate'][1],
+            clamp01(0.70 * old_rx_c + 0.30 * clamp01(1.0 - mis_rx))
+        )
+
+    return result
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,274 @@
+To improve the performance of the Expert Parallelism Load Balancer, I propose enhancing the `_refine_packing` function to support "2-for-2" item swaps between the heaviest and lightest packs, in addition to the existing "1-for-1" swaps. I also recommend slightly increasing the number of re-weighting attempts to better exploit this refined local search.
+
+The standard 1-for-1 swap logic often deadlocks when a single large item in the heaviest pack is balanced against multiple smaller items in lighter packs. By enabling 2-for-2 swaps, the algorithm can resolve these situations (e.g., swapping a pair of items that sum to a large value with a pair from the lightest pack). This is computationally feasible because the number of items per pack (`groups_per_pack`) is typically small.
+
+<NAME>
+refine_packing_with_2item_swaps
+</NAME>
+
+<DESCRIPTION>
+Improves the packing refinement step by introducing "2-for-2" item swaps between the heaviest (max-load) and lightest (min-load) packs, in addition to the existing "1-for-1" swaps between the heaviest and any other pack.
+
+The implementation:
+1.  Computes all pairwise sums for the max-load pack and min-load pack.
+2.  Calculates the potential load reduction for swapping every pair from max with every pair from min.
+3.  Selects the move (either 1-item Max-vs-All or 2-item Max-vs-Min) that maximally reduces the peak load.
+
+This helps break local optima where single item swaps are insufficient.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 50) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items between the max-load
+    pack and any other pack to reduce the maximum load.
+
+    Args:
+        weights: [num_groups] weights of items
+        pack_indices: [num_packs, groups_per_pack] indices of items in each pack
+        pack_weights: [num_packs] total weight of each pack
+
+    Returns:
+        pack_indices: Refined item assignments
+    """
+    for _ in range(max_iters):
+        # Identify max pack
+        max_load, max_pid = torch.max(pack_weights, dim=0)
+
+        # Get items currently in max pack
+        items_max = pack_indices[max_pid]  # [groups_per_pack]
+        w_max_items = weights[items_max]   # [groups_per_pack]
+
+        # Get items in all packs
+        all_items = pack_indices           # [num_packs, groups_per_pack]
+        w_all_items = weights[all_items]   # [num_packs, groups_per_pack]
+
+        # Calculate deltas for swapping item i from max pack with item j from any pack k
+        # delta = w_max_i - w_k_j
+        # [1, 1, G] - [P, G, 1] -> [P, G, G]
+        deltas = w_max_items.view(1, 1, -1) - w_all_items.view(num_packs, groups_per_pack, 1)
+
+        # Calculate new loads if swap happens
+        # New max pack load: max_load - delta
+        # New pack k load: current_k_load + delta
+        new_max_load = max_load - deltas
+        new_k_load = pack_weights.view(num_packs, 1, 1) + deltas
+
+        # We want to minimize the larger of the two resulting loads
+        # Objective: max(new_max_load, new_k_load)
+        objectives = torch.max(new_max_load, new_k_load)
+
+        # Mask out swaps with self (k == max_pid)
+        objectives[max_pid] = float('inf')
+
+        # Find best swap
+        min_obj, flat_idx = torch.min(objectives.flatten(), dim=0)
+
+        # If the best swap doesn't improve the max load significantly, stop
+        if min_obj >= max_load - 1e-6:
+            break
+
+        # Decode indices
+        best_pid = flat_idx // (groups_per_pack * groups_per_pack)
+        rem = flat_idx % (groups_per_pack * groups_per_pack)
+        best_k_item_idx = rem // groups_per_pack
+        best_max_item_idx = rem % groups_per_pack
+
+        # Execute swap
+        item_from_max = items_max[best_max_item_idx].item()
+        item_from_k = all_items[best_pid, best_k_item_idx].item()
+
+        pack_indices[max_pid, best_max_item_idx] = item_from_k
+        pack_indices[best_pid, best_k_item_idx] = item_from_max
+
+        # Update weights
+        delta_val = deltas[best_pid, best_k_item_idx, best_max_item_idx]
+        pack_weights[max_pid] -= delta_val
+        pack_weights[best_pid] += delta_val
+
+    return pack_indices
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 50) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items.
+    Supports:
+    1. 1-item swap between Max Load Pack and Any Other Pack.
+    2. 2-item swap between Max Load Pack and Min Load Pack.
+    """
+    device = weights.device
+
+    # Pre-compute indices for 2-item pairs if applicable
+    can_do_pairs = groups_per_pack >= 2
+    if can_do_pairs:
+        # Upper triangle indices excluding diagonal
+        pair_idxs = torch.triu_indices(groups_per_pack, groups_per_pack, offset=1, device=device)
+        num_pairs = pair_idxs.shape[1]
+
+    for _ in range(max_iters):
+        # 1. Identify stats
+        max_load, max_pid = torch.max(pack_weights, dim=0)
+
+        # 2. Strategy A: 1-item swap Max vs All
+        items_max = pack_indices[max_pid] # [G]
+        w_max = weights[items_max]        # [G]
+
+        all_items = pack_indices          # [M, G]
+        w_all = weights[all_items]        # [M, G]
+
+        # deltas[p, j, i] = w_max[i] - w_all[p, j]
+        # [1, 1, G] - [M, G, 1] -> [M, G, G]
+        deltas_1 = w_max.view(1, 1, -1) - w_all.view(num_packs, groups_per_pack, 1)
+
+        new_max_1 = max_load - deltas_1
+        new_other_1 = pack_weights.view(num_packs, 1, 1) + deltas_1
+
+        obj_1 = torch.max(new_max_1, new_other_1)
+        # Mask self-swap
+        obj_1[max_pid] = float('inf')
+
+        min_obj_1, idx_flat_1 = torch.min(obj_1.flatten(), dim=0)
+
+        # 3. Strategy B: 2-item swap Max vs Min
+        min_obj_2 = float('inf')
+
+        if can_do_pairs:
+            min_load, min_pid = torch.min(pack_weights, dim=0)
+            if max_pid != min_pid:
+                items_min = pack_indices[min_pid]
+                w_min = weights[items_min]
+
+                # Sums of pairs
+                w_max_pairs = w_max[pair_idxs[0]] + w_max[pair_idxs[1]] # [N_pairs]
+                w_min_pairs = w_min[pair_idxs[0]] + w_min[pair_idxs[1]] # [N_pairs]
+
+                # Delta = pair_from_max - pair_from_min
+                # [N_p, 1] - [1, N_p] -> [N_p, N_p]
+                deltas_2 = w_max_pairs.unsqueeze(1) - w_min_pairs.unsqueeze(0)
+
+                new_max_2 = max_load - deltas_2
+                new_min_2 = min_load + deltas_2
+
+                # Objective: minimize max(new_max, new_min)
+                # We assume intermediate packs don't become new max, which is a heuristic.
+                obj_2 = torch.max(new_max_2, new_min_2)
+
+                min_obj_2, idx_flat_2 = torch.min(obj_2.flatten(), dim=0)
+
+        # 4. Select Best Move
+        best_obj = max_load - 1e-6
+        move_type = 0 # 0: None, 1: 1-item, 2: 2-item
+
+        if min_obj_1 < best_obj:
+            best_obj = min_obj_1
+            move_type = 1
+
+        if min_obj_2 < best_obj:
+            best_obj = min_obj_2
+            move_type = 2
+
+        if move_type == 0:
+            break
+
+        # 5. Execute Move
+        if move_type == 1:
+            # 1-item swap
+            # idx_flat_1: p * G * G + j * G + i
+            G2 = groups_per_pack * groups_per_pack
+            p = idx_flat_1 // G2
+            rem = idx_flat_1 % G2
+            j = rem // groups_per_pack
+            i = rem % groups_per_pack
+
+            val_max = items_max[i].item()
+            val_other = all_items[p, j].item()
+
+            pack_indices[max_pid, i] = val_other
+            pack_indices[p, j] = val_max
+
+            d = deltas_1[p, j, i]
+            pack_weights[max_pid] -= d
+            pack_weights[p] += d
+
+        else: # move_type == 2
+            # 2-item swap
+            # idx_flat_2: pair_max_idx * num_pairs + pair_min_idx
+            pm_idx = idx_flat_2 // num_pairs
+            pn_idx = idx_flat_2 % num_pairs
+
+            m1, m2 = pair_idxs[0, pm_idx], pair_idxs[1, pm_idx]
+            n1, n2 = pair_idxs[0, pn_idx], pair_idxs[1, pn_idx]
+
+            val_m1 = pack_indices[max_pid, m1].item()
+            val_m2 = pack_indices[max_pid, m2].item()
+            val_n1 = pack_indices[min_pid, n1].item()
+            val_n2 = pack_indices[min_pid, n2].item()
+
+            pack_indices[max_pid, m1] = val_n1
+            pack_indices[max_pid, m2] = val_n2
+            pack_indices[min_pid, n1] = val_m1
+            pack_indices[min_pid, n2] = val_m2
+
+            d = deltas_2[pm_idx, pn_idx]
+            pack_weights[max_pid] -= d
+            pack_weights[min_pid] += d
+
+    return pack_indices
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+increase_reweighting_attempts
+</NAME>
+
+<DESCRIPTION>
+Increases the number of attempts in the iterative re-weighting loop from 5 to 8. This allows the algorithm to explore a wider variety of initial greedy packings, which the new 2-item refinement can then optimize.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_attempts: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Implements a Greedy LPT initialization with Iterative Re-weighting and
+    Swapping refinement.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+        num_attempts: number of iterations for re-weighting optimization
+
+    Returns:
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_attempts: int = 8) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Implements a Greedy LPT initialization with Iterative Re-weighting and
+    Swapping refinement.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+        num_attempts: number of iterations for re-weighting optimization
+
+    Returns:
+>>>>>>> REPLACE
+</DIFF>

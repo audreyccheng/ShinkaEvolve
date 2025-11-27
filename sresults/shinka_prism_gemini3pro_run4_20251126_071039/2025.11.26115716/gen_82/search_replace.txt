@@ -1,0 +1,249 @@
+<NAME>
+multi_strategy_beam_search
+</NAME>
+
+<DESCRIPTION>
+Improves the feasibility check (`solve_check`) by incorporating a multi-strategy Beam Search. Instead of relying solely on linearized cost sorting, it now attempts packing with Size-descending and Weight-descending sort orders, as well as randomized perturbations of the linearized cost when needed. This significantly increases the probability of finding a valid placement for tight K constraints. Additionally, the Beam Search now includes symmetry breaking to improve efficiency and uses adaptive beam width and effort levels within the binary search loop to balance speed and thoroughness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def solve_check(k_target, beam_width=4):
+        """
+        Check feasibility for K using Beam Search.
+        Constraint: Sum(w + K*s) <= K*C for each bin.
+        """
+        limit = k_target * GPU_MEM_SIZE
+
+        # Prepare and sort items by linearized cost
+        weighted = []
+        for x in items:
+            cost = x['w'] + k_target * x['s']
+            if cost > limit + 1e-5: return None
+            weighted.append((cost, x))
+
+        # Sort descending (Best Fit Decreasing strategy)
+        weighted.sort(key=lambda x: x[0], reverse=True)
+
+        # Beam State: (score, loads_tuple, placement_list)
+        # Score: Sum of squares of loads (preference for tight packing)
+        # Loads: Tuple of linearized loads
+
+        start_loads = tuple([0.0] * gpu_num)
+        start_pl = tuple([[] for _ in range(gpu_num)])
+
+        beam = [(0.0, start_loads, start_pl)]
+
+        for cost, item in weighted:
+            candidates = []
+            seen_signatures = set()
+
+            for score, loads, pl in beam:
+                # Try placing in each bin
+                # Optimization: Duplicate load handling (Symmetry breaking)
+                tried_loads = set()
+
+                for i in range(gpu_num):
+                    current_l = loads[i]
+                    if current_l in tried_loads: continue
+
+                    if current_l + cost <= limit + 1e-5:
+                        tried_loads.add(current_l)
+
+                        new_loads_list = list(loads)
+                        new_loads_list[i] += cost
+
+                        # Signature for state merging: sorted loads
+                        sig = tuple(sorted(new_loads_list))
+                        if sig in seen_signatures: continue
+                        seen_signatures.add(sig)
+
+                        new_pl_list = list(pl)
+                        new_pl_list[i] = pl[i] + [item]
+
+                        # Heuristic: Maximize sum of squares (Best Fit)
+                        new_score = sum(l*l for l in new_loads_list)
+
+                        # Use negative score for sorting logic (if min-heap/sort default)
+                        # Here we just store score and sort desc later
+                        candidates.append((new_score, tuple(new_loads_list), tuple(new_pl_list)))
+
+            if not candidates:
+                return None
+
+            # Select top beam_width
+            candidates.sort(key=lambda x: x[0], reverse=True)
+            beam = candidates[:beam_width]
+
+        return beam[0][2]
+=======
+    def solve_check(k_target, beam_width=10, effort_level=0):
+        """
+        Check feasibility for K using Beam Search with multiple heuristics.
+        effort_level: 0 = deterministic strategies only
+                      1 = include randomized strategies
+        """
+        limit = k_target * GPU_MEM_SIZE
+
+        # Wrap items with their linearized costs
+        wrapped_items = []
+        for x in items:
+            cost = x['w'] + k_target * x['s']
+            if cost > limit + 1e-5: return None
+            wrapped_items.append({'item': x, 'cost': cost})
+
+        def run_beam(key_func):
+            # Sort items based on the provided strategy
+            sorted_items = sorted(wrapped_items, key=key_func, reverse=True)
+
+            # Beam State: (score, loads_tuple, placement_tuple)
+            start_loads = tuple([0.0] * gpu_num)
+            start_pl = tuple([[] for _ in range(gpu_num)])
+            beam = [(0.0, start_loads, start_pl)]
+
+            for w_item in sorted_items:
+                cost = w_item['cost']
+                item = w_item['item']
+                candidates = []
+                seen_signatures = set()
+
+                for score, loads, pl in beam:
+                    # Symmetry breaking: only try unique load values
+                    tried_loads = set()
+
+                    for i in range(gpu_num):
+                        current_l = loads[i]
+                        if current_l in tried_loads: continue
+
+                        if current_l + cost <= limit + 1e-5:
+                            tried_loads.add(current_l)
+
+                            new_loads = list(loads)
+                            new_loads[i] += cost
+
+                            # Signature for pruning equivalent states
+                            sig = tuple(sorted(new_loads))
+                            if sig in seen_signatures: continue
+                            seen_signatures.add(sig)
+
+                            new_pl = list(pl)
+                            new_pl[i] = pl[i] + [item]
+
+                            # Heuristic: Sum of squares (Best Fit)
+                            new_score = sum(l*l for l in new_loads)
+                            candidates.append((new_score, tuple(new_loads), tuple(new_pl)))
+
+                if not candidates:
+                    return None
+
+                # Keep top beam_width
+                candidates.sort(key=lambda x: x[0], reverse=True)
+                beam = candidates[:beam_width]
+
+            return beam[0][2]
+
+        # 1. Standard Linearized Cost
+        res = run_beam(lambda x: x['cost'])
+        if res: return res
+
+        # 2. Size (Good for large items)
+        res = run_beam(lambda x: x['item']['s'])
+        if res: return res
+
+        # 3. Weight
+        res = run_beam(lambda x: x['item']['w'])
+        if res: return res
+
+        # 4. Randomized Perturbations (if high effort)
+        if effort_level > 0:
+            import random
+            rng = random.Random(42 + int(k_target*100))
+            for _ in range(3):
+                # Multiplicative noise on cost
+                res = run_beam(lambda x: x['cost'] * rng.uniform(0.9, 1.1))
+                if res: return res
+
+        return None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Binary Search
+    high = 1e9
+
+    # Initial Check (try simple greedy then wide beam)
+    res = solve_check(high, beam_width=1)
+    if not res:
+        res = solve_check(high, beam_width=8)
+        if not res:
+            raise ValueError("Unable to place models on GPUs.")
+
+    # Optimize initial solution to tighten bound
+    res = local_optimize(res)
+    best_pl = res
+    high = min(high, get_max_kvpr(res))
+    low = lb
+
+    for _ in range(25):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+
+        # Adaptive Beam Width: Fast check then robust check
+        r = solve_check(mid, beam_width=2)
+        if not r:
+            r = solve_check(mid, beam_width=8)
+
+        if r:
+            # Found valid placement for K=mid.
+            # Can we do better? Run local optimization on this placement
+            r = local_optimize(r)
+            mx = get_max_kvpr(r)
+
+            if mx < get_max_kvpr(best_pl):
+                best_pl = r
+
+            high = min(mid, mx)
+        else:
+            low = mid
+
+    # Final Optimization pass
+    best_pl = local_optimize(best_pl)
+=======
+    # Binary Search
+    high = 1e9
+
+    # Initial Check with high effort
+    res = solve_check(high, beam_width=20, effort_level=1)
+    if not res:
+        raise ValueError("Unable to place models on GPUs.")
+
+    # Optimize initial solution
+    res = local_optimize(res)
+    best_pl = res
+    high = min(high, get_max_kvpr(res))
+    low = lb
+
+    for i in range(25):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+
+        # Adaptive effort: increase depth as we converge or periodically
+        # This helps break through hard constraints near the optimal K
+        is_hard = (i > 15) or (high - low < 0.1)
+        r = solve_check(mid, beam_width=10 if is_hard else 5, effort_level=1 if is_hard else 0)
+
+        if r:
+            # Found valid placement
+            # Local optimize to potentially lower K further than 'mid' implies
+            r = local_optimize(r)
+            mx = get_max_kvpr(r)
+
+            if mx < get_max_kvpr(best_pl):
+                best_pl = r
+
+            high = min(mid, mx)
+        else:
+            low = mid
+
+    # Final Optimization pass
+    best_pl = local_optimize(best_pl)
+>>>>>>> REPLACE
+</DIFF>

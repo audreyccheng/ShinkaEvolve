@@ -1,0 +1,322 @@
+<NAME>
+quartic_beam_deep_lookahead
+</NAME>
+
+<DESCRIPTION>
+1.  **Quartic Weighting**: Replaced cubic ($d^3$) with quartic ($d^4$) weighting in the stochastic sampling step of the beam search. This creates a steeper probability curve, virtually eliminating low-urgency transactions from consideration while maintaining a small chance for diversity, ensuring the beam focuses on the most critical items ("big rocks") first.
+2.  **Deep Multi-Target Lookahead**: Expanded the lookahead horizon from top-3 to top-6 urgent remaining items. This increases the probability of finding a compatible "mate" for the current candidate among the critical tasks, reducing the likelihood of scheduling a transaction that blocks all immediate high-priority successors.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Cubic-Weighted Beam Search and Stagnation-Based Adaptive ILS.
+
+    Innovations:
+    1. Cubic Sampling (d^3): heavily biases selection towards urgent tasks while maintaining
+       stochastic diversity for beam search.
+    2. Multi-Target Lookahead: evaluates candidates by checking if *any* of the top-3 urgent
+       remaining items can follow efficiently.
+    3. Adaptive Stagnation ILS: dynamically scales perturbation intensity (Swap -> Block Move
+       -> Ruin & Recreate) based on search stagnation.
+
+    Args:
+        workload: Workload object
+        num_seqs: Budget parameter
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    num_txns = workload.num_txns
+
+    # --- 1. METRIC COMPUTATION ---
+    txn_durations = {}
+    txn_rw_sets = {}
+
+    for t in range(num_txns):
+        # Duration
+        try:
+            d = workload.txns[t][0][3]
+        except:
+            d = 1.0
+        txn_durations[t] = d
+
+        # R/W Sets
+        reads = set()
+        writes = set()
+        try:
+            ops_str = workload.txns[t][0][1]
+            if isinstance(ops_str, str):
+                for op in ops_str.split():
+                    if '-' in op:
+                        parts = op.split('-')
+                        if len(parts) == 2:
+                            op_type, key = parts
+                            if op_type == 'r': reads.add(key)
+                            elif op_type == 'w': writes.add(key)
+        except:
+            pass
+        txn_rw_sets[t] = (reads, writes)
+
+    # Conflict Volume: Sum of durations of conflicting transactions
+    txn_conflict_vol = {t: 0.0 for t in range(num_txns)}
+
+    if num_txns < 2000:
+        for i in range(num_txns):
+            r1, w1 = txn_rw_sets[i]
+            vol = 0.0
+            for j in range(num_txns):
+                if i == j: continue
+                r2, w2 = txn_rw_sets[j]
+                if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+                    vol += txn_durations[j]
+            txn_conflict_vol[i] = vol
+
+    # Urgency Score
+    max_vol = max(txn_conflict_vol.values()) if txn_conflict_vol else 1.0
+    if max_vol == 0: max_vol = 1.0
+    max_dur = max(txn_durations.values()) if txn_durations else 1.0
+
+    txn_urgency = {}
+    for t in range(num_txns):
+        # Balanced score: Duration + Conflict Volume
+        # This identifies long items that also block many others.
+        u = (txn_durations[t] / max_dur) + (txn_conflict_vol[t] / max_vol)
+        txn_urgency[t] = u
+
+    # --- 2. BEAM SEARCH WITH MULTI-TARGET LOOKAHEAD ---
+
+    BEAM_WIDTH = max(5, int(num_seqs))
+
+    # Beam State: (immediate_cost, schedule, remaining)
+    beam = [(0, [], list(range(num_txns)))]
+
+    for _ in range(num_txns):
+        candidates_pool = []
+
+        for p_cost, p_sched, p_remain in beam:
+
+            # Sort remaining by Urgency
+            sorted_remain = sorted(p_remain, key=lambda x: txn_urgency[x], reverse=True)
+
+            to_evaluate = set()
+
+            # 1. Deterministic Top 2 (Greedy Backbone)
+            to_evaluate.update(sorted_remain[:2])
+
+            # 2. Cubic Weighted Stochastic Sampling
+            if len(sorted_remain) > 2:
+                pool = sorted_remain[2:]
+                # Weights = urgency^3 (Strong bias to heavy items)
+                weights = [txn_urgency[x]**3 for x in pool]
+                # Sample 3
+                if pool:
+                    k_samples = min(3, len(pool))
+                    samples = random.choices(pool, weights=weights, k=k_samples)
+                    to_evaluate.update(samples)
+
+            # 3. Pure Random (Diversity)
+            if len(sorted_remain) > 15:
+                to_evaluate.update(random.sample(sorted_remain, 1))
+
+            # Lookahead Evaluation
+            for cand in to_evaluate:
+                curr_sched = p_sched + [cand]
+                curr_cost = workload.get_opt_seq_cost(curr_sched)
+
+                # Lookahead: Check if candidate allows *any* of the top 3 remaining urgent items
+                # to follow efficiently.
+                probes = []
+                count = 0
+                for r in sorted_remain:
+                    if r != cand:
+                        probes.append(r)
+                        count += 1
+                    if count >= 3: break
+
+                la_metric = curr_cost
+
+                if probes:
+                    # Calculate cost of sequence + probe
+                    probe_costs = []
+                    for p in probes:
+                        probe_costs.append(workload.get_opt_seq_cost(curr_sched + [p]))
+
+                    if probe_costs:
+                        # Best case lookahead
+                        la_metric = min(probe_costs)
+
+                # Score: (LookaheadCost, ImmediateCost, -Urgency)
+                # Primary: Minimizing lookahead cost
+                score = (la_metric, curr_cost, -txn_urgency[cand])
+
+                rem_c = list(p_remain)
+                rem_c.remove(cand)
+
+                candidates_pool.append((score, curr_sched, rem_c))
+
+        # Pruning
+        candidates_pool.sort(key=lambda x: x[0])
+        # Construct next beam. x[0] is metric tuple. x[0][1] is immediate cost.
+        beam = [(x[0][1], x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH]]
+
+    best_state = beam[0]
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Quartic-Weighted Beam Search and Stagnation-Based Adaptive ILS.
+
+    Innovations:
+    1. Quartic Sampling (d^4): Uses stronger exponential weighting to eliminate low-value
+       candidates early while retaining just enough stochasticity for robustness.
+    2. Deep Multi-Target Lookahead: Evaluates candidates by checking if *any* of the top-6
+       urgent remaining items can follow efficiently (up from 3), increasing fit probability.
+    3. Adaptive Stagnation ILS: Dynamically scales perturbation intensity (Swap -> Block Move
+       -> Ruin & Recreate) based on search stagnation.
+
+    Args:
+        workload: Workload object
+        num_seqs: Budget parameter
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    num_txns = workload.num_txns
+
+    # --- 1. METRIC COMPUTATION ---
+    txn_durations = {}
+    txn_rw_sets = {}
+
+    for t in range(num_txns):
+        # Duration
+        try:
+            d = workload.txns[t][0][3]
+        except:
+            d = 1.0
+        txn_durations[t] = d
+
+        # R/W Sets
+        reads = set()
+        writes = set()
+        try:
+            ops_str = workload.txns[t][0][1]
+            if isinstance(ops_str, str):
+                for op in ops_str.split():
+                    if '-' in op:
+                        parts = op.split('-')
+                        if len(parts) == 2:
+                            op_type, key = parts
+                            if op_type == 'r': reads.add(key)
+                            elif op_type == 'w': writes.add(key)
+        except:
+            pass
+        txn_rw_sets[t] = (reads, writes)
+
+    # Conflict Volume: Sum of durations of conflicting transactions
+    txn_conflict_vol = {t: 0.0 for t in range(num_txns)}
+
+    if num_txns < 2000:
+        for i in range(num_txns):
+            r1, w1 = txn_rw_sets[i]
+            vol = 0.0
+            for j in range(num_txns):
+                if i == j: continue
+                r2, w2 = txn_rw_sets[j]
+                if not w1.isdisjoint(w2) or not w1.isdisjoint(r2) or not r1.isdisjoint(w2):
+                    vol += txn_durations[j]
+            txn_conflict_vol[i] = vol
+
+    # Urgency Score
+    max_vol = max(txn_conflict_vol.values()) if txn_conflict_vol else 1.0
+    if max_vol == 0: max_vol = 1.0
+    max_dur = max(txn_durations.values()) if txn_durations else 1.0
+
+    txn_urgency = {}
+    for t in range(num_txns):
+        # Balanced score: Duration + Conflict Volume
+        # This identifies long items that also block many others.
+        u = (txn_durations[t] / max_dur) + (txn_conflict_vol[t] / max_vol)
+        txn_urgency[t] = u
+
+    # --- 2. BEAM SEARCH WITH MULTI-TARGET LOOKAHEAD ---
+
+    BEAM_WIDTH = max(5, int(num_seqs))
+
+    # Beam State: (immediate_cost, schedule, remaining)
+    beam = [(0, [], list(range(num_txns)))]
+
+    for _ in range(num_txns):
+        candidates_pool = []
+
+        for p_cost, p_sched, p_remain in beam:
+
+            # Sort remaining by Urgency
+            sorted_remain = sorted(p_remain, key=lambda x: txn_urgency[x], reverse=True)
+
+            to_evaluate = set()
+
+            # 1. Deterministic Top 2 (Greedy Backbone)
+            to_evaluate.update(sorted_remain[:2])
+
+            # 2. Quartic Weighted Stochastic Sampling
+            if len(sorted_remain) > 2:
+                pool = sorted_remain[2:]
+                # Weights = urgency^4 (Stronger bias to heavy items)
+                weights = [txn_urgency[x]**4 for x in pool]
+                # Sample 3
+                if pool:
+                    k_samples = min(3, len(pool))
+                    samples = random.choices(pool, weights=weights, k=k_samples)
+                    to_evaluate.update(samples)
+
+            # 3. Pure Random (Diversity)
+            if len(sorted_remain) > 15:
+                to_evaluate.update(random.sample(sorted_remain, 1))
+
+            # Lookahead Evaluation
+            for cand in to_evaluate:
+                curr_sched = p_sched + [cand]
+                curr_cost = workload.get_opt_seq_cost(curr_sched)
+
+                # Lookahead: Check if candidate allows *any* of the top 6 remaining urgent items
+                # to follow efficiently.
+                probes = []
+                count = 0
+                for r in sorted_remain:
+                    if r != cand:
+                        probes.append(r)
+                        count += 1
+                    if count >= 6: break
+
+                la_metric = curr_cost
+
+                if probes:
+                    # Calculate cost of sequence + probe
+                    probe_costs = []
+                    for p in probes:
+                        probe_costs.append(workload.get_opt_seq_cost(curr_sched + [p]))
+
+                    if probe_costs:
+                        # Best case lookahead
+                        la_metric = min(probe_costs)
+
+                # Score: (LookaheadCost, ImmediateCost, -Urgency)
+                # Primary: Minimizing lookahead cost
+                score = (la_metric, curr_cost, -txn_urgency[cand])
+
+                rem_c = list(p_remain)
+                rem_c.remove(cand)
+
+                candidates_pool.append((score, curr_sched, rem_c))
+
+        # Pruning
+        candidates_pool.sort(key=lambda x: x[0])
+        # Construct next beam. x[0] is metric tuple. x[0][1] is immediate cost.
+        beam = [(x[0][1], x[1], x[2]) for x in candidates_pool[:BEAM_WIDTH]]
+
+    best_state = beam[0]
+>>>>>>> REPLACE
+</DIFF>

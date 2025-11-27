@@ -1,0 +1,263 @@
+<NAME>
+focused_bundle_and_smoothing
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements that should further increase counter accuracy while tightening confidence calibration:
+
+1) Focused router correction on low-confidence interfaces:
+   - In Stage 2, instead of distributing the router-level correction across all interfaces on the chosen side, we restrict adjustments to the lowest-confidence subset that accounts for 70% of the total weight (weights are already proportional to (1 - conf) * traffic).
+   - This prevents unnecessary changes to high-confidence links and concentrates the correction where it is most likely needed.
+   - The change applies consistently to both majority-bundle scaling and non-majority per-interface adjustments and preserves the total correction (using the focused weight denominator).
+
+2) Order-independent peer smoothing:
+   - The existing peer smoothing updates confidences in-place within the loop, causing order dependency. I replace it with a two-map staged update that harmonizes per-direction confidences across peers without unintended feedback in the same loop iteration. This improves stability and calibration.
+
+These changes preserve all invariants, retain bundle-aware scaling, re-sync guards, and calibration logic, and are consistent with prior successful strategies but more precise in where corrections are applied.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+=======
+    PEER_SMOOTH = 0.10       # 10% peer smoothing
+    WEIGHT_FOCUS = 0.70      # focus router correction on lowest-confidence 70% weight
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        weights = {i: (1.0 - clamp01(side_confs[i])) * max(side_vals[i], ZERO_THRESH) + 1e-9 for i in up_ifs}
+        total_w = sum(weights.values())
+        if total_w <= 0:
+            weights = {i: 1.0 for i in up_ifs}
+            total_w = float(len(up_ifs))
+
+        # Apply bundle-aware scaling if there is a majority bundle; else per-interface adjustments
+        if majority_bundles:
+            # Distribute total_adjust across bundles proportionally to their combined weights
+            # Compute per-bundle weight as sum of member weights
+            bundle_weights: Dict[Tuple[Any, Any], float] = {}
+            for key, members, _ in majority_bundles:
+                bundle_weights[key] = sum(weights[m] for m in members)
+            # Remaining non-majority as one group (per-interface below)
+            major_total_w = sum(bundle_weights.values())
+
+            # First, scale majority bundles with a shared factor per bundle
+            for key, members, s_sum in majority_bundles:
+                w_g = bundle_weights.get(key, 0.0)
+                if major_total_w <= 0 or s_sum <= ZERO_EPS:
+                    continue
+                adj_g = total_adjust * (w_g / total_w)  # use global total_w to preserve proportionality
+                target_sum = max(0.0, s_sum + adj_g)
+                scale_g = target_sum / s_sum
+                # Clip group scale to [0.85, 1.15]
+                scale_g = max(1.0 - BUNDLE_CLIP, min(1.0 + BUNDLE_CLIP, scale_g))
+                for m in members:
+                    old = side_vals[m]
+                    new = max(0.0, scale_g * old)
+                    if adjust_side == 'rx':
+                        if hardened_rx[m] > ZERO_EPS:
+                            scaled_rx_factor[m] *= (new / hardened_rx[m])
+                        hardened_rx[m] = new
+                        # Confidence penalty proportional to relative change
+                        relc = abs(new - old) / max(1.0, abs(old))
+                        conf_rx[m] = clamp01(conf_rx[m] * (1.0 - 0.6 * relc))
+                    else:
+                        if hardened_tx[m] > ZERO_EPS:
+                            scaled_tx_factor[m] *= (new / hardened_tx[m])
+                        hardened_tx[m] = new
+                        relc = abs(new - old) / max(1.0, abs(old))
+                        conf_tx[m] = clamp01(conf_tx[m] * (1.0 - 0.6 * relc))
+
+            # Then, adjust remaining non-majority interfaces individually using leftover weights
+            non_majority = [i for i in up_ifs if all(i not in members for _, members, _ in majority_bundles)]
+            nm_total_w = sum(weights[i] for i in non_majority)
+            if nm_total_w > 0:
+                # Compute remaining adjustment share for non-majority
+                adj_nm = total_adjust * (nm_total_w / total_w)
+                for i in non_majority:
+                    v_old = side_vals[i]
+                    w_i = weights[i] / nm_total_w
+                    adj_i = adj_nm * w_i
+                    # Clip per-interface relative change ±10%
+                    cap = PER_LINK_CLIP * v_old
+                    adj_i = min(max(adj_i, -cap), cap)
+                    v_new = max(0.0, v_old + adj_i)
+                    if adjust_side == 'rx':
+                        if hardened_rx[i] > ZERO_EPS:
+                            scaled_rx_factor[i] *= (v_new / hardened_rx[i])
+                        hardened_rx[i] = v_new
+                        relc = abs(adj_i) / max(1.0, abs(v_old))
+                        conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
+                    else:
+                        if hardened_tx[i] > ZERO_EPS:
+                            scaled_tx_factor[i] *= (v_new / hardened_tx[i])
+                        hardened_tx[i] = v_new
+                        relc = abs(adj_i) / max(1.0, abs(v_old))
+                        conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
+        else:
+            # No dominant bundle: targeted per-interface corrections only
+            for i in up_ifs:
+                v_old = side_vals[i]
+                w_i = weights[i] / total_w
+                adj_i = total_adjust * w_i
+                cap = PER_LINK_CLIP * v_old
+                adj_i = min(max(adj_i, -cap), cap)
+                v_new = max(0.0, v_old + adj_i)
+                if adjust_side == 'rx':
+                    if hardened_rx[i] > ZERO_EPS:
+                        scaled_rx_factor[i] *= (v_new / hardened_rx[i])
+                    hardened_rx[i] = v_new
+                    relc = abs(adj_i) / max(1.0, abs(v_old))
+                    conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
+                else:
+                    if hardened_tx[i] > ZERO_EPS:
+                        scaled_tx_factor[i] *= (v_new / hardened_tx[i])
+                    hardened_tx[i] = v_new
+                    relc = abs(adj_i) / max(1.0, abs(v_old))
+                    conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
+=======
+        weights = {i: (1.0 - clamp01(side_confs[i])) * max(side_vals[i], ZERO_THRESH) + 1e-9 for i in up_ifs}
+        total_w = sum(weights.values())
+        if total_w <= 0:
+            weights = {i: 1.0 for i in up_ifs}
+            total_w = float(len(up_ifs))
+
+        # Focus adjustments on the lowest-confidence subset covering WEIGHT_FOCUS of total weight
+        sorted_ifs = sorted(up_ifs, key=lambda x: weights[x], reverse=True)
+        focus_set = []
+        acc = 0.0
+        for i in sorted_ifs:
+            if acc / max(total_w, 1e-12) >= WEIGHT_FOCUS:
+                break
+            focus_set.append(i)
+            acc += weights[i]
+        # Fallback: if empty due to zeros, use all
+        if not focus_set:
+            focus_set = list(up_ifs)
+            acc = total_w
+        focus_total_w = max(acc, 1e-9)
+
+        # Apply bundle-aware scaling if there is a majority bundle; else per-interface adjustments
+        if majority_bundles:
+            # Compute per-bundle weight from focused members only
+            bundle_weights: Dict[Tuple[Any, Any], float] = {}
+            bundle_members_focused: Dict[Tuple[Any, Any], List[str]] = {}
+            for key, members, _ in majority_bundles:
+                focused_members = [m for m in members if m in focus_set]
+                if not focused_members:
+                    continue
+                bundle_members_focused[key] = focused_members
+                bundle_weights[key] = sum(weights[m] for m in focused_members)
+            major_total_w = sum(bundle_weights.values())
+
+            # First, scale majority bundles with a shared factor per bundle
+            for key, members, s_sum in majority_bundles:
+                focused_members = bundle_members_focused.get(key, [])
+                if not focused_members or s_sum <= ZERO_EPS:
+                    continue
+                w_g = bundle_weights.get(key, 0.0)
+                if w_g <= 0.0:
+                    continue
+                adj_g = total_adjust * (w_g / focus_total_w)
+                target_sum = max(0.0, s_sum + adj_g)
+                scale_g = target_sum / max(s_sum, 1e-12)
+                # Clip group scale to [0.85, 1.15]
+                scale_g = max(1.0 - BUNDLE_CLIP, min(1.0 + BUNDLE_CLIP, scale_g))
+                for m in focused_members:
+                    old = side_vals[m]
+                    new = max(0.0, scale_g * old)
+                    if adjust_side == 'rx':
+                        prev = hardened_rx[m]
+                        if prev > ZERO_EPS:
+                            scaled_rx_factor[m] *= (new / prev)
+                        hardened_rx[m] = new
+                        relc = abs(new - old) / max(1.0, abs(old))
+                        conf_rx[m] = clamp01(conf_rx[m] * (1.0 - 0.6 * relc))
+                    else:
+                        prev = hardened_tx[m]
+                        if prev > ZERO_EPS:
+                            scaled_tx_factor[m] *= (new / prev)
+                        hardened_tx[m] = new
+                        relc = abs(new - old) / max(1.0, abs(old))
+                        conf_tx[m] = clamp01(conf_tx[m] * (1.0 - 0.6 * relc))
+
+            # Then, adjust remaining non-majority interfaces individually using focused leftover weights
+            all_major_members = [m for _, members, _ in majority_bundles for m in members]
+            non_majority_all = [i for i in up_ifs if i not in all_major_members]
+            non_majority = [i for i in non_majority_all if i in focus_set]
+            nm_total_w = sum(weights[i] for i in non_majority)
+            if nm_total_w > 0:
+                adj_nm = total_adjust * (nm_total_w / focus_total_w)
+                for i in non_majority:
+                    v_old = side_vals[i]
+                    w_i = weights[i] / nm_total_w
+                    adj_i = adj_nm * w_i
+                    # Clip per-interface relative change ±10%
+                    cap = PER_LINK_CLIP * v_old
+                    adj_i = min(max(adj_i, -cap), cap)
+                    v_new = max(0.0, v_old + adj_i)
+                    if adjust_side == 'rx':
+                        prev = hardened_rx[i]
+                        if prev > ZERO_EPS:
+                            scaled_rx_factor[i] *= (v_new / prev)
+                        hardened_rx[i] = v_new
+                        relc = abs(adj_i) / max(1.0, abs(v_old))
+                        conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
+                    else:
+                        prev = hardened_tx[i]
+                        if prev > ZERO_EPS:
+                            scaled_tx_factor[i] *= (v_new / prev)
+                        hardened_tx[i] = v_new
+                        relc = abs(adj_i) / max(1.0, abs(v_old))
+                        conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
+        else:
+            # No dominant bundle: targeted per-interface corrections only over focus_set
+            for i in focus_set:
+                v_old = side_vals[i]
+                w_i = weights[i] / focus_total_w
+                adj_i = total_adjust * w_i
+                cap = PER_LINK_CLIP * v_old
+                adj_i = min(max(adj_i, -cap), cap)
+                v_new = max(0.0, v_old + adj_i)
+                if adjust_side == 'rx':
+                    prev = hardened_rx[i]
+                    if prev > ZERO_EPS:
+                        scaled_rx_factor[i] *= (v_new / prev)
+                    hardened_rx[i] = v_new
+                    relc = abs(adj_i) / max(1.0, abs(v_old))
+                    conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.6 * relc))
+                else:
+                    prev = hardened_tx[i]
+                    if prev > ZERO_EPS:
+                        scaled_tx_factor[i] *= (v_new / prev)
+                    hardened_tx[i] = v_new
+                    relc = abs(adj_i) / max(1.0, abs(v_old))
+                    conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.6 * relc))
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Peer smoothing
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            conf_tx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[a] + PEER_SMOOTH * conf_rx[b])
+            conf_rx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[b] + PEER_SMOOTH * conf_tx[a])
+            conf_rx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[a] + PEER_SMOOTH * conf_tx[b])
+            conf_tx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[b] + PEER_SMOOTH * conf_rx[a])
+=======
+    # Peer smoothing (order-independent via staged update)
+    new_conf_rx = dict(conf_rx)
+    new_conf_tx = dict(conf_tx)
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            new_conf_tx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[a] + PEER_SMOOTH * conf_rx[b])
+            new_conf_rx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[b] + PEER_SMOOTH * conf_tx[a])
+            new_conf_rx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[a] + PEER_SMOOTH * conf_tx[b])
+            new_conf_tx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[b] + PEER_SMOOTH * conf_rx[a])
+    conf_rx, conf_tx = new_conf_rx, new_conf_tx
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,226 @@
+<NAME>
+decision_noise_greedy
+</NAME>
+
+<DESCRIPTION>
+This edit improves the balanced packing algorithm by introducing "Decision Noise" to the greedy construction phase and rebalancing the Exploration/Exploitation stages.
+
+1.  **Soft-Greedy with Decision Noise**: The `run_greedy` kernel is modified to accept a `decision_noise` parameter. When provided, random noise (scaled by the average item weight) is added to the pack loads before selecting the destination pack. This allows the algorithm to probabilistically select the 2nd or 3rd best pack, preventing the greedy heuristic from getting stuck in local optima for a specific input permutation.
+2.  **Rebalanced Pipeline**: The candidate pool is adjusted from 32/96 (Exploration/Exploitation) to 64/64. The Exploration stage now includes 32 LPT and 32 Interleaved candidates to better cover the search space.
+3.  **Enhanced Exploitation**: In Stage 2, instead of only mutating the input rank order (which indirectly changes packing), we now also apply varying levels of Decision Noise to the candidates derived from the best Stage 1 solution. This allows the algorithm to explore different valid packings for the high-quality permutations found in Stage 1.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Helper: Vectorized Greedy Packer ---
+    def run_greedy(indices_in, batch_w):
+        """
+        indices_in: [Batch, N]
+        batch_w: [Batch, N] (weights sorted according to indices_in)
+        """
+        batch_size = indices_in.shape[0]
+
+        pack_w = torch.zeros(batch_size, num_packs, device=device, dtype=weight.dtype)
+        pack_c = torch.zeros(batch_size, num_packs, device=device, dtype=torch.int64)
+        sorted_p_idx = torch.zeros_like(indices_in)
+
+        inf_val = torch.tensor(float('inf'), device=device)
+
+        for i in range(num_groups):
+            w_item = batch_w[:, i:i+1]
+
+            # Mask full packs
+            is_full = (pack_c >= groups_per_pack)
+            cand_w = torch.where(is_full, inf_val, pack_w)
+
+            # Choose pack with min weight
+            chosen = cand_w.argmin(dim=1, keepdim=True)
+
+            sorted_p_idx[:, i:i+1] = chosen
+            pack_w.scatter_add_(1, chosen, w_item)
+            pack_c.scatter_add_(1, chosen, torch.ones_like(chosen))
+
+        return sorted_p_idx, pack_w
+
+    # --- Stage 1: Exploration ---
+    # [L, 1, N]
+    w_base = weight.unsqueeze(1)
+
+    # 1a. Randomized LPT
+    scales_lpt = torch.linspace(0, 0.3, num_expl_lpt, device=device).view(1, -1, 1)
+    noise_lpt = torch.rand(num_layers, num_expl_lpt, num_groups, device=device, dtype=weight.dtype) * w_base * scales_lpt
+    noise_lpt[:, 0, :] = 0 # Cand 0 is pure LPT
+    keys_lpt = w_base + noise_lpt
+    _, indices_lpt = keys_lpt.sort(dim=-1, descending=True)
+
+    # 1b. Randomized Interleaved
+    # We apply noise to LPT keys, sort, then apply interleaving pattern.
+    scales_int = torch.linspace(0, 0.3, num_expl_int, device=device).view(1, -1, 1)
+    noise_int = torch.rand(num_layers, num_expl_int, num_groups, device=device, dtype=weight.dtype) * w_base * scales_int
+    keys_int_pre = w_base + noise_int
+    _, indices_int_sorted = keys_int_pre.sort(dim=-1, descending=True)
+
+    # Interleaving Map: 0, N-1, 1, N-2, ...
+    interleave_map = torch.empty(num_groups, dtype=torch.long, device=device)
+    interleave_map[0::2] = torch.arange((num_groups + 1) // 2, device=device)
+    interleave_map[1::2] = torch.arange(num_groups - 1, (num_groups + 1) // 2 - 1, step=-1, device=device)
+
+    indices_int = indices_int_sorted.gather(2, interleave_map.view(1, 1, -1).expand(num_layers, num_expl_int, -1))
+
+    # Combine Stage 1
+    # [L, 32, N]
+    stage1_indices = torch.cat([indices_lpt, indices_int], dim=1)
+    flat_stage1_indices = stage1_indices.reshape(num_layers * num_expl, num_groups)
+
+    # Gather weights for greedy
+    w_s1 = weight.repeat_interleave(num_expl, dim=0)
+    w_s1_sorted = torch.gather(w_s1, 1, flat_stage1_indices)
+
+    # Run Greedy S1
+    s1_pack_idx, s1_loads = run_greedy(flat_stage1_indices, w_s1_sorted)
+=======
+    # --- Helper: Vectorized Greedy Packer with Decision Noise ---
+    def run_greedy(indices_in, batch_w, decision_noise=None):
+        """
+        indices_in: [Batch, N]
+        batch_w: [Batch, N] (weights sorted according to indices_in)
+        decision_noise: [Batch, 1] or None. Scale of random noise added to pack loads.
+        """
+        batch_size = indices_in.shape[0]
+
+        pack_w = torch.zeros(batch_size, num_packs, device=device, dtype=weight.dtype)
+        pack_c = torch.zeros(batch_size, num_packs, device=device, dtype=torch.int64)
+        sorted_p_idx = torch.zeros_like(indices_in)
+
+        inf_val = torch.tensor(float('inf'), device=device)
+
+        # Precompute noise magnitude basis
+        if decision_noise is not None:
+             avg_w = batch_w.mean(dim=1, keepdim=True) # [Batch, 1]
+             noise_mag = avg_w * decision_noise # [Batch, 1]
+
+        for i in range(num_groups):
+            w_item = batch_w[:, i:i+1]
+
+            # Mask full packs
+            is_full = (pack_c >= groups_per_pack)
+            cand_w = torch.where(is_full, inf_val, pack_w)
+
+            # Add decision noise
+            if decision_noise is not None:
+                # noise: [Batch, Packs]
+                d_noise = torch.rand(batch_size, num_packs, device=device, dtype=weight.dtype) * noise_mag
+                cand_w = cand_w + d_noise
+
+            # Choose pack with min weight
+            chosen = cand_w.argmin(dim=1, keepdim=True)
+
+            sorted_p_idx[:, i:i+1] = chosen
+            pack_w.scatter_add_(1, chosen, w_item)
+            pack_c.scatter_add_(1, chosen, torch.ones_like(chosen))
+
+        return sorted_p_idx, pack_w
+
+    # --- Stage 1: Exploration ---
+    # Increase Exploration candidates
+    num_expl_lpt = 32
+    num_expl_int = 32
+    num_expl = num_expl_lpt + num_expl_int # 64
+
+    # Stage 2: Exploitation
+    num_exploit = 64
+
+    total_candidates = num_expl + num_exploit # 128
+
+    # [L, 1, N]
+    w_base = weight.unsqueeze(1)
+
+    # 1a. Randomized LPT
+    scales_lpt = torch.linspace(0, 0.4, num_expl_lpt, device=device).view(1, -1, 1)
+    noise_lpt = torch.rand(num_layers, num_expl_lpt, num_groups, device=device, dtype=weight.dtype) * w_base * scales_lpt
+    noise_lpt[:, 0, :] = 0 # Cand 0 is pure LPT
+    keys_lpt = w_base + noise_lpt
+    _, indices_lpt = keys_lpt.sort(dim=-1, descending=True)
+
+    # 1b. Randomized Interleaved
+    scales_int = torch.linspace(0, 0.4, num_expl_int, device=device).view(1, -1, 1)
+    noise_int = torch.rand(num_layers, num_expl_int, num_groups, device=device, dtype=weight.dtype) * w_base * scales_int
+    keys_int_pre = w_base + noise_int
+    _, indices_int_sorted = keys_int_pre.sort(dim=-1, descending=True)
+
+    # Interleaving Map: 0, N-1, 1, N-2, ...
+    interleave_map = torch.empty(num_groups, dtype=torch.long, device=device)
+    interleave_map[0::2] = torch.arange((num_groups + 1) // 2, device=device)
+    interleave_map[1::2] = torch.arange(num_groups - 1, (num_groups + 1) // 2 - 1, step=-1, device=device)
+
+    indices_int = indices_int_sorted.gather(2, interleave_map.view(1, 1, -1).expand(num_layers, num_expl_int, -1))
+
+    # Combine Stage 1
+    # [L, 64, N]
+    stage1_indices = torch.cat([indices_lpt, indices_int], dim=1)
+    flat_stage1_indices = stage1_indices.reshape(num_layers * num_expl, num_groups)
+
+    # Gather weights for greedy
+    w_s1 = weight.repeat_interleave(num_expl, dim=0)
+    w_s1_sorted = torch.gather(w_s1, 1, flat_stage1_indices)
+
+    # Run Greedy S1 (No decision noise for S1 to keep it stable/deterministic baseline)
+    s1_pack_idx, s1_loads = run_greedy(flat_stage1_indices, w_s1_sorted)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # --- Stage 2: Exploitation (Mutation) ---
+    # Create rank scores based on best permutation
+    # pos_scores[l, i] = rank of item i in the best permutation of layer l
+    # To do this efficiently: pos_scores.scatter_(1, best_indices, range)
+    pos_scores = torch.empty_like(best_indices_s1, dtype=torch.float32)
+    src_range = torch.arange(num_groups, device=device, dtype=torch.float32).expand(num_layers, -1)
+    pos_scores.scatter_(1, best_indices_s1, src_range)
+
+    # Expand: [L, 96, N]
+    pos_expanded = pos_scores.unsqueeze(1).expand(-1, num_exploit, -1)
+
+    # Add noise to ranks to induce local swaps
+    noise_levels = torch.linspace(0.5, 4.0, num_exploit, device=device).view(1, -1, 1)
+    rank_noise = torch.randn(num_layers, num_exploit, num_groups, device=device) * noise_levels
+    new_scores = pos_expanded + rank_noise
+
+    # Sort to get mutated indices
+    _, stage2_indices = new_scores.sort(dim=-1)
+
+    flat_stage2_indices = stage2_indices.reshape(num_layers * num_exploit, num_groups)
+
+    # Run Greedy S2
+    w_s2 = weight.repeat_interleave(num_exploit, dim=0)
+    w_s2_sorted = torch.gather(w_s2, 1, flat_stage2_indices)
+    s2_pack_idx, s2_loads = run_greedy(flat_stage2_indices, w_s2_sorted)
+=======
+    # --- Stage 2: Exploitation (Mutation + Decision Noise) ---
+    # Create rank scores based on best permutation
+    pos_scores = torch.empty_like(best_indices_s1, dtype=torch.float32)
+    src_range = torch.arange(num_groups, device=device, dtype=torch.float32).expand(num_layers, -1)
+    pos_scores.scatter_(1, best_indices_s1, src_range)
+
+    # Expand: [L, 64, N]
+    pos_expanded = pos_scores.unsqueeze(1).expand(-1, num_exploit, -1)
+
+    # Add noise to ranks to induce local swaps in input order
+    # Lower rank noise since we also use decision noise
+    noise_levels = torch.linspace(0.0, 3.0, num_exploit, device=device).view(1, -1, 1)
+    rank_noise = torch.randn(num_layers, num_exploit, num_groups, device=device) * noise_levels
+    new_scores = pos_expanded + rank_noise
+
+    _, stage2_indices = new_scores.sort(dim=-1)
+    flat_stage2_indices = stage2_indices.reshape(num_layers * num_exploit, num_groups)
+
+    # Prepare Decision Noise for S2
+    # Vary decision noise from 0.0 to 0.2
+    # We broadcast this across layers
+    dec_noise_scales = torch.linspace(0.0, 0.2, num_exploit, device=device)
+    dec_noise_flat = dec_noise_scales.repeat(num_layers).view(-1, 1) # [L*C, 1]
+
+    # Run Greedy S2 with decision noise
+    w_s2 = weight.repeat_interleave(num_exploit, dim=0)
+    w_s2_sorted = torch.gather(w_s2, 1, flat_stage2_indices)
+    s2_pack_idx, s2_loads = run_greedy(flat_stage2_indices, w_s2_sorted, decision_noise=dec_noise_flat)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,1026 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads
+Deterministic best-two insertion memoization (with LRU, incl. block variant) +
+consensus-regret adaptive beam + VND with DLB and block-memo Or-opt +
+consensus-guided sensitivity LNS + endgame branch-and-bound + relinking.
+"""
+
+import time
+import random
+import sys
+import os
+from math import ceil
+from collections import OrderedDict
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    import os as _os
+    current = _os.path.abspath(start_path)
+    while current != _os.path.dirname(current):  # Stop at filesystem root
+        candidate = _os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if _os.path.exists(candidate):
+            return current
+        current = _os.path.dirname(current)
+
+    script_dir = _os.path.dirname(_os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,
+        _os.path.dirname(script_dir),
+        _os.path.dirname(_os.path.dirname(script_dir)),
+        '/home/ubuntu/ShinkaEvolve',
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',
+    ]
+    for root in possible_roots:
+        candidate = _os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if _os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Compute a low-makespan schedule using:
+      - LRU-memoized best-two insertion (single + block),
+      - Consensus-regret adaptive beam search with suffix diversity and endgame widening,
+      - VND (Or-opt(1–3) with block memo, non-adjacent swaps and 2-opt with DLB),
+      - Consensus-guided sensitivity LNS with stagnation escalation,
+      - Bidirectional block-aware path relinking among elites,
+      - Endgame branch-and-bound for the last K transactions.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Search effort parameter (controls seeds, beam width, and refinement budgets)
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    n = workload.num_txns
+    txns_all = list(range(n))
+
+    # ------------------------ Adaptive parameters ------------------------
+    small = n <= 50
+    med = 50 < n <= 90
+    large = n > 90
+
+    # Position sampling for insertion (deterministic)
+    POS_SAMPLE_CAP = None if small else (22 if med else 18)
+    RING_SPAN = 3  # ± window around focus index
+    EXHAUSTIVE_THRESHOLD = 20  # use all positions when sequence is small
+
+    # Construction / GRASP
+    STARTER_SAMPLE = min(10, n)
+    CAND_SAMPLE_BASE = 12 if small else (10 if med else 9)
+    RCL_K = 3
+    JITTER = 2
+    RCL_REGRET_PROB = 0.65  # probability to choose within RCL by regret rather than pure cost
+
+    # Beam search
+    base_beam_width = max(6, min(12, (num_seqs // 2) + (3 if small else 0)))
+    cand_per_state = min(30, max(12, n // (4 if large else 3)))
+    lookahead_k = 6 if med or large else 8
+    base_diversity_quota_ratio = 0.35
+    suffix_diversity_k_early = 2
+    suffix_diversity_k_late = 3
+
+    # Local search (VND)
+    VND_MAX_ROUNDS = 2 if large else 3
+    MAX_ADJ_PASSES = 2 if large else 3
+    PAIR_SWAP_TRIES = min(220, max(100, n))
+    SEGMENT_REV_TRIES = min(220, max(100, n))
+
+    # LNS
+    LNS_ROUNDS = 2 if med or large else 3
+    LNS_BASE_REMOVE_FRAC = 0.08 if large else (0.10 if med else 0.12)
+    LNS_REMOVE_MIN = 8 if med or large else 6
+    LNS_REMOVE_MAX = 18 if med or large else 14
+
+    # ILS
+    ILS_ITERS = max(2, min(4, num_seqs))
+
+    # Elites
+    ELITE_CAP = max(4, min(6, 2 + num_seqs // 2))
+
+    # Endgame branch-and-bound
+    BNB_K = 9
+    BNB_TIME_BUDGET = 0.03  # seconds per completion
+
+    # Memoization caps
+    BEST_TWO_LRU_CAP = 20000
+    BLOCK_TWO_LRU_CAP = 10000
+
+    # Seed RNG per call for reproducible-but-diverse runs
+    random.seed((n * 1315423911 + num_seqs * 2654435761 + 13) % (2**32 - 1))
+
+    # ------------------------ Episode-wide caches ------------------------
+    class LRU:
+        def __init__(self, cap):
+            self.cap = cap
+            self.od = OrderedDict()
+
+        def get(self, k):
+            v = self.od.get(k)
+            if v is not None:
+                self.od.move_to_end(k)
+            return v
+
+        def put(self, k, v):
+            self.od[k] = v
+            self.od.move_to_end(k)
+            if len(self.od) > self.cap:
+                self.od.popitem(last=False)
+
+        def __contains__(self, k):
+            return k in self.od
+
+    class EpisodeContext:
+        def __init__(self, workload, n):
+            self.workload = workload
+            self.n = n
+            # Partial-prefix cost cache
+            self.cost_cache = {}
+            # LRU best-two insertion caches
+            self.best_two_cache = LRU(BEST_TWO_LRU_CAP)        # (tuple(seq), txn, pos_sig)
+            self.best_two_block_cache = LRU(BLOCK_TWO_LRU_CAP) # (tuple(seq), tuple(block), pos_sig)
+
+        def eval_cost(self, seq):
+            key = tuple(seq)
+            c = self.cost_cache.get(key)
+            if c is None:
+                c = self.workload.get_opt_seq_cost(list(seq))
+                self.cost_cache[key] = c
+            return c
+
+        def positions_signature(self, seq_len, exhaustive=False, focus_idx=None):
+            total = seq_len + 1
+            if exhaustive or POS_SAMPLE_CAP is None or total <= POS_SAMPLE_CAP:
+                return ('all', seq_len)  # canonical signature for all positions
+            anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+            # ring around focus
+            if focus_idx is not None:
+                for d in range(-RING_SPAN, RING_SPAN + 1):
+                    p = focus_idx + d
+                    if 0 <= p <= seq_len:
+                        anchors.add(p)
+            # low-discrepancy interior: evenly spaced points
+            need = max(0, POS_SAMPLE_CAP - len(anchors))
+            if need > 0:
+                for i in range(1, need + 1):
+                    pos = round(i * seq_len / (need + 1))
+                    if 0 <= pos <= seq_len:
+                        anchors.add(pos)
+            positions = tuple(sorted(anchors))
+            return positions
+
+        def positions_for_insertion(self, seq_len, exhaustive=False, focus_idx=None):
+            sig = self.positions_signature(seq_len, exhaustive=exhaustive, focus_idx=focus_idx)
+            if sig == ('all', seq_len):
+                return list(range(seq_len + 1)), sig
+            return list(sig), sig
+
+        def best_two_insertions(self, seq, txn, focus_idx=None, exhaustive=None):
+            if exhaustive is None:
+                exhaustive = (len(seq) <= EXHAUSTIVE_THRESHOLD)
+            positions, sig = self.positions_for_insertion(len(seq), exhaustive=exhaustive, focus_idx=focus_idx)
+
+            # If an 'all' entry exists, prefer it
+            all_sig = ('all', len(seq))
+            all_key = (tuple(seq), txn, all_sig)
+            hit = self.best_two_cache.get(all_key)
+            if hit is not None:
+                return hit
+
+            key = (tuple(seq), txn, sig)
+            cached = self.best_two_cache.get(key)
+            if cached is not None:
+                return cached
+
+            best_c = float('inf')
+            best_p = 0
+            second_c = float('inf')
+            for p in positions:
+                cand = seq[:]
+                cand.insert(p, txn)
+                c = self.eval_cost(cand)
+                if c < best_c:
+                    second_c = best_c
+                    best_c = c
+                    best_p = p
+                elif c < second_c:
+                    second_c = c
+            if second_c == float('inf'):
+                second_c = best_c
+            res = (best_c, best_p, second_c)
+            self.best_two_cache.put(key, res)
+            if sig == all_sig:
+                self.best_two_cache.put(all_key, res)
+            return res
+
+        def best_two_block(self, base_seq, block, focus_idx=None, exhaustive=None):
+            """
+            Compute best and second-best insertion positions for a contiguous block into base_seq.
+            Returns (best_cost, best_pos, second_cost).
+            """
+            seq_len = len(base_seq)
+            if exhaustive is None:
+                exhaustive = (seq_len <= EXHAUSTIVE_THRESHOLD)
+            positions, sig = self.positions_for_insertion(seq_len, exhaustive=exhaustive, focus_idx=focus_idx)
+
+            key = (tuple(base_seq), tuple(block), sig)
+            cached = self.best_two_block_cache.get(key)
+            if cached is not None:
+                return cached
+
+            best_c = float('inf')
+            best_p = 0
+            second_c = float('inf')
+            for p in positions:
+                cand = base_seq[:]
+                cand[p:p] = block
+                c = self.eval_cost(cand)
+                if c < best_c:
+                    second_c = best_c
+                    best_c = c
+                    best_p = p
+                elif c < second_c:
+                    second_c = c
+            if second_c == float('inf'):
+                second_c = best_c
+            res = (best_c, best_p, second_c)
+            self.best_two_block_cache.put(key, res)
+            return res
+
+    ctx = EpisodeContext(workload, n)
+
+    # ------------------------ Elite pool with suffix-3 diversity ------------------------
+    elites = []  # list of (cost, seq)
+
+    def elite_suffix3(seq):
+        return tuple(seq[-3:]) if len(seq) >= 3 else tuple(seq)
+
+    def add_elite(cost, seq):
+        nonlocal elites
+        if not seq or len(seq) != n:
+            return
+        key = tuple(seq)
+        for i, (c, s) in enumerate(elites):
+            if tuple(s) == key:
+                if cost < c:
+                    elites[i] = (cost, list(seq))
+                return
+        # ensure suffix-3 diversity
+        sfx = elite_suffix3(seq)
+        for i, (c, s) in enumerate(elites):
+            if elite_suffix3(s) == sfx:
+                if cost < c:
+                    elites[i] = (cost, list(seq))
+                break
+        else:
+            elites.append((cost, list(seq)))
+        elites.sort(key=lambda x: x[0])
+        if len(elites) > ELITE_CAP:
+            elites = elites[:ELITE_CAP]
+
+    def compute_consensus():
+        """
+        Build consensus rank mapping from current elites (median rank).
+        Returns dict txn -> rank, or None if insufficient elites.
+        """
+        if len(elites) < 2:
+            return None
+        positions = {t: [] for t in txns_all}
+        for _, s in elites:
+            idx = {t: i for i, t in enumerate(s)}
+            for t in txns_all:
+                positions[t].append(idx.get(t, n))
+        consensus = {}
+        for t, lst in positions.items():
+            if not lst:
+                consensus[t] = n
+            else:
+                sl = sorted(lst)
+                consensus[t] = sl[len(sl) // 2]
+        return consensus
+
+    # ------------------------ GRASP constructor (regret-weighted) ------------------------
+    def select_starter():
+        cands = random.sample(txns_all, STARTER_SAMPLE) if STARTER_SAMPLE < n else txns_all
+        best_t, best_c = None, float('inf')
+        for t in cands:
+            c = ctx.eval_cost([t])
+            if c < best_c:
+                best_c, best_t = c, t
+        return best_t if best_t is not None else random.randint(0, n - 1)
+
+    def construct_grasp_regret():
+        remaining = set(txns_all)
+        seq = [select_starter()]
+        remaining.remove(seq[0])
+
+        # Strong second: exhaustive over a few candidates and both positions
+        if remaining:
+            k2 = min(8, len(remaining))
+            trials = []
+            for t in random.sample(list(remaining), k2):
+                for p in [0, 1]:
+                    cand = seq[:]
+                    cand.insert(p, t)
+                    c = ctx.eval_cost(cand)
+                    trials.append((c, t, p))
+            if trials:
+                trials.sort(key=lambda x: x[0])
+                choice = random.choice(trials[:min(3, len(trials))])
+                _, t2, p2 = choice
+                seq.insert(p2, t2)
+                remaining.remove(t2)
+
+        while remaining:
+            sz = len(remaining)
+            cand_size = sz if sz <= max(8, 2 * CAND_SAMPLE_BASE) else min(sz, max(4, CAND_SAMPLE_BASE + random.randint(-JITTER, JITTER)))
+            cand_txns = random.sample(list(remaining), cand_size)
+
+            scored = []
+            for t in cand_txns:
+                c1, p1, c2 = ctx.best_two_insertions(seq, t, exhaustive=(len(seq) <= EXHAUSTIVE_THRESHOLD))
+                regret = max(0.0, c2 - c1)
+                scored.append((c1, regret, t, p1))
+            if not scored:
+                t = random.choice(list(remaining))
+                seq.append(t)
+                remaining.remove(t)
+                continue
+
+            scored.sort(key=lambda x: x[0])
+            rcl = scored[:min(len(scored), max(3, RCL_K))]
+            if random.random() < RCL_REGRET_PROB:
+                rcl.sort(key=lambda x: (-x[1], x[0]))
+                choice = rcl[0]
+            else:
+                choice = random.choice(rcl)
+            _, _, t_pick, pos_pick = choice
+            seq.insert(pos_pick, t_pick)
+            remaining.remove(t_pick)
+
+        return ctx.eval_cost(seq), seq
+
+    # ------------------------ Endgame branch-and-bound (DFS) ------------------------
+    def complete_with_bnb(prefix, rem_set, time_budget=BNB_TIME_BUDGET, K=BNB_K):
+        """
+        If |rem_set| <= K, run a bounded DFS enumeration with branch-and-bound.
+        Otherwise, greedily shrink to K then run DFS. Returns (cost, seq).
+        """
+        start = time.time()
+        cur_seq = list(prefix)
+        rem = list(rem_set)
+
+        def greedy_completion(cur, rem_list):
+            cur2 = list(cur)
+            rem2 = list(rem_list)
+            while rem2:
+                best_t, best_c = None, float('inf')
+                for t in rem2:
+                    c2 = ctx.eval_cost(cur2 + [t])
+                    if c2 < best_c:
+                        best_c, best_t = c2, t
+                cur2.append(best_t)
+                rem2.remove(best_t)
+            return ctx.eval_cost(cur2), cur2
+
+        if len(rem) > K:
+            # shrink by greedy to reach K
+            while len(rem) > K:
+                best_t, best_c = None, float('inf')
+                for t in rem:
+                    c2 = ctx.eval_cost(cur_seq + [t])
+                    if c2 < best_c:
+                        best_c, best_t = c2, t
+                cur_seq.append(best_t)
+                rem.remove(best_t)
+
+        # initial upper bound from greedy
+        ub_cost, ub_seq = greedy_completion(cur_seq, rem)
+        best_cost, best_seq = ub_cost, list(ub_seq)
+        state_cache = {}
+
+        def dfs(prefix_seq, remaining):
+            nonlocal best_cost, best_seq
+            if time.time() - start > time_budget:
+                return
+            if not remaining:
+                c = ctx.eval_cost(prefix_seq)
+                if c < best_cost:
+                    best_cost, best_seq = c, list(prefix_seq)
+                return
+            key = (tuple(prefix_seq), tuple(sorted(remaining)))
+            # optional: simple memoization (store lower bound achieved)
+            prev = state_cache.get(key)
+            cur_cost = ctx.eval_cost(prefix_seq)
+            if prev is not None and prev <= cur_cost:
+                return
+            state_cache[key] = cur_cost
+
+            # order choices by immediate cost, break ties by higher best-two regret (for pruning)
+            scored = []
+            for t in remaining:
+                c1 = ctx.eval_cost(prefix_seq + [t])
+                # best-two regret estimate on append position: use single insertion on current prefix (not append-best)
+                bt1, _, bt2 = ctx.best_two_insertions(prefix_seq, t, exhaustive=False)
+                regret = max(0.0, bt2 - bt1)
+                scored.append((c1, -regret, t))
+            scored.sort(key=lambda x: (x[0], x[1]))
+
+            for c1, neg_reg, t in scored:
+                if c1 >= best_cost:
+                    continue  # prune by bound (monotone cost)
+                prefix_seq.append(t)
+                remaining.remove(t)
+                dfs(prefix_seq, remaining)
+                remaining.add(t)
+                prefix_seq.pop()
+
+        dfs(list(cur_seq), set(rem))
+        return best_cost, best_seq
+
+    # ------------------------ Regret-adaptive consensus-guided beam search ------------------------
+    def beam_search():
+        consensus = compute_consensus()
+        beam_width = base_beam_width
+        diversity_quota_ratio = base_diversity_quota_ratio
+        diversity_quota = max(1, int(diversity_quota_ratio * beam_width))
+
+        # initialize with strong singletons and one GRASP seed
+        starters = [(ctx.eval_cost([t]), [t]) for t in txns_all]
+        starters.sort(key=lambda x: x[0])
+        init = starters[:min(len(starters), max(beam_width * 2, beam_width + 2))]
+        c0, s0 = construct_grasp_regret()
+        init.append((c0, s0))
+
+        beam = []
+        used = set()
+        for c, seq in init:
+            k = tuple(seq)
+            if k in used:
+                continue
+            used.add(k)
+            rem = frozenset(t for t in txns_all if t not in seq)
+            beam.append((c, seq, rem))
+            if len(beam) >= beam_width:
+                break
+
+        best_complete = (float('inf'), [])
+
+        for depth in range(1, n + 1):
+            if not beam:
+                break
+            next_pool = []
+            layer_seen = set()
+
+            # estimate endgame and suffix diversity length
+            min_remaining = min((len(rem) for _, _, rem in beam), default=n)
+            endgame = min_remaining <= 2 * beam_width
+            suffix_k = suffix_diversity_k_late if endgame else suffix_diversity_k_early
+            suffix_seen = set()
+
+            for c_so_far, prefix, rem in beam:
+                if not rem:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    continue
+                rem_list = list(rem)
+                expand_list = rem_list if len(rem_list) <= cand_per_state else random.sample(rem_list, cand_per_state)
+
+                local_moves = []
+                c2_samples_all = []
+                for t in expand_list:
+                    # append expansion (order is the schedule order)
+                    new_prefix = prefix + [t]
+                    c1 = ctx.eval_cost(new_prefix)
+                    rem_after = [x for x in rem_list if x != t]
+                    # lookahead sampling
+                    best_c2 = c1
+                    c2_samples = []
+                    if rem_after:
+                        k2 = min(lookahead_k, len(rem_after))
+                        second = rem_after if (endgame and len(rem_after) <= k2) else random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        for u in second:
+                            cu = ctx.eval_cost(new_prefix + [u])
+                            c2_samples.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                    if c2_samples:
+                        c2_samples_all.extend(c2_samples)
+                    local_moves.append((c1, best_c2, new_prefix, frozenset(rem_after), t))
+
+                if not local_moves:
+                    continue
+
+                # compute dispersion and adapt ratios
+                if c2_samples_all:
+                    disp = max(c2_samples_all) - min(c2_samples_all)
+                    med = sorted(c2_samples_all)[len(c2_samples_all) // 2]
+                else:
+                    disp, med = 0.0, 0.0
+
+                if disp > med:
+                    alpha = 0.5
+                    diversity_quota_ratio_cur = 0.5
+                else:
+                    alpha = 0.8
+                    diversity_quota_ratio_cur = 0.2
+                diversity_quota_cur = max(1, int(diversity_quota_ratio_cur * beam_width))
+
+                # score and build candidate sets
+                ranked = []
+                for c1, c2, seq2, rem2, t in local_moves:
+                    score = alpha * c1 + (1.0 - alpha) * c2
+                    ranked.append((score, c1, c2, seq2, rem2, t))
+                ranked.sort(key=lambda x: x[0])
+                top_cost = ranked[:max(1, min(beam_width, len(ranked)))]
+
+                # regret by higher second-best (c2) among good ones
+                top_regret = sorted(ranked, key=lambda x: (x[2], x[0]))[:min(diversity_quota_cur, len(ranked))]
+
+                # consensus misalignment set
+                misaligned = []
+                if consensus is not None:
+                    for score, c1, c2, seq2, rem2, t in ranked:
+                        pos = len(seq2) - 1  # position of t after append
+                        mis = abs(pos - consensus.get(t, n))
+                        misaligned.append((mis, score, c1, c2, seq2, rem2))
+                    misaligned.sort(key=lambda x: (-x[0], x[1]))
+                    misaligned = [(sc, c1, c2, s2, r2) for _, sc, c1, c2, s2, r2 in misaligned[:min(diversity_quota_cur, len(misaligned))]]
+
+                # merge candidate sets
+                cand = []
+                seen_seq = set()
+                for sc, c1, c2, s2, r2, _t in top_cost + top_regret:
+                    k = tuple(s2)
+                    if k not in seen_seq:
+                        cand.append((sc, c1, c2, s2, r2))
+                        seen_seq.add(k)
+                for sc, c1, c2, s2, r2 in misaligned:
+                    k = tuple(s2)
+                    if k not in seen_seq:
+                        cand.append((sc, c1, c2, s2, r2))
+                        seen_seq.add(k)
+
+                for score, c1, c2, seq2, rem2 in cand:
+                    key = tuple(seq2)
+                    if key in layer_seen:
+                        continue
+                    # suffix-k diversity
+                    if suffix_k >= 1:
+                        sig = tuple(seq2[-suffix_k:]) if len(seq2) >= suffix_k else tuple(seq2)
+                        if sig in suffix_seen:
+                            continue
+                        suffix_seen.add(sig)
+                    layer_seen.add(key)
+                    next_pool.append((c1, seq2, rem2))
+
+            if not next_pool:
+                break
+
+            next_pool.sort(key=lambda x: x[0])
+            pruned = []
+            seen_prefixes = set()
+
+            # Endgame widening
+            local_bw = beam_width + (2 if endgame else 0)
+            local_bw = min(local_bw, len(next_pool))
+            for c1, seq, rem in next_pool:
+                key = tuple(seq)
+                if key in seen_prefixes:
+                    continue
+                seen_prefixes.add(key)
+                pruned.append((c1, seq, rem))
+                if len(pruned) >= local_bw:
+                    break
+            beam = pruned
+
+        # return best complete if any
+        for c, seq, rem in beam:
+            if not rem and c < best_complete[0]:
+                best_complete = (c, seq)
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # otherwise branch-and-bound endgame completion from best partial
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            c_fin, s_fin = complete_with_bnb(seq, set(rem), time_budget=BNB_TIME_BUDGET, K=BNB_K)
+            return c_fin, s_fin
+
+        # fallback
+        ident = list(range(n))
+        return ctx.eval_cost(ident), ident
+
+    # ------------------------ Local Search (VND with DLB + block memo) ------------------------
+    def vnd_local_search(seq, start_cost, max_rounds=VND_MAX_ROUNDS):
+        best_seq = list(seq)
+        best_cost = start_cost
+
+        def or_opt_pass(k):
+            nonlocal best_seq, best_cost
+            L = len(best_seq)
+            if L <= k:
+                return False
+            improved = False
+            i = 0
+            while i <= len(best_seq) - k:
+                block = best_seq[i:i + k]
+                base = best_seq[:i] + best_seq[i + k:]
+                # best reinsertion using cached best-two, focus around i
+                if k == 1:
+                    t = block[0]
+                    c_ins, p_ins, _ = ctx.best_two_insertions(base, t, focus_idx=i, exhaustive=(len(base) <= EXHAUSTIVE_THRESHOLD))
+                    move_best_c, move_best_p = c_ins, p_ins
+                else:
+                    c_blk, p_blk, _ = ctx.best_two_block(base, block, focus_idx=i, exhaustive=(len(base) <= EXHAUSTIVE_THRESHOLD))
+                    move_best_c, move_best_p = c_blk, p_blk
+                if move_best_p is not None and move_best_c + 1e-9 < best_cost:
+                    new_seq = base[:]
+                    new_seq[move_best_p:move_best_p] = block
+                    best_seq = new_seq
+                    best_cost = move_best_c
+                    improved = True
+                    i = 0  # restart after improvement
+                else:
+                    i += 1
+            return improved
+
+        def dlb_swaps_and_reversals():
+            nonlocal best_seq, best_cost
+            L = len(best_seq)
+            if L <= 5:
+                return False
+            improved_any = False
+
+            # Non-adjacent swaps with DLB
+            dont_look = [False] * L
+            attempts = 0
+            max_tries = PAIR_SWAP_TRIES
+            while attempts < max_tries:
+                i = random.randint(0, L - 1)
+                if dont_look[i]:
+                    attempts += 1
+                    continue
+                j = random.randint(0, L - 1)
+                if i == j or abs(i - j) <= 1:
+                    attempts += 1
+                    continue
+                cand = best_seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                c = ctx.eval_cost(cand)
+                if c + 1e-12 < best_cost:
+                    best_seq = cand
+                    best_cost = c
+                    improved_any = True
+                    # reset local don't-look around affected area
+                    for idx in range(max(0, min(i, j) - 2), min(L, max(i, j) + 3)):
+                        if 0 <= idx < len(dont_look):
+                            dont_look[idx] = False
+                    attempts = 0
+                else:
+                    dont_look[i] = True
+                    attempts += 1
+
+            # 2-opt segment reversals with DLB
+            L = len(best_seq)
+            dont_look2 = [False] * L
+            attempts = 0
+            max_tries = SEGMENT_REV_TRIES
+            while attempts < max_tries:
+                i = random.randint(0, L - 3)
+                if dont_look2[i]:
+                    attempts += 1
+                    continue
+                j = random.randint(i + 2, min(L - 1, i + 12))
+                cand = best_seq[:]
+                cand[i:j + 1] = reversed(cand[i:j + 1])
+                c = ctx.eval_cost(cand)
+                if c + 1e-12 < best_cost:
+                    best_seq = cand
+                    best_cost = c
+                    improved_any = True
+                    # reset local don't-look around affected area
+                    for idx in range(max(0, i - 2), min(L, j + 3)):
+                        if 0 <= idx < len(dont_look2):
+                            dont_look2[idx] = False
+                    attempts = 0
+                else:
+                    dont_look2[i] = True
+                    attempts += 1
+
+            return improved_any
+
+        def adjacent_swap_pass(max_passes=MAX_ADJ_PASSES):
+            nonlocal best_seq, best_cost
+            improved_any = False
+            for _ in range(max_passes):
+                improved = False
+                for i in range(len(best_seq) - 1):
+                    cand = best_seq[:]
+                    cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                    c = ctx.eval_cost(cand)
+                    if c + 1e-12 < best_cost:
+                        best_seq = cand
+                        best_cost = c
+                        improved = True
+                improved_any = improved_any or improved
+                if not improved:
+                    break
+            return improved_any
+
+        rounds = 0
+        while rounds < max_rounds:
+            rounds += 1
+            any_improved = False
+            for k in (3, 2, 1):
+                if or_opt_pass(k):
+                    any_improved = True
+            if adjacent_swap_pass(max_passes=1):
+                any_improved = True
+            if dlb_swaps_and_reversals():
+                any_improved = True
+            if not any_improved:
+                break
+
+        return best_seq, best_cost
+
+    # ------------------------ LNS: Consensus-guided sensitivity destroy/repair ------------------------
+    def lns_ruin_and_repair(seq, start_cost, rounds=LNS_ROUNDS):
+        best_seq = list(seq)
+        best_cost = start_cost
+        fails = 0
+
+        for _ in range(max(1, rounds)):
+            cur = list(best_seq)
+            L = len(cur)
+            if L <= 6:
+                break
+
+            consensus = compute_consensus()
+
+            # Sensitivity scoring: span across deterministic reinsertion positions
+            K = min(20, L)
+            P = 6
+            sampled_idx = random.sample(range(L), K)
+            sensitivity = []
+            for i in sampled_idx:
+                t = cur[i]
+                base = cur[:i] + cur[i + 1:]
+                positions, _ = ctx.positions_for_insertion(len(base), exhaustive=False, focus_idx=i)
+                # pick deterministic anchors subset up to P
+                anchors = [0, len(base) // 4 if len(base) >= 4 else 0, len(base) // 2, (3 * len(base)) // 4 if len(base) >= 4 else len(base), len(base)]
+                pos_list = sorted(set([p for p in anchors if 0 <= p <= len(base)]))
+                if len(pos_list) < P:
+                    for p in positions:
+                        if p not in pos_list:
+                            pos_list.append(p)
+                            if len(pos_list) >= P:
+                                break
+                costs = []
+                for p in pos_list[:P]:
+                    cand = base[:]
+                    cand.insert(p, t)
+                    costs.append(ctx.eval_cost(cand))
+                span = (max(costs) - min(costs)) if costs else 0.0
+                sensitivity.append((span, i))
+            sensitivity.sort(reverse=True)
+
+            # Consensus displacement
+            displacement = []
+            if consensus is not None:
+                for i, t in enumerate(cur):
+                    displacement.append((abs(i - consensus.get(t, n)), i))
+                displacement.sort(reverse=True)
+
+            # Removal budget with stagnation escalation
+            frac = LNS_BASE_REMOVE_FRAC * (1.25 if fails >= 2 else 1.0)
+            alpha = frac  # used to choose mix; also serves as destroy fraction
+            k_remove = max(LNS_REMOVE_MIN, min(LNS_REMOVE_MAX, int(alpha * L)))
+            k_remove = min(k_remove, L - 2)
+
+            # Choose top by combined score (0.5 sens + 0.5 displacement)
+            remove_idx_set = set()
+            take_sensitive = max(1, int(0.5 * k_remove))
+            remove_idx_set.update(i for _, i in sensitivity[:take_sensitive])
+            if consensus is not None:
+                take_disp = max(1, int(0.5 * k_remove))
+                remove_idx_set.update(i for _, i in displacement[:take_disp])
+
+            # Add one or two contiguous blocks under stagnation
+            blocks = 2 if fails >= 2 else 1
+            remaining = k_remove - len(remove_idx_set)
+            for _b in range(blocks):
+                if remaining <= 0:
+                    break
+                block_len = max(2, min(remaining, max(2, L // 12)))
+                start = random.randint(0, max(0, L - block_len))
+                for j in range(start, start + block_len):
+                    remove_idx_set.add(j)
+                    if len(remove_idx_set) >= k_remove:
+                        break
+                remaining = k_remove - len(remove_idx_set)
+
+            while len(remove_idx_set) < k_remove:
+                remove_idx_set.add(random.randint(0, L - 1))
+
+            remove_idx = sorted(remove_idx_set)
+            removed = [cur[i] for i in remove_idx]
+            base_seq = [cur[i] for i in range(L) if i not in remove_idx]
+            # Map txn -> original index for focused reinsertion rings
+            orig_pos = {cur[i]: i for i in remove_idx}
+
+            # Regret-guided deterministic repair using best-two cache
+            rebuilt = list(base_seq)
+            pool = list(removed)
+            while pool:
+                # evaluate all when small; else sample deterministically by order
+                exhaustive = (len(pool) <= 2 * base_beam_width or len(rebuilt) <= EXHAUSTIVE_THRESHOLD)
+                cand_txns = list(pool) if exhaustive else pool[:min(10, len(pool))]
+                scored = []
+                for t in cand_txns:
+                    approx_focus = min(orig_pos.get(t, len(rebuilt)), len(rebuilt))
+                    c1, p1, c2 = ctx.best_two_insertions(rebuilt, t, focus_idx=approx_focus, exhaustive=exhaustive or (len(rebuilt) <= EXHAUSTIVE_THRESHOLD))
+                    scored.append((c1, c2, t, p1))
+                if not scored:
+                    t = pool.pop()
+                    rebuilt.append(t)
+                    continue
+                scored.sort(key=lambda x: x[0])
+                # high-regret among best few
+                top = scored[:min(3, len(scored))]
+                top.sort(key=lambda x: (-(x[1] - x[0]), x[0]))
+                c1, c2, t_pick, pos_pick = top[0]
+                rebuilt.insert(pos_pick, t_pick)
+                pool.remove(t_pick)
+
+            c_new = ctx.eval_cost(rebuilt)
+            if c_new + 1e-9 < best_cost:
+                best_cost = c_new
+                best_seq = rebuilt
+                fails = 0
+            else:
+                fails += 1
+
+            # quick VND polish
+            best_seq, best_cost = vnd_local_search(best_seq, best_cost, max_rounds=1)
+
+        return best_seq, best_cost
+
+    # ------------------------ Path relinking (bidirectional, block-aware) ------------------------
+    def path_relink(a_seq, b_seq, keep_intermediate=2):
+        def relink_one(src, tgt):
+            cur = list(src)
+            best_c = ctx.eval_cost(cur)
+            best_s = list(cur)
+            candidates = []
+
+            i = 0
+            while i < len(cur):
+                want = tgt[i]
+                j = cur.index(want)
+                if j == i:
+                    i += 1
+                    continue
+                # Move the longest consecutive block already matching target order
+                k = 1
+                while j + k < len(cur) and i + k < len(tgt) and cur[j + k] == tgt[i + k]:
+                    k += 1
+                block = cur[j:j + k]
+                base = cur[:j] + cur[j + k:]
+                # evaluate block move
+                new_seq = base[:i] + block + base[i:]
+                c = ctx.eval_cost(new_seq)
+                cur = new_seq
+                if c < best_c:
+                    best_c, best_s = c, list(cur)
+                candidates.append((c, list(cur)))
+                i += k
+
+            candidates.sort(key=lambda x: x[0])
+            for c, s in candidates[:min(keep_intermediate, len(candidates))]:
+                s2, c2 = vnd_local_search(s, c, max_rounds=1)
+                if c2 < best_c:
+                    best_c, best_s = c2, s2
+            return best_c, best_s
+
+        c1, s1 = relink_one(a_seq, b_seq)
+        c2, s2 = relink_one(b_seq, a_seq)
+        return (c1, s1) if c1 <= c2 else (c2, s2)
+
+    # ------------------------ Search orchestration ------------------------
+    best_cost = float('inf')
+    best_seq = list(range(n))
+
+    # 1) GRASP seeds + quick polish
+    seeds = max(3, min(6, num_seqs))
+    for _ in range(seeds):
+        c, s = construct_grasp_regret()
+        s, c = vnd_local_search(s, c, max_rounds=1)
+        add_elite(c, s)
+        if c < best_cost:
+            best_cost, best_seq = c, s
+
+    # 2) Beam search seeds
+    beam_runs = max(1, num_seqs // 3)
+    for _ in range(beam_runs):
+        c, s = beam_search()
+        s, c = vnd_local_search(s, c, max_rounds=1)
+        add_elite(c, s)
+        if c < best_cost:
+            best_cost, best_seq = c, s
+
+    # 3) Path relinking among top elites
+    if len(elites) >= 2:
+        base_cost, base_seq = elites[0]
+        for i in range(1, min(len(elites), ELITE_CAP)):
+            _, seq2 = elites[i]
+            c_rel, s_rel = path_relink(base_seq, seq2, keep_intermediate=2)
+            s_rel, c_rel = vnd_local_search(s_rel, c_rel, max_rounds=1)
+            add_elite(c_rel, s_rel)
+            if c_rel < best_cost:
+                best_cost, best_seq = c_rel, s_rel
+
+    # 4) Iterated LNS + VND from incumbent or elites
+    incumbent_cost, incumbent_seq = best_cost, best_seq
+    for _ in range(ILS_ITERS):
+        if elites and random.random() < 0.5:
+            start_c, start_s = random.choice(elites[:min(3, len(elites))])
+        else:
+            start_c, start_s = incumbent_cost, incumbent_seq
+
+        s1, c1 = lns_ruin_and_repair(start_s, start_c, rounds=LNS_ROUNDS)
+        s2, c2 = vnd_local_search(s1, c1, max_rounds=VND_MAX_ROUNDS)
+        if c2 < incumbent_cost:
+            incumbent_cost, incumbent_seq = c2, s2
+            add_elite(c2, s2)
+        # quick polish
+        s3, c3 = vnd_local_search(incumbent_seq, incumbent_cost, max_rounds=1)
+        if c3 < incumbent_cost:
+            incumbent_cost, incumbent_seq = c3, s3
+            add_elite(c3, s3)
+
+    best_cost, best_seq = incumbent_cost, incumbent_seq
+
+    # Safety checks
+    assert len(best_seq) == n and len(set(best_seq)) == n, "Schedule must include each transaction exactly once"
+
+    return best_cost, best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

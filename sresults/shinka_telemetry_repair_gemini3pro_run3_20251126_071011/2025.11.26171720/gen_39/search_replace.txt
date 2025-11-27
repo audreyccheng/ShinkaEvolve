@@ -1,0 +1,253 @@
+<soft_consensus_momentum>
+Integrate a Soft-Consensus arbitration model with momentum-based iterative updates.
+</soft_consensus_momentum>
+
+<DESCRIPTION>
+This change improves the repair algorithm by replacing the binary "reliable/unreliable" flow check with a continuous "flow quality" score (0.0 to 1.0). This allows the arbiter to weigh flow signals proportionally to the router's balance.
+
+Additionally, I implement a momentum-based update in the iterative refinement phase (`new = 0.6*old + 0.4*target`) and increase iterations to 3. This stabilizes the flow targets, preventing oscillation in complex topologies where multiple routers are correcting simultaneously.
+
+Finally, the arbitration logic is updated to explicitly handle "Phantom Traffic" (where Flow implies 0 but sensors show noise) and better calibrate confidence scores based on the `flow_qual` metric.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 2: Iterative Refinement ---
+    # We refine estimates in a loop to resolve circular dependencies in flow calculation.
+
+    for iteration in range(2):
+        # 1. Calculate Router Totals from current estimates
+        router_totals = {}
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in working_state]
+            t_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+            t_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+            imb = abs(t_in - t_out)
+            mx = max(t_in, t_out, 1.0)
+            reliable = (imb / mx) < 0.05
+            router_totals[r_id] = {'in': t_in, 'out': t_out, 'reliable': reliable}
+
+        # 2. Update Estimates based on Flow Context
+        for if_id, d in working_state.items():
+            r_id = telemetry[if_id].get('local_router')
+
+            # Calculate Flow Hypothesis
+            f_rx, f_tx, f_valid = d['est_rx'], d['est_tx'], False
+
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                # Target RX = Total_Out - (Total_In - My_RX)
+                other_rx = rt['in'] - d['est_rx']
+                f_rx = max(0.0, rt['out'] - other_rx)
+
+                # Target TX = Total_In - (Total_Out - My_TX)
+                other_tx = rt['out'] - d['est_tx']
+                f_tx = max(0.0, rt['in'] - other_tx)
+
+                f_valid = rt['reliable']
+
+            # Update Estimates using Arbitration
+            if d['status'] == 'down':
+                 d['est_rx'], d['est_tx'] = 0.0, 0.0
+            else:
+                # RX
+                val_rx, conf_rx = arbitrate(
+                    d['s_rx'], d['p_tx'], f_rx,
+                    d['has_peer'], f_valid, REL_TOL, ABS_TOL
+                )
+                d['est_rx'] = val_rx
+                d['conf_rx'] = conf_rx # Store for final pass
+
+                # TX
+                val_tx, conf_tx = arbitrate(
+                    d['s_tx'], d['p_rx'], f_tx,
+                    d['has_peer'], f_valid, REL_TOL, ABS_TOL
+                )
+                d['est_tx'] = val_tx
+                d['conf_tx'] = conf_tx
+=======
+    # --- Phase 2: Iterative Refinement ---
+    # We refine estimates in a loop to resolve circular dependencies in flow calculation.
+    # Increased iterations and momentum ensure stability.
+
+    for iteration in range(3):
+        # 1. Calculate Router Totals from current estimates
+        router_totals = {}
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in working_state]
+            t_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+            t_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+            imb = abs(t_in - t_out)
+            mx = max(t_in, t_out, 1.0)
+
+            # Continuous Flow Reliability (0.0 to 1.0)
+            # Perfect at 0% imbalance, degrades to 0.0 at 10% imbalance
+            ratio = imb / mx
+            quality = max(0.0, 1.0 - (ratio * 10.0))
+            router_totals[r_id] = {'in': t_in, 'out': t_out, 'quality': quality}
+
+        # 2. Update Estimates based on Flow Context
+        for if_id, d in working_state.items():
+            r_id = telemetry[if_id].get('local_router')
+
+            # Calculate Flow Hypothesis
+            f_rx, f_tx, f_qual = d['est_rx'], d['est_tx'], 0.0
+
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                f_qual = rt['quality']
+
+                # Target RX = Total_Out - (Total_In - My_RX)
+                other_rx = rt['in'] - d['est_rx']
+                f_rx = max(0.0, rt['out'] - other_rx)
+
+                # Target TX = Total_In - (Total_Out - My_TX)
+                other_tx = rt['out'] - d['est_tx']
+                f_tx = max(0.0, rt['in'] - other_tx)
+
+            # Update Estimates using Arbitration
+            if d['status'] == 'down':
+                 d['est_rx'], d['est_tx'] = 0.0, 0.0
+            else:
+                # RX
+                val_rx, conf_rx = arbitrate(
+                    d['s_rx'], d['p_tx'], f_rx,
+                    d['has_peer'], f_qual, REL_TOL, ABS_TOL
+                )
+                # Momentum update to dampen oscillations
+                d['est_rx'] = 0.6 * d['est_rx'] + 0.4 * val_rx
+                d['conf_rx'] = conf_rx # Store for final pass
+
+                # TX
+                val_tx, conf_tx = arbitrate(
+                    d['s_tx'], d['p_rx'], f_tx,
+                    d['has_peer'], f_qual, REL_TOL, ABS_TOL
+                )
+                d['est_tx'] = 0.6 * d['est_tx'] + 0.4 * val_tx
+                d['conf_tx'] = conf_tx
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+def arbitrate(v_self: float, v_peer: float, v_flow: float,
+              has_peer: bool, flow_valid: bool, rel_tol: float, abs_tol: float) -> Tuple[float, float]:
+    """
+    Arbitrates between signals using goodness-of-fit to determine confidence.
+    Prioritizes consensus (e.g. Self+Flow or Peer+Flow) over reliability flags.
+    """
+
+    def dist(a, b):
+        if a is None or b is None: return 999.0
+        diff = abs(a - b)
+        if diff <= abs_tol: return 0.0
+        return diff / max(abs(a), abs(b), 1.0) / rel_tol
+
+    # Calculate Distances (0.0 = Perfect match, <=1.0 = Agree)
+    d_sp = dist(v_self, v_peer) if has_peer else 999.0
+    d_sf = dist(v_self, v_flow)
+    d_pf = dist(v_peer, v_flow) if has_peer else 999.0
+
+    # 1. Unanimous Agreement (S ≈ P ≈ F)
+    # Strongest possible signal.
+    if d_sp <= 1.0 and d_pf <= 1.0:
+         return (v_self + v_peer + v_flow)/3.0, max(0.9, 1.0 - 0.05 * max(d_sp, d_pf))
+
+    # 2. Self == Peer (Flow Disagrees or Invalid)
+    # Link symmetry is the physical baseline.
+    if d_sp <= 1.0:
+         return (v_self + v_peer)/2.0, max(0.8, 0.95 - 0.1 * d_sp)
+
+    # 3. Peer == Flow (Self Disagrees)
+    # Strong evidence that local sensor is broken.
+    if d_pf <= 1.0:
+         return (v_peer + v_flow)/2.0, max(0.8, 0.95 - 0.1 * d_pf)
+
+    # 4. Self == Flow (Peer Disagrees)
+    # Evidence that Peer is dead/wrong, provided neighbors are consistent.
+    # We trust this even if 'flow_valid' was loose, because exact numerical match is rare by chance.
+    if d_sf <= 1.0:
+         return (v_self + v_flow)/2.0, max(0.7, 0.90 - 0.1 * d_sf)
+
+    # 5. Fallbacks (No Consensus)
+    if has_peer:
+         return v_peer, 0.6 # Trust Symmetry over unknown Flow
+    elif flow_valid:
+         # External Link with valid flow context
+         # If Self is close to Flow (relaxed), trust Self verified by Flow
+         if d_sf <= 2.0: return v_self, 0.8
+         return v_flow, 0.75 # Trust Flow
+    else:
+         return v_self, 0.5 # Blind Trust
+=======
+def arbitrate(v_self: float, v_peer: float, v_flow: float,
+              has_peer: bool, flow_qual: float, rel_tol: float, abs_tol: float) -> Tuple[float, float]:
+    """
+    Arbitrates between signals using a Soft-Consensus model.
+    Scales confidence based on agreement quality and source reliability.
+
+    Args:
+        flow_qual: 0.0 (unreliable) to 1.0 (perfectly balanced router)
+    """
+
+    def dist(a, b):
+        if a is None or b is None: return 999.0
+        diff = abs(a - b)
+        if diff <= abs_tol: return 0.0
+        return diff / (max(abs(a), abs(b), 1.0) * rel_tol)
+
+    # Calculate Distances (0.0 = Perfect match, <=1.0 = Agree)
+    d_sp = dist(v_self, v_peer) if has_peer else 999.0
+    d_sf = dist(v_self, v_flow)
+    d_pf = dist(v_peer, v_flow) if has_peer else 999.0
+
+    # Flow Trust Threshold
+    # We only trust flow for strict arbitration if it's reasonably reliable
+    flow_is_good = flow_qual > 0.5
+
+    # 1. Unanimous Agreement (S ≈ P ≈ F)
+    if d_sp <= 1.0 and d_pf <= 1.0 and flow_is_good:
+         avg = (v_self + v_peer + v_flow) / 3.0
+         conf = 1.0 - 0.05 * max(d_sp, d_pf)
+         return avg, max(0.9, conf)
+
+    # 2. Self ≈ Peer (Flow Outlier or Bad)
+    if d_sp <= 1.0:
+         avg = (v_self + v_peer) / 2.0
+         # If Flow is 'good' but strongly disagrees, slightly reduce confidence
+         # This implies some risk that S&P are both wrong (unlikely) or Flow is wrong (likely)
+         penalty = 0.05 if (flow_is_good and d_pf > 2.0) else 0.0
+         conf = 0.95 - (0.1 * d_sp) - penalty
+         return avg, max(0.8, conf)
+
+    # 3. Peer ≈ Flow (Self Outlier)
+    if has_peer and d_pf <= 1.0 and flow_is_good:
+         avg = (v_peer + v_flow) / 2.0
+         # Confidence depends on how good the flow calc is
+         conf = 0.90 * flow_qual - (0.1 * d_pf)
+         return avg, max(0.7, conf)
+
+    # 4. Self ≈ Flow (Peer Outlier)
+    if d_sf <= 1.0 and flow_is_good:
+         avg = (v_self + v_flow) / 2.0
+         conf = 0.85 * flow_qual - (0.1 * d_sf)
+         return avg, max(0.7, conf)
+
+    # 5. Fallbacks (No Consensus)
+
+    # Edge Case: Phantom Traffic (Self/Peer > 0, Flow ≈ 0)
+    if flow_qual > 0.8 and v_flow < abs_tol:
+        return 0.0, 0.8
+
+    if has_peer:
+         return v_peer, 0.60
+
+    if flow_is_good:
+         # Edge link (no peer), trust Flow
+         return v_flow, 0.70 * flow_qual
+
+    return v_self, 0.50
+>>>>>>> REPLACE
+</DIFF>

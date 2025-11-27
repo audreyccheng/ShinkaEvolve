@@ -1,0 +1,201 @@
+<NAME>
+init_strat_and_smart_kick
+</NAME>
+
+<DESCRIPTION>
+1. Adds 'Load' (workload) as a sorting strategy in the Binary Search initialization. This increases the diversity of initial solutions and helps when load is the dominant constraint regardless of size.
+2. Replaces the random perturbation (kick) with a "Targeted Ruin & Recreate" strategy. Instead of picking random partners, it preferentially selects the least loaded GPUs to help absorb the bottleneck's items. It also attempts multiple randomized repackings to find the best local configuration, increasing the probability of a successful escape from the local optimum.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        strategies = [
+            lambda x: x['w'] + target_k * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+=======
+        strategies = [
+            lambda x: x['w'] + target_k * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        else:
+            # Perturbation (Burst Kick)
+            # Repack Bottleneck + Random Partners
+            k = min(3, gpu_num - 1)
+            if k == 0: break
+
+            victims = [bottleneck] + random.sample([g for g in range(gpu_num) if g != bottleneck], k)
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Randomized Density Sort
+            # (req/slo)/size
+            repack_items.sort(key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.8, 1.2), reverse=True)
+
+            success = True
+            for item in repack_items:
+                w, s = item.req_rate/item.slo, item.model_size
+                best_v = -1
+                best_p = float('inf')
+
+                for v in victims:
+                    rem = GPU_MEM_SIZE - used[v] - s
+                    if rem > 1e-6:
+                        p = (loads[v] + w) / rem
+                        if p < best_p:
+                            best_p = p
+                            best_v = v
+
+                # Fallback
+                if best_v == -1:
+                    for v in victims:
+                        if used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                            best_v = v
+                            break
+
+                if best_v != -1:
+                    current_placement[best_v].append(item)
+                    loads[best_v] += w
+                    used[best_v] += s
+                else:
+                    success = False
+                    break
+
+            if success:
+                for v in victims:
+                    pressures[v] = get_p(loads[v], used[v])
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+                # We don't update best here, we hope the kick leads to better states later
+            else:
+                # Revert
+                current_placement = {k: list(v) for k, v in best_placement_copy.items()}
+                # Rebuild state
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_p(loads[g], used[g]) for g in range(gpu_num)]
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+=======
+        else:
+            # Perturbation (Targeted Ruin & Recreate)
+            # Select victims: Bottleneck + Least Loaded GPUs + Random
+            candidates = [g for g in range(gpu_num) if g != bottleneck]
+            if not candidates: break
+
+            # Sort candidates by pressure ascending (least loaded first)
+            candidates.sort(key=lambda g: pressures[g])
+
+            # Select partners: 2 least loaded + 1 random (if available)
+            k_target = 3
+            partners = []
+
+            # Take up to 2 best candidates
+            best_k = min(2, len(candidates))
+            partners.extend(candidates[:best_k])
+            rem_candidates = candidates[best_k:]
+
+            # Fill remaining slot with random
+            while len(partners) < k_target and rem_candidates:
+                c = random.choice(rem_candidates)
+                partners.append(c)
+                rem_candidates.remove(c)
+
+            victims = [bottleneck] + partners
+
+            # Extract items
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            # Try multiple randomized packings and pick the best local result
+            best_local_res = None
+            best_local_max = float('inf')
+
+            # 5 Trials of randomized greedy
+            for _ in range(5):
+                # Copy items for this trial
+                trial_items = list(repack_items)
+                random.shuffle(trial_items)
+
+                # Sort: Randomized Density
+                trial_items.sort(key=lambda x: (x.req_rate/x.slo)/(x.model_size+1e-6) * random.uniform(0.85, 1.15), reverse=True)
+
+                # Temp state
+                t_loads = {v: 0.0 for v in victims}
+                t_used = {v: 0.0 for v in victims}
+                t_placement = {v: [] for v in victims}
+                possible = True
+
+                for item in trial_items:
+                    w, s = item.req_rate/item.slo, item.model_size
+                    best_v = -1
+                    best_score = float('inf')
+
+                    for v in victims:
+                        rem = GPU_MEM_SIZE - t_used[v] - s
+                        if rem > 1e-6:
+                            # Minimizing pressure in the target bin
+                            p = (t_loads[v] + w) / rem
+                            if p < best_score:
+                                best_score = p
+                                best_v = v
+
+                    if best_v == -1:
+                         # Fallback to any fit
+                         for v in victims:
+                            if t_used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                                best_v = v
+                                break
+
+                    if best_v != -1:
+                        t_placement[best_v].append(item)
+                        t_loads[best_v] += w
+                        t_used[best_v] += s
+                    else:
+                        possible = False
+                        break
+
+                if possible:
+                    local_max = max(get_p(t_loads[v], t_used[v]) for v in victims)
+                    if local_max < best_local_max:
+                        best_local_max = local_max
+                        best_local_res = (t_placement, t_loads, t_used)
+
+            if best_local_res:
+                l_place, l_l, l_u = best_local_res
+                for v in victims:
+                    current_placement[v] = l_place[v]
+                    loads[v] = l_l[v]
+                    used[v] = l_u[v]
+                    pressures[v] = get_p(loads[v], used[v])
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+            else:
+                # Revert if all trials failed
+                current_placement = {k: list(v) for k, v in best_placement_copy.items()}
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                pressures = [get_p(loads[g], used[g]) for g in range(gpu_num)]
+                current_sorted_p = tuple(sorted(pressures, reverse=True))
+>>>>>>> REPLACE
+</DIFF>

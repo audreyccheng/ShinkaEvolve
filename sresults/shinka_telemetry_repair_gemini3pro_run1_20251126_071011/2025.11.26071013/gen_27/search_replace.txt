@@ -1,0 +1,172 @@
+<NAME>
+flow_synthesis_repair
+</NAME>
+
+<DESCRIPTION>
+Implements flow-based candidate synthesis in the rate repair stage.
+Instead of only choosing between local and remote measurements (which might both be wrong), the algorithm now calculates predicted values that would satisfy flow conservation at verifiable routers.
+These synthesized values are treated as first-class candidates alongside the measurements.
+The candidate with the lowest global flow error (sum of local and remote flow violations) is selected.
+This allows the system to reconstruct missing traffic (e.g., when a link is "dead" on both ends but required to balance a router) and resolve conflicts more accurately.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = avg
+            else:
+                # Disagreement: Resolve conflict using Flow Conservation constraints
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # Calculate errors if we chose TX value
+                err_local_tx = get_flow_error(rid_local, if_id, 'tx', val_tx)
+                err_remote_tx = get_flow_error(rid_remote, peer_id, 'rx', val_tx)
+
+                # Calculate errors if we chose RX value
+                err_local_rx = get_flow_error(rid_local, if_id, 'tx', val_rx)
+                err_remote_rx = get_flow_error(rid_remote, peer_id, 'rx', val_rx)
+
+                # Continuous Cost Scoring (Lower is better)
+                # Instead of binary good/bad, use actual error magnitude
+                def get_cost(err):
+                    if err is None: return 0.05 # Unverified = small neutral cost
+                    return min(err, 1.0)        # Verified = actual error cost
+
+                score_tx = get_cost(err_local_tx) + get_cost(err_remote_tx)
+                score_rx = get_cost(err_local_rx) + get_cost(err_remote_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                if val_tx < MIN_ACTIVITY and val_rx > MIN_ACTIVITY: score_tx += 0.5
+                if val_rx < MIN_ACTIVITY and val_tx > MIN_ACTIVITY: score_rx += 0.5
+
+                # Selection
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = avg # Tie -> Average
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+=======
+    # --- 3. Rate Repair (Iterative Consensus) ---
+
+    # Helper to predict value from flow conservation
+    def get_flow_prediction(rid, if_target, field):
+        if rid not in verifiable_routers:
+            return None
+
+        # Calculate flow imbalance excluding the target interface
+        sum_in = 0.0
+        sum_out = 0.0
+        for iface in router_map[rid]:
+            if iface == if_target: continue
+            sum_in += state[iface]['rx']
+            sum_out += state[iface]['tx']
+
+        # Target value must balance the flow: Sum(In) = Sum(Out)
+        if field == 'tx':
+            # Solving for Tx_target: Tx_target = Rx_target + Sum(In_others) - Sum(Out_others)
+            val = state[if_target]['rx'] + sum_in - sum_out
+        else:
+            # Solving for Rx_target: Rx_target = Tx_target + Sum(Out_others) - Sum(In_others)
+            val = state[if_target]['tx'] + sum_out - sum_in
+
+        return max(0.0, val)
+
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = avg
+            else:
+                # Disagreement: Resolve conflict using Flow Conservation constraints
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # Generate candidates: measurements + flow-based predictions
+                candidates = [val_tx, val_rx]
+
+                pred_tx = get_flow_prediction(rid_local, if_id, 'tx')
+                if pred_tx is not None: candidates.append(pred_tx)
+
+                pred_rx = get_flow_prediction(rid_remote, peer_id, 'rx')
+                if pred_rx is not None: candidates.append(pred_rx)
+
+                # Deduplicate candidates (tolerance 1e-6)
+                unique_candidates = []
+                for c in candidates:
+                    if not any(abs(c - u) < 1e-6 for u in unique_candidates):
+                        unique_candidates.append(c)
+
+                # Continuous Cost Scoring (Lower is better)
+                def get_cost(err):
+                    if err is None: return 0.05 # Unverified = small neutral cost
+                    return min(err, 1.0)        # Verified = actual error cost
+
+                best_score = float('inf')
+                best_val = avg
+
+                for cand in unique_candidates:
+                    # Calculate errors if we chose this candidate
+                    err_local = get_flow_error(rid_local, if_id, 'tx', cand)
+                    err_remote = get_flow_error(rid_remote, peer_id, 'rx', cand)
+
+                    score = get_cost(err_local) + get_cost(err_remote)
+
+                    # Heuristic penalties
+                    # Penalize zero/near-zero values if the other original measurement was active
+                    # This biases against "dead" counters unless flow strongly supports them
+                    if cand < MIN_ACTIVITY and (val_tx > MIN_ACTIVITY or val_rx > MIN_ACTIVITY):
+                        score += 0.2
+
+                    if score < best_score:
+                        best_score = score
+                        best_val = cand
+
+                new_val = best_val
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+>>>>>>> REPLACE
+</DIFF>

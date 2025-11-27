@@ -1,0 +1,199 @@
+<NAME>
+status_aware_hypothesis_scoring
+</NAME>
+
+<DESCRIPTION>
+Introduces status-aware Bayesian priors and a "minimum pull" flow mechanism to the hypothesis selection solver.
+1.  **Status Priors**: If the interface status is 'up', the `0.0` hypothesis (phantom traffic) is penalized (0.8x score). This helps distinguish between "broken counter" (Self=0, Peer=0) and "missing telemetry" where Flow implies traffic.
+2.  **Flow Annealing**: A minimum reliability floor (0.1) is applied to Flow signals if they exist. This ensures that even in imbalanced (low reliability) routers, the Flow signal exerts a small "pull" on the estimates, helping the iterative solver escape local minima caused by bad initial estimates.
+3.  **Tighter Sigma**: Reduces Gaussian Kernel sigma from 3.0 to 2.5 to better discriminate between close competing hypotheses.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Hypothesis Selection
+            target_rx, _ = solve_hypothesis(
+                d['s_rx'], d['p_tx'], f_rx,
+                d['has_peer'], f_qual, REL_TOL, ABS_TOL
+            )
+
+            target_tx, _ = solve_hypothesis(
+                d['s_tx'], d['p_rx'], f_tx,
+                d['has_peer'], f_qual, REL_TOL, ABS_TOL
+            )
+=======
+            # Hypothesis Selection
+            target_rx, _ = solve_hypothesis(
+                d['s_rx'], d['p_tx'], f_rx,
+                d['has_peer'], f_qual, d['status'], REL_TOL, ABS_TOL
+            )
+
+            target_tx, _ = solve_hypothesis(
+                d['s_tx'], d['p_rx'], f_tx,
+                d['has_peer'], f_qual, d['status'], REL_TOL, ABS_TOL
+            )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+             final_rx, conf_rx = solve_hypothesis(
+                 d['s_rx'], d['p_tx'], f_rx,
+                 d['has_peer'], f_qual, REL_TOL, ABS_TOL
+             )
+             final_tx, conf_tx = solve_hypothesis(
+                 d['s_tx'], d['p_rx'], f_tx,
+                 d['has_peer'], f_qual, REL_TOL, ABS_TOL
+             )
+=======
+             final_rx, conf_rx = solve_hypothesis(
+                 d['s_rx'], d['p_tx'], f_rx,
+                 d['has_peer'], f_qual, d['status'], REL_TOL, ABS_TOL
+             )
+             final_tx, conf_tx = solve_hypothesis(
+                 d['s_tx'], d['p_rx'], f_tx,
+                 d['has_peer'], f_qual, d['status'], REL_TOL, ABS_TOL
+             )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def solve_hypothesis(v_self, v_peer, v_flow, has_peer, flow_qual, rel_tol, abs_tol):
+    """
+    Selects the best estimate by scoring candidates against available signals.
+    """
+    # 1. Define Candidates
+    candidates = {v_self, 0.0}
+    if has_peer:
+        candidates.add(v_peer)
+        candidates.add((v_self + v_peer) / 2.0)
+
+    # Allow flow if it has even minimal quality
+    if flow_qual > 0.05:
+        candidates.add(v_flow)
+        if has_peer:
+            candidates.add((v_peer + v_flow) / 2.0)
+        candidates.add((v_self + v_flow) / 2.0)
+
+    # 2. Weights
+    # Widen sigma: 3x tolerance window to improve confidence calibration and recall
+    # This reflects that "within 3 sigma" (approx 6%) is still strongly supportive
+    SIGMA_SCALE = 3.0
+
+    W_SELF = 1.0
+    W_PEER = 1.5 # Boosted symmetry importance
+
+    # Adaptive Flow Weight
+    # If no peer, flow is the only external validator. Trust it more if quality is decent.
+    if not has_peer:
+        W_FLOW = 3.0 * flow_qual
+    else:
+        W_FLOW = 1.5 * flow_qual
+
+    # 3. Score Candidates
+    best_score = -1.0
+    best_val = v_self
+
+    for cand in candidates:
+        score = 0.0
+
+        # Helper for Gaussian Kernel
+        def kernel(val, ref, w):
+            sigma = SIGMA_SCALE * max(abs(val) * rel_tol, abs_tol)
+            z = abs(val - ref) / sigma
+            return w * math.exp(-0.5 * min(z*z, 20.0))
+
+        # Self Score
+        score += kernel(cand, v_self, W_SELF)
+
+        # Peer Score
+        if has_peer:
+            score += kernel(cand, v_peer, W_PEER)
+
+        # Flow Score
+        if flow_qual > 0.05:
+            score += kernel(cand, v_flow, W_FLOW)
+
+        if score > best_score:
+            best_score = score
+            best_val = cand
+
+    # 4. Confidence
+    # Normalize by potential max score to get [0,1] confidence
+    max_weight = W_SELF + (W_PEER if has_peer else 0) + (W_FLOW if flow_qual > 0.05 else 0)
+    confidence = best_score / max(max_weight, 1.0)
+
+    return best_val, min(1.0, max(0.0, confidence))
+=======
+def solve_hypothesis(v_self, v_peer, v_flow, has_peer, flow_qual, status, rel_tol, abs_tol):
+    """
+    Selects the best estimate by scoring candidates against available signals.
+    """
+    # 1. Define Candidates
+    # Always consider Self and 0.0
+    candidates = {v_self, 0.0}
+
+    # Add Peer candidates
+    if has_peer:
+        candidates.add(v_peer)
+        candidates.add((v_self + v_peer) / 2.0)
+
+    # Add Flow candidates (conditional on minimal quality to avoid noise pollution)
+    # We lower the bar to 0.01 to allow 'annealing' from bad initial states
+    if flow_qual > 0.01:
+        candidates.add(v_flow)
+        if has_peer:
+            candidates.add((v_peer + v_flow) / 2.0)
+        candidates.add((v_self + v_flow) / 2.0)
+
+    # 2. Weights
+    # Tighter sigma (2.5) improves discrimination between close hypotheses
+    SIGMA_SCALE = 2.5
+
+    W_SELF = 1.0
+    W_PEER = 1.5 # Link Symmetry is the strongest signal
+
+    # Adaptive Flow Weight
+    # If no peer, flow is the only external validator.
+    # We enforce a floor (0.1) to ensure Flow always exerts some pull, preventing stasis.
+    effective_flow_qual = max(0.1, flow_qual) if flow_qual > 0.0 else 0.0
+
+    if not has_peer:
+        W_FLOW = 3.0 * effective_flow_qual
+    else:
+        W_FLOW = 1.5 * effective_flow_qual
+
+    # 3. Score Candidates
+    best_score = -1.0
+    best_val = v_self
+
+    for cand in candidates:
+        score = 0.0
+
+        # Gaussian Kernel
+        def kernel(val, ref, w):
+            sigma = SIGMA_SCALE * max(abs(val) * rel_tol, abs_tol)
+            z = abs(val - ref) / sigma
+            return w * math.exp(-0.5 * min(z*z, 20.0))
+
+        # Base Scores
+        score += kernel(cand, v_self, W_SELF)
+
+        if has_peer:
+            score += kernel(cand, v_peer, W_PEER)
+
+        if flow_qual > 0.01:
+            score += kernel(cand, v_flow, W_FLOW)
+
+        # Prior Probability Adjustments
+        # If Status is UP, '0.0' is unlikely unless supported by data.
+        if status == 'up' and cand == 0.0:
+            score *= 0.8
+
+        if score > best_score:
+            best_score = score
+            best_val = cand
+
+    # 4. Confidence
+    # Normalize by potential max score to get [0,1] confidence
+    max_weight = W_SELF + (W_PEER if has_peer else 0) + (W_FLOW if flow_qual > 0.01 else 0)
+    confidence = best_score / max(max_weight, 1.0)
+
+    return best_val, min(1.0, max(0.0, confidence))
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,128 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        A placement of models to GPUs
+    """
+
+    # Sort models by pressure per GB: (r_j / s_j) per unit memory, breaking ties by r_j / s_j
+    def _pressure_per_gb(m):
+        rs = (m.req_rate / m.slo) if m.slo != 0 else float('inf')
+        size = m.model_size if m.model_size > 0 else 1e-9
+        return (rs / size, rs)
+
+    sorted_models = sorted(models, key=_pressure_per_gb, reverse=True)
+
+    # Initialize per-GPU states
+    placement = {gpu_id: [] for gpu_id in range(gpu_num)}
+    remaining_mem = [GPU_MEM_SIZE for _ in range(gpu_num)]  # remaining memory per GPU
+    weighted_req_rate = [0.0 for _ in range(gpu_num)]       # sum of r_j / s_j per GPU
+
+    def kvpr(numer, denom):
+        return (numer / denom) if denom > 0 else float('inf')
+
+    # Assign each model to the GPU that minimizes the maximum KVPR after placement
+    for model in sorted_models:
+        delta = (model.req_rate / model.slo) if model.slo != 0 else float('inf')
+        best_idx = None
+        best_max_kvpr = float('inf')
+        best_local_kvpr = float('inf')
+        best_post_remaining = -1.0
+
+        current_kvprs = [kvpr(weighted_req_rate[g], remaining_mem[g]) for g in range(gpu_num)]
+
+        for gpu_id in range(gpu_num):
+            if model.model_size <= remaining_mem[gpu_id]:
+                new_numer = weighted_req_rate[gpu_id] + delta
+                new_rem = remaining_mem[gpu_id] - model.model_size
+                new_kvpr_gpu = kvpr(new_numer, new_rem)
+
+                # Compute new max KVPR across GPUs if we place on this gpu_id
+                new_max = new_kvpr_gpu
+                for idx, val in enumerate(current_kvprs):
+                    if idx != gpu_id and val > new_max:
+                        new_max = val
+
+                # Tie-breakers: minimize new_max, then local new_kvpr, then leave more remaining mem, then lower gpu_id
+                if (new_max < best_max_kvpr or
+                    (new_max == best_max_kvpr and new_kvpr_gpu < best_local_kvpr) or
+                    (new_max == best_max_kvpr and new_kvpr_gpu == best_local_kvpr and new_rem > best_post_remaining) or
+                    (new_max == best_max_kvpr and new_kvpr_gpu == best_local_kvpr and new_rem == best_post_remaining and (best_idx is None or gpu_id < best_idx))):
+                    best_idx = gpu_id
+                    best_max_kvpr = new_max
+                    best_local_kvpr = new_kvpr_gpu
+                    best_post_remaining = new_rem
+
+        # Failure: if no GPU can fit, raise an error instead of overcommitting
+        if best_idx is None:
+            raise ValueError(
+                f"Unable to place model of size {model.model_size} GB on any GPU. "
+                f"Remaining per-GPU memory: {remaining_mem}"
+            )
+
+        placement[best_idx].append(model)
+        weighted_req_rate[best_idx] += delta
+        remaining_mem[best_idx] -= model.model_size
+
+    return placement
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

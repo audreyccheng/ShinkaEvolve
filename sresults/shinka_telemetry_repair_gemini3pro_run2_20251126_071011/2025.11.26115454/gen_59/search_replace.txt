@@ -1,0 +1,223 @@
+<NAME>
+flow_aware_repair
+</NAME>
+
+<DESCRIPTION>
+Introduces a flow conservation check to validate and arbitrate repairs.
+1. Defines a `check_flow_consistency` helper that calculates router imbalance for a candidate value.
+2. Enhances the repair loop to:
+   - Perform more robust status repair (using traffic activity to resolve UP/DOWN conflicts).
+   - Use flow consistency scores to validate Link Symmetry repairs. If the Peer's value (the default repair candidate) creates a large flow imbalance on the local router, and the Local value fits perfectly, we stick with the Local value.
+   - Boost confidence scores when flow analysis confirms the chosen value (High "Solidity").
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Second pass: repair using redundant signals
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        interface_status = data.get('interface_status', 'unknown')
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        connected_to = data.get('connected_to')
+
+        # Default: no repair, high confidence
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        # Check for issues and attempt repair
+        if interface_id in link_symmetry_violations:
+            violations = link_symmetry_violations[interface_id]
+
+            # Repair RX rate if link symmetry is violated
+            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's TX as more reliable signal
+                repaired_rx = violations['peer_tx']
+                # Confidence decreases with magnitude of violation
+                rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+
+            # Repair TX rate if link symmetry is violated
+            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's RX as more reliable signal
+                repaired_tx = violations['peer_rx']
+                # Confidence decreases with magnitude of violation
+                tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+
+        # Check status consistency
+        if connected_to and connected_to in telemetry:
+            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+            # If statuses don't match, lower confidence
+            if interface_status != peer_status:
+                status_confidence = 0.5
+                # If interface is down but has non-zero rates, that's suspicious
+                if interface_status == 'down' and (rx_rate > 0 or tx_rate > 0):
+                    repaired_rx = 0.0
+                    repaired_tx = 0.0
+                    rx_confidence = 0.3
+                    tx_confidence = 0.3
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+=======
+    # Helper to calculate flow imbalance impact
+    def check_flow_consistency(router_id, if_id, direction, value):
+        if not router_id or router_id not in topology:
+            return None
+
+        sum_in = 0.0
+        sum_out = 0.0
+
+        for neighbor_if in topology[router_id]:
+            if neighbor_if not in telemetry: continue
+
+            # Determine neighbor values
+            n_data = telemetry[neighbor_if]
+            # Use fixed status logic for flow calc: if marked down, treat as 0
+            # But we don't have repaired status yet, so use raw status + traffic check heuristic
+            n_status = n_data.get('interface_status', 'unknown')
+            n_rx = n_data.get('rx_rate', 0.0)
+            n_tx = n_data.get('tx_rate', 0.0)
+
+            # If status is down but traffic is high, treat as UP for calculation
+            if n_status == 'down' and (n_rx <= 1.0 and n_tx <= 1.0):
+                n_rx, n_tx = 0.0, 0.0
+
+            if neighbor_if == if_id:
+                # Use our candidate value
+                if direction == 'rx':
+                    sum_in += value
+                    sum_out += n_tx
+                else:
+                    sum_in += n_rx
+                    sum_out += value
+            else:
+                sum_in += n_rx
+                sum_out += n_tx
+
+        imbalance = abs(sum_in - sum_out)
+        total_flow = max(sum_in, sum_out, 1.0)
+        return imbalance / total_flow
+
+    # Second pass: repair using redundant signals
+    for interface_id, data in telemetry.items():
+        repaired_data = {}
+
+        rx_rate = data.get('rx_rate', 0.0)
+        tx_rate = data.get('tx_rate', 0.0)
+        interface_status = data.get('interface_status', 'unknown')
+
+        repaired_rx = rx_rate
+        repaired_tx = tx_rate
+        repaired_status = interface_status
+
+        rx_confidence = 1.0
+        tx_confidence = 1.0
+        status_confidence = 1.0
+
+        connected_to = data.get('connected_to')
+        peer_data = telemetry.get(connected_to) if connected_to else None
+
+        # 1. Status Repair
+        if peer_data:
+            peer_status = peer_data.get('interface_status', 'unknown')
+            if interface_status != peer_status:
+                # Disagreement. Check traffic.
+                local_active = rx_rate > 1.0 or tx_rate > 1.0
+                peer_active = peer_data.get('rx_rate', 0.0) > 1.0 or peer_data.get('tx_rate', 0.0) > 1.0
+
+                if local_active or peer_active:
+                    repaired_status = 'up'
+                    status_confidence = 0.9
+                else:
+                    repaired_status = 'down'
+                    status_confidence = 0.9
+
+        # Enforce Down
+        if repaired_status == 'down':
+            repaired_rx = 0.0
+            repaired_tx = 0.0
+            # If we force zero, confidence is high
+            if rx_rate > 1.0 or tx_rate > 1.0:
+                rx_confidence = 0.95
+                tx_confidence = 0.95
+
+        # 2. Rate Repair (Only if UP)
+        elif interface_id in link_symmetry_violations:
+            violations = link_symmetry_violations[interface_id]
+            local_router = data.get('local_router')
+
+            # --- RX Repair ---
+            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+                cand_peer = violations['peer_tx']
+
+                # Check flow consistency
+                score_local = check_flow_consistency(local_router, interface_id, 'rx', rx_rate)
+                score_peer = check_flow_consistency(local_router, interface_id, 'rx', cand_peer)
+
+                # Heuristic: Prefer Peer unless Local is MUCH better for flow
+                use_peer = True
+                if score_local is not None and score_peer is not None:
+                    # If local fits flow perfectly (<1%) and peer creates significant imbalance (>5%)
+                    if score_local < 0.01 and score_peer > 0.05:
+                        use_peer = False
+
+                if use_peer:
+                    repaired_rx = cand_peer
+                    # High confidence if verified by flow
+                    if score_peer is not None and score_peer < 0.02:
+                        rx_confidence = 0.95
+                    else:
+                        rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+                else:
+                    repaired_rx = rx_rate
+                    rx_confidence = 0.9
+
+            # --- TX Repair ---
+            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+                cand_peer = violations['peer_rx']
+
+                score_local = check_flow_consistency(local_router, interface_id, 'tx', tx_rate)
+                score_peer = check_flow_consistency(local_router, interface_id, 'tx', cand_peer)
+
+                use_peer = True
+                if score_local is not None and score_peer is not None:
+                     if score_local < 0.01 and score_peer > 0.05:
+                        use_peer = False
+
+                if use_peer:
+                    repaired_tx = cand_peer
+                    if score_peer is not None and score_peer < 0.02:
+                        tx_confidence = 0.95
+                    else:
+                        tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+                else:
+                    repaired_tx = tx_rate
+                    tx_confidence = 0.9
+
+        # Store repaired values with confidence scores
+        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
+
+        # Copy metadata unchanged
+        repaired_data['connected_to'] = connected_to
+        repaired_data['local_router'] = data.get('local_router')
+        repaired_data['remote_router'] = data.get('remote_router')
+
+        result[interface_id] = repaired_data
+>>>>>>> REPLACE
+</DIFF>

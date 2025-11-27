@@ -1,0 +1,216 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Beam Search with diversity and local refinement.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Used to scale the beam width
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # Beam Search configuration
+    BEAM_WIDTH = max(5, num_seqs)  # Width of the beam
+    SAMPLES_PER_NODE = 16          # Candidates to evaluate per parent node
+    MAX_CHILDREN = 3               # Max extensions from one parent (diversity)
+
+    num_txns = workload.num_txns
+
+    # Pre-calculate individual costs for tie-breaking
+    # Longer transactions are preferred when costs are equal to fill schedule holes
+    txn_costs = {t: workload.get_opt_seq_cost([t]) for t in range(num_txns)}
+
+    # Initialize Beam with a mix of random starts
+    start_candidates = list(range(num_txns))
+    random.shuffle(start_candidates)
+
+    beam = []
+    # Seed beam with single transactions
+    for t in start_candidates[:min(len(start_candidates), BEAM_WIDTH * 2)]:
+        beam.append({
+            'cost': txn_costs[t],
+            'seq': [t],
+            'rem': set(range(num_txns)) - {t}
+        })
+
+    # Sort and trim to initial width
+    beam.sort(key=lambda x: x['cost'])
+    beam = beam[:BEAM_WIDTH]
+
+    # Beam Search Main Loop
+    for _ in range(num_txns - 1):
+        candidates = []
+
+        for p_idx, parent in enumerate(beam):
+            rem_list = list(parent['rem'])
+
+            # Sample next transactions
+            if len(rem_list) <= SAMPLES_PER_NODE:
+                samples = rem_list
+            else:
+                samples = random.sample(rem_list, SAMPLES_PER_NODE)
+
+            for t in samples:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+
+                # Priority: Minimize Cost, then Maximize individual Txn Duration
+                candidates.append({
+                    'priority': (new_cost, -txn_costs[t]),
+                    'cost': new_cost,
+                    'seq': new_seq,
+                    'added': t,
+                    'p_idx': p_idx
+                })
+
+        # Select best candidates preserving diversity
+        candidates.sort(key=lambda x: x['priority'])
+
+        new_beam = []
+        parent_usage = {i: 0 for i in range(len(beam))}
+        reserve = []
+
+        for cand in candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            p_idx = cand['p_idx']
+            if parent_usage[p_idx] < MAX_CHILDREN:
+                # Add to beam
+                new_rem = beam[p_idx]['rem'].copy()
+                new_rem.remove(cand['added'])
+                new_beam.append({'cost': cand['cost'], 'seq': cand['seq'], 'rem': new_rem})
+                parent_usage[p_idx] += 1
+            else:
+                reserve.append(cand)
+
+        # Fill remaining spots from reserve if needed
+        if len(new_beam) < BEAM_WIDTH:
+            for cand in reserve:
+                if len(new_beam) >= BEAM_WIDTH:
+                    break
+                p_idx = cand['p_idx']
+                # Check if this parent+child combo is not already implicitly handled
+                # (Logic ensures unique sequences as we extend unique parents with unique children)
+                new_rem = beam[p_idx]['rem'].copy()
+                new_rem.remove(cand['added'])
+                new_beam.append({'cost': cand['cost'], 'seq': cand['seq'], 'rem': new_rem})
+
+        if not new_beam:
+            break
+        beam = new_beam
+
+    # Get best result from beam
+    best_result = min(beam, key=lambda x: x['cost'])
+    best_cost = best_result['cost']
+    best_seq = best_result['seq']
+
+    # Local Search Refinement
+    # Attempt one pass of adjacent swaps to see if we can improve
+    # This catches cases where two transactions were ordered sub-optimally in the greedy phase
+    for i in range(num_txns - 1):
+        # Create swap candidate
+        swap_seq = best_seq[:]
+        swap_seq[i], swap_seq[i+1] = swap_seq[i+1], swap_seq[i]
+
+        # Check cost
+        new_c = workload.get_opt_seq_cost(swap_seq)
+        if new_c < best_cost:
+            best_cost = new_c
+            best_seq = swap_seq
+            # We greedily accept the first improvement to save time and continue scanning
+            # (In a full hill-climber we might loop until no improvements, but time is constrained)
+
+    return best_cost, best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

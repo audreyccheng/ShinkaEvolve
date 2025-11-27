@@ -1,0 +1,279 @@
+# EVOLVE-BLOCK-START
+"""
+Bayesian Consensus Repair
+Combines iterative flow-target refinement with a probabilistic selection model.
+Features Status-Aware Priors, Anchor-Weighted Flow, and Cluster-Mass Confidence.
+"""
+import math
+from typing import Dict, Any, Tuple, List
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    # --- Configuration ---
+    REL_TOL = 0.02
+    ABS_TOL = 0.5
+    ITERATIONS = 5
+    
+    # --- Helper Functions ---
+    def get_sigma(val: float) -> float:
+        """Adaptive standard deviation for Gaussian kernels."""
+        return max(ABS_TOL, abs(val) * REL_TOL)
+
+    def gaussian_score(x: float, target: float, sigma: float) -> float:
+        """Unnormalized Gaussian Likelihood."""
+        if target is None: return 0.0
+        diff = abs(x - target)
+        return math.exp(-0.5 * (diff / sigma) ** 2)
+
+    # --- Phase 1: Initialization & Status Repair ---
+    state = {}
+    
+    for if_id, data in telemetry.items():
+        s_rx = float(data.get('rx_rate', 0.0))
+        s_tx = float(data.get('tx_rate', 0.0))
+        s_stat = data.get('interface_status', 'unknown')
+        
+        peer_id = data.get('connected_to')
+        has_peer = False
+        p_rx, p_tx, p_stat = 0.0, 0.0, 'unknown'
+        
+        if peer_id and peer_id in telemetry:
+            has_peer = True
+            p_data = telemetry[peer_id]
+            p_rx = float(p_data.get('rx_rate', 0.0))
+            p_tx = float(p_data.get('tx_rate', 0.0))
+            p_stat = p_data.get('interface_status', 'unknown')
+
+        # Traffic Analysis
+        # Proven Activity: My counters moving OR Peer receiving from me
+        proven_active = (s_rx > ABS_TOL or s_tx > ABS_TOL or p_rx > ABS_TOL)
+        
+        final_stat = s_stat
+        stat_conf = 1.0
+        
+        # Status Repair Logic
+        if s_stat == 'down' and proven_active:
+            final_stat = 'up'
+            stat_conf = 0.95
+        elif s_stat == 'up' and not proven_active:
+            # If I'm silent, and Peer is Down (and silent), I'm likely Down.
+            if p_stat == 'down' and p_tx < ABS_TOL:
+                final_stat = 'down'
+                stat_conf = 0.90
+            
+        # Initial Value Estimation
+        # If Down, strictly 0. If Up, prefer Peer (symmetry) as starting point.
+        if final_stat == 'down':
+            est_rx, est_tx = 0.0, 0.0
+        else:
+            est_rx = p_tx if has_peer else s_rx
+            est_tx = p_rx if has_peer else s_tx
+            
+        state[if_id] = {
+            's_rx': s_rx, 's_tx': s_tx,
+            'p_rx': p_rx, 'p_tx': p_tx,
+            'est_rx': est_rx, 'est_tx': est_tx,
+            'status': final_stat,
+            'stat_conf': stat_conf,
+            'orig_stat': s_stat,
+            'has_peer': has_peer
+        }
+
+    # --- Phase 2: Iterative Bayesian Consensus ---
+    
+    for iteration in range(ITERATIONS):
+        # 1. Router Anchor Analysis
+        # Calculate how trustworthy each router is based on its interfaces' agreement
+        router_metrics = {}
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in state]
+            if not valid_ifs: continue
+            
+            sum_in, sum_out, sum_agreement = 0.0, 0.0, 0.0
+            
+            for i in valid_ifs:
+                d = state[i]
+                sum_in += d['est_rx']
+                sum_out += d['est_tx']
+                
+                # Agreement Score: How well does this link match its peer?
+                if d['has_peer']:
+                    ag_rx = gaussian_score(d['est_rx'], d['p_tx'], get_sigma(d['est_rx']))
+                    ag_tx = gaussian_score(d['est_tx'], d['p_rx'], get_sigma(d['est_tx']))
+                    sum_agreement += (ag_rx + ag_tx) / 2.0
+                else:
+                    sum_agreement += 0.5 # Neutral
+            
+            # Anchor Score: Average agreement of the router's neighbors
+            anchor = sum_agreement / len(valid_ifs)
+            
+            # Balance Score: Conservation quality
+            imb = abs(sum_in - sum_out)
+            mag = max(sum_in, sum_out, 1.0)
+            balance = math.exp(- (imb / (mag * 0.05))**2 )
+            
+            router_metrics[r_id] = {
+                'sin': sum_in, 'sout': sum_out,
+                'anchor': anchor, 'balance': balance
+            }
+            
+        # 2. Update Estimates
+        for if_id, d in state.items():
+            if d['status'] == 'down': continue
+            
+            r_id = telemetry[if_id].get('local_router')
+            r_info = router_metrics.get(r_id)
+            
+            def solve_direction(current, s_val, p_val, is_rx):
+                # Calculate Flow Target
+                f_val = None
+                f_weight = 0.0
+                
+                if r_info:
+                    # Target = What balances the router?
+                    if is_rx:
+                        others = r_info['sin'] - current
+                        f_val = max(0.0, r_info['sout'] - others)
+                    else:
+                        others = r_info['sout'] - current
+                        f_val = max(0.0, r_info['sin'] - others)
+                    
+                    # Weighting: Trust flow only if router is an Anchor (Neighbors agree)
+                    # and reasonably balanced.
+                    f_weight = 2.0 * r_info['anchor'] * (0.4 + 0.6 * r_info['balance'])
+                
+                # Generate Hypotheses
+                candidates = [s_val, 0.0]
+                if d['has_peer']: candidates.append(p_val)
+                if f_val is not None: candidates.append(f_val)
+                
+                # Conditional Mean: If Self and Peer are close (Noise), add average
+                if d['has_peer']:
+                    diff = abs(s_val - p_val)
+                    if diff > ABS_TOL and (diff / max(s_val, p_val, 1.0)) < 0.10:
+                        candidates.append((s_val + p_val) / 2.0)
+                        
+                best_val = current
+                best_score = -1.0
+                
+                for cand in set(candidates):
+                    sigma = get_sigma(cand)
+                    
+                    # Likelihoods
+                    l_self = 0.8 * gaussian_score(cand, s_val, sigma)
+                    l_peer = 1.0 * gaussian_score(cand, p_val, sigma) if d['has_peer'] else 0.0
+                    l_flow = f_weight * gaussian_score(cand, f_val, sigma) if f_val is not None else 0.0
+                    
+                    score = l_self + l_peer + l_flow
+                    
+                    # Status-Aware Priors
+                    # We are in 'UP' status loop. Penalize Zero unless evidence is overwhelming.
+                    if cand < ABS_TOL:
+                        score *= 0.15
+                        
+                    if score > best_score:
+                        best_score = score
+                        best_val = cand
+                        
+                return best_val
+
+            d['est_rx'] = solve_direction(d['est_rx'], d['s_rx'], d['p_tx'], True)
+            d['est_tx'] = solve_direction(d['est_tx'], d['s_tx'], d['p_rx'], False)
+
+    # --- Phase 3: Final Output & Probability Calibration ---
+    results = {}
+    
+    # Final Router Context for Flow Targets
+    final_metrics = {}
+    for r_id, if_list in topology.items():
+        valid_ifs = [i for i in if_list if i in state]
+        sin = sum(state[i]['est_rx'] for i in valid_ifs)
+        sout = sum(state[i]['est_tx'] for i in valid_ifs)
+        # Recalc anchor
+        ag_sum = 0
+        for i in valid_ifs:
+            entry = state[i]
+            if entry['has_peer']:
+                 ag_sum += (gaussian_score(entry['est_rx'], entry['p_tx'], get_sigma(entry['est_rx'])) + 
+                            gaussian_score(entry['est_tx'], entry['p_rx'], get_sigma(entry['est_tx']))) / 2.0
+            else: ag_sum += 0.5
+        anchor = ag_sum / len(valid_ifs) if valid_ifs else 0.0
+        bal = math.exp(-(abs(sin-sout)/max(sin,sout,1.0)*20)**2)
+        final_metrics[r_id] = {'sin': sin, 'sout': sout, 'anchor': anchor, 'bal': bal}
+    
+    for if_id, d in state.items():
+        res = telemetry[if_id].copy()
+        
+        if d['status'] == 'down':
+            # High confidence repair for Down
+            crx = 1.0 if d['s_rx'] <= ABS_TOL else 0.95
+            ctx = 1.0 if d['s_tx'] <= ABS_TOL else 0.95
+            res['rx_rate'] = (d['s_rx'], 0.0, crx)
+            res['tx_rate'] = (d['s_tx'], 0.0, ctx)
+        else:
+            r_id = telemetry[if_id].get('local_router')
+            r_info = final_metrics.get(r_id)
+            
+            def calc_conf(val, s_val, p_val, is_rx):
+                # 1. Reconstruct Context
+                f_val = None
+                f_w = 0.0
+                if r_info:
+                    # Target relative to FINAL estimate
+                    if is_rx: target = r_info['sout'] - (r_info['sin'] - d['est_rx'])
+                    else:     target = r_info['sin'] - (r_info['sout'] - d['est_tx'])
+                    f_val = max(0.0, target)
+                    f_w = 2.0 * r_info['anchor'] * (0.4 + 0.6 * r_info['bal'])
+                
+                # 2. Build Hypothesis Set
+                hyps = {val, s_val, 0.0}
+                if d['has_peer']: hyps.add(p_val)
+                if f_val is not None: hyps.add(f_val)
+                if d['has_peer']: hyps.add((s_val + p_val)/2.0)
+                
+                # 3. Calculate Probability Mass
+                total_mass = 0.0
+                winner_mass = 0.0
+                sigma_win = get_sigma(val)
+                
+                for h in hyps:
+                    sigma = get_sigma(h)
+                    # Scores
+                    sc_s = 0.8 * gaussian_score(h, s_val, sigma)
+                    sc_p = 1.0 * gaussian_score(h, p_val, sigma) if d['has_peer'] else 0.0
+                    sc_f = f_w * gaussian_score(h, f_val, sigma) if f_val is not None else 0.0
+                    
+                    score = sc_s + sc_p + sc_f
+                    
+                    # Prior
+                    if h < ABS_TOL: score *= 0.15
+                    
+                    total_mass += score
+                    
+                    # Cluster Summation: If h is close to Winner, add to winner mass
+                    if abs(h - val) <= sigma_win:
+                        winner_mass += score
+                        
+                if total_mass < 0.001: return 0.5
+                
+                prob = winner_mass / total_mass
+                
+                # 4. Sanity Cap for Single-Source Support
+                # If Peer disagrees and Flow is weak, cap confidence
+                peer_supports = d['has_peer'] and (abs(val - p_val) <= sigma_win)
+                if not peer_supports and f_w < 0.5:
+                    prob = min(prob, 0.75)
+                    
+                return max(0.5, min(1.0, prob))
+
+            conf_rx = calc_conf(d['est_rx'], d['s_rx'], d['p_tx'], True)
+            conf_tx = calc_conf(d['est_tx'], d['s_tx'], d['p_rx'], False)
+            
+            res['rx_rate'] = (d['s_rx'], d['est_rx'], conf_rx)
+            res['tx_rate'] = (d['s_tx'], d['est_tx'], conf_tx)
+            
+        res['interface_status'] = (d['orig_stat'], d['status'], d['stat_conf'])
+        results[if_id] = res
+
+    return results

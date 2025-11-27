@@ -1,0 +1,418 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair via robust global consensus projections.
+
+Algorithm summary:
+- Resolve status with redundant link evidence.
+- Gentle router multiplicative pre-step toward balance on the less-trusted direction.
+- Iterative robust projections:
+  * Link projection: weighted consensus for (my_tx <-> peer_rx) and (my_rx <-> peer_tx).
+  * Router projection: exact flow conservation via closed-form minimum-weight adjustment
+    with non-negativity handled by iterative clamping (water-filling style).
+- Confidence: rate-aware tolerances, logistic decay from residuals, and change penalties.
+
+This is a fundamentally different approach from prior local-heuristic redistribution: it
+uses alternating projections (IRLS/ADMM flavor) to enforce invariants globally.
+"""
+from typing import Dict, Any, Tuple, List
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Parameters
+    TAU_H = 0.02                  # hardening tolerance baseline (2%)
+    TRAFFIC_EVIDENCE_MIN = 0.5    # Mbps threshold to infer link up when statuses disagree
+    PRESTEP_CAP = 0.15            # max multiplicative step per router prestep (±15%)
+    LINK_RELAX = 0.8              # partial step in link projection to avoid oscillations
+    ITERATIONS = 3                # number of alternating projection rounds
+    HUBER_DELTA = 0.03            # Huber-like threshold for downweighting large residuals (3%)
+    CHANGE_PENALTY_WEIGHT = 0.6   # confidence penalty weight for large edits
+    EPS = 1e-9
+
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b), EPS)
+        return abs(a - b) / denom
+
+    def rate_aware_tol_pair(traffic: float) -> float:
+        # Wider tolerance at very low traffic; minimum is TAU_H
+        return max(TAU_H, 5.0 / max(traffic, 1.0))
+
+    def rate_aware_tol_router(total: float) -> float:
+        # Router tolerance scaled by total traffic through the router
+        return max(TAU_H * 2.0, 5.0 / max(total, 1.0))
+
+    def logistic_conf(residual: float, tol: float, k: float = 3.0) -> float:
+        # Map residual to [0,1] with smoother, calibrated decay
+        # x = residual / tol; x=1 roughly mid, x<<1 -> high conf, x>>1 -> low conf
+        x = residual / max(tol, EPS)
+        return 1.0 / (1.0 + pow(2.718281828, k * (x - 1.0)))
+
+    # Build pairs
+    visited = set()
+    pairs: List[Tuple[str, str]] = []
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted((if_id, peer)))
+            if key not in visited:
+                visited.add(key)
+                pairs.append((key[0], key[1]))
+
+    peer_of: Dict[str, str] = {}
+    for a_id, b_id in pairs:
+        peer_of[a_id] = b_id
+        peer_of[b_id] = a_id
+
+    # Build router_ifaces from topology if provided, else from metadata
+    if topology:
+        router_ifaces: Dict[str, List[str]] = {r: [i for i in ifs if i in telemetry] for r, ifs in topology.items()}
+    else:
+        router_ifaces = {}
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None:
+                router_ifaces.setdefault(r, []).append(if_id)
+
+    # Initialize state
+    state: Dict[str, Dict[str, Any]] = {}
+    for if_id, data in telemetry.items():
+        rx0 = float(data.get('rx_rate', 0.0))
+        tx0 = float(data.get('tx_rate', 0.0))
+        st0 = data.get('interface_status', 'unknown')
+        state[if_id] = {
+            'rx': rx0,
+            'tx': tx0,
+            'orig_rx': rx0,
+            'orig_tx': tx0,
+            'status': st0,
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+        }
+
+    # Resolve status with redundant evidence
+    for a_id, b_id in pairs:
+        a = state[a_id]
+        b = state[b_id]
+        a_stat = a['status']
+        b_stat = b['status']
+        a_rx, a_tx = a['rx'], a['tx']
+        b_rx, b_tx = b['rx'], b['tx']
+        traffic_max = max(a_rx, a_tx, b_rx, b_tx)
+
+        if a_stat == b_stat:
+            resolved = a_stat
+            sconf = 0.95 if resolved in ('up', 'down') else 0.7
+        else:
+            if traffic_max > TRAFFIC_EVIDENCE_MIN:
+                resolved = 'up'
+                sconf = 0.85
+            else:
+                resolved = 'down'
+                sconf = 0.75
+
+        for if_id in (a_id, b_id):
+            prev = state[if_id]['status_conf']
+            state[if_id]['status'] = resolved
+            state[if_id]['status_conf'] = min(prev, sconf) if prev is not None else sconf
+
+        if resolved == 'down':
+            for if_id, rxv, txv in [(a_id, a_rx, a_tx), (b_id, b_rx, b_tx)]:
+                state[if_id]['rx'] = 0.0
+                state[if_id]['tx'] = 0.0
+                # no need to set confidences here; final calibration will handle
+
+    # Seed trust from pair agreement
+    seed_tx_conf: Dict[str, float] = {}
+    seed_rx_conf: Dict[str, float] = {}
+    for if_id, r in state.items():
+        peer = peer_of.get(if_id)
+        if peer and state[if_id]['status'] == 'up' and state[peer]['status'] == 'up':
+            res_fwd = rel_diff(state[if_id]['tx'], state[peer]['rx'])
+            res_rev = rel_diff(state[if_id]['rx'], state[peer]['tx'])
+            seed_tx_conf[if_id] = clamp(1.0 - res_fwd)
+            seed_rx_conf[if_id] = clamp(1.0 - res_rev)
+        else:
+            seed_tx_conf[if_id] = 0.6
+            seed_rx_conf[if_id] = 0.6
+
+    # Gentle router multiplicative pre-step (bounded), scale less-trusted direction
+    for router, if_list in router_ifaces.items():
+        up_ifaces = [i for i in if_list if state.get(i, {}).get('status') == 'up']
+        if not up_ifaces:
+            continue
+        sum_tx = sum(max(0.0, state[i]['tx']) for i in up_ifaces)
+        sum_rx = sum(max(0.0, state[i]['rx']) for i in up_ifaces)
+        if max(sum_tx, sum_rx) <= EPS:
+            continue
+        avg_tx_trust = sum(seed_tx_conf.get(i, 0.6) for i in up_ifaces) / len(up_ifaces)
+        avg_rx_trust = sum(seed_rx_conf.get(i, 0.6) for i in up_ifaces) / len(up_ifaces)
+        # scale less trusted direction toward balance
+        if avg_tx_trust >= avg_rx_trust and sum_rx > 0.0:
+            s = sum_tx / max(sum_rx, EPS)
+            s_bounded = max(1.0 - PRESTEP_CAP, min(1.0 + PRESTEP_CAP, s ** 0.5))
+            for i in up_ifaces:
+                state[i]['rx'] = max(0.0, state[i]['rx'] * s_bounded)
+        elif avg_rx_trust > avg_tx_trust and sum_tx > 0.0:
+            s = sum_rx / max(sum_tx, EPS)
+            s_bounded = max(1.0 - PRESTEP_CAP, min(1.0 + PRESTEP_CAP, s ** 0.5))
+            for i in up_ifaces:
+                state[i]['tx'] = max(0.0, state[i]['tx'] * s_bounded)
+
+    # Alternating projections: link -> router, repeated
+    for it in range(ITERATIONS):
+        # 1) Link projection (R3)
+        for a_id, b_id in pairs:
+            if state[a_id]['status'] != 'up' or state[b_id]['status'] != 'up':
+                # down links already zero; nothing to do
+                continue
+            # Forward: a.tx <-> b.rx
+            w_a_tx = 0.5 + 0.5 * seed_tx_conf.get(a_id, 0.6)
+            w_b_rx = 0.5 + 0.5 * seed_rx_conf.get(b_id, 0.6)
+            denom = max(w_a_tx + w_b_rx, EPS)
+            v_fwd = (w_a_tx * state[a_id]['tx'] + w_b_rx * state[b_id]['rx']) / denom
+            # Relaxed projection
+            state[a_id]['tx'] = max(0.0, state[a_id]['tx'] + LINK_RELAX * (v_fwd - state[a_id]['tx']))
+            state[b_id]['rx'] = max(0.0, state[b_id]['rx'] + LINK_RELAX * (v_fwd - state[b_id]['rx']))
+
+            # Reverse: a.rx <-> b.tx
+            w_a_rx = 0.5 + 0.5 * seed_rx_conf.get(a_id, 0.6)
+            w_b_tx = 0.5 + 0.5 * seed_tx_conf.get(b_id, 0.6)
+            denom2 = max(w_a_rx + w_b_tx, EPS)
+            v_rev = (w_a_rx * state[a_id]['rx'] + w_b_tx * state[b_id]['tx']) / denom2
+            state[a_id]['rx'] = max(0.0, state[a_id]['rx'] + LINK_RELAX * (v_rev - state[a_id]['rx']))
+            state[b_id]['tx'] = max(0.0, state[b_id]['tx'] + LINK_RELAX * (v_rev - state[b_id]['tx']))
+
+        # 2) Router projection (R1) with exact conservation and non-negativity
+        for router, if_list in router_ifaces.items():
+            up_ifaces = [i for i in if_list if state.get(i, {}).get('status') == 'up']
+            if not up_ifaces:
+                continue
+            # compute imbalance
+            sum_tx = [max(0.0, state[i]['tx']) for i in up_ifaces]
+            sum_rx = [max(0.0, state[i]['rx']) for i in up_ifaces]
+            total_tx = sum(sum_tx)
+            total_rx = sum(sum_rx)
+            if max(total_tx, total_rx) <= EPS:
+                continue
+            B = total_tx - total_rx
+            rel_imb = abs(B) / max(total_tx, total_rx, EPS)
+            tol_r = rate_aware_tol_router(total_tx + total_rx)
+            if rel_imb <= tol_r * 0.5:
+                continue
+
+            # Weights: higher for trusted or near-zero to protect them
+            w_tx = {}
+            w_rx = {}
+            for i in up_ifaces:
+                conf_tx = seed_tx_conf.get(i, 0.6)
+                conf_rx = seed_rx_conf.get(i, 0.6)
+                # Protect near-zero values more (avoid negative)
+                prot_tx = 0.5 if state[i]['tx'] <= 1.0 else 0.0
+                prot_rx = 0.5 if state[i]['rx'] <= 1.0 else 0.0
+                w_tx[i] = 0.5 + 0.5 * conf_tx + prot_tx
+                w_rx[i] = 0.5 + 0.5 * conf_rx + prot_rx
+
+            # Solve min sum w_tx*dx^2 + sum w_rx*dy^2 s.t. sum(dx) - sum(dy) = -B with non-negativity
+            # Iterative clamp-and-recompute
+            active_tx = set(up_ifaces)
+            active_rx = set(up_ifaces)
+            # capacities (lower bounds are -current values)
+            cap_low_tx = {i: -state[i]['tx'] for i in up_ifaces}
+            cap_low_rx = {i: -state[i]['rx'] for i in up_ifaces}
+
+            target = -B
+            for _ in range(20):  # limit iterations
+                denom = 0.0
+                for i in active_tx:
+                    denom += 1.0 / max(w_tx[i], EPS)
+                for i in active_rx:
+                    denom += 1.0 / max(w_rx[i], EPS)
+                if denom <= EPS:
+                    break
+                lam = 2.0 * target / denom
+                # propose deltas
+                dx = {}
+                dy = {}
+                violated = False
+                for i in up_ifaces:
+                    if i in active_tx:
+                        d = -lam / (2.0 * max(w_tx[i], EPS))
+                        if d < cap_low_tx[i] - 1e-12:
+                            d = cap_low_tx[i]
+                            violated = True
+                        dx[i] = d
+                    else:
+                        dx[i] = 0.0
+                    if i in active_rx:
+                        d2 = lam / (2.0 * max(w_rx[i], EPS))
+                        if d2 < cap_low_rx[i] - 1e-12:
+                            d2 = cap_low_rx[i]
+                            violated = True
+                        dy[i] = d2
+                    else:
+                        dy[i] = 0.0
+                # if any violated lower bounds, freeze them and recompute lambda
+                if violated:
+                    for i in up_ifaces:
+                        if i in active_tx and dx[i] <= cap_low_tx[i] + 1e-12:
+                            active_tx.remove(i)
+                            target -= dx[i]
+                        if i in active_rx and dy[i] <= cap_low_rx[i] + 1e-12:
+                            active_rx.remove(i)
+                            target += dy[i]
+                    continue
+                # feasible; apply
+                for i in up_ifaces:
+                    state[i]['tx'] = max(0.0, state[i]['tx'] + dx[i])
+                    state[i]['rx'] = max(0.0, state[i]['rx'] + dy[i])
+                break  # done
+
+    # Final confidence calibration
+    # Compute pair residuals and router residuals after repair
+    router_residuals: Dict[str, float] = {}
+    for router, if_list in router_ifaces.items():
+        up_ifaces = [i for i in if_list if state.get(i, {}).get('status') == 'up']
+        if not up_ifaces:
+            router_residuals[router] = 0.0
+            continue
+        ttx = sum(max(0.0, state[i]['tx']) for i in up_ifaces)
+        trx = sum(max(0.0, state[i]['rx']) for i in up_ifaces)
+        router_residuals[router] = rel_diff(ttx, trx)
+
+    # Assemble output with calibrated confidences
+    result: Dict[str, Dict[str, Tuple]] = {}
+    for if_id, r in state.items():
+        peer = peer_of.get(if_id)
+        resolved_status = r.get('status', 'unknown')
+
+        # Pair components
+        if peer and state.get(peer, {}).get('status') == resolved_status:
+            # Use rate-aware tolerance
+            traffic_pair = max(r['rx'], r['tx'], state[peer]['rx'], state[peer]['tx'])
+            tol_pair = rate_aware_tol_pair(traffic_pair)
+            res_fwd = rel_diff(r['tx'], state[peer]['rx'])
+            res_rev = rel_diff(r['rx'], state[peer]['tx'])
+            pair_conf_tx = logistic_conf(res_fwd, tol_pair)
+            pair_conf_rx = logistic_conf(res_rev, tol_pair)
+        else:
+            pair_conf_tx = 0.6
+            pair_conf_rx = 0.6
+
+        # Router component
+        router = r.get('local_router')
+        total_router = 0.0
+        if router in router_ifaces:
+            for i in router_ifaces[router]:
+                if state.get(i, {}).get('status') == 'up':
+                    total_router += state[i]['tx'] + state[i]['rx']
+        tol_router = rate_aware_tol_router(total_router)
+        router_res = router_residuals.get(router, 0.0)
+        router_conf = logistic_conf(router_res, tol_router)
+
+        # Status component
+        status_conf = clamp(r.get('status_conf', 0.8))
+        if resolved_status == 'up':
+            if r['rx'] <= TRAFFIC_EVIDENCE_MIN and r['tx'] <= TRAFFIC_EVIDENCE_MIN:
+                status_conf = clamp(status_conf * 0.9)
+        elif resolved_status == 'down':
+            # If any traffic remains, lower status confidence
+            if r['rx'] > TRAFFIC_EVIDENCE_MIN or r['tx'] > TRAFFIC_EVIDENCE_MIN:
+                status_conf = clamp(min(status_conf, 0.3))
+
+        # Aggregate
+        w_pair, w_router, w_status = 0.6, 0.3, 0.1
+        base_tx_conf = w_pair * pair_conf_tx + w_router * router_conf + w_status * status_conf
+        base_rx_conf = w_pair * pair_conf_rx + w_router * router_conf + w_status * status_conf
+
+        # Change penalty
+        dtx = rel_diff(state[if_id]['orig_tx'], r['tx'])
+        drx = rel_diff(state[if_id]['orig_rx'], r['rx'])
+        pen_tx = max(0.0, dtx - TAU_H)
+        pen_rx = max(0.0, drx - TAU_H)
+        final_tx_conf = clamp(base_tx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_rx))
+
+        # Status overrides for down links: trust zeros if already near zero
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if state[if_id]['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if state[if_id]['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        # Package result tuples and copy metadata
+        out: Dict[str, Tuple] = {}
+        out['rx_rate'] = (state[if_id]['orig_rx'], r['rx'], final_rx_conf)
+        out['tx_rate'] = (state[if_id]['orig_tx'], r['tx'], final_tx_conf)
+        out['interface_status'] = (telemetry[if_id].get('interface_status', 'unknown'),
+                                   resolved_status,
+                                   status_conf)
+        out['connected_to'] = r['connected_to']
+        out['local_router'] = r['local_router']
+        out['remote_router'] = r['remote_router']
+        result[if_id] = out
+
+    # For interfaces without peers that remained down, ensure zero rates are enforced
+    for if_id, out in result.items():
+        repaired_status = out['interface_status'][1]
+        if repaired_status == 'down':
+            # Ensure zeros are output (already enforced during status resolution)
+            rx_orig, rx_rep, rx_conf = out['rx_rate']
+            tx_orig, tx_rep, tx_conf = out['tx_rate']
+            out['rx_rate'] = (rx_orig, 0.0, rx_conf)
+            out['tx_rate'] = (tx_orig, 0.0, tx_conf)
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

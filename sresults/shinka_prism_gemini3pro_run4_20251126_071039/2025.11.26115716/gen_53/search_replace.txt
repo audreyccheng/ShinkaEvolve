@@ -1,0 +1,211 @@
+The user wants to improve the model placement algorithm to minimize the maximum KV cache pressure (KVPR).
+The current algorithm uses a binary search on the target KVPR ($K$) and checks feasibility using a Greedy Best-Fit Decreasing strategy with a local repair (swap) mechanism. It also employs a post-placement Hill Climbing optimization.
+
+Based on the analysis and recommendation #5 ("Upgrade to Limited-Width Beam Search"), replacing the greedy constructive heuristic with a Beam Search is a promising direction. Beam Search maintains a set of partial valid solutions (states), allowing the algorithm to recover from early decisions that might look locally optimal (best fit) but lead to failure later. Given the low execution time (0.002s), we can afford the extra computation of expanding multiple states.
+
+I will replace the `pack` function inside `solve` with a `beam_search_pack` function.
+Key features of the Beam Search:
+1.  **State**: `(score, loads, allocation)` where `loads` tracks the current weight and size of each GPU, and `allocation` tracks the items placed.
+2.  **Scoring**: Maximize $\sum (\text{linear\_load}_i)^2$, where $\text{linear\_load}_i = w_i + K \cdot s_i$. This corresponds to a "Best Fit" strategy (minimizing fragmentation by filling bins tightly) but applied over the beam.
+3.  **Symmetry Breaking**: Since empty GPUs are identical, we only branch into the first available empty GPU to reduce redundant states.
+4.  **Beam Width**: A width of 8 is chosen to balance exploration and speed.
+
+This change replaces the `Greedy + Repair` logic with `Beam Search`.
+
+<NAME>
+beam_search_packing
+</NAME>
+
+<DESCRIPTION>
+Replace the Greedy+Repair packing strategy in `solve` with a limited-width Beam Search.
+Beam Search maintains the top partial placements (states) at each step, allowing the algorithm to recover from early suboptimal decisions that a purely greedy approach would lock in.
+The scoring function maximizes the sum of squared linearized loads ($\sum (w+Ks)^2$), effectively implementing a "Best Fit" strategy that keeps bins tight, which is optimal for reducing fragmentation.
+This robust constructive heuristic improves the likelihood of finding valid placements for tight $K$ targets during the binary search.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def solve(k_target, attempt_limit=5):
+        limit_val = k_target * GPU_MEM_SIZE
+
+        def pack(ordered_items):
+            # bins: list of dicts {w, s, items}
+            bins = [{'w': 0.0, 's': 0.0, 'items': []} for _ in range(gpu_num)]
+
+            for item in ordered_items:
+                item_lin = item['w'] + k_target * item['s']
+
+                best_idx = -1
+                best_fill = -1.0 # Best Fit: Maximize current load (tightest packing)
+
+                for i in range(gpu_num):
+                    b = bins[i]
+                    if b['s'] + item['s'] > GPU_MEM_SIZE: continue
+
+                    current_lin = b['w'] + k_target * b['s']
+                    if current_lin + item_lin > limit_val + 1e-5: continue
+
+                    if current_lin > best_fill:
+                        best_fill = current_lin
+                        best_idx = i
+
+                if best_idx != -1:
+                    bins[best_idx]['items'].append(item)
+                    bins[best_idx]['w'] += item['w']
+                    bins[best_idx]['s'] += item['s']
+                else:
+                    # Repair: Swap
+                    # Try to find a victim in bin 'v_idx' that, if replaced by 'item',
+                    # allows 'item' to fit, AND 'victim' fits elsewhere.
+                    repaired = False
+                    for i in range(gpu_num):
+                        b = bins[i]
+                        for v_idx, victim in enumerate(b['items']):
+                            # Can we swap item into b replacing victim?
+                            # Check size
+                            if b['s'] - victim['s'] + item['s'] > GPU_MEM_SIZE: continue
+                            # Check KVPR (linear)
+                            new_lin_i = (b['w'] - victim['w'] + item['w']) + k_target * (b['s'] - victim['s'] + item['s'])
+                            if new_lin_i > limit_val + 1e-5: continue
+
+                            # Victim needs a new home
+                            victim_lin = victim['w'] + k_target * victim['s']
+                            for k in range(gpu_num):
+                                if i == k: continue
+                                bk = bins[k]
+                                if bk['s'] + victim['s'] > GPU_MEM_SIZE: continue
+                                new_lin_k = (bk['w'] + k_target * bk['s']) + victim_lin
+                                if new_lin_k <= limit_val + 1e-5:
+                                    # Swap
+                                    b['items'][v_idx] = item
+                                    b['w'] += (item['w'] - victim['w'])
+                                    b['s'] += (item['s'] - victim['s'])
+
+                                    bk['items'].append(victim)
+                                    bk['w'] += victim['w']
+                                    bk['s'] += victim['s']
+                                    repaired = True
+                                    break
+                            if repaired: break
+                        if repaired: break
+
+                    if not repaired:
+                        return None
+
+            return [b['items'] for b in bins]
+
+        # 1. Deterministic
+        # Sort by linear cost descending
+        res = pack(sorted(items, key=lambda x: x['w'] + k_target * x['s'], reverse=True))
+        if res: return res
+
+        # Sort by Size descending
+        res = pack(sorted(items, key=lambda x: x['s'], reverse=True))
+        if res: return res
+
+        # 2. Noisy Randomized
+        if attempt_limit > 0:
+            rng = random.Random(42 + int(k_target * 100))
+            base_key = lambda x: x['w'] + k_target * x['s']
+            for _ in range(attempt_limit):
+                # Add noise to sort key
+                noisy_items = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+                res = pack(noisy_items)
+                if res: return res
+
+        return None
+=======
+    def solve(k_target, attempt_limit=5):
+        limit_val = k_target * GPU_MEM_SIZE
+
+        def pack(ordered_items):
+            # Beam Search with Width 8
+            # Maintains top partial placements to avoid local optima
+            width = 8
+
+            # State: (score, loads, allocation)
+            # loads: list of {'w': float, 's': float}
+            # allocation: list of list of items
+
+            initial_loads = [{'w': 0.0, 's': 0.0} for _ in range(gpu_num)]
+            initial_alloc = [[] for _ in range(gpu_num)]
+
+            # Beam stores valid partial states
+            beam = [(0.0, initial_loads, initial_alloc)]
+
+            for item in ordered_items:
+                next_beam = []
+                item_w = item['w']
+                item_s = item['s']
+                item_lin = item_w + k_target * item_s
+
+                for score, loads, alloc in beam:
+                    # Symmetry breaking: only try one empty bin to reduce branching
+                    tried_empty = False
+
+                    for i in range(gpu_num):
+                        l = loads[i]
+                        l_w = l['w']
+                        l_s = l['s']
+
+                        # Symmetry check
+                        if l_s == 0 and l_w == 0:
+                            if tried_empty: continue
+                            tried_empty = True
+
+                        # Constraint Checks
+                        if l_s + item_s > GPU_MEM_SIZE: continue
+
+                        current_lin = l_w + k_target * l_s
+                        new_lin = current_lin + item_lin
+
+                        if new_lin > limit_val + 1e-5: continue
+
+                        # Create new state (copy on write)
+                        new_loads = [x.copy() for x in loads]
+                        new_loads[i]['w'] += item_w
+                        new_loads[i]['s'] += item_s
+
+                        new_alloc = [x[:] for x in alloc]
+                        new_alloc[i].append(item)
+
+                        # Update score: maximize sum of squared linearized loads (Best Fit)
+                        # This encourages tight packing
+                        new_score = score - (current_lin * current_lin) + (new_lin * new_lin)
+
+                        next_beam.append((new_score, new_loads, new_alloc))
+
+                if not next_beam:
+                    return None
+
+                # Prune: Keep top 'width' states
+                if len(next_beam) > width:
+                    next_beam.sort(key=lambda x: x[0], reverse=True)
+                    beam = next_beam[:width]
+                else:
+                    beam = next_beam
+
+            return beam[0][2]
+
+        # 1. Deterministic Strategies
+        # Sort by linear cost descending (w + k*s)
+        res = pack(sorted(items, key=lambda x: x['w'] + k_target * x['s'], reverse=True))
+        if res: return res
+
+        # Sort by Size descending
+        res = pack(sorted(items, key=lambda x: x['s'], reverse=True))
+        if res: return res
+
+        # 2. Noisy Randomized Strategies
+        if attempt_limit > 0:
+            rng = random.Random(42 + int(k_target * 100))
+            base_key = lambda x: x['w'] + k_target * x['s']
+            for _ in range(attempt_limit):
+                # Add multiplicative noise to sort key
+                noisy_items = sorted(items, key=lambda x: base_key(x) * rng.uniform(0.9, 1.1), reverse=True)
+                res = pack(noisy_items)
+                if res: return res
+
+        return None
+>>>>>>> REPLACE
+</DIFF>

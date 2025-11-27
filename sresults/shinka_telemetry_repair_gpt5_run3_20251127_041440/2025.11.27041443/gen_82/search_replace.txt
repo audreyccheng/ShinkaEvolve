@@ -1,0 +1,145 @@
+<NAME>
+expected_penalty_and_guarded_resync
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to boost counter repair accuracy while maintaining strong confidence calibration:
+
+1) Expected-penalty router-side selection: Instead of always scaling the side with lower aggregate confidence, we estimate a penalty for scaling TX vs RX per router using current rates, per-link confidences, and dominance (HHI) of low-confidence weights. We then pick the side that yields the lower expected penalty, with a near-tie fallback to the original rule. This avoids picking a side that would disproportionately impact a dominant subset of links, improving flow-conservation projection fidelity.
+
+2) Guarded unilateral re-sync: In the post-projection link re-sync (Stage 2.5), unilateral nudges are now capped to ±2% of the current value (as already done for bilateral micro-steps). This prevents over-adjustment in stubborn asymmetry cases, reducing potential overshoot and improving both repair accuracy and confidence calibration.
+
+These changes are minimal, consistent with existing design, and leverage already-defined utilities (clamp, sigmoid, rel_diff). They should raise counter accuracy while keeping the calibration robust.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Decide which side to adjust per-router and apply targeted scaling
+    for router, if_list in router_ifaces.items():
+        if len(if_list) <= 1:
+            continue
+        # Compute router mismatch and adaptive tau
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        if max(sum_tx, sum_rx) < EPS:
+            continue
+        n_active_tx = sum(1 for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+        n_active_rx = sum(1 for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+        tau_r = tau_router(max(n_active_tx, n_active_rx))
+        if rel_diff(sum_tx, sum_rx) <= tau_r:
+            continue
+        # Choose side with lower aggregate confidence
+        c_tx_total = sum(conf_tx_link.get(i, 0.6) for i in if_list)
+        c_rx_total = sum(conf_rx_link.get(i, 0.6) for i in if_list)
+        if c_tx_total < c_rx_total:
+            targeted_scale(router, "tx", if_list, tau_r)
+        else:
+            targeted_scale(router, "rx", if_list, tau_r)
+=======
+    # Decide which side to adjust per-router and apply targeted scaling
+    for router, if_list in router_ifaces.items():
+        if len(if_list) <= 1:
+            continue
+        # Compute router mismatch and adaptive tau
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        if max(sum_tx, sum_rx) < EPS:
+            continue
+        n_active_tx = sum(1 for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+        n_active_rx = sum(1 for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+        tau_r = tau_router(max(n_active_tx, n_active_rx))
+        if rel_diff(sum_tx, sum_rx) <= tau_r:
+            continue
+
+        # Expected-penalty lookahead for side selection (dominance- and confidence-aware)
+        def _side_penalty(side: str) -> float:
+            vals = [hard_tx.get(i, 0.0) if side == "tx" else hard_rx.get(i, 0.0) for i in if_list]
+            confs = [clamp01(conf_tx_link.get(i, 0.6) if side == "tx" else conf_rx_link.get(i, 0.6)) for i in if_list]
+            active = [(v, c) for v, c in zip(vals, confs) if v >= ZERO_THRESH]
+            if not active:
+                return float('inf')
+            cur = sum(v for v, _ in active)
+            tgt = sum(hard_rx.get(i, 0.0) for i in if_list) if side == "tx" else sum(hard_tx.get(i, 0.0) for i in if_list)
+            alpha = tgt / max(cur, EPS)
+            alpha = clamp(alpha, 0.95, 1.05)
+            alpha_eff = 1.0 + 0.4 * (alpha - 1.0)
+            scale_dev = abs(alpha_eff - 1.0)
+            n_act = len(active)
+            penalty_scale = scale_dev * n_act
+            penalty_conf = 0.5 * sum(1.0 - c for _, c in active)
+            weights = [(1.0 - c) * v for v, c in active]
+            sw = sum(weights) if weights else EPS
+            hhi = sum((w / sw) ** 2 for w in weights) if sw > 0 else 1.0
+            penalty_dom = 0.05 * hhi
+            return penalty_scale + penalty_conf + penalty_dom
+
+        pen_tx = _side_penalty("tx")
+        pen_rx = _side_penalty("rx")
+        if abs(pen_tx - pen_rx) / max(1e-6, max(pen_tx, pen_rx)) < 0.05:
+            # Near tie: fallback to aggregate link confidence
+            c_tx_total = sum(conf_tx_link.get(i, 0.6) for i in if_list)
+            c_rx_total = sum(conf_rx_link.get(i, 0.6) for i in if_list)
+            adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+        else:
+            adjust_side = "tx" if pen_tx < pen_rx else "rx"
+
+        targeted_scale(router, adjust_side, if_list, tau_r)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                if ca < cb:
+                    gap = max(0.0, cb - ca)
+                    f = min(0.4, gap) * f_gain
+                    hard_tx[a] = (1.0 - f) * tx_a + f * mean_ab
+                    conf_tx_link[a] *= 0.97
+                elif cb < ca:
+                    gap = max(0.0, ca - cb)
+                    f = min(0.4, gap) * f_gain
+                    hard_rx[b] = (1.0 - f) * rx_b + f * mean_ab
+                    conf_rx_link[b] *= 0.97
+=======
+                if ca < cb:
+                    gap = max(0.0, cb - ca)
+                    f = min(0.4, gap) * f_gain
+                    new_tx = (1.0 - f) * tx_a + f * mean_ab
+                    hard_tx[a] = clamp(new_tx, tx_a * 0.98, tx_a * 1.02)
+                    conf_tx_link[a] *= 0.97
+                elif cb < ca:
+                    gap = max(0.0, ca - cb)
+                    f = min(0.4, gap) * f_gain
+                    new_rx = (1.0 - f) * rx_b + f * mean_ab
+                    hard_rx[b] = clamp(new_rx, rx_b * 0.98, rx_b * 1.02)
+                    conf_rx_link[b] *= 0.97
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                if cb_tx < ca_rx:
+                    gap = max(0.0, ca_rx - cb_tx)
+                    f = min(0.4, gap) * f_gain
+                    hard_tx[b] = (1.0 - f) * tx_b + f * mean_ba
+                    conf_tx_link[b] *= 0.97
+                elif ca_rx < cb_tx:
+                    gap = max(0.0, cb_tx - ca_rx)
+                    f = min(0.4, gap) * f_gain
+                    hard_rx[a] = (1.0 - f) * rx_a + f * mean_ba
+                    conf_rx_link[a] *= 0.97
+=======
+                if cb_tx < ca_rx:
+                    gap = max(0.0, ca_rx - cb_tx)
+                    f = min(0.4, gap) * f_gain
+                    new_tx = (1.0 - f) * tx_b + f * mean_ba
+                    hard_tx[b] = clamp(new_tx, tx_b * 0.98, tx_b * 1.02)
+                    conf_tx_link[b] *= 0.97
+                elif ca_rx < cb_tx:
+                    gap = max(0.0, cb_tx - ca_rx)
+                    f = min(0.4, gap) * f_gain
+                    new_rx = (1.0 - f) * rx_a + f * mean_ba
+                    hard_rx[a] = clamp(new_rx, rx_a * 0.98, rx_a * 1.02)
+                    conf_rx_link[a] *= 0.97
+>>>>>>> REPLACE
+
+</DIFF>

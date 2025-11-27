@@ -1,0 +1,424 @@
+<NAME>
+iterative_consensus_repair
+</NAME>
+
+<DESCRIPTION>
+Introduces an iterative solver for the flow conservation targets. This resolves circular dependencies where a bad initial estimate (e.g., from a dead peer) causes the router to appear imbalanced, invalidating the flow correction that would fix it. The repair now runs in two passes: first to converge estimates, second to generate final confidence scores.
+
+Also refines the arbitration logic to use continuous agreement scores (goodness-of-fit) rather than boolean thresholds, improving confidence calibration. It prioritizes consensus (Self+Flow or Peer+Flow) over reliability flags, allowing valid flow targets to rescue bad estimates even if the router initially looks imbalanced.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repairs telemetry using a calibrated consensus model.
+
+    Key Improvements:
+    1. Decoupled Confidence: Confidence scores are based on the *reliability of the source*
+       (e.g., Peer + Flow Agreement = 0.95), not the magnitude of the error.
+    2. Hierarchical Validation:
+       - Tier 1: Link Symmetry (Peer) - Strongest physical signal.
+       - Tier 2: Flow Conservation - Contextual verification to resolve conflicts.
+    3. Flow Gating: Flow signals are only used if the router's overall state is reasonably balanced,
+       preventing noise propagation.
+    """
+
+    # --- Configuration ---
+    REL_TOL = 0.02  # 2% Relative Tolerance
+    ABS_TOL = 0.5   # 0.5 Mbps Absolute Tolerance (Noise Floor)
+
+    results = {}
+
+    # Helper: Agreement Check
+    def agrees(v1: float, v2: float) -> bool:
+        diff = abs(v1 - v2)
+        if diff <= ABS_TOL: return True
+        return (diff / max(abs(v1), abs(v2))) <= REL_TOL
+
+    # --- Phase 1: Status Normalization & Signal Collection ---
+    # We create a working state to perform flow calculations
+
+    working_state = {} # if_id -> {metrics}
+
+    for if_id, data in telemetry.items():
+        # 1. Extract Raw Signals
+        s_rx = float(data.get('rx_rate', 0.0))
+        s_tx = float(data.get('tx_rate', 0.0))
+        s_status = data.get('interface_status', 'unknown')
+
+        peer_id = data.get('connected_to')
+        has_peer = False
+        p_rx, p_tx, p_status = 0.0, 0.0, 'unknown'
+
+        if peer_id and peer_id in telemetry:
+            has_peer = True
+            p_data = telemetry[peer_id]
+            p_rx = float(p_data.get('rx_rate', 0.0))
+            p_tx = float(p_data.get('tx_rate', 0.0))
+            p_status = p_data.get('interface_status', 'unknown')
+
+        # 2. Status Repair
+        # Logic: Traffic = UP. No Traffic + Peer Down = DOWN.
+        # Traffic is defined as any significant signal on Self OR Peer.
+        has_traffic = (s_rx > ABS_TOL or s_tx > ABS_TOL or
+                       p_rx > ABS_TOL or p_tx > ABS_TOL)
+
+        final_status = s_status
+        status_conf = 1.0
+
+        if s_status == 'down' and has_traffic:
+            final_status = 'up'
+            status_conf = 0.95 # Correcting false negative
+        elif s_status == 'up' and not has_traffic:
+            if p_status == 'down':
+                final_status = 'down'
+                status_conf = 0.90
+            # If peer is UP but idle, we stay UP.
+
+        # 3. Initial Estimation for Flow Context
+        # We need a baseline to calculate router totals.
+        # Strategy: Trust agreement, else trust Peer (Symmetry), else Self.
+
+        # Estimate RX (Inbound)
+        if has_peer:
+            est_rx = (s_rx + p_tx) / 2.0 if agrees(s_rx, p_tx) else p_tx
+        else:
+            est_rx = s_rx
+
+        # Estimate TX (Outbound)
+        if has_peer:
+            est_tx = (s_tx + p_rx) / 2.0 if agrees(s_tx, p_rx) else p_rx
+        else:
+            est_tx = s_tx
+
+        # Force estimates to 0 if we determined status is DOWN
+        if final_status == 'down':
+            est_rx, est_tx = 0.0, 0.0
+
+        working_state[if_id] = {
+            's_rx': s_rx, 's_tx': s_tx,
+            'p_rx': p_rx, 'p_tx': p_tx,
+            'est_rx': est_rx, 'est_tx': est_tx,
+            'status': final_status, 'status_conf': status_conf,
+            'orig_status': s_status,
+            'has_peer': has_peer
+        }
+
+    # --- Phase 2: Flow Target Calculation ---
+    # Calculate what the values *should* be based on router-wide conservation.
+
+    flow_context = {} # if_id -> {'rx': val, 'tx': val, 'valid': bool}
+
+    for router_id, if_list in topology.items():
+        valid_ifs = [i for i in if_list if i in working_state]
+
+        # Calculate Aggregates
+        total_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+        total_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+        # Validate Flow Integrity
+        # If router is massively imbalanced, we can't trust flow conservation
+        # to fix specific counters (garbage in -> garbage out).
+        imbalance = abs(total_in - total_out)
+        max_flow = max(total_in, total_out, 1.0)
+        is_flow_reliable = (imbalance / max_flow) < 0.05 # 5% tolerance
+
+        for i in valid_ifs:
+            ws = working_state[i]
+            # Target RX: What balances the output?
+            # RX_i = Total_Out - (Total_In - RX_i)
+            target_rx = max(0.0, total_out - (total_in - ws['est_rx']))
+
+            # Target TX: What balances the input?
+            # TX_i = Total_In - (Total_Out - TX_i)
+            target_tx = max(0.0, total_in - (total_out - ws['est_tx']))
+
+            flow_context[i] = {
+                'rx': target_rx,
+                'tx': target_tx,
+                'valid': is_flow_reliable
+            }
+
+    # --- Phase 3: Arbitration & Confidence Assignment ---
+
+    for if_id, d in working_state.items():
+        f_ctx = flow_context.get(if_id, {'rx': 0.0, 'tx': 0.0, 'valid': False})
+
+        # --- Repair RX ---
+        # Sources: Self(s_rx), Peer(p_tx), Flow(f_ctx['rx'])
+        if d['status'] == 'down':
+            final_rx = 0.0
+            # If we are suppressing real noise, confidence is slightly lower but still high
+            conf_rx = 0.95 if d['s_rx'] > ABS_TOL else 1.0
+        else:
+            final_rx, conf_rx = arbitrate(
+                d['s_rx'], d['p_tx'], f_ctx['rx'],
+                d['has_peer'], f_ctx['valid'], agrees
+            )
+
+        # --- Repair TX ---
+        # Sources: Self(s_tx), Peer(p_rx), Flow(f_ctx['tx'])
+        if d['status'] == 'down':
+            final_tx = 0.0
+            conf_tx = 0.95 if d['s_tx'] > ABS_TOL else 1.0
+        else:
+            final_tx, conf_tx = arbitrate(
+                d['s_tx'], d['p_rx'], f_ctx['tx'],
+                d['has_peer'], f_ctx['valid'], agrees
+            )
+
+        # Construct Result
+        orig_data = telemetry[if_id]
+        res_entry = orig_data.copy()
+        res_entry['rx_rate'] = (d['s_rx'], final_rx, conf_rx)
+        res_entry['tx_rate'] = (d['s_tx'], final_tx, conf_tx)
+        res_entry['interface_status'] = (d['orig_status'], d['status'], d['status_conf'])
+
+        results[if_id] = res_entry
+
+    return results
+
+def arbitrate(v_self: float, v_peer: float, v_flow: float,
+              has_peer: bool, flow_valid: bool, agree_func) -> Tuple[float, float]:
+    """
+    Selects the best value and assigns a fixed confidence score based on the
+    verification level.
+    """
+
+    # 1. Handle Isolated Interfaces (No Peer)
+    if not has_peer:
+        if flow_valid and agree_func(v_self, v_flow):
+            return v_self, 0.90 # Self verified by Flow
+        elif flow_valid:
+            return v_flow, 0.75 # Self wrong, trusting Flow
+        else:
+            return v_self, 0.50 # Blind trust
+
+    # 2. Link Symmetry Check (Strongest Signal)
+    if agree_func(v_self, v_peer):
+        # Consensus: Self and Peer agree.
+        return (v_self + v_peer) / 2.0, 1.0
+
+    # 3. Conflict Resolution
+    # Self and Peer disagree. Who is right?
+
+    if flow_valid:
+        # Check Flow alignment
+        peer_agrees_flow = agree_func(v_peer, v_flow)
+        self_agrees_flow = agree_func(v_self, v_flow)
+
+        if peer_agrees_flow and not self_agrees_flow:
+            # Peer verified by Flow. Strong repair.
+            return (v_peer + v_flow) / 2.0, 0.95
+
+        if self_agrees_flow and not peer_agrees_flow:
+            # Self verified by Flow. Peer likely wrong.
+            return (v_self + v_flow) / 2.0, 0.90
+            # Slightly lower than Peer-Flow match because Peer is usually ground truth.
+
+    # 4. Fallback (Flow ambiguous or invalid)
+    # Trust Peer (Link Symmetry).
+    # This captures cases like dead local sensors (Self=0, Peer=100)
+    # We assign 0.8 because we lack Flow confirmation, but symmetry is robust.
+    return v_peer, 0.80
+=======
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Repairs telemetry using an Iterative Calibrated Consensus model.
+
+    Strategy:
+    1. Initial Guess: Based on Link Symmetry (Peer > Self).
+    2. Iterative Refinement (2 Passes):
+       - Calculate Flow Targets for each interface based on current estimates of neighbors.
+       - Update estimates by arbitrating between Self, Peer, and Flow.
+       - This allows Flow Conservation to correct bad initial estimates (e.g., dead peer)
+         that initially make the router appear unbalanced.
+    3. Final Arbitration: Produces value and confidence score based on consensus quality.
+    """
+
+    # --- Configuration ---
+    REL_TOL = 0.02  # 2% Relative Tolerance
+    ABS_TOL = 0.5   # 0.5 Mbps Noise Floor
+
+    results = {}
+
+    # --- Phase 1: Status Normalization & Initialization ---
+    working_state = {}
+
+    for if_id, data in telemetry.items():
+        # Extract Signals
+        s_rx = float(data.get('rx_rate', 0.0))
+        s_tx = float(data.get('tx_rate', 0.0))
+        s_status = data.get('interface_status', 'unknown')
+
+        peer_id = data.get('connected_to')
+        has_peer = False
+        p_rx, p_tx, p_status = 0.0, 0.0, 'unknown'
+
+        if peer_id and peer_id in telemetry:
+            has_peer = True
+            p_data = telemetry[peer_id]
+            p_rx = float(p_data.get('rx_rate', 0.0))
+            p_tx = float(p_data.get('tx_rate', 0.0))
+            p_status = p_data.get('interface_status', 'unknown')
+
+        # Status Repair
+        has_traffic = (s_rx > ABS_TOL or s_tx > ABS_TOL or
+                       p_rx > ABS_TOL or p_tx > ABS_TOL)
+
+        final_status = s_status
+        status_conf = 1.0
+
+        if s_status == 'down' and has_traffic:
+            final_status = 'up'
+            status_conf = 0.95
+        elif s_status == 'up' and not has_traffic and p_status == 'down':
+            final_status = 'down'
+            status_conf = 0.90
+
+        # Initial Estimates (Prefer Peer, else Self)
+        # Note: We rely on iteration to fix these if Peer is wrong but Flow is right.
+        if final_status == 'down':
+            est_rx, est_tx = 0.0, 0.0
+        else:
+            # Simple initial guess: Trust Peer if available, else Self
+            est_rx = p_tx if has_peer else s_rx
+            est_tx = p_rx if has_peer else s_tx
+
+        working_state[if_id] = {
+            's_rx': s_rx, 's_tx': s_tx,
+            'p_rx': p_rx, 'p_tx': p_tx,
+            'est_rx': est_rx, 'est_tx': est_tx,
+            'status': final_status, 'status_conf': status_conf,
+            'orig_status': s_status,
+            'has_peer': has_peer
+        }
+
+    # --- Phase 2: Iterative Refinement ---
+    # We refine estimates in a loop to resolve circular dependencies in flow calculation.
+
+    for iteration in range(2):
+        # 1. Calculate Router Totals from current estimates
+        router_totals = {}
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in working_state]
+            t_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+            t_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+            imb = abs(t_in - t_out)
+            mx = max(t_in, t_out, 1.0)
+            reliable = (imb / mx) < 0.05
+            router_totals[r_id] = {'in': t_in, 'out': t_out, 'reliable': reliable}
+
+        # 2. Update Estimates based on Flow Context
+        for if_id, d in working_state.items():
+            r_id = telemetry[if_id].get('local_router')
+
+            # Calculate Flow Hypothesis
+            f_rx, f_tx, f_valid = d['est_rx'], d['est_tx'], False
+
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                # Target RX = Total_Out - (Total_In - My_RX)
+                other_rx = rt['in'] - d['est_rx']
+                f_rx = max(0.0, rt['out'] - other_rx)
+
+                # Target TX = Total_In - (Total_Out - My_TX)
+                other_tx = rt['out'] - d['est_tx']
+                f_tx = max(0.0, rt['in'] - other_tx)
+
+                f_valid = rt['reliable']
+
+            # Update Estimates using Arbitration
+            if d['status'] == 'down':
+                 d['est_rx'], d['est_tx'] = 0.0, 0.0
+            else:
+                # RX
+                val_rx, conf_rx = arbitrate(
+                    d['s_rx'], d['p_tx'], f_rx,
+                    d['has_peer'], f_valid, REL_TOL, ABS_TOL
+                )
+                d['est_rx'] = val_rx
+                d['conf_rx'] = conf_rx # Store for final pass
+
+                # TX
+                val_tx, conf_tx = arbitrate(
+                    d['s_tx'], d['p_rx'], f_tx,
+                    d['has_peer'], f_valid, REL_TOL, ABS_TOL
+                )
+                d['est_tx'] = val_tx
+                d['conf_tx'] = conf_tx
+
+    # --- Phase 3: Final Result Generation ---
+    for if_id, d in working_state.items():
+        res = telemetry[if_id].copy()
+
+        if d['status'] == 'down':
+            # High confidence if signal is actually quiet
+            crx = 1.0 if d['s_rx'] <= ABS_TOL else 0.95
+            ctx = 1.0 if d['s_tx'] <= ABS_TOL else 0.95
+            res['rx_rate'] = (d['s_rx'], 0.0, crx)
+            res['tx_rate'] = (d['s_tx'], 0.0, ctx)
+        else:
+            res['rx_rate'] = (d['s_rx'], d['est_rx'], d.get('conf_rx', 0.5))
+            res['tx_rate'] = (d['s_tx'], d['est_tx'], d.get('conf_tx', 0.5))
+
+        res['interface_status'] = (d['orig_status'], d['status'], d['status_conf'])
+        results[if_id] = res
+
+    return results
+
+def arbitrate(v_self: float, v_peer: float, v_flow: float,
+              has_peer: bool, flow_valid: bool, rel_tol: float, abs_tol: float) -> Tuple[float, float]:
+    """
+    Arbitrates between signals using goodness-of-fit to determine confidence.
+    Prioritizes consensus (e.g. Self+Flow or Peer+Flow) over reliability flags.
+    """
+
+    def dist(a, b):
+        if a is None or b is None: return 999.0
+        diff = abs(a - b)
+        if diff <= abs_tol: return 0.0
+        return diff / max(abs(a), abs(b), 1.0) / rel_tol
+
+    # Calculate Distances (0.0 = Perfect match, <=1.0 = Agree)
+    d_sp = dist(v_self, v_peer) if has_peer else 999.0
+    d_sf = dist(v_self, v_flow)
+    d_pf = dist(v_peer, v_flow) if has_peer else 999.0
+
+    # 1. Unanimous Agreement (S ≈ P ≈ F)
+    # Strongest possible signal.
+    if d_sp <= 1.0 and d_pf <= 1.0:
+         return (v_self + v_peer + v_flow)/3.0, max(0.9, 1.0 - 0.05 * max(d_sp, d_pf))
+
+    # 2. Self == Peer (Flow Disagrees or Invalid)
+    # Link symmetry is the physical baseline.
+    if d_sp <= 1.0:
+         return (v_self + v_peer)/2.0, max(0.8, 0.95 - 0.1 * d_sp)
+
+    # 3. Peer == Flow (Self Disagrees)
+    # Strong evidence that local sensor is broken.
+    if d_pf <= 1.0:
+         return (v_peer + v_flow)/2.0, max(0.8, 0.95 - 0.1 * d_pf)
+
+    # 4. Self == Flow (Peer Disagrees)
+    # Evidence that Peer is dead/wrong, provided neighbors are consistent.
+    # We trust this even if 'flow_valid' was loose, because exact numerical match is rare by chance.
+    if d_sf <= 1.0:
+         return (v_self + v_flow)/2.0, max(0.7, 0.90 - 0.1 * d_sf)
+
+    # 5. Fallbacks (No Consensus)
+    if has_peer:
+         return v_peer, 0.6 # Trust Symmetry over unknown Flow
+    elif flow_valid:
+         # External Link with valid flow context
+         # If Self is close to Flow (relaxed), trust Self verified by Flow
+         if d_sf <= 2.0: return v_self, 0.8
+         return v_flow, 0.75 # Trust Flow
+    else:
+         return v_self, 0.5 # Blind Trust
+>>>>>>> REPLACE
+</DIFF>

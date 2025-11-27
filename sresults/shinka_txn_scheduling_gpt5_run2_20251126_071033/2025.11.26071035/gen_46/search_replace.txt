@@ -1,0 +1,365 @@
+<NAME>
+best_two_cache_vnd_lns
+</NAME>
+
+<DESCRIPTION>
+I introduce three synergistic improvements aimed at directly minimizing makespan via better conflict-aware decisions while keeping runtime practical:
+
+1) Deterministic, stratified position sampling and best-two insertion caching:
+   - Replace random position sampling with evenly spaced anchors that always include both ends, making insertion evaluation repeatable.
+   - Add a best_two_cache keyed by (tuple(seq), txn) to memoize best and second-best insertion evaluations. This enables regret-driven choices to consistently reflect true makespan shifts and avoids recomputation across construction and LNS.
+
+2) Regret-aware best-two insertions used in construction and LNS:
+   - Modify best_insertion_for_txn to leverage the cached best_two_insertions and compute regret (second_best − best). This specifically targets minimizing conflict-induced delays.
+
+3) Stronger local refinement stack with VND and a light LNS:
+   - Add Or-opt (k=3,2,1) block relocations and a VND orchestrator combining Or-opt, adjacent swaps, and relocations.
+   - Add a small ruin-and-recreate phase that removes a contiguous block and reinserts items via regret-guided best-two insertion, followed by a quick polish; only accept improving reconstructions.
+   - Update the multi-start loop to use VND and LNS for deeper local minima escape and better final schedules.
+
+These changes are targeted and consistent with prior strong variants. They bring back the most effective mechanisms from higher-scoring hybrids while preserving the current code structure and ensuring correctness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    JITTER = 2  # small random variation in candidate set size
+=======
+    JITTER = 2  # small random variation in candidate set size
+    # Cache for best and second-best insertion results per (seq, txn)
+    best_two_cache = {}
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def sample_positions(seq_len):
+        # Return list of positions [0..seq_len] where insertion can occur
+        if POS_SAMPLE_LIMIT is None or seq_len + 1 <= (POS_SAMPLE_LIMIT or (seq_len + 1)):
+            return list(range(seq_len + 1))
+        # Sample positions but always include ends to preserve global structure
+        num_to_sample = max(2, min(POS_SAMPLE_LIMIT, seq_len + 1))
+        mandatory = {0, seq_len}
+        # Available interior positions
+        interior = list(range(1, seq_len))
+        if len(interior) <= num_to_sample - 2:
+            chosen = set(interior)
+        else:
+            chosen = set(random.sample(interior, num_to_sample - 2))
+        chosen.update(mandatory)
+        return sorted(chosen)
+=======
+    def sample_positions(seq_len):
+        """
+        Return deterministic stratified insertion anchors to stabilize evaluations and support caching.
+        Always includes both ends; if small enough, evaluates all positions.
+        """
+        total = seq_len + 1
+        if POS_SAMPLE_LIMIT is None or total <= POS_SAMPLE_LIMIT:
+            return list(range(total))
+        # Evenly spaced anchors including both ends
+        k = max(2, min(POS_SAMPLE_LIMIT, total))
+        anchors = {0, seq_len}
+        if k > 2:
+            # Generate k-2 interior anchors spaced across 1..seq_len-1
+            for i in range(1, k - 1):
+                pos = round(i * seq_len / (k - 1))
+                pos = max(0, min(seq_len, int(pos)))
+                anchors.add(pos)
+        return sorted(anchors)
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def best_insertion_for_txn(current_seq, txn):
+        """
+        Try inserting txn into multiple positions in current_seq.
+        Returns (best_cost, best_pos, regret), where regret = second_best_cost - best_cost.
+        """
+        seq_len = len(current_seq)
+        best_cost = float('inf')
+        second_best = float('inf')
+        best_pos = 0
+        positions = sample_positions(seq_len)
+        for pos in positions:
+            # Build candidate sequence with insertion
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                second_best = best_cost
+                best_cost = cost
+                best_pos = pos
+            elif cost < second_best:
+                second_best = cost
+        regret = (second_best - best_cost) if second_best < float('inf') else 0.0
+        return best_cost, best_pos, regret
+=======
+    def best_two_insertions(current_seq, txn):
+        """
+        Compute and cache the best and second-best insertion (cost, pos) for txn into current_seq.
+        Returns (best_cost, best_pos, second_best_cost).
+        """
+        key = (tuple(current_seq), txn)
+        cached = best_two_cache.get(key)
+        if cached is not None:
+            return cached
+
+        best_cost = float('inf')
+        second_best = float('inf')
+        best_pos = 0
+        for pos in sample_positions(len(current_seq)):
+            cand = current_seq.copy()
+            cand.insert(pos, txn)
+            cost = eval_cost(cand)
+            if cost < best_cost:
+                second_best = best_cost
+                best_cost = cost
+                best_pos = pos
+            elif cost < second_best:
+                second_best = cost
+        if second_best == float('inf'):
+            second_best = best_cost
+        result = (best_cost, best_pos, second_best)
+        best_two_cache[key] = result
+        return result
+
+    def best_insertion_for_txn(current_seq, txn):
+        """
+        Wrapper using cached best-two insertions; returns (best_cost, best_pos, regret).
+        """
+        best_cost, best_pos, second_best = best_two_insertions(current_seq, txn)
+        regret = max(0.0, second_best - best_cost)
+        return best_cost, best_pos, regret
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def local_search_relocations(seq, curr_cost):
+        """
+        Random relocation: remove at index i and reinsert at j if improves.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        trials = 0
+        # Early exit if trivial
+        if len(best_seq) <= 2:
+            return best_seq, best_cost
+
+        while trials < RELOC_TRIES:
+            i = random.randint(0, len(best_seq) - 1)
+            j = random.randint(0, len(best_seq) - 1)
+            if i == j:
+                trials += 1
+                continue
+            cand = best_seq.copy()
+            t = cand.pop(i)
+            # Adjust j if removal shifts indices
+            if j > i:
+                j -= 1
+            cand.insert(j, t)
+            c = eval_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+                # On improvement, reset trials to keep exploring around new incumbent
+                trials = 0
+            else:
+                trials += 1
+        return best_seq, best_cost
+=======
+    def local_search_relocations(seq, curr_cost):
+        """
+        Random relocation: remove at index i and reinsert at j if improves.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        trials = 0
+        # Early exit if trivial
+        if len(best_seq) <= 2:
+            return best_seq, best_cost
+
+        while trials < RELOC_TRIES:
+            i = random.randint(0, len(best_seq) - 1)
+            j = random.randint(0, len(best_seq) - 1)
+            if i == j:
+                trials += 1
+                continue
+            cand = best_seq.copy()
+            t = cand.pop(i)
+            # Adjust j if removal shifts indices
+            if j > i:
+                j -= 1
+            cand.insert(j, t)
+            c = eval_cost(cand)
+            if c < best_cost:
+                best_cost = c
+                best_seq = cand
+                # On improvement, reset trials to keep exploring around new incumbent
+                trials = 0
+            else:
+                trials += 1
+        return best_seq, best_cost
+
+    def or_opt_block(seq, curr_cost, k):
+        """
+        Or-opt move with block size k: relocate any contiguous block of length k to its best position.
+        Performs best-improving passes until no improvement.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        if len(best_seq) <= k:
+            return best_seq, best_cost
+
+        improved = True
+        while improved:
+            improved = False
+            move_best_cost = best_cost
+            move = None  # (i, pos)
+            L = len(best_seq)
+            for i in range(0, L - k + 1):
+                block = best_seq[i:i + k]
+                base = best_seq[:i] + best_seq[i + k:]
+                positions = sample_positions(len(base))
+                for pos in positions:
+                    cand = base[:]
+                    cand[pos:pos] = block
+                    c = eval_cost(cand)
+                    if c < move_best_cost:
+                        move_best_cost = c
+                        move = (i, pos)
+            if move is not None:
+                i, pos = move
+                block = best_seq[i:i + k]
+                base = best_seq[:i] + best_seq[i + k:]
+                new_seq = base[:]
+                new_seq[pos:pos] = block
+                best_seq = new_seq
+                best_cost = move_best_cost
+                improved = True
+        return best_seq, best_cost
+
+    def vnd_local_search(seq, curr_cost):
+        """
+        Variable Neighborhood Descent:
+        Or-opt blocks k=3,2,1 (best-improving), then adjacent swaps, then random relocations.
+        Repeat cycle until no further improvement.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        changed = True
+        while changed:
+            changed = False
+            for k in (3, 2, 1):
+                s, c = or_opt_block(best_seq, best_cost, k)
+                if c < best_cost:
+                    best_seq, best_cost = s, c
+                    changed = True
+            s, c = local_search_adjacent_swaps(best_seq, best_cost)
+            if c < best_cost:
+                best_seq, best_cost = s, c
+                changed = True
+            s, c = local_search_relocations(best_seq, best_cost)
+            if c < best_cost:
+                best_seq, best_cost = s, c
+                changed = True
+        return best_seq, best_cost
+
+    def lns_ruin_recreate(seq, curr_cost, rounds=2):
+        """
+        Light LNS: remove a contiguous block (plus a few random extras) and rebuild
+        via regret-guided reinsertion using cached best-two insertions.
+        Accept only improving reconstructions; repeat for a few rounds.
+        """
+        best_seq = list(seq)
+        best_cost = curr_cost
+        for _ in range(max(1, rounds)):
+            L = len(best_seq)
+            if L < 6:
+                break
+            # Choose block to remove
+            base_len = max(4, L // 10)
+            block_len = min(L - 2, base_len + random.randint(0, 3))
+            start = random.randint(0, L - block_len)
+            removed = best_seq[start:start + block_len]
+            skeleton = best_seq[:start] + best_seq[start + block_len:]
+            # Optionally remove a few extras for diversification
+            extra_count = min(3, max(0, L // 30))
+            extras_idx = sorted(random.sample(range(len(skeleton)), extra_count)) if extra_count and len(skeleton) > extra_count else []
+            extras = []
+            offset = 0
+            for idx in extras_idx:
+                idx_adj = idx - offset
+                extras.append(skeleton.pop(idx_adj))
+                offset += 1
+            to_insert = removed + extras
+
+            # Regret-guided reinsertion with small candidate sampling per step
+            rebuilt = list(skeleton)
+            remaining = list(to_insert)
+            while remaining:
+                k_t = min(len(remaining), max(4, len(remaining) // 2))
+                cand_txns = remaining if len(remaining) <= k_t else random.sample(remaining, k_t)
+                scored = []
+                for t in cand_txns:
+                    best_c, best_p, second_c = best_two_insertions(rebuilt, t)
+                    regret = max(0.0, second_c - best_c)
+                    scored.append((regret, best_c, best_p, t))
+                if not scored:
+                    # fallback: append any remaining
+                    t = remaining.pop()
+                    rebuilt.append(t)
+                    continue
+                # Choose highest regret; tie-break on best cost
+                scored.sort(key=lambda x: (-x[0], x[1]))
+                regret, best_c, best_p, t = scored[0]
+                rebuilt.insert(best_p, t)
+                remaining.remove(t)
+
+            c_final = eval_cost(rebuilt)
+            if c_final < best_cost:
+                best_cost = c_final
+                best_seq = rebuilt
+        return best_seq, best_cost
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for _ in range(max(1, num_seqs)):
+        seq, cost = construct_sequence()
+        # Local search refinement: reinsertion, then adjacent swaps, then random relocations, polish
+        seq, cost = local_search_best_reinsert(seq, cost, max_rounds=2)
+        seq, cost = local_search_adjacent_swaps(seq, cost)
+        seq, cost = local_search_relocations(seq, cost)
+        # Final quick adjacent pass to capture small improvements
+        seq, cost = local_search_adjacent_swaps(seq, cost)
+
+        if cost < global_best_cost:
+            global_best_cost = cost
+            global_best_seq = seq
+=======
+    for _ in range(max(1, num_seqs)):
+        seq, cost = construct_sequence()
+        # Strong VND refinement (Or-opt blocks + swaps + relocations)
+        seq, cost = vnd_local_search(seq, cost)
+        # Light ruin-and-recreate with regret-guided reinsertion; accept only if improvement
+        rr_rounds = 2 if n > 50 else 3
+        seq_rr, cost_rr = lns_ruin_recreate(seq, cost, rounds=rr_rounds)
+        if cost_rr < cost:
+            seq, cost = vnd_local_search(seq_rr, cost_rr)
+        else:
+            # quick adjacent polish
+            seq, cost = local_search_adjacent_swaps(seq, cost)
+
+        if cost < global_best_cost:
+            global_best_cost = cost
+            global_best_seq = seq
+>>>>>>> REPLACE
+
+</DIFF>

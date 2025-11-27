@@ -1,0 +1,248 @@
+To improve the network telemetry repair performance, I will implement a **Confidence-Weighted Flow Conservation** model combined with a **Zero Hypothesis** voting mechanism.
+
+### Reasoning
+
+1.  **Confidence-Weighted Flow Trust**: The previous implementation used router imbalance to determine the reliability of flow targets. This creates a problem: if a specific link is broken and causes the imbalance, the "reliability" drops to zero, effectively disabling the flow correction mechanism just when it is needed most.
+    *   **Solution**: Instead of using imbalance, we calculate the "Confidence Mass" of the router. We estimate the confidence of each interface based on its agreement with its peer. The trustworthiness of a flow target for interface $i$ is then determined by the average confidence of *all other* interfaces on the router. If neighbors are highly confident (e.g., they match their peers), the flow constraint becomes a very strong signal to correct $i$. This effectively implements "Blame Assignment" where uncertain links yield to certain ones.
+
+2.  **Zero Hypothesis (Phantom Traffic)**: Many network errors involve "phantom traffic" where a port is logically down or idle, but counters report non-zero noise.
+    *   **Solution**: In the voting arbitration, I explicitly add a candidate vote of `0.0` with a small weight (0.15). If the Flow target is 0.0 (due to conservation) and the Peer is 0.0 (or absent), these votes cluster with the Zero Hypothesis to overcome a noisy "Self" signal.
+
+3.  **Iterative Refinement**: The confidence scores are recalculated in each iteration, allowing the system to converge. As links get repaired and align with peers/flow, their confidence increases, solidifying the network state.
+
+### Code Changes
+
+I will modify `repair_network_telemetry` to calculate confidence-based flow weights and update `arbitrate_voting` to include the zero hypothesis.
+
+<NAME>
+confidence_weighted_flow_repair
+</NAME>
+
+<DESCRIPTION>
+Introduces a confidence-weighted flow conservation model to better handle external links and phantom traffic.
+1. Implements a 'Confidence Mass' logic: Flow targets are trusted proportional to the average confidence of other interfaces on the router. This allows high-confidence peers to correct low-confidence external links.
+2. Adds a 'Zero Hypothesis' (0.0 Mbps) to the voting arbitration to explicitly detect and suppress phantom traffic on idle links.
+3. Updates the iterative loop to recalculate confidence dynamically.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 2: Iterative Refinement ---
+    # We refine estimates in a loop to improve Flow Conservation signals
+    for iteration in range(2):
+        # 1. Calculate Router Totals & Reliability
+        router_totals = {}
+        for router_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in working_state]
+            t_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+            t_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+            imb = abs(t_in - t_out)
+            mx = max(t_in, t_out, 1.0)
+
+            # Continuous reliability: 1.0 at 0% imbalance, 0.0 at 10% imbalance
+            ratio = imb / mx
+            reliability = max(0.0, 1.0 - (ratio * 10.0))
+            router_totals[router_id] = {'in': t_in, 'out': t_out, 'rel': reliability}
+
+        # 2. Update Estimates
+        for if_id, d in working_state.items():
+            r_id = telemetry[if_id].get('local_router')
+            f_rx, f_tx, f_qual = d['est_rx'], d['est_tx'], 0.0
+
+            if r_id and r_id in router_totals:
+                rt = router_totals[r_id]
+                f_rx = max(0.0, rt['out'] - (rt['in'] - d['est_rx']))
+                f_tx = max(0.0, rt['in'] - (rt['out'] - d['est_tx']))
+                f_qual = rt['rel']
+
+            if d['status'] == 'down':
+                d['est_rx'], d['est_tx'] = 0.0, 0.0
+            else:
+                # Update estimates using weighted voting
+                v_rx, _ = arbitrate_voting(d['s_rx'], d['p_tx'], f_rx, d['has_peer'], f_qual, REL_TOL, ABS_TOL)
+                v_tx, _ = arbitrate_voting(d['s_tx'], d['p_rx'], f_tx, d['has_peer'], f_qual, REL_TOL, ABS_TOL)
+
+                d['est_rx'] = 0.5 * d['est_rx'] + 0.5 * v_rx
+                d['est_tx'] = 0.5 * d['est_tx'] + 0.5 * v_tx
+
+    # --- Phase 3: Final Arbitration ---
+
+    # Recalculate Flow Targets one last time
+    flow_context = {}
+    for router_id, if_list in topology.items():
+        valid_ifs = [i for i in if_list if i in working_state]
+        t_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+        t_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+        ratio = abs(t_in - t_out) / max(t_in, t_out, 1.0)
+        reliability = max(0.0, 1.0 - (ratio * 10.0))
+
+        for i in valid_ifs:
+            ws = working_state[i]
+            target_rx = max(0.0, t_out - (t_in - ws['est_rx']))
+            target_tx = max(0.0, t_in - (t_out - ws['est_tx']))
+            flow_context[i] = {'rx': target_rx, 'tx': target_tx, 'qual': reliability}
+
+    for if_id, d in working_state.items():
+        f_ctx = flow_context.get(if_id, {'rx': 0.0, 'tx': 0.0, 'qual': 0.0})
+
+        if d['status'] == 'down':
+            final_rx, final_tx = 0.0, 0.0
+            conf_rx = 0.95 if d['s_rx'] > ABS_TOL else 1.0
+            conf_tx = 0.95 if d['s_tx'] > ABS_TOL else 1.0
+        else:
+            final_rx, conf_rx = arbitrate_voting(
+                d['s_rx'], d['p_tx'], f_ctx['rx'], d['has_peer'], f_ctx['qual'], REL_TOL, ABS_TOL
+            )
+            final_tx, conf_tx = arbitrate_voting(
+                d['s_tx'], d['p_rx'], f_ctx['tx'], d['has_peer'], f_ctx['qual'], REL_TOL, ABS_TOL
+            )
+=======
+    # --- Phase 2: Iterative Refinement ---
+    # We refine estimates in a loop.
+    # Flow targets are weighted by the confidence of *other* interfaces on the router.
+    # This allows high-confidence peers to correct low-confidence external links.
+
+    for iteration in range(2):
+        # 1. Assess Local Confidence & Router Totals
+        router_stats = {}
+
+        for r_id, if_list in topology.items():
+            valid_ifs = [i for i in if_list if i in working_state]
+            sum_in = 0.0
+            sum_out = 0.0
+            sum_conf = 0.0
+
+            for i in valid_ifs:
+                ws = working_state[i]
+                # Estimate confidence of current state
+                # 1.0 = Perfect Peer Agreement or Down, 0.5 = No Peer/Disagree
+                c = 0.5
+                if ws['status'] == 'down':
+                    c = 1.0
+                elif ws['has_peer']:
+                    # Check agreement with Peer
+                    diff_rx = abs(ws['est_rx'] - ws['p_tx'])
+                    diff_tx = abs(ws['est_tx'] - ws['p_rx'])
+                    # Normalize
+                    n_rx = diff_rx / max(abs(ws['est_rx']), abs(ws['p_tx']), 1.0)
+                    n_tx = diff_tx / max(abs(ws['est_tx']), abs(ws['p_rx']), 1.0)
+                    if max(n_rx, n_tx) < REL_TOL * 2:
+                        c = 0.95
+                    elif max(n_rx, n_tx) < REL_TOL * 5:
+                        c = 0.8
+                    else:
+                        c = 0.6 # Peer disagreement
+
+                ws['curr_conf'] = c
+                sum_in += ws['est_rx']
+                sum_out += ws['est_tx']
+                sum_conf += c
+
+            router_stats[r_id] = {
+                'sum_in': sum_in, 'sum_out': sum_out,
+                'sum_conf': sum_conf, 'count': len(valid_ifs)
+            }
+
+        # 2. Update Estimates
+        for if_id, d in working_state.items():
+            r_id = telemetry[if_id].get('local_router')
+            f_rx, f_tx, f_weight = d['est_rx'], d['est_tx'], 0.0
+
+            if r_id and r_id in router_stats:
+                rs = router_stats[r_id]
+                # Calculate Trust in Flow based on others' confidence
+                other_conf_sum = rs['sum_conf'] - d.get('curr_conf', 0.5)
+                n_others = max(1, rs['count'] - 1)
+
+                # Average confidence of the *rest* of the router
+                # This determines how reliable the flow target is.
+                f_weight = other_conf_sum / n_others
+
+                f_rx = max(0.0, rs['sum_out'] - (rs['sum_in'] - d['est_rx']))
+                f_tx = max(0.0, rs['sum_in'] - (rs['sum_out'] - d['est_tx']))
+
+            if d['status'] == 'down':
+                d['est_rx'], d['est_tx'] = 0.0, 0.0
+            else:
+                # Update estimates using weighted voting with dynamic flow weight
+                v_rx, _ = arbitrate_voting(d['s_rx'], d['p_tx'], f_rx, d['has_peer'], f_weight, REL_TOL, ABS_TOL)
+                v_tx, _ = arbitrate_voting(d['s_tx'], d['p_rx'], f_tx, d['has_peer'], f_weight, REL_TOL, ABS_TOL)
+
+                d['est_rx'] = 0.5 * d['est_rx'] + 0.5 * v_rx
+                d['est_tx'] = 0.5 * d['est_tx'] + 0.5 * v_tx
+
+    # --- Phase 3: Final Arbitration ---
+
+    # Recalculate contexts one last time for final output
+    final_flow_ctx = {}
+    for r_id, if_list in topology.items():
+        valid_ifs = [i for i in if_list if i in working_state]
+        # Re-compute stats for final weights
+        sum_conf = 0.0
+        sum_in = sum(working_state[i]['est_rx'] for i in valid_ifs)
+        sum_out = sum(working_state[i]['est_tx'] for i in valid_ifs)
+
+        for i in valid_ifs:
+             sum_conf += working_state[i].get('curr_conf', 0.5)
+
+        for i in valid_ifs:
+            ws = working_state[i]
+            other_conf = sum_conf - ws.get('curr_conf', 0.5)
+            n_others = max(1, len(valid_ifs) - 1)
+            f_qual = other_conf / n_others
+
+            tgt_rx = max(0.0, sum_out - (sum_in - ws['est_rx']))
+            tgt_tx = max(0.0, sum_in - (sum_out - ws['est_tx']))
+            final_flow_ctx[i] = {'rx': tgt_rx, 'tx': tgt_tx, 'qual': f_qual}
+
+    for if_id, d in working_state.items():
+        f_ctx = final_flow_ctx.get(if_id, {'rx': 0.0, 'tx': 0.0, 'qual': 0.0})
+
+        if d['status'] == 'down':
+            final_rx, final_tx = 0.0, 0.0
+            conf_rx = 0.95 if d['s_rx'] > ABS_TOL else 1.0
+            conf_tx = 0.95 if d['s_tx'] > ABS_TOL else 1.0
+        else:
+            final_rx, conf_rx = arbitrate_voting(
+                d['s_rx'], d['p_tx'], f_ctx['rx'], d['has_peer'], f_ctx['qual'], REL_TOL, ABS_TOL
+            )
+            final_tx, conf_tx = arbitrate_voting(
+                d['s_tx'], d['p_rx'], f_ctx['tx'], d['has_peer'], f_ctx['qual'], REL_TOL, ABS_TOL
+            )
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # 1. Define Votes
+    votes = []
+
+    # Self: Base trust.
+    votes.append({'val': v_self, 'weight': 0.8, 'src': 'self'})
+
+    # Peer: High trust (independent hardware).
+    if has_peer:
+        votes.append({'val': v_peer, 'weight': 1.0, 'src': 'peer'})
+
+    # Flow: Trust scaled by router reliability.
+    if flow_qual > 0.0:
+        votes.append({'val': v_flow, 'weight': flow_qual * 1.0, 'src': 'flow'})
+=======
+    # 1. Define Votes
+    votes = []
+
+    # Self: Base trust.
+    votes.append({'val': v_self, 'weight': 0.8, 'src': 'self'})
+
+    # Peer: High trust (independent hardware).
+    if has_peer:
+        votes.append({'val': v_peer, 'weight': 1.0, 'src': 'peer'})
+
+    # Flow: Trust scaled by neighborhood confidence.
+    if flow_qual > 0.0:
+        votes.append({'val': v_flow, 'weight': flow_qual * 1.2, 'src': 'flow'}) # Boosted flow weight
+
+    # Zero Hypothesis: Phantom Traffic Check
+    # Small anchor weight to allow snapping to 0 if multiple signals suggest it (e.g. Peer=0, Flow=0)
+    votes.append({'val': 0.0, 'weight': 0.15, 'src': 'zero'})
+>>>>>>> REPLACE
+</DIFF>

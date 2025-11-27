@@ -1,0 +1,288 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using State-Aware Flow Consensus.
+Combines robust state initialization with evidence-based consensus logic.
+1. Establishes effective status/rates to clean input noise.
+2. Calculates Flow Conservation hints from cleaned state.
+3. Resolves conflicts using a prioritized Symmetry > Hint architecture with calibrated confidence.
+"""
+from typing import Dict, Any, Tuple, List
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+
+    HARDENING_THRESHOLD = 0.02  # 2% tolerance for measurement timing
+    TRAFFIC_THRESHOLD = 1.0     # 1 Mbps threshold for active link detection
+    ITERATIONS = 3              # Number of refinement passes
+
+    # --- Phase 1: State Initialization ---
+    # Establish a trusted belief state for Status and initial Rates
+    state = {}
+
+    for iface_id, data in telemetry.items():
+        raw_rx = data.get('rx_rate', 0.0)
+        raw_tx = data.get('tx_rate', 0.0)
+        raw_status = data.get('interface_status', 'unknown')
+
+        peer_id = data.get('connected_to')
+        peer_data = telemetry.get(peer_id, {}) if (peer_id and peer_id in telemetry) else {}
+
+        # 1. Status Repair Logic
+        traffic_signals = [raw_rx, raw_tx, peer_data.get('rx_rate', 0.0), peer_data.get('tx_rate', 0.0)]
+        max_traffic = max(traffic_signals) if traffic_signals else 0.0
+
+        eff_status = raw_status
+        status_conf = 1.0
+
+        if max_traffic > TRAFFIC_THRESHOLD:
+            if raw_status != 'up':
+                eff_status = 'up'
+                status_conf = 0.95
+        elif raw_status == 'up' and peer_data.get('interface_status') == 'down':
+             eff_status = 'down'
+             status_conf = 0.8
+
+        # Initial rates based on status
+        if eff_status == 'down':
+            cur_rx, cur_tx = 0.0, 0.0
+        else:
+            cur_rx, cur_tx = raw_rx, raw_tx
+
+        state[iface_id] = {
+            'rx': cur_rx,
+            'tx': cur_tx,
+            'status': eff_status,
+            'status_conf': status_conf,
+            'orig_rx': raw_rx,
+            'orig_tx': raw_tx,
+            'orig_status': raw_status,
+            'peer_id': peer_id,
+            'has_peer': bool(peer_data)
+        }
+
+    # --- Phase 2: Iterative Refinement ---
+    # Refine rates by enforcing Flow Conservation and Link Symmetry repeatedly.
+    # This allows corrections to propagate across the topology.
+
+    for _ in range(ITERATIONS):
+        # 1. Calculate Flow Hints based on current state
+        router_balances = {}
+        for r_id, ifaces in topology.items():
+            valid_ifaces = [i for i in ifaces if i in state]
+            sum_rx = sum(state[i]['rx'] for i in valid_ifaces)
+            sum_tx = sum(state[i]['tx'] for i in valid_ifaces)
+            router_balances[r_id] = {'rx': sum_rx, 'tx': sum_tx}
+
+        updates = {}
+
+        for iface_id, curr in state.items():
+            if curr['status'] == 'down':
+                updates[iface_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            # Get Hints
+            r_id = telemetry[iface_id].get('local_router')
+            hint_rx, hint_tx = None, None
+            if r_id and r_id in router_balances:
+                rb = router_balances[r_id]
+                # Hint RX: The value needed to balance total TX
+                hint_rx = max(0.0, rb['tx'] - (rb['rx'] - curr['rx']))
+                # Hint TX: The value needed to balance total RX
+                hint_tx = max(0.0, rb['rx'] - (rb['tx'] - curr['tx']))
+
+            # Get Peer Values
+            peer_rx, peer_tx = 0.0, 0.0
+            if curr['has_peer']:
+                p_state = state[curr['peer_id']]
+                peer_rx, peer_tx = p_state['rx'], p_state['tx']
+
+            def resolve_rate_iterative(local_val, peer_val, hint_val):
+                # 1. Symmetry
+                denom_sym = max(local_val, peer_val, 1.0)
+                diff_sym = abs(local_val - peer_val) / denom_sym
+
+                if diff_sym <= HARDENING_THRESHOLD:
+                    # Symmetry holds.
+                    avg = (local_val + peer_val) / 2.0
+
+                    # Double Dead Check: If both 0 but hint is high, trust hint
+                    if avg < TRAFFIC_THRESHOLD and hint_val is not None and hint_val > 5.0:
+                         # Only do this if hint is significantly non-zero
+                         return hint_val
+                    return avg
+
+                # 2. Symmetry Broken
+                if hint_val is None:
+                    # Fallback to peer if no hint available (sensor usually worse than wire?)
+                    # Or keep local? Let's keep local to avoid thrashing without evidence.
+                    return local_val
+
+                # Compare against hint
+                denom_l = max(local_val, hint_val, 1.0)
+                diff_l = abs(local_val - hint_val) / denom_l
+
+                denom_p = max(peer_val, hint_val, 1.0)
+                diff_p = abs(peer_val - hint_val) / denom_p
+
+                if diff_l < diff_p:
+                    return local_val
+                else:
+                    return peer_val
+
+            # Resolve RX (Target: Peer TX)
+            tgt_peer_tx = peer_tx if curr['has_peer'] else curr['rx']
+            next_rx = resolve_rate_iterative(curr['rx'], tgt_peer_tx, hint_rx)
+
+            # Resolve TX (Target: Peer RX)
+            tgt_peer_rx = peer_rx if curr['has_peer'] else curr['tx']
+            next_tx = resolve_rate_iterative(curr['tx'], tgt_peer_rx, hint_tx)
+
+            updates[iface_id] = {'rx': next_rx, 'tx': next_tx}
+
+        # Apply updates
+        for i_id, vals in updates.items():
+            state[i_id]['rx'] = vals['rx']
+            state[i_id]['tx'] = vals['tx']
+
+    # --- Phase 3: Final Calibration ---
+    result = {}
+
+    # Recalculate hints one last time for confidence scoring
+    final_router_balances = {}
+    for r_id, ifaces in topology.items():
+        valid_ifaces = [i for i in ifaces if i in state]
+        sum_rx = sum(state[i]['rx'] for i in valid_ifaces)
+        sum_tx = sum(state[i]['tx'] for i in valid_ifaces)
+        final_router_balances[r_id] = {'rx': sum_rx, 'tx': sum_tx}
+
+    for iface_id, curr in state.items():
+        if curr['status'] == 'down':
+             # If we suppressed real traffic, confidence is inherited from status
+             c_rx = curr['status_conf'] if curr['orig_rx'] > TRAFFIC_THRESHOLD else 1.0
+             c_tx = curr['status_conf'] if curr['orig_tx'] > TRAFFIC_THRESHOLD else 1.0
+
+             result[iface_id] = {
+                'rx_rate': (curr['orig_rx'], 0.0, c_rx),
+                'tx_rate': (curr['orig_tx'], 0.0, c_tx),
+                'interface_status': (curr['orig_status'], 'down', curr['status_conf']),
+                'connected_to': curr['peer_id'],
+                'local_router': telemetry[iface_id].get('local_router'),
+                'remote_router': telemetry[iface_id].get('remote_router')
+             }
+             continue
+
+        # Get Final Reference Values
+        r_id = telemetry[iface_id].get('local_router')
+        hint_rx, hint_tx = None, None
+        if r_id and r_id in final_router_balances:
+            rb = final_router_balances[r_id]
+            hint_rx = max(0.0, rb['tx'] - (rb['rx'] - curr['rx']))
+            hint_tx = max(0.0, rb['rx'] - (rb['tx'] - curr['tx']))
+
+        peer_rx, peer_tx = 0.0, 0.0
+        if curr['has_peer']:
+            p_state = state[curr['peer_id']]
+            peer_rx, peer_tx = p_state['rx'], p_state['tx']
+        else:
+            # Self-reference if no peer
+            peer_rx, peer_tx = curr['tx'], curr['rx']
+
+        def get_confidence(final_val, peer_ref, hint_ref):
+            # Calculate errors against available evidence
+
+            # Error vs Peer (Symmetry)
+            denom_s = max(final_val, peer_ref, 1.0)
+            err_sym = abs(final_val - peer_ref) / denom_s
+
+            # Error vs Hint (Flow)
+            err_flow = 1.0 # Default high error if no hint
+            if hint_ref is not None:
+                denom_f = max(final_val, hint_ref, 1.0)
+                err_flow = abs(final_val - hint_ref) / denom_f
+
+            # Logic: We are confident if we match EITHER Peer OR Hint.
+            # We are most confident if we match BOTH.
+            # We are worried if we match NEITHER.
+
+            best_support = min(err_sym, err_flow)
+
+            # Continuous calibration:
+            # 1.0 at 0 error, decaying to ~0.5 at 50% error
+            conf = max(0.0, 1.0 - (best_support * 1.5))
+
+            # Boost if both agree (corroboration)
+            if err_sym < 0.05 and err_flow < 0.05:
+                conf = 1.0
+            elif err_sym > 0.1 and err_flow > 0.1:
+                # Contradiction on all fronts
+                conf = max(0.0, conf - 0.2)
+
+            return conf
+
+        # Calculate Confidences
+        # RX compared to Peer TX and RX Hint
+        conf_rx = get_confidence(curr['rx'], peer_tx, hint_rx)
+        # TX compared to Peer RX and TX Hint
+        conf_tx = get_confidence(curr['tx'], peer_rx, hint_tx)
+
+        result[iface_id] = {
+            'rx_rate': (curr['orig_rx'], curr['rx'], conf_rx),
+            'tx_rate': (curr['orig_tx'], curr['tx'], conf_tx),
+            'interface_status': (curr['orig_status'], curr['status'], curr['status_conf']),
+            'connected_to': curr['peer_id'],
+            'local_router': telemetry[iface_id].get('local_router'),
+            'remote_router': telemetry[iface_id].get('remote_router')
+        }
+
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

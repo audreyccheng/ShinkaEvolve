@@ -1,0 +1,199 @@
+<NAME>
+feedback_init_and_adaptive_k
+</NAME>
+
+<DESCRIPTION>
+1. Split randomized greedy initialization into Exploration (Phase 1) and Exploitation (Phase 2). Phase 1 identifies items causing bottlenecks (critical items). Phase 2 boosts their sorting weight to force earlier scheduling.
+2. Enhance refinement to check all pairs of packs for swaps when num_packs is small (<= 32), enabling better global variance reduction.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Configuration
+    num_restarts = 4096
+    num_refined = 64
+
+    # --- 1. Parallel Randomized Initialization ---
+
+    # Expand weights: [Layers, Restarts, Groups]
+    weight_expanded = weight.unsqueeze(1).expand(-1, num_restarts, -1).clone()
+
+    # Apply multiplicative noise (linear scale 0.01 -> 0.20)
+    if num_restarts > 1:
+        noise_scales = torch.linspace(0.01, 0.20, steps=num_restarts - 1, device=device)
+        noise = torch.rand_like(weight_expanded[:, 1:]) * noise_scales.view(1, -1, 1)
+        weight_expanded[:, 1:] *= (1.0 + noise)
+
+    flat_weight_perturbed = weight_expanded.reshape(-1, num_groups)
+
+    # Use original weights for actual summing to avoid drift
+    flat_weight_original = weight.unsqueeze(1).expand(-1, num_restarts, -1).reshape(-1, num_groups)
+
+    # Sort based on perturbed weights (LPT)
+    sorted_indices = flat_weight_perturbed.argsort(dim=-1, descending=True)
+    sorted_w = flat_weight_original.gather(1, sorted_indices)
+
+    batch_size = flat_weight_original.shape[0]
+
+    # --- 2. Vectorized Greedy Packing ---
+
+    # Transpose for coalesced memory access during loop: [Groups, Batch]
+    sorted_w_t = sorted_w.t().contiguous()
+
+    pack_weights = torch.zeros(batch_size, num_packs, device=device)
+    pack_counts = torch.zeros(batch_size, num_packs, dtype=torch.int64, device=device)
+
+    # Store decisions in temporary arrays [Groups, Batch]
+    # We store the PACK index assigned to the i-th sorted item
+    pack_decisions_t = torch.zeros(num_groups, batch_size, dtype=torch.int64, device=device)
+    rank_decisions_t = torch.zeros(num_groups, batch_size, dtype=torch.int64, device=device)
+
+    row_indices = torch.arange(batch_size, device=device)
+    inf_tensor = torch.full((batch_size, num_packs), float('inf'), device=device)
+
+    for i in range(num_groups):
+        w = sorted_w_t[i]
+
+        valid_mask = pack_counts < groups_per_pack
+        # Choose min weight pack among valid ones
+        costs = torch.where(valid_mask, pack_weights, inf_tensor)
+        chosen_pack = costs.argmin(dim=1)
+
+        # Update
+        pack_weights[row_indices, chosen_pack] += w
+        rank_decisions_t[i] = pack_counts[row_indices, chosen_pack]
+        pack_counts[row_indices, chosen_pack] += 1
+        pack_decisions_t[i] = chosen_pack
+=======
+    # Configuration
+    num_restarts = 4096
+    num_refined = 64
+
+    # --- 1 & 2. Feedback-Driven Randomized Greedy Packing ---
+
+    def run_greedy_pass(w_pert_flat, w_orig_flat):
+        b_sz = w_pert_flat.size(0)
+        # Sort
+        s_idx = w_pert_flat.argsort(dim=-1, descending=True)
+        s_w = w_orig_flat.gather(1, s_idx)
+
+        # Transpose [Groups, Batch]
+        s_w_t = s_w.t().contiguous()
+
+        p_weights = torch.zeros(b_sz, num_packs, device=device)
+        p_counts = torch.zeros(b_sz, num_packs, dtype=torch.int64, device=device)
+
+        p_dec_t = torch.zeros(num_groups, b_sz, dtype=torch.int64, device=device)
+        r_dec_t = torch.zeros(num_groups, b_sz, dtype=torch.int64, device=device)
+
+        r_idx = torch.arange(b_sz, device=device)
+        inf_t = torch.tensor(float('inf'), device=device)
+
+        for i in range(num_groups):
+            val = s_w_t[i]
+            # Greedy choice: min weight pack among valid ones
+            c_pack = torch.where(p_counts < groups_per_pack, p_weights, inf_t).argmin(dim=1)
+
+            p_weights[r_idx, c_pack] += val
+            r_dec_t[i] = p_counts[r_idx, c_pack]
+            p_counts[r_idx, c_pack] += 1
+            p_dec_t[i] = c_pack
+
+        return p_weights, p_dec_t, r_dec_t, s_idx, s_w
+
+    # Phase 1: Exploration
+    n_p1 = 256
+    w_p1 = weight.unsqueeze(1).expand(-1, n_p1, -1).clone() # [L, N1, G]
+    if n_p1 > 1:
+        noise1 = torch.rand_like(w_p1[:, 1:]) * 0.15
+        w_p1[:, 1:] *= (1.0 + noise1)
+
+    flat_w_p1 = w_p1.reshape(-1, num_groups)
+    flat_w_orig_p1 = weight.unsqueeze(1).expand(-1, n_p1, -1).reshape(-1, num_groups)
+
+    p1_weights, p1_dec_t, p1_rank_t, p1_s_idx, p1_s_w = run_greedy_pass(flat_w_p1, flat_w_orig_p1)
+
+    # Analyze Phase 1 to find critical items
+    # Reshape weights to [L, N1, P]
+    p1_w_view = p1_weights.view(num_layers, n_p1, num_packs)
+    # Find best restart per layer
+    imbal_p1 = p1_w_view.max(dim=2).values - p1_w_view.min(dim=2).values
+    best_idx_p1 = imbal_p1.argmin(dim=1) # [L]
+
+    # Identify items in the heaviest pack of the best restart
+    flat_best_indices = torch.arange(num_layers, device=device) * n_p1 + best_idx_p1
+
+    # best_dec_t [G, L]
+    best_dec_t = p1_dec_t[:, flat_best_indices]
+
+    # max_packs [L]
+    best_run_weights = p1_w_view[torch.arange(num_layers, device=device), best_idx_p1]
+    max_packs = best_run_weights.argmax(dim=1)
+
+    # Check where dec == max_pack
+    is_critical_sorted = (best_dec_t == max_packs.unsqueeze(0)) # [G, L]
+
+    # Map back to original item indices
+    best_s_idx = p1_s_idx[flat_best_indices] # [L, G]
+
+    critical_mask = torch.zeros(num_layers, num_groups, dtype=torch.bool, device=device)
+    # Scatter sorted bools back to original positions
+    critical_mask.scatter_(1, best_s_idx, is_critical_sorted.t())
+
+    # Phase 2: Exploitation
+    n_p2 = num_restarts - n_p1
+    w_p2 = weight.unsqueeze(1).expand(-1, n_p2, -1).clone()
+
+    # Noise
+    noise_scales = torch.linspace(0.01, 0.20, steps=n_p2, device=device)
+    noise2 = torch.rand_like(w_p2) * noise_scales.view(1, -1, 1)
+    w_p2 *= (1.0 + noise2)
+
+    # Apply Boost to critical items
+    w_p2 *= (1.0 + critical_mask.unsqueeze(1).float() * 0.15)
+
+    flat_w_p2 = w_p2.reshape(-1, num_groups)
+    flat_w_orig_p2 = weight.unsqueeze(1).expand(-1, n_p2, -1).reshape(-1, num_groups)
+
+    p2_weights, p2_dec_t, p2_rank_t, p2_s_idx, p2_s_w = run_greedy_pass(flat_w_p2, flat_w_orig_p2)
+
+    # Merge results
+    def reshape_and_concat(t1, t2, extra_dims):
+        v1 = t1.view(num_layers, n_p1, *extra_dims)
+        v2 = t2.view(num_layers, n_p2, *extra_dims)
+        return torch.cat([v1, v2], dim=1).view(-1, *extra_dims)
+
+    pack_weights = reshape_and_concat(p1_weights, p2_weights, (num_packs,))
+
+    pack_decisions_t = torch.cat([p1_dec_t.view(num_groups, num_layers, n_p1),
+                                  p2_dec_t.view(num_groups, num_layers, n_p2)], dim=2).view(num_groups, -1)
+
+    rank_decisions_t = torch.cat([p1_rank_t.view(num_groups, num_layers, n_p1),
+                                  p2_rank_t.view(num_groups, num_layers, n_p2)], dim=2).view(num_groups, -1)
+
+    sorted_w = reshape_and_concat(p1_s_w, p2_s_w, (num_groups,))
+    sorted_indices = reshape_and_concat(p1_s_idx, p2_s_idx, (num_groups,))
+
+    batch_size = num_layers * num_restarts
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Pre-calculate pair indices for 2-for-2 swap (if applicable)
+    can_do_2for2 = (groups_per_pack >= 2) and (groups_per_pack <= 32)
+    if can_do_2for2:
+        triu_r, triu_c = torch.triu_indices(groups_per_pack, groups_per_pack, offset=1, device=device)
+
+    K_swap = min(num_packs, 4)
+
+    for _ in range(30):
+=======
+    # Pre-calculate pair indices for 2-for-2 swap (if applicable)
+    can_do_2for2 = (groups_per_pack >= 2) and (groups_per_pack <= 32)
+    if can_do_2for2:
+        triu_r, triu_c = torch.triu_indices(groups_per_pack, groups_per_pack, offset=1, device=device)
+
+    # Adaptive K_swap: Check all pairs if num_packs is small
+    K_swap = num_packs if num_packs <= 32 else 4
+
+    for _ in range(30):
+>>>>>>> REPLACE
+</DIFF>

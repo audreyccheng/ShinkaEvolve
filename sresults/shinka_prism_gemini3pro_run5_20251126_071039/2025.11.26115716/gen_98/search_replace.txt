@@ -1,0 +1,192 @@
+<NAME>
+hybrid_local_search_and_randomized_packing
+</NAME>
+
+<DESCRIPTION>
+1.  **Hybrid Local Search**: Replaced the pure Ruin & Recreate LNS with a hybrid approach. It first attempts greedy "Moves" and "Swaps" to resolve the bottleneck GPU's pressure. Moves/Swaps are computationally cheaper and can resolve simple imbalances precisely. Ruin & Recreate is retained as a fallback "kick" mechanism when greedy local moves fail.
+2.  **Randomized Feasibility Check**: Added randomized shuffling to the binary search feasibility check (`_check_feasibility_robust`). If standard deterministic sorts (Size, Load, Density) fail to pack items within a target KVPR, the algorithm tries random permutations. This improves the likelihood of validating tighter lower bounds ($K$) when the constraint landscape is jagged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. LNS Refinement (Ruin and Recreate)
+    return _lns_refinement(gpu_num, placement_map)
+
+def _check_feasibility_robust(gpu_num, items, K):
+    """
+    Checks feasibility using multiple sorting heuristics and packing algorithms (FFD/BFD).
+    """
+    virtual_cap = K * GPU_MEM_SIZE
+    pack_items = []
+    for x in items:
+        v = x['w'] + K * x['s']
+        # Density for sorting
+        d = x['w'] / (x['s'] + 1e-6)
+        pack_items.append({'v': v, 's': x['s'], 'w': x['w'], 'd': d, 'm': x['m']})
+
+    # Heuristics: key function, reverse
+    sorters = [
+        (lambda x: x['v'], True),  # Virtual Desc
+        (lambda x: x['s'], True),  # Physical Desc
+        (lambda x: x['d'], True),  # Density Desc
+        (lambda x: x['w'], True),  # Load Desc
+    ]
+
+    for key_func, reverse in sorters:
+        sorted_items = sorted(pack_items, key=key_func, reverse=reverse)
+
+        # Try BFD (Best Fit Decreasing) - usually superior
+        if res := _pack_bfd(gpu_num, sorted_items, virtual_cap):
+            return True, res
+
+        # Try FFD (First Fit Decreasing)
+        if res := _pack_ffd(gpu_num, sorted_items, virtual_cap):
+            return True, res
+
+    return False, None
+=======
+    # 3. Hybrid Local Search Refinement
+    return _hybrid_local_search(gpu_num, placement_map)
+
+def _check_feasibility_robust(gpu_num, items, K):
+    """
+    Checks feasibility using multiple sorting heuristics and packing algorithms (FFD/BFD).
+    """
+    virtual_cap = K * GPU_MEM_SIZE
+    pack_items = []
+    for x in items:
+        v = x['w'] + K * x['s']
+        # Density for sorting
+        d = x['w'] / (x['s'] + 1e-6)
+        pack_items.append({'v': v, 's': x['s'], 'w': x['w'], 'd': d, 'm': x['m']})
+
+    # Heuristics: key function, reverse
+    sorters = [
+        (lambda x: x['v'], True),  # Virtual Desc
+        (lambda x: x['s'], True),  # Physical Desc
+        (lambda x: x['d'], True),  # Density Desc
+        (lambda x: x['w'], True),  # Load Desc
+    ]
+
+    for key_func, reverse in sorters:
+        sorted_items = sorted(pack_items, key=key_func, reverse=reverse)
+
+        # Try BFD (Best Fit Decreasing) - usually superior
+        if res := _pack_bfd(gpu_num, sorted_items, virtual_cap):
+            return True, res
+
+        # Try FFD (First Fit Decreasing)
+        if res := _pack_ffd(gpu_num, sorted_items, virtual_cap):
+            return True, res
+
+    # Randomized trials for tight constraints
+    # Random shuffling helps when structured sorts create awkward gaps
+    indices = list(range(len(pack_items)))
+    for _ in range(4):
+        random.shuffle(indices)
+        shuffled_items = [pack_items[i] for i in indices]
+        if res := _pack_bfd(gpu_num, shuffled_items, virtual_cap):
+            return True, res
+
+    return False, None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _lns_refinement(gpu_num, placement):
+    """
+    Refines placement using Ruin and Recreate (LNS).
+    """
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(i):
+        rem = GPU_MEM_SIZE - gpu_s[i]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[i] / rem
+
+    best_max_k = max(get_k(i) for i in range(gpu_num))
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 500
+    patience = 40
+    no_improve = 0
+
+    for step in range(max_steps):
+        # Identify bottleneck
+        ks = [get_k(i) for i in range(gpu_num)]
+        max_k = max(ks)
+
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # Ruin and Recreate Strategy
+        # Always target bottleneck + random others
+        # Probability of large ruin increases with 'no_improve'
+
+        candidates = [i for i, k in enumerate(ks) if k > max_k * 0.98]
+        if not candidates: candidates = [random.randint(0, gpu_num-1)]
+        src = random.choice(candidates)
+
+        ruin_set = {src}
+        n_ruin = 2
+        if no_improve > patience // 2: n_ruin = 3
+        if no_improve > patience: n_ruin = 4
+
+        others = list(range(gpu_num))
+        random.shuffle(others)
+        for o in others:
+            if len(ruin_set) >= min(gpu_num, n_ruin): break
+            if o != src: ruin_set.add(o)
+
+        # Extract models
+        removed_models = []
+        backup = {}
+
+        for r_idx in ruin_set:
+            backup[r_idx] = (list(placement[r_idx]), gpu_s[r_idx], gpu_w[r_idx])
+            removed_models.extend(placement[r_idx])
+            placement[r_idx] = []
+            gpu_s[r_idx] = 0.0
+            gpu_w[r_idx] = 0.0
+
+        # Recreate: Greedy Insertion into Ruin Set
+        # Sort models to pack large/dense first
+        removed_models.sort(key=lambda m: (m.model_size, m.req_rate/m.slo), reverse=True)
+
+        possible = True
+        for m in removed_models:
+            best_dest = -1
+            best_score = float('inf') # Minimize resulting local K
+
+            for dest in ruin_set:
+                if gpu_s[dest] + m.model_size <= GPU_MEM_SIZE:
+                    # Calculate Hypothetical K
+                    rem = GPU_MEM_SIZE - (gpu_s[dest] + m.model_size)
+                    k = (gpu_w[dest] + m.req_rate/m.slo) / rem if rem > 1e-7 else 1e9
+
+                    if k < best_score:
+                        best_score = k
+                        best_dest = dest
+
+            if best_dest != -1:
+                placement[best_dest].append(m)
+                gpu_s[best_dest] += m.model_size
+                gpu_w[best_dest] += m.req_rate/m.slo
+            else:
+                possible = False
+                break
+
+        if possible:
+            # Check if global state improved or accepted by simple criteria
+            new_max = max(get_k(i) for i in range(gpu_num))
+
+            accept = False
+            if new_max < max_k - 1e-6:
+                accept = True
+            elif new_max < max_k + 1e-6:
+                 # Accept equal moves to traverse plateau
+                 accept = True
+            elif no_improve > patience and random.random() < 0.

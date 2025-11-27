@@ -1,0 +1,495 @@
+--- a/original.py
++++ b/original.py
+@@ -1,391 +1,420 @@
+ # EVOLVE-BLOCK-START
+ """
+-adaptive_hybrid_consensus
+-Merges "Bayesian Hypothesis Competition" with "Variance-Adaptive" flow logic.
++annealed_trust_consensus
++Enhances consensus convergence by "annealing" (pruning) improbable candidates 
++in later iterations. Implements dynamic self-trust based on global device reliability, 
++allowing the algorithm to discount local measurements from noisy routers.
+ Features:
+-- Adaptive Flow Sigma: Widens flow target acceptance on imbalanced routers.
+-- Hybrid Calibration: Combines Winner-vs-RunnerUp dominance with Absolute Fit scaling.
+-- Trust Transfer: Uses global router reliability to weight local flow signals.
++- Candidate Annealing: Removes hypotheses far from the consensus mean in late stages.
++- Dynamic Self-Weighting: Scales local signal trust (s_val) by router reliability.
++- Aggressive Zero Penalty: Exponentially penalizes zero hypotheses in high-traffic contexts.
+ """
+ import math
+ from typing import Dict, Any, Tuple, List
+ 
+ def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                              topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     
+     # --- Configuration ---
+     REL_TOL = 0.02
+     ABS_TOL = 0.5
+     ITERATIONS = 5
++    ANNEAL_START = 3 # Start pruning candidates from this iteration index
+     
+     # --- Helper Functions ---
+     def get_sigma(val: float) -> float:
+         """Adaptive standard deviation for Gaussian kernels."""
+         return max(ABS_TOL, abs(val) * REL_TOL)
+ 
+     def gaussian_score(x: float, target: float, sigma: float) -> float:
+         """Unnormalized Gaussian Likelihood (0.0 to 1.0)."""
+         if target is None: return 0.0
+         diff = abs(x - target)
+         return math.exp(-0.5 * (diff / sigma) ** 2)
+ 
+     def is_zero(val: float) -> bool:
+         return val < ABS_TOL
+ 
+     # --- Phase 1: Initialization & Status Repair ---
+     state = {}
+     
+     for if_id, data in telemetry.items():
+         s_rx = float(data.get('rx_rate', 0.0))
+         s_tx = float(data.get('tx_rate', 0.0))
+         s_stat = data.get('interface_status', 'unknown')
+         
+         peer_id = data.get('connected_to')
+         has_peer = False
+         p_rx, p_tx, p_stat = 0.0, 0.0, 'unknown'
+         
+         if peer_id and peer_id in telemetry:
+             has_peer = True
+             p_data = telemetry[peer_id]
+             p_rx = float(p_data.get('rx_rate', 0.0))
+             p_tx = float(p_data.get('tx_rate', 0.0))
+             p_stat = p_data.get('interface_status', 'unknown')
+ 
+         # Traffic Analysis
+         proven_active = (s_rx > ABS_TOL or s_tx > ABS_TOL or 
+                          p_rx > ABS_TOL or p_tx > ABS_TOL)
+         
+         final_stat = s_stat
+         stat_conf = 1.0
+         
+         # Status Repair Logic
+         if s_stat == 'down' and proven_active:
+             final_stat = 'up'
+             stat_conf = 0.95
+         elif s_stat == 'up' and not proven_active:
++            # If I'm silent, and Peer is Down (and silent), I'm likely Down.
+             if p_stat == 'down':
+                 final_stat = 'down'
+                 stat_conf = 0.90
+             
+         # Initial Value Estimation
++        # Start with Peer if available (Symmetry R3), else Self.
+         if final_stat == 'down':
+             est_rx, est_tx = 0.0, 0.0
+         else:
+             est_rx = p_tx if has_peer else s_rx
+             est_tx = p_rx if has_peer else s_tx
+             
+         state[if_id] = {
+             's_rx': s_rx, 's_tx': s_tx,
+             'p_rx': p_rx, 'p_tx': p_tx,
+             'est_rx': est_rx, 'est_tx': est_tx,
+             'status': final_stat,
+             'stat_conf': stat_conf,
+             'orig_stat': s_stat,
+             'has_peer': has_peer
+         }
+ 
+     # --- Phase 2: Iterative Consensus ---
+     
+     for iteration in range(ITERATIONS):
+         # 1. Router Trust Analysis
+         router_metrics = {}
+         for r_id, if_list in topology.items():
+             valid_ifs = [i for i in if_list if i in state]
+             if not valid_ifs: continue
+             
+             sum_in, sum_out = 0.0, 0.0
+             total_agreement = 0.0
+             
+             for i in valid_ifs:
+                 d = state[i]
+                 sum_in += d['est_rx']
+                 sum_out += d['est_tx']
+                 
+                 # Agreement Score
++                # Measures how well the current estimate matches external validation (Peer) or Self
++                # We use the *current estimate* to judge trust, assuming it moves towards truth.
+                 ag = 0.5
+                 if d['has_peer']:
+                     s_rx = get_sigma(d['est_rx'])
+                     s_tx = get_sigma(d['est_tx'])
+                     ag_rx = gaussian_score(d['est_rx'], d['p_tx'], s_rx)
+                     ag_tx = gaussian_score(d['est_tx'], d['p_rx'], s_tx)
+                     ag = (ag_rx + ag_tx) / 2.0
+                 else:
+-                    # Isolated links: rely on self-consistency (weaker)
++                    # Isolated links rely on self-consistency (weaker signal)
+                     s_rx = get_sigma(d['est_rx'])
+                     s_tx = get_sigma(d['est_tx'])
+                     ag_rx = gaussian_score(d['est_rx'], d['s_rx'], s_rx)
+                     ag_tx = gaussian_score(d['est_tx'], d['s_tx'], s_tx)
+-                    ag = (ag_rx + ag_tx) / 2.0 * 0.8
++                    ag = (ag_rx + ag_tx) / 2.0 * 0.8 # Discount isolated
+                 
+                 total_agreement += ag
+             
+             # Router Trust: Global reliability of the device
+             trust = total_agreement / len(valid_ifs)
+             
+             # Router Balance: Flow conservation adherence
+             imb = abs(sum_in - sum_out)
+             mag = max(sum_in, sum_out, 1.0)
+             balance = math.exp(- (imb / (mag * 0.05))**2 )
+             
+             router_metrics[r_id] = {
+                 'sin': sum_in, 'sout': sum_out,
+                 'trust': trust, 'balance': balance
+             }
+             
+         # 2. Update Estimates
+         for if_id, d in state.items():
+             if d['status'] == 'down': continue
+             
+             r_id = telemetry[if_id].get('local_router')
+             r_info = router_metrics.get(r_id)
+             
+             def solve_direction(current, s_val, p_val, is_rx):
+                 f_val = None
+                 f_weight = 0.0
+                 f_sigma_mult = 1.0
+                 
++                # Dynamic Self-Weighting
++                # If router is trustworthy, we trust s_val more (up to 1.0).
++                # If untrustworthy, we rely heavily on Peer (1.0).
++                w_self = 0.6 + 0.4 * (r_info['trust'] if r_info else 0.5)
++                
+                 if r_info:
+-                    # Flow Target
++                    # Flow Target Calculation
+                     if is_rx:
+                         others = r_info['sin'] - current
+                         f_val = max(0.0, r_info['sout'] - others)
+                     else:
+                         others = r_info['sout'] - current
+                         f_val = max(0.0, r_info['sin'] - others)
+                     
+-                    # Weighting Logic
++                    # Trusted routers get stronger flow enforcement
+                     base_weight = 2.0
+                     # Boost flow if edge link (no peer) but router is trusted
+                     if not d['has_peer'] and r_info['trust'] > 0.8:
+                         base_weight = 3.0
+                     
+                     f_weight = base_weight * r_info['trust'] * (0.3 + 0.7 * r_info['balance'])
+-                    
+-                    # Adaptive Variance: Widen acceptance if router is imbalanced
++                    # Widen acceptance window if router is imbalanced
+                     f_sigma_mult = 1.0 + 3.0 * (1.0 - r_info['balance'])
+                 
+                 # Hypothesis Generation
+-                candidates = [s_val, 0.0]
+-                if d['has_peer']: candidates.append(p_val)
+-                if f_val is not None: candidates.append(f_val)
+-                
+-                # Mean injection for noise handling
+-                if d['has_peer']:
+-                    diff = abs(s_val - p_val)
+-                    if diff > ABS_TOL and (diff/max(s_val, p_val, 1.0)) < 0.2:
+-                        candidates.append((s_val + p_val)/2.0)
+-                        
+-                unique_cands = sorted(list(set(candidates)))
+-                max_cand_mag = max(unique_cands) if unique_cands else 0.0
+-                
++                candidates = set()
++                candidates.add(s_val)
++                candidates.add(0.0)
++                if d['has_peer']: candidates.add(p_val)
++                if f_val is not None: candidates.add(f_val)
++                
++                # Sort and cluster merging
++                sorted_cands = sorted(list(candidates))
++                merged_cands = []
++                if sorted_cands:
++                    curr = sorted_cands[0]
++                    for next_val in sorted_cands[1:]:
++                        if abs(next_val - curr) < get_sigma(curr):
++                            pass # Too close, skip
++                        else:
++                            merged_cands.append(curr)
++                            curr = next_val
++                    merged_cands.append(curr)
++                
++                # Annealing: Prune improbable candidates based on previous estimate stability
++                final_candidates = []
++                if iteration >= ANNEAL_START:
++                    sigma_curr = get_sigma(current)
++                    for c in merged_cands:
++                        # Keep if close to current estimate OR if it's the Flow target (which is dynamic)
++                        # We must keep Flow target as it might move into range
++                        if abs(c - current) < 3.0 * sigma_curr or (f_val is not None and abs(c - f_val) < 1e-6):
++                            final_candidates.append(c)
++                    # Safety fallback
++                    if not final_candidates: final_candidates = [current]
++                else:
++                    final_candidates = merged_cands
++
++                # Scoring
+                 best_val = current
+                 best_score = -1.0
+-                
+-                for cand in unique_cands:
++                max_mag = max(final_candidates) if final_candidates else 0.0
++                
++                for cand in final_candidates:
+                     sigma = get_sigma(cand)
+                     
+-                    # Likelihoods
+-                    sc_s = 0.8 * gaussian_score(cand, s_val, sigma)
+-                    sc_p = 1.0 * gaussian_score(cand, p_val, sigma) if d['has_peer'] else 0.0
+-                    
+-                    sc_f = 0.0
++                    l_s = w_self * gaussian_score(cand, s_val, sigma)
++                    l_p = 1.0 * gaussian_score(cand, p_val, sigma) if d['has_peer'] else 0.0
++                    
++                    l_f = 0.0
+                     if f_val is not None:
+-                         # Combine candidate sigma with flow uncertainty multiplier
+-                         sc_f = f_weight * gaussian_score(cand, f_val, sigma * f_sigma_mult)
+-                    
+-                    score = sc_s + sc_p + sc_f
+-                    
+-                    # Magnitude-Dependent Zero Penalty
+-                    # If alternative hypotheses are large, Zero is less likely
+-                    if is_zero(cand):
+-                        deg = 1.0 / (1.0 + max_cand_mag / 10.0)
+-                        score *= (0.1 + 0.1 * deg)
++                         l_f = f_weight * gaussian_score(cand, f_val, sigma * f_sigma_mult)
++                    
++                    score = l_s + l_p + l_f
++                    
++                    # Aggressive Zero Penalty
++                    # If there's a large competing signal, 0.0 is exponentially unlikely
++                    if is_zero(cand) and max_mag > ABS_TOL:
++                        penalty = 1.0 / (1.0 + max_mag / 5.0)
++                        score *= penalty
+                         
+                     if score > best_score:
+                         best_score = score
+                         best_val = cand
+                         
+                 return best_val
+ 
+             new_rx = solve_direction(d['est_rx'], d['s_rx'], d['p_tx'], True)
+             new_tx = solve_direction(d['est_tx'], d['s_tx'], d['p_rx'], False)
+             
+             # Momentum update
+             d['est_rx'] = 0.5 * d['est_rx'] + 0.5 * new_rx
+             d['est_tx'] = 0.5 * d['est_tx'] + 0.5 * new_tx
+ 
+-    # --- Phase 3: Final Output & Hybrid Calibration ---
++    # --- Phase 3: Final Output & Calibration ---
+     results = {}
+     
+-    # Recalculate metrics for final calibration
++    # Recalculate context for final scoring
+     final_metrics = {}
+     for r_id, if_list in topology.items():
+         valid_ifs = [i for i in if_list if i in state]
+         if not valid_ifs: continue
+         sin = sum(state[i]['est_rx'] for i in valid_ifs)
+         sout = sum(state[i]['est_tx'] for i in valid_ifs)
+         
+         tot_ag = 0.0
+         for i in valid_ifs:
+             d = state[i]
+             s_rx = get_sigma(d['est_rx'])
+             s_tx = get_sigma(d['est_tx'])
+             if d['has_peer']:
+                  ag = (gaussian_score(d['est_rx'], d['p_tx'], s_rx) + 
+                        gaussian_score(d['est_tx'], d['p_rx'], s_tx)) / 2.0
+             else:
+                  ag = (gaussian_score(d['est_rx'], d['s_rx'], s_rx) + 
+                        gaussian_score(d['est_tx'], d['s_tx'], s_tx)) / 2.0 * 0.8
+             tot_ag += ag
+         trust = tot_ag / len(valid_ifs)
+         bal = math.exp(-(abs(sin-sout)/max(sin,sout,1.0)*20)**2)
+         final_metrics[r_id] = {'sin': sin, 'sout': sout, 'trust': trust, 'bal': bal}
+ 
+     for if_id, d in state.items():
+         res = telemetry[if_id].copy()
+         
+         if d['status'] == 'down':
+             crx = 1.0 if d['s_rx'] <= ABS_TOL else 0.95
+             ctx = 1.0 if d['s_tx'] <= ABS_TOL else 0.95
+             res['rx_rate'] = (d['s_rx'], 0.0, crx)
+             res['tx_rate'] = (d['s_tx'], 0.0, ctx)
+         else:
+             r_id = telemetry[if_id].get('local_router')
+             r_info = final_metrics.get(r_id)
+             
+             def calc_conf(val, s_val, p_val, is_rx):
+                 f_val = None
+                 f_weight = 0.0
+                 f_sigma_mult = 1.0
+                 
++                # Reconstruct params
++                w_self = 0.6 + 0.4 * (r_info['trust'] if r_info else 0.5)
++                
+                 if r_info:
+                     if is_rx: target = r_info['sout'] - (r_info['sin'] - d['est_rx'])
+                     else:     target = r_info['sin'] - (r_info['sout'] - d['est_tx'])
+                     f_val = max(0.0, target)
+                     
+                     base_weight = 2.0
+                     if not d['has_peer'] and r_info['trust'] > 0.8: base_weight = 3.0
+                     f_weight = base_weight * r_info['trust'] * (0.3 + 0.7 * r_info['bal'])
+                     f_sigma_mult = 1.0 + 3.0 * (1.0 - r_info['bal'])
+ 
+-                # Hypothesis Set
+                 hyps = {val, s_val, 0.0}
+                 if d['has_peer']: hyps.add(p_val)
+                 if f_val is not None: hyps.add(f_val)
+                 if d['has_peer']: hyps.add((s_val + p_val)/2.0)
+                 
+-                sorted_hyps = sorted(list(hyps))
+-                max_cand_mag = max(sorted_hyps) if sorted_hyps else 0.0
+-                
++                max_mag = max(hyps)
+                 sigma_win = get_sigma(val)
+                 
+                 def get_score(h, sigma):
+-                    sc_s = 0.8 * gaussian_score(h, s_val, sigma)
++                    sc_s = w_self * gaussian_score(h, s_val, sigma)
+                     sc_p = 1.0 * gaussian_score(h, p_val, sigma) if d['has_peer'] else 0.0
+                     sc_f = 0.0
+                     if f_val is not None:
+                         sc_f = f_weight * gaussian_score(h, f_val, sigma * f_sigma_mult)
+-                    
+                     tot = sc_s + sc_p + sc_f
+                     
+-                    if is_zero(h):
+-                        deg = 1.0 / (1.0 + max_cand_mag / 10.0)
+-                        tot *= (0.1 + 0.1 * deg)
++                    if is_zero(h) and max_mag > ABS_TOL:
++                        tot *= 1.0 / (1.0 + max_mag / 5.0)
+                     return tot
+ 
+                 winner_score = get_score(val, sigma_win)
+                 
+-                # Runner-Up Score (for Dominance calculation)
+-                # Find best hypothesis not in the winner's cluster
+-                runner_up_score = 0.0
+-                for h in sorted_hyps:
+-                    if abs(h - val) <= sigma_win: continue
+-                    sigma_h = get_sigma(h)
+-                    s = get_score(h, sigma_h)
+-                    if s > runner_up_score:
+-                        runner_up_score = s
+-                        
+-                # 1. Probability Dominance (Winner vs Runner-Up)
+-                # Provides separation for discrete choices
+-                dominance_prob = winner_score / (winner_score + runner_up_score + 1e-9)
+-                
+-                # 2. Absolute Fit Scaling
+-                # Penalizes confidence if the winner is a poor fit to the data
+-                max_possible = 0.8 + (1.0 if d['has_peer'] else 0.0) + (f_weight if f_val is not None else 0.0)
++                # Probability Dominance
++                total_mass = 0.0
++                sorted_h = sorted(list(hyps))
++                for h in sorted_h:
++                    total_mass += get_score(h, get_sigma(h))
++                
++                if total_mass < 1e-9: return 0.5
++                
++                # Mass supporting the winner
++                cluster_mass = 0.0
++                for h in sorted_h:
++                    if abs(h - val) <= sigma_win:
++                        cluster_mass += get_score(h, get_sigma(h))
++                
++                dominance = cluster_mass / total_mass
++                
++                # Absolute Fit Calibration
++                max_possible = w_self + (1.0 if d['has_peer'] else 0.0) + (f_weight if f_val is not None else 0.0)
+                 fit_ratio = winner_score / max(1.0, max_possible)
+                 
+-                final_conf = dominance_prob
+-                
++                final_conf = dominance
+                 if fit_ratio < 0.5:
+                     final_conf *= (fit_ratio * 2.0)
+                     
+-                # Sanity Checks
++                # Validator Support Sanity Check
+                 peer_support = d['has_peer'] and abs(val - p_val) <= sigma_win
+                 flow_support = f_val is not None and abs(val - f_val) <= (sigma_win * f_sigma_mult)
+                 
+                 if not peer_support and not flow_support:
+                     final_conf = min(final_conf, 0.75)
+                     
+                 return max(0.5, min(1.0, final_conf))
+ 
+             conf_rx = calc_conf(d['est_rx'], d['s_rx'], d['p_tx'], True)
+             conf_tx = calc_conf(d['est_tx'], d['s_tx'], d['p_rx'], False)
+             
+             res['rx_rate'] = (d['s_rx'], d['est_rx'], conf_rx)
+             res['tx_rate'] = (d['s_tx'], d['est_tx'], conf_tx)
+             
+         res['interface_status'] = (d['orig_stat'], d['status'], d['stat_conf'])
+         results[if_id] = res
+ 
+     return results
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+     Main entry point that will be called by the evaluator.
+ 
+     Args:
+         telemetry: Network interface telemetry data
+         topology: Dictionary where key is router_id and value contains a list of interface_ids
+ 
+     Returns:
+         Dictionary containing repaired results with confidence scores
+     """
+     return repair_network_telemetry(telemetry, topology)
+ 
+ 
+ if __name__ == "__main__":
+     # Simple test case
+     test_telemetry = {
+         'if1_to_if2': {
+             'interface_status': 'up',
+             'rx_rate': 100.0,
+             'tx_rate': 95.0,
+             'connected_to': 'if2_to_if1',
+             'local_router': 'router1',
+             'remote_router': 'router2'
+         },
+         'if2_to_if1': {
+             'interface_status': 'up',
+             'rx_rate': 95.0,  # Should match if1's TX
+             'tx_rate': 100.0,  # Should match if1's RX
+             'connected_to': 'if1_to_if2',
+             'local_router': 'router2',
+             'remote_router': 'router1'
+         }
+     }
+ 
+     test_topology = {
+         'router1': ['if1_to_if2'],
+         'router2': ['if2_to_if1']
+     }
+ 
+     result = run_repair(test_telemetry, test_topology)
+ 
+     print("Repair results:")
+     for if_id, data in result.items():
+         print(f"\n{if_id}:")
+         print(f"  RX: {data['rx_rate']}")
+         print(f"  TX: {data['tx_rate']}")
+         print(f"  Status: {data['interface_status']}")

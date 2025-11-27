@@ -1,0 +1,657 @@
+<NAME>
+insertion_beam_memo_vnd2opt
+</NAME>
+
+<DESCRIPTION>
+I propose three synergistic improvements that directly reduce simulated makespan by aligning the search more closely with true insertion impacts while avoiding redundant evaluations:
+
+1) Deterministic, memoized best-two insertion: Add an insertion_cache keyed by (tuple(seq), txn, positions_signature). I introduce a deterministic positions sampler (with signature) and use it inside best_two_insertions to cache and reuse results across construction, beam, LNS, and local search. This reduces repeated simulator calls and stabilizes regret signals.
+
+2) Insertion-based beam expansions with lookahead: Replace the beam expansion that appended transactions with a version that inserts each candidate at its best position (via best_two_insertions), scores with adaptive two-step lookahead (also by best-two insertions), and mixes cost and regret-diversity. This aligns expansion choices with the actual schedule cost changes, which better reflects conflict delays.
+
+3) Stronger VND neighborhoods: Add sampled non-adjacent swaps and segment reversals (2-opt-like) to VND, and order Or-opt passes from larger to smaller blocks. These neighborhoods capture larger structural improvements that adjacent swaps and single Or-opt moves miss, converting more construction quality into final gains.
+
+Additionally, greedy completion now uses best insertion per candidate instead of appending, improving partial-to-full solutions. These changes maintain determinism for caching and preserve existing interfaces and safety checks. Overall, they should lower makespan and improve the combined score without inflating runtime excessively due to caching and sampling controls.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def sample_positions(seq_len):
+        total = seq_len + 1
+        if pos_sample_cap is None or total <= pos_sample_cap:
+            return list(range(total))
+        # Keep ends, sample interior
+        interior = list(range(1, seq_len))
+        k = max(2, min(pos_sample_cap - 2, len(interior)))
+        chosen = set(random.sample(interior, k)) if interior else set()
+        chosen.update({0, seq_len})
+        return sorted(chosen)
+=======
+    def sample_positions_with_sig(seq_len):
+        """
+        Deterministic anchor-based position selection.
+        Returns (positions_list, signature) where signature is ('all', seq_len) or a tuple of positions.
+        """
+        total = seq_len + 1
+        if pos_sample_cap is None or total <= pos_sample_cap:
+            positions = list(range(total))
+            return positions, ('all', seq_len)
+        anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+        anchors = {p for p in anchors if 0 <= p <= seq_len}
+        # Fill evenly spaced interior positions up to cap
+        k = max(0, pos_sample_cap - len(anchors))
+        for i in range(1, k + 1):
+            pos = round(i * seq_len / (k + 1))
+            if 0 <= pos <= seq_len:
+                anchors.add(pos)
+        positions = sorted(anchors)
+        return positions, tuple(positions)
+
+    def sample_positions(seq_len):
+        # Backward-compatible wrapper returning only the positions list
+        positions, _ = sample_positions_with_sig(seq_len)
+        return positions
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    cost_cache = {}
+
+    def eval_cost(prefix):
+=======
+    cost_cache = {}
+    insertion_cache = {}
+
+    def eval_cost(prefix):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def best_two_insertions(seq, txn):
+        positions = sample_positions(len(seq))
+        best = (float('inf'), None)
+        second = (float('inf'), None)
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best[0]:
+                second = best
+                best = (c, pos)
+            elif c < second[0]:
+                second = (c, pos)
+        return best, second
+=======
+    def best_two_insertions(seq, txn):
+        # Use deterministic position signature for cache correctness
+        positions, sig = sample_positions_with_sig(len(seq))
+        key = (tuple(seq), txn, sig)
+        cached = insertion_cache.get(key)
+        if cached is not None:
+            return cached
+        best = (float('inf'), None)
+        second = (float('inf'), None)
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best[0]:
+                second = best
+                best = (c, pos)
+            elif c < second[0]:
+                second = (c, pos)
+        if second[0] == float('inf'):
+            second = best
+        insertion_cache[key] = (best, second)
+        return best, second
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def beam_search():
+        # Initialize with top singletons (and 1 GRASP seed)
+        starters = [(eval_cost([t]), [t]) for t in txns_all]
+        starters.sort(key=lambda x: x[0])
+        init = starters[:min(len(starters), max(beam_width * 2, beam_width + 2))]
+
+        # Add a GRASP seed for diversity
+        c0, s0 = construct_regret_insertion()
+        init.append((c0, s0))
+
+        # Beam state: tuples (cost, seq, remaining_set)
+        beam = []
+        seen = set()
+        for c, seq in init:
+            key = tuple(seq)
+            if key in seen:
+                continue
+            seen.add(key)
+            rem = frozenset(txn for txn in txns_all if txn not in seq)
+            beam.append((c, seq, rem))
+            if len(beam) >= beam_width:
+                break
+
+        best_complete = (float('inf'), [])
+
+        for depth in range(1, n + 1):
+            if not beam:
+                break
+            next_pool = []
+            layer_seen = set()
+            suffix_seen = set()  # suffix diversity on last-2
+            for c, seq, rem in beam:
+                if not rem:
+                    if c < best_complete[0]:
+                        best_complete = (c, seq)
+                    continue
+
+                rem_list = list(rem)
+                # Sample candidates
+                if len(rem_list) <= cand_per_state:
+                    expand_list = rem_list
+                else:
+                    expand_list = random.sample(rem_list, cand_per_state)
+
+                # Score expansions with lookahead and regret-based alternative
+                scored = []
+                for t in expand_list:
+                    seq1 = seq + [t]
+                    c1 = eval_cost(seq1)
+
+                    # lookahead: best among k sampled second steps
+                    rem_after = [x for x in rem if x != t]
+                    if rem_after:
+                        k2 = min(lookahead_k, len(rem_after))
+                        second = random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        second_costs = []
+                        for u in second:
+                            cu = eval_cost(seq1 + [u])
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        # regret approx: variance among second step costs
+                        if len(second_costs) >= 2:
+                            mx = max(second_costs)
+                            mn = min(second_costs)
+                            regret = mx - mn
+                        else:
+                            regret = 0.0
+                        score = 0.7 * c1 + 0.3 * best_c2
+                    else:
+                        regret = 0.0
+                        score = c1
+
+                    scored.append((score, c1, regret, t))
+
+                # Select by cost and regret diversity
+                scored.sort(key=lambda x: x[0])  # by score
+                top_cost = scored[:max(1, min(len(scored), beam_width))]
+                # Add regret-heavy options
+                scored_by_regret = sorted(scored, key=lambda x: (-x[2], x[0]))
+                top_regret = scored_by_regret[:min(diversity_quota, len(scored_by_regret))]
+
+                cand_acts = top_cost + top_regret
+                # Dedup actions
+                uniq = {}
+                for sc, c1, rg, t in cand_acts:
+                    if t not in uniq or c1 < uniq[t][1]:
+                        uniq[t] = (sc, c1, rg)
+                for t, (sc, c1, rg) in uniq.items():
+                    new_seq = seq + [t]
+                    new_rem = frozenset(x for x in rem if x != t)
+
+                    # Suffix diversity: last-2 signature
+                    if len(new_seq) >= 2:
+                        sig = (new_seq[-2], new_seq[-1])
+                    else:
+                        sig = (None, new_seq[-1])
+
+                    key = tuple(new_seq)
+                    if key in layer_seen:
+                        continue
+                    if sig in suffix_seen:
+                        # allow only if significantly better than previous signatures in pool
+                        # We'll just skip to maintain diversity
+                        continue
+
+                    layer_seen.add(key)
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, new_seq, new_rem))
+
+            if not next_pool:
+                break
+
+            # Prune to beam width by cost; deduplicate by full prefix
+            next_pool.sort(key=lambda x: x[0])
+            pruned = []
+            seen_prefixes = set()
+            for c1, seq, rem in next_pool:
+                key = tuple(seq)
+                if key in seen_prefixes:
+                    continue
+                seen_prefixes.add(key)
+                pruned.append((c1, seq, rem))
+                if len(pruned) >= beam_width:
+                    break
+            beam = pruned
+
+        # Complete if not already
+        for c, seq, rem in beam:
+            if not rem and c < best_complete[0]:
+                best_complete = (c, seq)
+
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # Greedy completion from best partial
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t = None
+                best_c = float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur + [t])
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                cur.append(best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur), cur
+
+        # Fallback: identity
+        ident = list(range(n))
+        return eval_cost(ident), ident
+=======
+    def beam_search():
+        # Initialize with top singletons (and 1 GRASP seed)
+        starters = [(eval_cost([t]), [t]) for t in txns_all]
+        starters.sort(key=lambda x: x[0])
+        init = starters[:min(len(starters), max(beam_width * 2, beam_width + 2))]
+
+        # Add a GRASP seed for diversity
+        c0, s0 = construct_regret_insertion()
+        init.append((c0, s0))
+
+        # Beam state: tuples (cost, seq, remaining_set)
+        beam = []
+        seen = set()
+        for c, seq in init:
+            key = tuple(seq)
+            if key in seen:
+                continue
+            seen.add(key)
+            rem = frozenset(txn for txn in txns_all if txn not in seq)
+            beam.append((c, seq, rem))
+            if len(beam) >= beam_width:
+                break
+
+        best_complete = (float('inf'), [])
+
+        for depth in range(1, n + 1):
+            if not beam:
+                break
+            next_pool = []
+            layer_seen = set()
+            suffix_seen = set()  # suffix diversity on last-2
+
+            for c, seq, rem in beam:
+                if not rem:
+                    if c < best_complete[0]:
+                        best_complete = (c, seq)
+                    continue
+
+                rem_list = list(rem)
+                # Sample candidates
+                if len(rem_list) <= cand_per_state:
+                    expand_list = rem_list
+                else:
+                    expand_list = random.sample(rem_list, cand_per_state)
+
+                # Score expansions using best-position insertion and lookahead
+                scored = []
+                for t in expand_list:
+                    # Best insertion of t into current seq
+                    (c1, p1), (c1_second, _) = best_two_insertions(seq, t)
+                    new_seq = seq[:]
+                    new_seq.insert(p1, t)
+
+                    # Lookahead: best insertion among a small sample of next txns
+                    rem_after = [x for x in rem if x != t]
+                    if rem_after:
+                        k2 = min(lookahead_k, len(rem_after))
+                        second = random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        second_costs = []
+                        for u in second:
+                            (cu, _), _ = best_two_insertions(new_seq, u)
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                        # Regret: combine primary (second-best vs best) and lookahead spread
+                        if len(second_costs) >= 2:
+                            mx = max(second_costs)
+                            mn = min(second_costs)
+                            regret2 = mx - mn
+                        else:
+                            regret2 = 0.0
+                        regret_primary = max(0.0, c1_second - c1)
+                        total_regret = 0.5 * regret_primary + 0.5 * regret2
+                        score = 0.7 * c1 + 0.3 * best_c2
+                    else:
+                        total_regret = max(0.0, c1_second - c1)
+                        score = c1
+
+                    scored.append((score, c1, total_regret, t, p1, tuple(new_seq)))
+
+                # Select by cost and regret diversity
+                scored.sort(key=lambda x: x[0])  # by score
+                top_cost = scored[:max(1, min(len(scored), beam_width))]
+                # Add regret-heavy options
+                scored_by_regret = sorted(scored, key=lambda x: (-x[2], x[0]))
+                top_regret = scored_by_regret[:min(diversity_quota, len(scored_by_regret))]
+
+                cand_acts = top_cost + top_regret
+                # Deduplicate by resulting sequence
+                for sc, c1, rg, t, p1, seq_tuple in cand_acts:
+                    if seq_tuple in layer_seen:
+                        continue
+                    layer_seen.add(seq_tuple)
+                    new_seq = list(seq_tuple)
+                    new_rem = frozenset(x for x in rem if x != t)
+                    # Suffix diversity: last-2 signature
+                    if len(new_seq) >= 2:
+                        sig = (new_seq[-2], new_seq[-1])
+                    else:
+                        sig = (None, new_seq[-1])
+                    if sig in suffix_seen:
+                        continue
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, new_seq, new_rem))
+
+            if not next_pool:
+                break
+
+            # Prune to beam width by cost; deduplicate by full prefix
+            next_pool.sort(key=lambda x: x[0])
+            pruned = []
+            seen_prefixes = set()
+            for c1, seq, rem in next_pool:
+                key = tuple(seq)
+                if key in seen_prefixes:
+                    continue
+                seen_prefixes.add(key)
+                pruned.append((c1, seq, rem))
+                if len(pruned) >= beam_width:
+                    break
+            beam = pruned
+
+        # Complete if not already
+        for c, seq, rem in beam:
+            if not rem and c < best_complete[0]:
+                best_complete = (c, seq)
+
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # Greedy completion from best partial using best-position insertion
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t = None
+                best_c = float('inf')
+                best_p = 0
+                for t in rem_list:
+                    (c2, p2), _ = best_two_insertions(cur, t)
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                        best_p = p2
+                cur.insert(best_p, best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur), cur
+
+        # Fallback: identity
+        ident = list(range(n))
+        return eval_cost(ident), ident
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def vnd_local_search(seq, start_cost, max_rounds=vnd_rounds):
+        best_seq = list(seq)
+        best_cost = start_cost
+        n_local = len(best_seq)
+        if n_local <= 2:
+            return best_cost, best_seq
+
+        # DLB flags for indices; reset when neighborhood changes locally
+        dont_look = [False] * n_local
+
+        def or_opt_pass(block_len):
+            nonlocal best_seq, best_cost, dont_look
+            improved = False
+            n_cur = len(best_seq)
+            i = 0
+            while i <= n_cur - block_len:
+                if dont_look[i]:
+                    i += 1
+                    continue
+                block = best_seq[i:i + block_len]
+                base = best_seq[:i] + best_seq[i + block_len:]
+                m = len(base) + 1
+                best_move_cost = best_cost
+                best_pos = None
+                # Try inserting block at all positions except original
+                for pos in range(m):
+                    if pos == i:
+                        continue
+                    cand = base[:]
+                    cand[pos:pos] = block
+                    c = eval_cost(cand)
+                    if c < best_move_cost:
+                        best_move_cost = c
+                        best_pos = pos
+                if best_pos is not None:
+                    # Apply improving move
+                    new_seq = base[:]
+                    new_seq[best_pos:best_pos] = block
+                    best_seq = new_seq
+                    best_cost = best_move_cost
+                    improved = True
+                    # Reset DLB around affected region
+                    dont_look = [False] * len(best_seq)
+                    # Stay on same i due to structural change
+                else:
+                    dont_look[i] = True
+                    i += 1
+            return improved
+
+        def adjacent_swap_pass():
+            nonlocal best_seq, best_cost, dont_look
+            improved = False
+            i = 0
+            while i < len(best_seq) - 1:
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_cost(cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand
+                    improved = True
+                    dont_look = [False] * len(best_seq)
+                i += 1
+            return improved
+
+        # VND loop across neighborhoods
+        rounds = 0
+        while rounds < max_rounds:
+            rounds += 1
+            any_improved = False
+            # Or-opt 1,2,3
+            for bl in (1, 2, 3):
+                if or_opt_pass(bl):
+                    any_improved = True
+            if adjacent_swap_pass():
+                any_improved = True
+            if not any_improved:
+                break
+
+        return best_cost, best_seq
+=======
+    def vnd_local_search(seq, start_cost, max_rounds=vnd_rounds):
+        best_seq = list(seq)
+        best_cost = start_cost
+        n_local = len(best_seq)
+        if n_local <= 2:
+            return best_cost, best_seq
+
+        # DLB flags for indices; reset when neighborhood changes locally
+        dont_look = [False] * n_local
+
+        def or_opt_pass(block_len):
+            nonlocal best_seq, best_cost, dont_look
+            improved = False
+            n_cur = len(best_seq)
+            i = 0
+            while i <= n_cur - block_len:
+                if i < len(dont_look) and dont_look[i]:
+                    i += 1
+                    continue
+                block = best_seq[i:i + block_len]
+                base = best_seq[:i] + best_seq[i + block_len:]
+                m = len(base) + 1
+                best_move_cost = best_cost
+                best_pos = None
+                # Try inserting block at all positions except original
+                for pos in range(m):
+                    if pos == i:
+                        continue
+                    cand = base[:]
+                    cand[pos:pos] = block
+                    c = eval_cost(cand)
+                    if c < best_move_cost:
+                        best_move_cost = c
+                        best_pos = pos
+                if best_pos is not None:
+                    # Apply improving move
+                    new_seq = base[:]
+                    new_seq[best_pos:best_pos] = block
+                    best_seq = new_seq
+                    best_cost = best_move_cost
+                    improved = True
+                    # Reset DLB around affected region
+                    dont_look = [False] * len(best_seq)
+                else:
+                    if i < len(dont_look):
+                        dont_look[i] = True
+                    i += 1
+            return improved
+
+        def adjacent_swap_pass():
+            nonlocal best_seq, best_cost, dont_look
+            improved = False
+            i = 0
+            while i < len(best_seq) - 1:
+                cand = best_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = eval_cost(cand)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = cand
+                    improved = True
+                    dont_look = [False] * len(best_seq)
+                i += 1
+            return improved
+
+        def sampled_pair_swaps(tries=None):
+            nonlocal best_seq, best_cost, dont_look
+            L = len(best_seq)
+            if L <= 4:
+                return False
+            if tries is None:
+                tries = min(200, max(100, L))
+            improved = False
+            best_delta = 0.0
+            best_move = None
+            for _ in range(tries):
+                i = random.randint(0, L - 1)
+                j = random.randint(0, L - 1)
+                if i == j or abs(i - j) <= 1:
+                    continue
+                cand = best_seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                c = eval_cost(cand)
+                delta = best_cost - c
+                if delta > best_delta:
+                    best_delta = delta
+                    best_move = (i, j, c)
+            if best_move is not None:
+                i, j, c = best_move
+                cand = best_seq[:]
+                cand[i], cand[j] = cand[j], cand[i]
+                best_seq = cand
+                best_cost = c
+                dont_look = [False] * len(best_seq)
+                improved = True
+            return improved
+
+        def sampled_segment_reversal(tries=None):
+            nonlocal best_seq, best_cost, dont_look
+            L = len(best_seq)
+            if L <= 5:
+                return False
+            if tries is None:
+                tries = min(200, max(100, L))
+            improved = False
+            best_delta = 0.0
+            best_move = None
+            for _ in range(tries):
+                i = random.randint(0, L - 3)
+                j = random.randint(i + 2, min(L - 1, i + 12))
+                cand = best_seq[:]
+                cand[i:j + 1] = reversed(cand[i:j + 1])
+                c = eval_cost(cand)
+                delta = best_cost - c
+                if delta > best_delta:
+                    best_delta = delta
+                    best_move = (i, j, c)
+            if best_move is not None:
+                i, j, c = best_move
+                cand = best_seq[:]
+                cand[i:j + 1] = reversed(cand[i:j + 1])
+                best_seq = cand
+                best_cost = c
+                dont_look = [False] * len(best_seq)
+                improved = True
+            return improved
+
+        # VND loop across neighborhoods
+        rounds = 0
+        while rounds < max_rounds:
+            rounds += 1
+            any_improved = False
+            # Or-opt 3,2,1 (larger first to escape deeper minima)
+            for bl in (3, 2, 1):
+                if or_opt_pass(bl):
+                    any_improved = True
+            if adjacent_swap_pass():
+                any_improved = True
+            if sampled_pair_swaps():
+                any_improved = True
+            if sampled_segment_reversal():
+                any_improved = True
+            if not any_improved:
+                break
+
+        return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>

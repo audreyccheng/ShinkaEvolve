@@ -1,0 +1,581 @@
+--- a/original.py
++++ b/original.py
+@@ -1,193 +1,484 @@
+ # EVOLVE-BLOCK-START
+ """Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+ 
+ import time
+ import random
+ import sys
+ import os
++from collections import defaultdict
+ 
+ # Add the openevolve_examples directory to the path to import txn_simulator and workloads
+-# Find the repository root by looking for the openevolve_examples directory
++# Find the repository root by looking for openevolve_examples directory
+ def find_repo_root(start_path):
+     """Find the repository root by looking for openevolve_examples directory."""
+     current = os.path.abspath(start_path)
+     # Search up the directory tree
+     while current != os.path.dirname(current):  # Stop at filesystem root
+         candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return current
+         current = os.path.dirname(current)
+ 
+     # If not found by searching up, try common locations relative to known paths
+     # This handles when the program is copied to a results directory
+     script_dir = os.path.dirname(os.path.abspath(__file__))
+     possible_roots = [
+         script_dir,  # Current directory
+         os.path.dirname(script_dir),  # Parent
+         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+         '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+         '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+     ]
+     for root in possible_roots:
+         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return root
+ 
+     raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+ 
+ repo_root = find_repo_root(os.path.dirname(__file__))
+ sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ 
++# -----------------------------
++# Core components (modularized)
++# -----------------------------
++
++class CostOracle:
++    """Memoizes workload.get_opt_seq_cost for sequence prefixes and full sequences."""
++    def __init__(self, workload):
++        self.workload = workload
++        self.cache = {}
++
++    def cost(self, seq):
++        key = tuple(seq)
++        c = self.cache.get(key)
++        if c is not None:
++            return c
++        c = self.workload.get_opt_seq_cost(seq)
++        self.cache[key] = c
++        return c
++
++
++class PairPreferenceModel:
++    """
++    Learns soft pairwise ordering preferences by sampling pair costs.
++    prefer[i][j] > 0 means 'prefer i before j' with weight = delta advantage.
++    prefer[i][j] < 0 means 'prefer j before i' with magnitude |weight|.
++    """
++    def __init__(self, N):
++        self.N = N
++        # Sparse dict of dicts: prefer[i][j] = signed weight
++        self.prefer = defaultdict(dict)
++
++    def build(self, oracle: CostOracle, sample_per_txn=12, rng=None, time_allow=None):
++        rng = rng or random
++        N = self.N
++        all_txns = list(range(N))
++        t_start = time.time() if time_allow else None
++
++        # Ensure we include some global pairs if N small
++        for i in range(N):
++            if time_allow and (time.time() - t_start) > time_allow:
++                break
++            # sample a subset of others
++            others = [x for x in all_txns if x != i]
++            k = min(sample_per_txn, len(others))
++            if k <= 0:
++                continue
++            sampled = rng.sample(others, k)
++            for j in sampled:
++                if j in self.prefer[i] or i in self.prefer[j]:
++                    continue
++                # Evaluate both orders with caching
++                cij = oracle.cost([i, j])
++                cji = oracle.cost([j, i])
++                # Positive weight means i before j is better by this margin
++                w = cji - cij
++                if w >= 0:
++                    self.prefer[i][j] = w
++                    self.prefer[j][i] = -w
++                else:
++                    self.prefer[i][j] = w  # negative
++                    self.prefer[j][i] = -w  # positive
++        return self
++
++    def precedence_penalty(self, seq_prefix, cand, remaining_set):
++        """
++        Estimate penalty of appending cand at end of current prefix:
++        - Violations with prefix: if prefer[cand][s] > 0 (prefer cand before s), appending cand violates it.
++        - Violations with remaining: cand will be before remaining, so if prefer[o][cand] > 0 (prefer o before cand),
++          appending cand violates it relative to each o in remaining.
++        """
++        pen = 0.0
++        pref_cand = self.prefer.get(cand, {})
++        for s in seq_prefix:
++            w = pref_cand.get(s)
++            if w and w > 0:
++                pen += w
++        for o in remaining_set:
++            w = self.prefer.get(o, {}).get(cand)
++            if w and w > 0:
++                pen += w
++        return pen
++
++    def violations_in_seq(self, seq):
++        """
++        Compute list of violating pairs present in seq with associated weights.
++        A pair (a before b) is a violation if prefer[b][a] > 0 or prefer[a][b] < 0 (equivalently).
++        Returns list of tuples: (weight, index_a, index_b)
++        """
++        pos = {t: i for i, t in enumerate(seq)}
++        violations = []
++        for i, a in enumerate(seq):
++            pref_a = self.prefer.get(a, {})
++            # For every b preferred after a (pref positive), check if b appears before a
++            for b, w in pref_a.items():
++                if w > 0:
++                    j = pos.get(b)
++                    if j is not None and j < i:
++                        # b is before a but we prefer a before b -> violation weight w
++                        violations.append((w, j, i))  # (weight, index_b, index_a) b before a but should be after
++        # Sort high weight first
++        violations.sort(key=lambda x: -x[0])
++        return violations
++
++
++class BeamConstructor:
++    """Precedence-guided beam search with lookahead using true cost + penalty scoring."""
++    def __init__(self, oracle: CostOracle, pref: PairPreferenceModel, time_budget_sec=0.4):
++        self.oracle = oracle
++        self.pref = pref
++        self.time_budget_sec = time_budget_sec
++
++    def construct(self, N, restarts=1, rng=None):
++        rng = rng or random
++        start_time = time.time()
++
++        def time_left():
++            return (time.time() - start_time) < self.time_budget_sec
++
++        best_cost = float('inf')
++        best_seq = None
++
++        # Scale beam based on N
++        base_beam = min(48, max(8, N // 6))
++        base_branch = min(32, max(6, N // 10))
++        lookahead_k = 3
++        lam_penalty = 0.25  # penalty scaling relative to makespan units
++
++        for r in range(max(1, restarts)):
++            if not time_left():
++                break
++            # Initialize with a good seed: choose minimal cost among a small random pool
++            all_txns = list(range(N))
++            init_pool = rng.sample(all_txns, min(max(8, N // 4), N))
++            beam = []
++            for t in init_pool:
++                if not time_left():
++                    break
++                c = self.oracle.cost([t])
++                rem = set(all_txns)
++                rem.remove(t)
++                beam.append((c, [t], rem))
++            if not beam:
++                break
++            beam.sort(key=lambda x: x[0])
++            beam = beam[:base_beam]
++
++            # Expand prefixes
++            steps = N - 1
++            for _ in range(steps):
++                if not time_left():
++                    break
++                new_beam = []
++                for prefix_cost, seq, rem in beam:
++                    if not rem:
++                        new_beam.append((prefix_cost, seq, rem))
++                        continue
++                    rem_list = list(rem)
++                    # candidate branching
++                    if len(rem_list) > base_branch:
++                        cands = rng.sample(rem_list, base_branch)
++                    else:
++                        cands = rem_list
++
++                    # Evaluate candidates with penalty + lookahead
++                    for cand in cands:
++                        if not time_left():
++                            break
++                        new_seq = seq + [cand]
++                        new_rem = rem.copy()
++                        new_rem.remove(cand)
++                        base_cost = self.oracle.cost(new_seq)
++                        penalty = self.pref.precedence_penalty(seq, cand, new_rem)
++                        score = base_cost + lam_penalty * penalty
++
++                        # shallow lookahead among a few next choices
++                        if new_rem and time_left():
++                            la_pool = list(new_rem)
++                            la_k = min(lookahead_k, len(la_pool))
++                            la_sample = rng.sample(la_pool, la_k)
++                            best_la = float('inf')
++                            for nxt in la_sample:
++                                if not time_left():
++                                    break
++                                la_cost = self.oracle.cost(new_seq + [nxt])
++                                # integrate penalty at next level lightly
++                                la_pen = self.pref.precedence_penalty(new_seq, nxt, new_rem - {nxt})
++                                la_score = la_cost + 0.5 * lam_penalty * la_pen
++                                if la_score < best_la:
++                                    best_la = la_score
++                            score = min(score, best_la)
++
++                        new_beam.append((score, new_seq, new_rem, base_cost))
++
++                if not new_beam:
++                    break
++
++                # Keep top unique by score; carry base_cost forward
++                new_beam.sort(key=lambda x: x[0])
++                unique = []
++                seen = set()
++                for ent in new_beam:
++                    key = tuple(ent[1])
++                    if key in seen:
++                        continue
++                    seen.add(key)
++                    actual_cost = ent[3] if len(ent) > 3 else ent[0]
++                    unique.append((actual_cost, ent[1], ent[2]))
++                    if len(unique) >= base_beam:
++                        break
++                beam = unique
++
++            # Greedy finish (in case time cut expansions short)
++            for prefix_cost, seq, rem in beam:
++                if not time_left():
++                    break
++                final_seq = list(seq)
++                final_cost = prefix_cost
++                rem_set = set(rem)
++                while rem_set and time_left():
++                    # choose cand minimizing base_cost + penalty
++                    cands = list(rem_set)
++                    best_val = float('inf')
++                    best_t = None
++                    for t in (rng.sample(cands, min(len(cands), base_branch)) if len(cands) > base_branch else cands):
++                        c = self.oracle.cost(final_seq + [t])
++                        pen = self.pref.precedence_penalty(final_seq, t, rem_set - {t})
++                        val = c + lam_penalty * pen
++                        if val < best_val:
++                            best_val = val
++                            best_t = t
++                    if best_t is None:
++                        best_t = cands[0]
++                        best_val = self.oracle.cost(final_seq + [best_t])
++                    final_seq.append(best_t)
++                    rem_set.remove(best_t)
++                    final_cost = self.oracle.cost(final_seq)
++                if final_cost < best_cost:
++                    best_cost, best_seq = final_cost, final_seq
++
++        if best_seq is None:
++            # Fallback random
++            best_seq = list(range(N))
++            random.shuffle(best_seq)
++            best_cost = self.oracle.cost(best_seq)
++        return best_cost, best_seq
++
++
++class LocalRefiner:
++    """Preference-guided local search: violation fixes, insertions, and swaps."""
++    def __init__(self, oracle: CostOracle, pref: PairPreferenceModel, time_budget_sec=0.25):
++        self.oracle = oracle
++        self.pref = pref
++        self.time_budget_sec = time_budget_sec
++
++    def refine(self, seq, start_cost, rng=None):
++        rng = rng or random
++        start_time = time.time()
++
++        def time_left():
++            return (time.time() - start_time) < self.time_budget_sec
++
++        best_seq = list(seq)
++        best_cost = start_cost
++
++        N = len(best_seq)
++
++        # Pass 1: Fix top violations by moving the later tx before the earlier one
++        if time_left():
++            violations = self.pref.violations_in_seq(best_seq)
++            # Try to fix up to a limited number for time
++            max_fixes = min(80, len(violations))
++            for w, j, i in violations[:max_fixes]:
++                if not time_left():
++                    break
++                # Move element at index i to before index j
++                cand = best_seq[:]
++                val = cand.pop(i)
++                cand.insert(j, val)
++                c = self.oracle.cost(cand)
++                if c < best_cost:
++                    best_seq, best_cost = cand, c
++                    # Update positions for future moves by recomputing violations lazily occasionally
++            # Optional second pass if still time
++            if time_left():
++                violations = self.pref.violations_in_seq(best_seq)
++                for w, j, i in violations[:max_fixes // 2]:
++                    if not time_left():
++                        break
++                    cand = best_seq[:]
++                    val = cand.pop(i)
++                    cand.insert(j, val)
++                    c = self.oracle.cost(cand)
++                    if c < best_cost:
++                        best_seq, best_cost = cand, c
++
++        # Pass 2: Adjacent swap hill-climbing
++        if time_left():
++            improved = True
++            while improved and time_left():
++                improved = False
++                for i in range(N - 1):
++                    if not time_left():
++                        break
++                    cand = best_seq[:]
++                    cand[i], cand[i + 1] = cand[i + 1], cand[i]
++                    c = self.oracle.cost(cand)
++                    if c < best_cost:
++                        best_seq, best_cost = cand, c
++                        improved = True
++
++        # Pass 3: Random insertion moves (ALNS style)
++        insertion_trials = 80
++        while insertion_trials > 0 and time_left():
++            insertion_trials -= 1
++            i, j = rng.sample(range(N), 2)
++            if i == j:
++                continue
++            cand = best_seq[:]
++            val = cand.pop(i)
++            cand.insert(j, val)
++            c = self.oracle.cost(cand)
++            if c < best_cost:
++                best_seq, best_cost = cand, c
++
++        # Pass 4: Sparse random long swaps
++        swap_trials = 80
++        while swap_trials > 0 and time_left():
++            swap_trials -= 1
++            i, j = rng.sample(range(N), 2)
++            if abs(i - j) <= 1:
++                continue
++            cand = best_seq[:]
++            cand[i], cand[j] = cand[j], cand[i]
++            c = self.oracle.cost(cand)
++            if c < best_cost:
++                best_seq, best_cost = cand, c
++
++        return best_cost, best_seq
++
++
++class SchedulerEngine:
++    """Orchestrates construction and refinement with shared caches and preferences."""
++    def __init__(self, workload, restarts, total_time_budget=0.7, rng=None):
++        self.workload = workload
++        self.N = workload.num_txns
++        self.restarts = max(1, int(restarts))
++        self.total_time_budget = total_time_budget
++        self.rng = rng or random
++
++    def run(self):
++        N = self.N
++        oracle = CostOracle(self.workload)
++
++        # Split time budget: preference build, construction, refinement
++        # Allocate based on N
++        pref_budget = min(0.18, 0.04 + 0.0015 * N)
++        construct_budget = max(0.25, self.total_time_budget - pref_budget - 0.2)
++        refine_budget = max(0.15, self.total_time_budget - pref_budget - construct_budget)
++
++        # Build pairwise preference model with sampling
++        pref = PairPreferenceModel(N)
++        # sample per txn adaptive
++        sample_k = min(16, max(8, N // 10))
++        pref.build(oracle, sample_per_txn=sample_k, rng=self.rng, time_allow=pref_budget)
++
++        # Construction with multiple restarts, shared oracle/prefs
++        constructor = BeamConstructor(oracle, pref, time_budget_sec=construct_budget)
++        cost, seq = constructor.construct(N, restarts=self.restarts, rng=self.rng)
++
++        # Refinement
++        refiner = LocalRefiner(oracle, pref, time_budget_sec=refine_budget)
++        cost, seq = refiner.refine(seq, cost, rng=self.rng)
++
++        return cost, seq
++
++
+ def get_best_schedule(workload, num_seqs):
+     """
+-    Find a near-optimal schedule using beam search with memoized partial costs
+-    and multiple random restarts.
++    Precedence-guided beam construction + ALNS refinement with shared memoized costs.
+ 
+     Args:
+         workload: Workload object containing transaction data
+-        num_seqs: Number of random restarts for the beam search
++        num_seqs: Number of restarts for constructor (used as an intensity parameter)
+ 
+     Returns:
+         Tuple of (lowest makespan, corresponding schedule)
+     """
+-
+-    def run_beam_search():
+-        N = workload.num_txns
+-        # Dynamically size the beam and branching according to problem size
+-        beam_width = min(max(4, N // 8), 32)
+-        branch_factor = min(max(6, N // 10), 24)
+-
+-        all_txns = list(range(N))
+-        # Memoize costs for partial prefixes to avoid recomputation
+-        cost_cache = {}
+-
+-        def eval_seq_cost(seq):
+-            key = tuple(seq)
+-            cached = cost_cache.get(key)
+-            if cached is not None:
+-                return cached
+-            c = workload.get_opt_seq_cost(seq)
+-            cost_cache[key] = c
+-            return c
+-
+-        # Initialize beam with the best singletons from a random pool
+-        init_pool_size = min(len(all_txns), beam_width * 2)
+-        init_candidates = random.sample(all_txns, init_pool_size) if init_pool_size > 0 else all_txns[:]
+-        beam = []
+-        for t in init_candidates:
+-            seq = [t]
+-            rem = set(all_txns)
+-            rem.remove(t)
+-            cost = eval_seq_cost(seq)
+-            beam.append((cost, seq, rem))
+-        beam.sort(key=lambda x: x[0])
+-        beam = beam[:max(1, min(beam_width, len(beam)))]
+-
+-        # Expand the beam until full sequences are built
+-        steps = N - 1
+-        for _ in range(steps):
+-            new_beam = []
+-            for cost, seq, rem in beam:
+-                if not rem:
+-                    # Already complete; keep as-is
+-                    new_beam.append((cost, seq, rem))
+-                    continue
+-
+-                rem_list = list(rem)
+-                # Limit branching to keep runtime reasonable
+-                if len(rem_list) <= branch_factor:
+-                    candidates = rem_list
+-                else:
+-                    candidates = random.sample(rem_list, branch_factor)
+-
+-                for cand in candidates:
+-                    new_seq = seq + [cand]
+-                    new_rem = rem.copy()
+-                    new_rem.remove(cand)
+-                    new_cost = eval_seq_cost(new_seq)
+-                    new_beam.append((new_cost, new_seq, new_rem))
+-
+-            if not new_beam:
+-                break
+-
+-            # Keep only the top beam_width unique prefixes by current cost
+-            new_beam.sort(key=lambda x: x[0])
+-            unique = []
+-            seen = set()
+-            for entry in new_beam:
+-                key = tuple(entry[1])
+-                if key in seen:
+-                    continue
+-                seen.add(key)
+-                unique.append(entry)
+-                if len(unique) >= beam_width:
+-                    break
+-            beam = unique
+-
+-        # Return the best full sequence from the beam
+-        best_entry = min(beam, key=lambda x: x[0])
+-        return best_entry[0], best_entry[1]
+-
+-    best_cost = float('inf')
+-    best_seq = None
+-
+-    # Multiple random restarts for robustness
+-    restarts = max(1, int(num_seqs))
+-    for _ in range(restarts):
+-        cost, seq = run_beam_search()
+-        if cost < best_cost:
+-            best_cost, best_seq = cost, seq
+-
+-    return best_cost, best_seq
++    # Per-workload total time budget; tuned to keep overall runtime modest
++    # while allowing better exploration than simple beam.
++    time_budget_sec = 0.75
++    engine = SchedulerEngine(workload, num_seqs, total_time_budget=time_budget_sec)
++    return engine.run()
+ 
+ 
+ def get_random_costs():
+     """
+     Evaluate scheduling algorithm on three different workloads.
+ 
+     Returns:
+         Tuple of (total_makespan, list_of_schedules, execution_time)
+     """
+     start_time = time.time()
+-    workload_size = 100
+ 
+     # Workload 1: Complex mixed read/write transactions
+     workload = Workload(WORKLOAD_1)
+     makespan1, schedule1 = get_best_schedule(workload, 10)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     # Workload 2: Simple read-then-write pattern
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, 10)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     # Workload 3: Minimal read/write operations
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, 10)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+ 
+     total_makespan = cost1 + cost2 + cost3
+     schedules = [schedule1, schedule2, schedule3]
+     execution_time = time.time() - start_time
+ 
+     return total_makespan, schedules, execution_time
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_scheduling():
+     """Run the transaction scheduling algorithm for all workloads"""
+     total_makespan, schedules, execution_time = get_random_costs()
+     return total_makespan, schedules, execution_time
+ 
+ 
+ if __name__ == "__main__":
+     total_makespan, schedules, execution_time = run_scheduling()
+     print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+     print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

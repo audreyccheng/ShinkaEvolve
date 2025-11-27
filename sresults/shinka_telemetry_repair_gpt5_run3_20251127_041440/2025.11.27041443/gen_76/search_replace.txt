@@ -1,0 +1,233 @@
+<NAME>
+stability_bundle_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose enriching the confidence calibration with two topology-aware terms and a guard penalty, without changing the core repair logic:
+
+1) Stability term (stab): penalize overconfidence on dominant interfaces at a router by considering each interface’s traffic share within the router per direction. This better reflects that dominant links can distort router balance and are riskier to adjust.
+
+2) Bundle-consistency term (bcons): within each unordered router pair (bundle), compare each link’s directional residual to the bundle’s median residual. Links aligned with bundle behavior get a boost; outliers are down-weighted. This captures dispersion across parallel links and improves calibration without altering counters.
+
+3) Clip-increase penalty: if a direction hit a clip during scaling and the router’s imbalance worsened from pre- to post-projection, apply a small additional confidence penalty, aligning action with reliability.
+
+These changes aim to improve confidence_calibration while preserving or slightly improving counter_repair_accuracy, yielding a higher combined score. The algorithm remains conservative and topology-aware. The edits are minimal and targeted: compute stab and bcons maps after repairs, blend them into final confidences with small weights, and add the clip-increase penalty.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 2) Final per-direction symmetry residuals AFTER all adjustments
+    post_mismatch_tx_dir: Dict[str, float] = {}
+    post_mismatch_rx_dir: Dict[str, float] = {}
+    for if_id in telemetry.keys():
+        peer = peers.get(if_id)
+        if peer:
+            post_mismatch_tx_dir[if_id] = rel_diff(hard_tx.get(if_id, 0.0), hard_rx.get(peer, 0.0))
+            post_mismatch_rx_dir[if_id] = rel_diff(hard_rx.get(if_id, 0.0), hard_tx.get(peer, 0.0))
+        else:
+            # No redundant signal available: use moderate default uncertainty
+            post_mismatch_tx_dir[if_id] = 0.4
+            post_mismatch_rx_dir[if_id] = 0.4
+=======
+    # 2) Final per-direction symmetry residuals AFTER all adjustments
+    post_mismatch_tx_dir: Dict[str, float] = {}
+    post_mismatch_rx_dir: Dict[str, float] = {}
+    for if_id in telemetry.keys():
+        peer = peers.get(if_id)
+        if peer:
+            post_mismatch_tx_dir[if_id] = rel_diff(hard_tx.get(if_id, 0.0), hard_rx.get(peer, 0.0))
+            post_mismatch_rx_dir[if_id] = rel_diff(hard_rx.get(if_id, 0.0), hard_tx.get(peer, 0.0))
+        else:
+            # No redundant signal available: use moderate default uncertainty
+            post_mismatch_tx_dir[if_id] = 0.4
+            post_mismatch_rx_dir[if_id] = 0.4
+
+    # Stability term per router and direction: stab_i = clamp01(1 - 0.5 * share_i)
+    stab_tx: Dict[str, float] = {}
+    stab_rx: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        sum_tx_r = sum(max(hard_tx.get(i, 0.0), 0.0) for i in ifs)
+        sum_rx_r = sum(max(hard_rx.get(i, 0.0), 0.0) for i in ifs)
+        for i in ifs:
+            vtx = max(hard_tx.get(i, 0.0), 0.0)
+            vrx = max(hard_rx.get(i, 0.0), 0.0)
+            share_tx = vtx / sum_tx_r if sum_tx_r > EPS else 0.0
+            share_rx = vrx / sum_rx_r if sum_rx_r > EPS else 0.0
+            stab_tx[i] = clamp01(1.0 - 0.5 * share_tx)
+            stab_rx[i] = clamp01(1.0 - 0.5 * share_rx)
+
+    # Bundle-consistency term: compare residuals to bundle median per unordered router pair
+    bcons_tx: Dict[str, float] = {}
+    bcons_rx: Dict[str, float] = {}
+    bundles_cons: Dict[Tuple[str, str], List[Tuple[str, str]]] = {}
+    seen_pairs_cons = set()
+    for a, data_a in telemetry.items():
+        b = peers.get(a)
+        if not b:
+            continue
+        key = tuple(sorted([a, b]))
+        if key in seen_pairs_cons:
+            continue
+        seen_pairs_cons.add(key)
+        ra = telemetry[a].get("local_router")
+        rb = telemetry[b].get("local_router")
+        if isinstance(ra, str) and isinstance(rb, str):
+            rp = tuple(sorted([ra, rb]))
+            bundles_cons.setdefault(rp, []).append((a, b))
+
+    for rp, pairs in bundles_cons.items():
+        if not pairs:
+            continue
+        # Build directional residual arrays
+        e_ab_list = []
+        e_ba_list = []
+        for (a, b) in pairs:
+            e_ab_list.append(hard_tx.get(a, 0.0) - hard_rx.get(b, 0.0))
+            e_ba_list.append(hard_tx.get(b, 0.0) - hard_rx.get(a, 0.0))
+        # Medians
+        def median(vals: List[float]) -> float:
+            s = sorted(vals)
+            n = len(s)
+            if n == 0:
+                return 0.0
+            if n % 2 == 1:
+                return s[n // 2]
+            return 0.5 * (s[n // 2 - 1] + s[n // 2])
+
+        med_ab = median(e_ab_list)
+        med_ba = median(e_ba_list)
+
+        # Assign per-interface consistency scores
+        for (a, b) in pairs:
+            # a->b direction (tx of a, rx of b)
+            tx_a = max(hard_tx.get(a, 0.0), 0.0)
+            rx_b = max(hard_rx.get(b, 0.0), 0.0)
+            rate_ab = max(tx_a, rx_b, 1.0)
+            e_ab = tx_a - rx_b
+            bcons_tx[a] = clamp01(1.0 - abs(e_ab - med_ab) / (abs(med_ab) + rate_ab))
+            bcons_rx[b] = clamp01(1.0 - abs(e_ab - med_ab) / (abs(med_ab) + rate_ab))
+            # b->a direction (tx of b, rx of a)
+            tx_b = max(hard_tx.get(b, 0.0), 0.0)
+            rx_a = max(hard_rx.get(a, 0.0), 0.0)
+            rate_ba = max(tx_b, rx_a, 1.0)
+            e_ba = tx_b - rx_a
+            bcons_tx[b] = clamp01(1.0 - abs(e_ba - med_ba) / (abs(med_ba) + rate_ba))
+            bcons_rx[a] = clamp01(1.0 - abs(e_ba - med_ba) / (abs(med_ba) + rate_ba))
+
+    # Default for interfaces not in bundles
+    for if_id in telemetry.keys():
+        if if_id not in bcons_tx:
+            bcons_tx[if_id] = 0.8
+        if if_id not in bcons_rx:
+            bcons_rx[if_id] = 0.8
+        if if_id not in stab_tx:
+            stab_tx[if_id] = 0.85
+        if if_id not in stab_rx:
+            stab_rx[if_id] = 0.85
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Blend confidence components with emphasis on final invariant satisfaction and scale penalty
+        scale_tx_term = clamp01(1.0 - min(0.5, abs(scaled_tx_factor.get(if_id, 1.0) - 1.0)))
+        scale_rx_term = clamp01(1.0 - min(0.5, abs(scaled_rx_factor.get(if_id, 1.0) - 1.0)))
+        conf_tx_final = clamp01(
+            0.20 * base_tx_conf +
+            0.18 * red_tx +
+            0.27 * fin_sym_tx +
+            0.10 * ch_tx +
+            0.10 * router_factor_after +
+            0.07 * scale_tx_term +
+            0.08 * imp_tx
+        )
+        conf_rx_final = clamp01(
+            0.20 * base_rx_conf +
+            0.18 * red_rx +
+            0.27 * fin_sym_rx +
+            0.10 * ch_rx +
+            0.10 * router_factor_after +
+            0.07 * scale_rx_term +
+            0.08 * imp_rx
+        )
+=======
+        # Blend confidence components with emphasis on final invariant satisfaction, scale penalty,
+        # plus stability and bundle-consistency terms.
+        scale_tx_term = clamp01(1.0 - min(0.5, abs(scaled_tx_factor.get(if_id, 1.0) - 1.0)))
+        scale_rx_term = clamp01(1.0 - min(0.5, abs(scaled_rx_factor.get(if_id, 1.0) - 1.0)))
+        stab_term_tx = clamp01(stab_tx.get(if_id, 0.85))
+        stab_term_rx = clamp01(stab_rx.get(if_id, 0.85))
+        bcons_term_tx = clamp01(bcons_tx.get(if_id, 0.8))
+        bcons_term_rx = clamp01(bcons_rx.get(if_id, 0.8))
+
+        conf_tx_final = clamp01(
+            0.18 * base_tx_conf +
+            0.16 * red_tx +
+            0.22 * fin_sym_tx +
+            0.10 * ch_tx +
+            0.10 * router_factor_after +
+            0.05 * scale_tx_term +
+            0.08 * imp_tx +
+            0.05 * stab_term_tx +
+            0.06 * bcons_term_tx
+        )
+        conf_rx_final = clamp01(
+            0.18 * base_rx_conf +
+            0.16 * red_rx +
+            0.22 * fin_sym_rx +
+            0.10 * ch_rx +
+            0.10 * router_factor_after +
+            0.05 * scale_rx_term +
+            0.08 * imp_rx +
+            0.05 * stab_term_rx +
+            0.06 * bcons_term_rx
+        )
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Confidence refinements: clip-hit penalty and untouched/strong-scale adjustments
+        if abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if clip_hit_tx.get(if_id, False):
+            conf_tx_final *= 0.95
+        if clip_hit_rx.get(if_id, False):
+            conf_rx_final *= 0.95
+        if strong_scaled_tx.get(if_id, False):
+            conf_tx_final *= 0.97
+        if strong_scaled_rx.get(if_id, False):
+            conf_rx_final *= 0.97
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - TAU_H):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - TAU_H):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+=======
+        # Confidence refinements: clip-hit penalty and untouched/strong-scale adjustments
+        if abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if clip_hit_tx.get(if_id, False):
+            conf_tx_final *= 0.95
+        if clip_hit_rx.get(if_id, False):
+            conf_rx_final *= 0.95
+        if strong_scaled_tx.get(if_id, False):
+            conf_tx_final *= 0.97
+        if strong_scaled_rx.get(if_id, False):
+            conf_rx_final *= 0.97
+        # Additional small penalty when a clip hit occurred and the router imbalance worsened
+        r_before = router_imbalance_before.get(router_of.get(if_id, ""), 0.0)
+        r_after = router_imbalance_after.get(router_of.get(if_id, ""), 0.0)
+        if clip_hit_tx.get(if_id, False) and r_after > r_before + 1e-12:
+            conf_tx_final *= 0.97
+        if clip_hit_rx.get(if_id, False) and r_after > r_before + 1e-12:
+            conf_rx_final *= 0.97
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - TAU_H):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - TAU_H):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+>>>>>>> REPLACE
+</DIFF>

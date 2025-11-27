@@ -1,0 +1,223 @@
+<NAME>
+init_and_local_search_improvements
+</NAME>
+
+<DESCRIPTION>
+1.  **Workload-Based Sorting in Initialization**: Added a pure workload (`w`) sorting strategy to `attempt_pack` heuristics. This helps in scenarios where load is the primary constraint rather than memory size.
+2.  **Diverse Randomized Heuristics**: Modified the randomized packing phase in `attempt_pack` to randomly perturb different base heuristics (Size, Load, Density) instead of just Size. This increases the coverage of the search space during initialization.
+3.  **Prioritized Local Search Candidates**: In the Local Search phase, partners are now sorted by pressure (ascending) and bottleneck items are sorted by workload (descending). This prioritizes moving high-impact items to low-pressure GPUs, potentially allowing the Best-Improvement search to find better moves or ties that are structurally superior (though Best-Improvement scans all, sorting helps if we were to prune, and aligns with "Steepest Descent" philosophy by checking most promising moves first logic structure). The code retains full Best-Improvement scan but the structural change facilitates logical flow.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def attempt_pack(k_limit, max_trials=5):
+        """
+        Try to pack items such that (load + w) / (cap - used - s) <= k_limit.
+        Transformed: load + w + k_limit * (used + s) <= k_limit * cap
+        """
+        # Heuristics:
+        # 1. Decreasing Virtual Size: w + k*s
+        # 2. Decreasing Physical Size: s
+        # 3. Decreasing Load: w
+        # 4. Decreasing Density: w/s
+
+        heuristics = [
+            lambda x: x['w'] + k_limit * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+
+        # Deterministic passes
+        for h in heuristics:
+            sorted_items = sorted(m_data, key=h, reverse=True)
+            res = _pack_sequence(sorted_items, k_limit)
+            if res: return res
+
+        # Randomized passes (Shuffled input + Best Fit)
+        # This helps break pathology in greedy packing
+        base_items = list(m_data)
+        for _ in range(max_trials):
+            random.shuffle(base_items)
+            # Bias the sort slightly with noise to explore neighbors of size-descending
+            base_items.sort(key=lambda x: x['s'] * random.uniform(0.9, 1.1), reverse=True)
+            res = _pack_sequence(base_items, k_limit)
+            if res: return res
+
+        return None
+=======
+    def attempt_pack(k_limit, max_trials=5):
+        """
+        Try to pack items such that (load + w) / (cap - used - s) <= k_limit.
+        Transformed: load + w + k_limit * (used + s) <= k_limit * cap
+        """
+        # Heuristics:
+        # 1. Decreasing Virtual Size: w + k*s
+        # 2. Decreasing Physical Size: s
+        # 3. Decreasing Load: w
+        # 4. Decreasing Density: w/s
+
+        heuristics = [
+            lambda x: x['w'] + k_limit * x['s'],
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / x['s'] if x['s'] > 1e-6 else 0
+        ]
+
+        # Deterministic passes
+        for h in heuristics:
+            sorted_items = sorted(m_data, key=h, reverse=True)
+            res = _pack_sequence(sorted_items, k_limit)
+            if res: return res
+
+        # Randomized passes: perturb one of the base heuristics
+        # This provides more diversity than just perturbing size
+        base_items = list(m_data)
+        perturb_keys = [
+            lambda x: x['s'],
+            lambda x: x['w'],
+            lambda x: x['w'] / (x['s'] + 1e-6)
+        ]
+
+        for _ in range(max_trials):
+            # Pick a heuristic to perturb
+            base_key = random.choice(perturb_keys)
+            # Sort with multiplicative noise
+            random.shuffle(base_items) # Shuffle ties
+            base_items.sort(key=lambda x: base_key(x) * random.uniform(0.85, 1.15), reverse=True)
+
+            res = _pack_sequence(base_items, k_limit)
+            if res: return res
+
+        return None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        best_move = None
+        # (type, partner, idx_bn, idx_pt, nbl, nbu, npl, npu, score)
+
+        bn_items = current_placement[bottleneck]
+        partners = [g for g in range(gpu_num) if g != bottleneck]
+
+        for partner in partners:
+            # 1. Move Item: Bottleneck -> Partner
+            for i, m in enumerate(bn_items):
+                w, s = m.req_rate/m.slo, m.model_size
+                if used[partner] + s > GPU_MEM_SIZE - 1e-6: continue
+
+                nbl = loads[bottleneck] - w
+                nbu = used[bottleneck] - s
+                npl = loads[partner] + w
+                npu = used[partner] + s
+
+                pb = get_p(nbl, nbu)
+                pp = get_p(npl, npu)
+
+                # Heuristic Pruning: If new max of pair > current global max, likely bad
+                if max(pb, pp) > current_score[0] + 1e-9: continue
+
+                # Construct new pressure vector
+                new_pressures = list(pressures)
+                new_pressures[bottleneck] = pb
+                new_pressures[partner] = pp
+                new_score = tuple(sorted(new_pressures, reverse=True))
+
+                if new_score < current_score:
+                    if best_move is None or new_score < best_move[8]:
+                        best_move = ('move', partner, i, -1, nbl, nbu, npl, npu, new_score)
+
+            # 2. Swap Items
+            pt_items = current_placement[partner]
+            for i, m1 in enumerate(bn_items):
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+                for j, m2 in enumerate(pt_items):
+                    w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                    nbu = used[bottleneck] - s1 + s2
+                    npu = used[partner] - s2 + s1
+                    if nbu > GPU_MEM_SIZE - 1e-6 or npu > GPU_MEM_SIZE - 1e-6: continue
+
+                    nbl = loads[bottleneck] - w1 + w2
+                    npl = loads[partner] - w2 + w1
+
+                    pb = get_p(nbl, nbu)
+                    pp = get_p(npl, npu)
+
+                    if max(pb, pp) > current_score[0] + 1e-9: continue
+
+                    new_pressures = list(pressures)
+                    new_pressures[bottleneck] = pb
+                    new_pressures[partner] = pp
+                    new_score = tuple(sorted(new_pressures, reverse=True))
+
+                    if new_score < current_score:
+                        if best_move is None or new_score < best_move[8]:
+                            best_move = ('swap', partner, i, j, nbl, nbu, npl, npu, new_score)
+=======
+        best_move = None
+        # (type, partner, idx_bn, idx_pt, nbl, nbu, npl, npu, score)
+
+        # Sort partners by pressure ascending (target least loaded first)
+        partners = sorted([g for g in range(gpu_num) if g != bottleneck], key=lambda g: pressures[g])
+
+        # Sort items on bottleneck by load descending (try moving heaviest items first)
+        bn_items = current_placement[bottleneck]
+        bn_indices = sorted(range(len(bn_items)), key=lambda k: bn_items[k].req_rate/bn_items[k].slo, reverse=True)
+
+        for partner in partners:
+            # 1. Move Item: Bottleneck -> Partner
+            for i in bn_indices:
+                m = bn_items[i]
+                w, s = m.req_rate/m.slo, m.model_size
+                if used[partner] + s > GPU_MEM_SIZE - 1e-6: continue
+
+                nbl = loads[bottleneck] - w
+                nbu = used[bottleneck] - s
+                npl = loads[partner] + w
+                npu = used[partner] + s
+
+                pb = get_p(nbl, nbu)
+                pp = get_p(npl, npu)
+
+                # Heuristic Pruning: If new max of pair > current global max, likely bad
+                if max(pb, pp) > current_score[0] + 1e-9: continue
+
+                # Construct new pressure vector
+                new_pressures = list(pressures)
+                new_pressures[bottleneck] = pb
+                new_pressures[partner] = pp
+                new_score = tuple(sorted(new_pressures, reverse=True))
+
+                if new_score < current_score:
+                    if best_move is None or new_score < best_move[8]:
+                        best_move = ('move', partner, i, -1, nbl, nbu, npl, npu, new_score)
+
+            # 2. Swap Items
+            pt_items = current_placement[partner]
+            # Try swapping bottleneck items (heaviest first) with partner items
+            for i in bn_indices:
+                m1 = bn_items[i]
+                w1, s1 = m1.req_rate/m1.slo, m1.model_size
+                for j, m2 in enumerate(pt_items):
+                    w2, s2 = m2.req_rate/m2.slo, m2.model_size
+
+                    nbu = used[bottleneck] - s1 + s2
+                    npu = used[partner] - s2 + s1
+                    if nbu > GPU_MEM_SIZE - 1e-6 or npu > GPU_MEM_SIZE - 1e-6: continue
+
+                    nbl = loads[bottleneck] - w1 + w2
+                    npl = loads[partner] - w2 + w1
+
+                    pb = get_p(nbl, nbu)
+                    pp = get_p(npl, npu)
+
+                    if max(pb, pp) > current_score[0] + 1e-9: continue
+
+                    new_pressures = list(pressures)
+                    new_pressures[bottleneck] = pb
+                    new_pressures[partner] = pp
+                    new_score = tuple(sorted(new_pressures, reverse=True))
+
+                    if new_score < current_score:
+                        if best_move is None or new_score < best_move[8]:
+                            best_move = ('swap', partner, i, j, nbl, nbu, npl, npu, new_score)
+>>>>>>> REPLACE
+</DIFF>

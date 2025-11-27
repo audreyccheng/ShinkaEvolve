@@ -1,0 +1,486 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs
+
+This module computes a placement of models across a fixed number of GPUs to minimize
+the maximum KV cache pressure (KVPR) while satisfying per-GPU memory limits.
+
+KVPR on a GPU g is:
+    KVPR_g = sum_j (req_rate_j / slo_j) / (GPU_MEM_SIZE - sum_j model_size_j)
+and the objective is to minimize max_g KVPR_g.
+"""
+
+GPU_MEM_SIZE = 80  # GB
+
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Args:
+        gpu_num: Number of GPUs (int)
+        models: List of models, each with attributes: model_size, req_rate, slo
+
+    Returns:
+        dict: {gpu_id: [models placed on this GPU]}
+    """
+    if gpu_num <= 0:
+        raise ValueError("gpu_num must be positive")
+
+    class KVPRPlacer:
+        def __init__(self, gpu_num, models):
+            self.G = gpu_num
+            self.models = models
+            self.items = []  # tuples: (idx, model_obj, size, demand, intrinsic_pressure)
+            self.total_mem = 0.0
+            self.total_dem = 0.0
+
+        # ----- Utilities -----
+        @staticmethod
+        def safe_div(num, den):
+            if den <= 0:
+                return float('inf') if num > 0 else 0.0
+            return num / den
+
+        def kvpr_gpu(self, numer, rem_mem):
+            return self.safe_div(numer, rem_mem)
+
+        def preprocess(self):
+            self.items.clear()
+            self.total_mem = 0.0
+            self.total_dem = 0.0
+            for idx, m in enumerate(self.models):
+                ms = float(getattr(m, "model_size"))
+                slo = float(getattr(m, "slo"))
+                rr = float(getattr(m, "req_rate"))
+                if ms < 0:
+                    raise ValueError("Model size must be non-negative")
+                if ms > GPU_MEM_SIZE + 1e-9:
+                    raise ValueError(f"Model of size {ms} GB cannot fit into a single GPU of size {GPU_MEM_SIZE} GB")
+                if slo <= 0:
+                    raise ValueError("Model SLO must be positive")
+                n = rr / slo
+                ip = self.safe_div(n, max(GPU_MEM_SIZE - ms, 1e-9))
+                self.items.append((idx, m, ms, n, ip))
+                self.total_mem += ms
+                self.total_dem += n
+
+            if not self.items:
+                return
+
+            total_capacity = self.G * GPU_MEM_SIZE
+            if self.total_mem - total_capacity > 1e-9:
+                raise ValueError("Total model memory exceeds total GPU memory")
+
+        # ----- Lower bounds on T -----
+        def lower_bound_T(self):
+            if not self.items:
+                return 0.0
+            total_capacity = self.G * GPU_MEM_SIZE
+
+            # Per-item bound
+            indiv_lb = max(self.safe_div(n, GPU_MEM_SIZE - ms) for _, _, ms, n, _ in self.items)
+
+            # Global bound with epsilon to avoid inf when exactly tight
+            global_lb = self.safe_div(self.total_dem, max(total_capacity - self.total_mem, 1e-9))
+
+            # Pair bound: consider top P by size to keep O(P^2) small
+            P = min(len(self.items), 200)
+            heavy = sorted(self.items, key=lambda it: it[2], reverse=True)[:P]
+            pair_lb = 0.0
+            for i in range(len(heavy)):
+                _, _, mi, ni, _ = heavy[i]
+                for j in range(i + 1, len(heavy)):
+                    _, _, mj, nj, _ = heavy[j]
+                    if mi + mj > GPU_MEM_SIZE + 1e-12:  # cannot co-reside
+                        denom = 2 * GPU_MEM_SIZE - (mi + mj)
+                        pair_lb = max(pair_lb, self.safe_div(ni + nj, max(denom, 1e-9)))
+
+            # k-bin prefix bounds for k = 1..min(G,4)
+            kprefix_lb = 0.0
+            items_by_m = sorted(self.items, key=lambda it: it[2], reverse=True)
+            for k in range(1, min(self.G, 4) + 1):
+                sum_m = 0.0
+                sum_n = 0.0
+                # Find shortest prefix S where sum_m > (k-1)*80
+                for it in items_by_m:
+                    sum_m += it[2]
+                    sum_n += it[3]
+                    if sum_m > (k - 1) * GPU_MEM_SIZE + 1e-12:
+                        break
+                denom = k * GPU_MEM_SIZE - sum_m
+                kprefix_lb = max(kprefix_lb, self.safe_div(sum_n, max(denom, 1e-9)))
+
+            return max(0.0, indiv_lb, global_lb, pair_lb, kprefix_lb)
+
+        # ----- Feasibility and packing at a given T -----
+        def pack_at_T(self, T, order_mode="w", fit_policy="best", seed=0, H_seed=0):
+            """
+            Pack using transformed capacity (cap = T*80; weight w = n + T*m)
+            - order_mode: "w" (by transformed weight), "intr" (by intrinsic pressure)
+            - fit_policy: "best" (best-fit), "first" (first-fit)
+            - seed: RNG seed for small randomized tie-breaking (deterministic)
+            - H_seed: number of models to pre-seed via worst-fit spread
+            """
+            if not self.items:
+                return True, {g: [] for g in range(self.G)}
+
+            import random
+            rng = random.Random(seed)
+
+            cap = GPU_MEM_SIZE * T
+            # Prepare ordering keys
+            if order_mode == "w":
+                key_fn = lambda it: (it[3] + T * it[2], it[3], it[2])  # w(T), n, m
+            else:  # "intr"
+                key_fn = lambda it: (it[4], it[2])  # intrinsic pressure, then memory
+
+            ordered = sorted(self.items, key=key_fn, reverse=True)
+
+            # Two-phase hybrid: seed H items with worst-fit spread using intrinsic pressure
+            H = max(0, min(H_seed, len(ordered)))
+            seed_items = sorted(ordered, key=lambda it: it[4], reverse=True)[:H]
+            remaining = [it for it in ordered if it not in seed_items]
+
+            mem_sum = [0.0] * self.G
+            dem_sum = [0.0] * self.G
+            used_cap = [0.0] * self.G
+            placement = [[] for _ in range(self.G)]
+            eps = 1e-12
+
+            # Worst-fit placement for seeds
+            for _, mdl, ms, n, _ in seed_items:
+                w = n + T * ms
+                # Find GPUs that can fit by mem and transformed capacity
+                candidates = []
+                for g in range(self.G):
+                    if mem_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    residual = cap - (used_cap[g] + w)
+                    if residual >= -eps:
+                        candidates.append((g, residual))
+                if not candidates:
+                    return False, None
+                # Worst-fit: choose largest residual; randomize minor ties
+                candidates.sort(key=lambda x: (-x[1], x[0]))
+                top_res = candidates[0][1]
+                near = [c for c in candidates if abs(c[1] - top_res) <= 1e-9]
+                g = rng.choice(near)[0] if len(near) > 1 else candidates[0][0]
+
+                placement[g].append(mdl)
+                mem_sum[g] += ms
+                dem_sum[g] += n
+                used_cap[g] += w
+
+            # Place remaining items by fit_policy
+            for _, mdl, ms, n, _ in remaining:
+                w = n + T * ms
+
+                best_g = None
+                best_metric = None
+                candidates = []
+                for g in range(self.G):
+                    if mem_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    residual = cap - (used_cap[g] + w)
+                    if residual >= -eps:
+                        candidates.append((g, residual))
+
+                if not candidates:
+                    return False, None
+
+                if fit_policy == "first":
+                    # Slight randomization among top-2 smallest GPU ids that fit
+                    candidates.sort(key=lambda x: x[0])
+                    pool = candidates[:2] if len(candidates) > 1 else candidates
+                    g = rng.choice(pool)[0] if len(pool) > 1 else pool[0][0]
+                else:  # "best" fit: minimize residual; break ties with small randomness
+                    candidates.sort(key=lambda x: (x[1], x[0]))
+                    best_res = candidates[0][1]
+                    near = [c for c in candidates if abs(c[1] - best_res) <= 1e-9]
+                    g = rng.choice(near)[0] if len(near) > 1 else candidates[0][0]
+
+                placement[g].append(mdl)
+                mem_sum[g] += ms
+                dem_sum[g] += n
+                used_cap[g] += w
+
+            return True, {g: placement[g] for g in range(self.G)}
+
+        # ----- Feasibility check across variants -----
+        def feasible_T(self, T):
+            # Simple variants to test feasibility quickly
+            ok, _ = self.pack_at_T(T, order_mode="w", fit_policy="best", seed=17, H_seed=min(max(1, self.G), max(1, len(self.items)//10)))
+            if ok:
+                return True
+            ok, _ = self.pack_at_T(T, order_mode="intr", fit_policy="best", seed=23, H_seed=min(max(1, self.G), max(1, len(self.items)//10)))
+            if ok:
+                return True
+            # Cheap fallback
+            ok, _ = self.pack_at_T(T, order_mode="w", fit_policy="first", seed=31, H_seed=0)
+            return ok
+
+        # ----- Search for minimal feasible T -----
+        def search_T(self, low_T):
+            # Exponential search for high_T
+            T = max(low_T, 1e-9)
+            for _ in range(50):
+                if self.feasible_T(T):
+                    break
+                T *= 2.0
+            else:
+                raise ValueError("Unable to find a feasible packing for any KVPR threshold")
+
+            high = T
+            low = low_T
+            # Binary search
+            for _ in range(40):
+                mid = (low + high) / 2.0
+                if self.feasible_T(mid):
+                    high = mid
+                else:
+                    low = mid
+            return high
+
+        # ----- Measure actual max KVPR of a placement -----
+        def measured_max_kvpr(self, plc):
+            vals = []
+            for g in range(self.G):
+                used_mem = sum(getattr(m, "model_size") for m in plc.get(g, []))
+                numer = sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in plc.get(g, []))
+                vals.append(self.kvpr_gpu(numer, GPU_MEM_SIZE - used_mem))
+            return max(vals) if vals else 0.0
+
+        # ----- Candidate generation around T -----
+        def generate_candidates(self, T):
+            # Build a small set of candidates across slightly perturbed Ts and orderings
+            T_list = [T, T * 0.995, T * 1.005]
+            variants = []
+            Hbase = min(max(1, self.G), max(1, len(self.items) // 10))
+            for Tv in T_list:
+                variants.append(("w", "best", 13, Hbase))
+                variants.append(("intr", "best", 29, Hbase))
+            # Add two extras with different policies/seeds
+            variants.append(("w", "first", 37, 0))
+            variants.append(("intr", "first", 41, 0))
+
+            candidates = []
+            for i, Tv in enumerate(T_list + [T, T]):
+                if len(candidates) >= 8:  # cap total candidates
+                    break
+                om, pol, sd, Hs = variants[i]
+                ok, plc = self.pack_at_T(Tv, order_mode=om, fit_policy=pol, seed=sd, H_seed=Hs)
+                if ok:
+                    candidates.append(plc)
+            # If none feasible (unlikely), try a simple variant at T
+            if not candidates:
+                ok, plc = self.pack_at_T(T, order_mode="w", fit_policy="best", seed=1, H_seed=Hbase)
+                if ok:
+                    candidates.append(plc)
+            return candidates
+
+        # ----- Local search: small move/swap from most loaded GPU -----
+        def local_search(self, plc, move_budget=20, swap_budget=10):
+            per_g = {g: list(plc.get(g, [])) for g in range(self.G)}
+            mem = [sum(getattr(m, "model_size") for m in per_g[g]) for g in range(self.G)]
+            num = [sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in per_g[g]) for g in range(self.G)]
+
+            def kvpr_g(g, msum=None, nsum=None):
+                msum = mem[g] if msum is None else msum
+                nsum = num[g] if nsum is None else nsum
+                return self.kvpr_gpu(nsum, GPU_MEM_SIZE - msum)
+
+            def global_vals():
+                vals = [kvpr_g(g) for g in range(self.G)]
+                return max(vals), vals
+
+            cur_max, vals = global_vals()
+            eps = 1e-12
+
+            # Moves
+            moves_done = 0
+            improved_any = True
+            while improved_any and moves_done < move_budget:
+                improved_any = False
+                cur_max, vals = global_vals()
+                worst = max(range(self.G), key=lambda g: vals[g])
+
+                best_new_max = cur_max
+                best_move = None
+
+                for mdl in list(per_g[worst]):
+                    ms = float(getattr(mdl, "model_size"))
+                    dn = float(getattr(mdl, "req_rate")) / float(getattr(mdl, "slo"))
+                    for tgt in range(self.G):
+                        if tgt == worst:
+                            continue
+                        if mem[tgt] + ms > GPU_MEM_SIZE + 1e-12:
+                            continue
+                        src_mem = mem[worst] - ms
+                        src_num = num[worst] - dn
+                        tgt_mem = mem[tgt] + ms
+                        tgt_num = num[tgt] + dn
+
+                        src_k = self.kvpr_gpu(src_num, GPU_MEM_SIZE - src_mem)
+                        tgt_k = self.kvpr_gpu(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                        new_max = max(src_k, tgt_k)
+                        for g in range(self.G):
+                            if g != worst and g != tgt:
+                                if vals[g] > new_max:
+                                    new_max = vals[g]
+
+                        if new_max + eps < best_new_max:
+                            best_new_max = new_max
+                            best_move = (mdl, worst, tgt, ms, dn)
+
+                if best_move is not None:
+                    mdl, src, tgt, ms, dn = best_move
+                    per_g[src].remove(mdl)
+                    per_g[tgt].append(mdl)
+                    mem[src] -= ms
+                    num[src] -= dn
+                    mem[tgt] += ms
+                    num[tgt] += dn
+                    moves_done += 1
+                    improved_any = True
+
+            # Swaps
+            swaps_done = 0
+            improved_swap = True
+            while improved_swap and swaps_done < swap_budget:
+                improved_swap = False
+                cur_max, vals = global_vals()
+                worst = max(range(self.G), key=lambda g: vals[g])
+
+                found = False
+                # Try first improving swap
+                for mdl_a in list(per_g[worst]):
+                    ms_a = float(getattr(mdl_a, "model_size"))
+                    dn_a = float(getattr(mdl_a, "req_rate")) / float(getattr(mdl_a, "slo"))
+                    for tgt in range(self.G):
+                        if tgt == worst:
+                            continue
+                        for mdl_b in list(per_g[tgt]):
+                            ms_b = float(getattr(mdl_b, "model_size"))
+                            dn_b = float(getattr(mdl_b, "req_rate")) / float(getattr(mdl_b, "slo"))
+
+                            if mem[worst] - ms_a + ms_b > GPU_MEM_SIZE + 1e-12:
+                                continue
+                            if mem[tgt] - ms_b + ms_a > GPU_MEM_SIZE + 1e-12:
+                                continue
+
+                            src_mem = mem[worst] - ms_a + ms_b
+                            src_num = num[worst] - dn_a + dn_b
+                            tgt_mem = mem[tgt] - ms_b + ms_a
+                            tgt_num = num[tgt] - dn_b + dn_a
+
+                            src_k = self.kvpr_gpu(src_num, GPU_MEM_SIZE - src_mem)
+                            tgt_k = self.kvpr_gpu(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                            new_max = max(src_k, tgt_k)
+                            for g in range(self.G):
+                                if g != worst and g != tgt:
+                                    if vals[g] > new_max:
+                                        new_max = vals[g]
+
+                            if new_max + eps < cur_max:
+                                # Apply swap
+                                per_g[worst].remove(mdl_a)
+                                per_g[tgt].remove(mdl_b)
+                                per_g[worst].append(mdl_b)
+                                per_g[tgt].append(mdl_a)
+                                mem[worst] = src_mem
+                                num[worst] = src_num
+                                mem[tgt] = tgt_mem
+                                num[tgt] = tgt_num
+                                swaps_done += 1
+                                improved_swap = True
+                                found = True
+                                break
+                        if found:
+                            break
+                    if found:
+                        break
+
+            return {g: per_g.get(g, []) for g in range(self.G)}
+
+    # ----- Run the redesigned pipeline -----
+    solver = KVPRPlacer(gpu_num, models)
+    solver.preprocess()
+
+    # Empty input shortcut
+    if not solver.items:
+        return {g: [] for g in range(gpu_num)}
+
+    low_T = solver.lower_bound_T()
+    T_star = solver.search_T(low_T)
+    candidates = solver.generate_candidates(T_star)
+
+    # Select best candidate by measured max KVPR
+    best_plc = None
+    best_score = float('inf')
+    for plc in candidates:
+        score = solver.measured_max_kvpr(plc)
+        if score < best_score:
+            best_score = score
+            best_plc = plc
+
+    # Short local search to improve max KVPR
+    best_plc = solver.local_search(best_plc, move_budget=20, swap_budget=10)
+
+    # Ensure all GPUs exist in the mapping
+    for g in range(gpu_num):
+        best_plc.setdefault(g, [])
+
+    return best_plc
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+    
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+    
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+    
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+    
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

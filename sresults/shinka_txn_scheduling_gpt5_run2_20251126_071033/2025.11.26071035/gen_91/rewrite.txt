@@ -1,0 +1,845 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+from collections import OrderedDict, defaultdict
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+class LRUCache:
+    def __init__(self, capacity=60000):
+        self.capacity = capacity
+        self.store = OrderedDict()
+
+    def get(self, k):
+        if k in self.store:
+            self.store.move_to_end(k)
+            return self.store[k]
+        return None
+
+    def set(self, k, v):
+        self.store[k] = v
+        self.store.move_to_end(k)
+        if len(self.store) > self.capacity:
+            self.store.popitem(last=False)
+
+    def __contains__(self, k):
+        return k in self.store
+
+
+class PairwiseOracle:
+    """
+    Lazily learns pairwise orientation advantage adv(i,j) = cost([i,j]) - cost([j,i]).
+    Negative adv means i before j is better, positive means j before i is better.
+    """
+    def __init__(self, seq_cost_func, n, cache_cap=100000):
+        self.seq_cost = seq_cost_func
+        self.adv_cache = LRUCache(capacity=cache_cap)  # key: (i,j) -> adv(i,j)
+
+    def adv(self, i, j):
+        if i == j:
+            return 0.0
+        key = (i, j)
+        v = self.adv_cache.get(key)
+        if v is not None:
+            return v
+        # compute by evaluating 2-length sequences (cheap and cached globally)
+        cij = self.seq_cost([i, j])
+        cji = self.seq_cost([j, i])
+        a = float(cij - cji)
+        self.adv_cache.set((i, j), a)
+        self.adv_cache.set((j, i), -a)
+        return a
+
+
+class SchedulerSolver:
+    def __init__(self, workload, num_seqs):
+        self.workload = workload
+        self.n = workload.num_txns
+        self.all_txns = list(range(self.n))
+        # Global caches
+        self.cost_cache = LRUCache(capacity=80000)
+        # best-two cache: (seq_tuple, ('T',t) or ('B',block_tuple), pos_sig) -> (best_c, best_p, second_c)
+        self.best_two_cache = LRUCache(capacity=80000)
+        # Parameters (adaptive by num_seqs)
+        self.num_seqs = num_seqs
+
+        # Construction params
+        self.elite_size = max(3, min(8, 2 + num_seqs // 2))
+        self.seed_elite_singletons = max(2, min(8, int(num_seqs)))
+        self.seed_random_additional = max(1, min(4, (num_seqs + 1) // 3))
+        self.k_txn_sample = min(16, max(8, 2 + int(1.4 * num_seqs)))
+        self.k_pos_sample = min(12, max(6, 2 + int(1.2 * num_seqs)))
+        self.build_beam_width = max(3, min(8, 2 + num_seqs // 2))
+        self.rem_all_threshold = 14
+        self.endgame_all_pos_threshold = max(6, min(12, num_seqs))
+        self.high_regret_quota_ratio = 0.3
+        self.diversity_suffix_k = 2
+
+        # Surrogate window for pairwise aggregation
+        self.surr_window = 6
+        self.surr_positions_cap = 6  # evaluate top-M by surrogate
+
+        # Local search params
+        self.reinsertion_pos_factor = 1.0
+        self.two_opt_trials = min(220, max(60, self.n))  # segment reversals
+        self.ls_adj_rounds_max = 2
+
+        # ILS params
+        self.ils_rounds = max(2, min(5, 1 + num_seqs // 4))
+        self.perturb_swap_count = max(2, min(6, 2 + num_seqs // 3))
+        self.perturb_block_len = max(3, min(10, 3 + num_seqs // 2))
+
+        # LNS params
+        self.lns_iters = max(2, min(6, 2 + num_seqs // 3))
+        self.destroy_frac_range = (0.08, 0.20)
+
+        # Endgame DFS params
+        self.endgame_enum_K = max(6, min(9, self.endgame_all_pos_threshold + 3))
+        self.endgame_node_cap = 3000
+
+        # Pairwise oracle
+        self.pw = PairwiseOracle(self.seq_cost, self.n, cache_cap=120000)
+
+    # ---------------- Core evaluation ----------------
+    def seq_cost(self, seq):
+        key = tuple(seq)
+        v = self.cost_cache.get(key)
+        if v is not None:
+            return v
+        c = self.workload.get_opt_seq_cost(seq)
+        self.cost_cache.set(key, c)
+        return c
+
+    # ---------------- Position sampling and signatures ----------------
+    def _pos_sig(self, L, pos_list, tag='ALL'):
+        # deterministic signature representing probed positions
+        s = tuple(sorted(set(pos_list)))
+        if len(s) <= 14:
+            return (tag, L, s)
+        return (tag, L, s[:7] + s[-7:])
+
+    def anchor_positions(self, L):
+        return sorted({0, L, L // 2, L // 4, (3 * L) // 4})
+
+    # ---------------- Surrogate scoring (pairwise-conflict aware) ----------------
+    def surrogate_penalty_insert(self, base_seq, t, pos, window=None):
+        """Sum positive pairwise advantages (misoriented conflicts) near pos."""
+        if window is None:
+            window = self.surr_window
+        L = len(base_seq)
+        # Left neighbors: j before t. Penalty += max(0, adv(j,t)) weighted by distance
+        pen = 0.0
+        # weights decay with distance
+        for d, idx in enumerate(range(max(0, pos - window), pos), start=1):
+            j = base_seq[idx]
+            a = self.pw.adv(j, t)  # >0 means t before j preferred; but we do j->t, so positive a is bad
+            if a > 0:
+                pen += a / (1.0 + d)
+        # Right neighbors: t before j. Penalty += max(0, adv(t,j))
+        for d, idx in enumerate(range(pos, min(L, pos + window)), start=1):
+            j = base_seq[idx]
+            a = self.pw.adv(t, j)  # >0 means j before t preferred; but we use t->j, so positive a is bad
+            if a > 0:
+                pen += a / (1.0 + d)
+        return pen
+
+    def top_positions_by_surrogate(self, base_seq, t, M=None, focus_idx=None):
+        """Rank all positions by surrogate penalty; return top-M positions (unique, sorted)."""
+        L = len(base_seq)
+        if L <= 12:
+            return list(range(L + 1))
+        if M is None:
+            M = self.surr_positions_cap
+        # Surrogate over all positions; bias towards focus index
+        scores = []
+        for p in range(L + 1):
+            pen = self.surrogate_penalty_insert(base_seq, t, p)
+            if focus_idx is not None:
+                pen += 0.001 * abs(p - min(max(0, focus_idx), L))
+            scores.append((pen, p))
+        scores.sort(key=lambda x: (x[0], x[1]))
+        chosen = [p for _, p in scores[:min(M, L + 1)]]
+        chosen = sorted(set(chosen))
+        return chosen
+
+    def top_positions_by_surrogate_block(self, base_seq, block, M=None, focus_idx=None):
+        """Approximate block penalty using head/tail interactions."""
+        L = len(base_seq)
+        if L <= 12:
+            return list(range(L + 1))
+        if M is None:
+            M = self.surr_positions_cap
+        head = block[0]
+        tail = block[-1]
+        scores = []
+        for p in range(L + 1):
+            # Left neighbors: j before head
+            pen = 0.0
+            for d, idx in enumerate(range(max(0, p - self.surr_window), p), start=1):
+                j = base_seq[idx]
+                a = self.pw.adv(j, head)
+                if a > 0:
+                    pen += a / (1.0 + d)
+            # Right neighbors: tail before j
+            for d, idx in enumerate(range(p, min(L, p + self.surr_window)), start=1):
+                j = base_seq[idx]
+                a = self.pw.adv(tail, j)
+                if a > 0:
+                    pen += a / (1.0 + d)
+            if focus_idx is not None:
+                pen += 0.001 * abs(p - min(max(0, focus_idx), L))
+            scores.append((pen, p))
+        scores.sort(key=lambda x: (x[0], x[1]))
+        chosen = [p for _, p in scores[:min(M, L + 1)]]
+        chosen = sorted(set(chosen))
+        return chosen
+
+    # ---------------- Best-two with surrogate-pruned exact evaluation ----------------
+    def best_two_insertion_surrogate(self, base_seq, t, use_all=False, focus_idx=None, limit_M=None):
+        L = len(base_seq)
+        if use_all or L <= 12:
+            pos_list = list(range(L + 1))
+            sig = self._pos_sig(L, pos_list, tag='ALL')
+        else:
+            M = limit_M if limit_M is not None else self.surr_positions_cap
+            pos_list = self.top_positions_by_surrogate(base_seq, t, M=M, focus_idx=focus_idx)
+            # Always include anchors to stabilize
+            pos_list = sorted(set(pos_list + self.anchor_positions(L)))
+            sig = self._pos_sig(L, pos_list, tag='S_TOP')
+        key = (tuple(base_seq), ('T', t), sig)
+        cached = self.best_two_cache.get(key)
+        if cached is not None:
+            return cached
+        best_c = float('inf')
+        best_p = None
+        second_c = float('inf')
+        for p in pos_list:
+            cand = base_seq[:p] + [t] + base_seq[p:]
+            c = self.seq_cost(cand)
+            if c < best_c:
+                second_c = best_c
+                best_c = c
+                best_p = p
+            elif c < second_c:
+                second_c = c
+        res = (best_c, best_p, second_c)
+        self.best_two_cache.set(key, res)
+        return res
+
+    def best_two_block_surrogate(self, base_seq, block, use_all=False, focus_idx=None, limit_M=None):
+        L = len(base_seq)
+        if use_all or L <= 12:
+            pos_list = list(range(L + 1))
+            sig = self._pos_sig(L, pos_list, tag='ALLB')
+        else:
+            M = limit_M if limit_M is not None else self.surr_positions_cap
+            pos_list = self.top_positions_by_surrogate_block(base_seq, block, M=M, focus_idx=focus_idx)
+            pos_list = sorted(set(pos_list + self.anchor_positions(L)))
+            sig = self._pos_sig(L, pos_list, tag='S_TOPB')
+        key = (tuple(base_seq), ('B', tuple(block)), sig)
+        cached = self.best_two_cache.get(key)
+        if cached is not None:
+            return cached
+        best_c = float('inf')
+        best_p = None
+        second_c = float('inf')
+        for p in pos_list:
+            cand = base_seq[:p] + list(block) + base_seq[p:]
+            c = self.seq_cost(cand)
+            if c < best_c:
+                second_c = best_c
+                best_c = c
+                best_p = p
+            elif c < second_c:
+                second_c = c
+        res = (best_c, best_p, second_c)
+        self.best_two_cache.set(key, res)
+        return res
+
+    # ---------------- Endgame enumeration (branch-and-bound) ----------------
+    def endgame_optimal_completion(self, prefix_seq, rem_set):
+        """Exact completion for small remaining set using DFS BnB with a small TT and node cap."""
+        if not rem_set:
+            return self.seq_cost(prefix_seq), prefix_seq[:]
+        best_c = float('inf')
+        best_s = None
+        nodes = 0
+        TT = {}
+
+        def suffix_key(seq, k=3):
+            m = min(k, len(seq))
+            return tuple(seq[-m:]) if m > 0 else ()
+
+        def dfs(seq, rem):
+            nonlocal best_c, best_s, nodes
+            if nodes >= self.endgame_node_cap:
+                return
+            nodes += 1
+            c_prefix = self.seq_cost(seq)
+            if c_prefix >= best_c:
+                return
+            key = (frozenset(rem), suffix_key(seq, 3))
+            prev = TT.get(key)
+            if prev is not None and prev <= c_prefix:
+                return
+            TT[key] = c_prefix
+            if not rem:
+                best_c = c_prefix
+                best_s = seq[:]
+                return
+            # Order expansions by higher regret then lower best cost
+            order = []
+            for t in rem:
+                b, p, s2 = self.best_two_insertion_surrogate(seq, t, use_all=True)
+                regret = (s2 - b) if s2 < float('inf') else 0.0
+                order.append((-regret, b, t, p))
+            order.sort()
+            for _, bcost, t, p in order:
+                if bcost >= best_c:
+                    continue
+                new_seq = seq[:p] + [t] + seq[p:]
+                new_rem = rem.copy()
+                new_rem.remove(t)
+                dfs(new_seq, new_rem)
+
+        dfs(prefix_seq[:], set(rem_set))
+        if best_s is None:
+            seq_complete = prefix_seq[:] + sorted(list(rem_set))
+            best_c = self.seq_cost(seq_complete)
+            best_s = seq_complete
+        return best_c, best_s
+
+    # ---------------- Conflict-informed initial ranking ----------------
+    def conflict_borda_seed(self, sample_k=10):
+        """Return a full sequence ranked by sampled pairwise wins (approx. Kemeny/Borda)."""
+        n = self.n
+        scores = [0.0] * n
+        # For each txn, sample a few opponents to estimate orientation score
+        for i in range(n):
+            opps = random.sample(self.all_txns, min(sample_k, n))
+            s = 0.0
+            for j in opps:
+                if i == j:
+                    continue
+                a = self.pw.adv(i, j)
+                # negative adv means i before j is good -> reward
+                s += -a
+            scores[i] = s
+        order = list(range(n))
+        order.sort(key=lambda x: (-scores[x], x))
+        return order
+
+    # ---------------- Construction: surrogate-regret beam ----------------
+    def construct_schedule(self, elite_ref=None):
+        n = self.n
+        # Seed by best singleton among a few randomly chosen, then grow
+        seed_t = random.randint(0, n - 1)
+        seq0 = [seed_t]
+        rem0 = set(self.all_txns)
+        rem0.remove(seed_t)
+        beam = [(seq0, rem0, self.seq_cost(seq0))]
+
+        def suffix_sig(seq, k):
+            if not seq:
+                return (None,)
+            m = min(k, len(seq))
+            return tuple(seq[-m:])
+
+        while True:
+            if all(len(rem) == 0 for _, rem, _ in beam):
+                break
+
+            expansions = []
+            seen = set()
+            for seq, rem, _ in beam:
+                if not rem:
+                    key = tuple(seq)
+                    if key not in seen:
+                        seen.add(key)
+                        expansions.append((seq, rem, self.seq_cost(seq), 0.0, None))
+                    continue
+
+                # Candidate transactions
+                if len(rem) <= self.rem_all_threshold:
+                    cand_txns = list(rem)
+                else:
+                    cand_txns = random.sample(list(rem), min(self.k_txn_sample, len(rem)))
+
+                # Positions policy
+                use_all_pos = (len(rem) <= self.endgame_all_pos_threshold) or (len(seq) <= 18)
+
+                # Evaluate insertions (best-two via surrogate-limited)
+                for t in cand_txns:
+                    b, p, s2 = self.best_two_insertion_surrogate(seq, t, use_all=use_all_pos, limit_M=self.surr_positions_cap)
+                    new_seq = seq[:p] + [t] + seq[p:]
+                    new_rem = rem.copy()
+                    new_rem.remove(t)
+                    regret = (s2 - b) if s2 < float('inf') else 0.0
+                    key = tuple(new_seq)
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    expansions.append((new_seq, new_rem, b, regret, t))
+
+            if not expansions:
+                break
+
+            # Rank by cost then regret; include a regret quota for exploration
+            by_cost = sorted(expansions, key=lambda x: (x[2], -x[3]))
+            by_regret = sorted(expansions, key=lambda x: (-x[3], x[2]))
+
+            # Beam width adjustment near end
+            min_rem_len = min((len(r) for _, r, _, _, _ in expansions), default=0)
+            bw = self.build_beam_width + 2 if min_rem_len <= 2 * self.build_beam_width else self.build_beam_width
+
+            base_quota = max(1, int(bw * (1.0 - self.high_regret_quota_ratio)))
+            regret_quota = max(0, bw - base_quota)
+            next_beam = []
+            seen_sig = set()
+
+            def try_add(entry):
+                s, r, c, reg, _t = entry
+                sig = suffix_sig(s, self.diversity_suffix_k)
+                if sig in seen_sig:
+                    return False
+                seen_sig.add(sig)
+                next_beam.append((s, r, c))
+                return True
+
+            i = 0
+            while len(next_beam) < base_quota and i < len(by_cost):
+                try_add(by_cost[i])
+                i += 1
+            j = 0
+            while len(next_beam) < base_quota + regret_quota and j < len(by_regret):
+                try_add(by_regret[j])
+                j += 1
+            k = 0
+            while len(next_beam) < bw and k < len(by_cost):
+                try_add(by_cost[k])
+                k += 1
+
+            if not next_beam:
+                next_beam = [(s, r, c) for s, r, c, _, _ in by_cost[:bw]]
+
+            beam = next_beam
+
+        # Choose best completion; if small remainder exists, solve exactly
+        best_seq = None
+        best_cost = float('inf')
+        for seq, rem, cost in beam:
+            if not rem:
+                c, s = cost, seq
+            else:
+                if len(rem) <= self.endgame_enum_K:
+                    c, s = self.endgame_optimal_completion(seq, rem)
+                else:
+                    seq_complete = seq + sorted(list(rem))
+                    c, s = self.seq_cost(seq_complete), seq_complete
+            if c < best_cost:
+                best_cost = c
+                best_seq = s
+        return best_seq
+
+    # ---------------- Local search: surrogate-accelerated VND ----------------
+    def local_refine(self, seq):
+        n = self.n
+        best_seq = seq[:]
+        best_cost = self.seq_cost(best_seq)
+
+        def try_reinsertion(cur_seq, cur_cost):
+            L = len(cur_seq)
+            for i in range(L):
+                item = cur_seq[i]
+                base = cur_seq[:i] + cur_seq[i + 1:]
+                use_all = len(base) <= 20
+                b, p, _s2 = self.best_two_block_surrogate(base, [item], use_all=use_all, focus_idx=i, limit_M=self.k_pos_sample)
+                cand = base[:p] + [item] + base[p:]
+                if cand == cur_seq:
+                    continue
+                if b < cur_cost:
+                    return True, b, cand
+            return False, cur_cost, cur_seq
+
+        def try_or_opt(cur_seq, cur_cost, k):
+            L = len(cur_seq)
+            for i in range(L - k + 1):
+                block = cur_seq[i:i + k]
+                base = cur_seq[:i] + cur_seq[i + k:]
+                use_all = len(base) <= 20
+                b, p, _s2 = self.best_two_block_surrogate(base, block, use_all=use_all, focus_idx=i, limit_M=self.k_pos_sample)
+                cand = base[:p] + block + base[p:]
+                if cand == cur_seq:
+                    continue
+                if b < cur_cost:
+                    return True, b, cand
+            return False, cur_cost, cur_seq
+
+        def two_opt_segment_reverse(cur_seq, cur_cost):
+            trials = self.two_opt_trials
+            L = len(cur_seq)
+            for _ in range(trials):
+                i = random.randint(0, L - 2)
+                j = random.randint(i + 2, L - 1) if i + 2 < L else None
+                if j is None or j == i + 1:
+                    continue
+                cand = cur_seq[:i] + cur_seq[i:j + 1][::-1] + cur_seq[j + 1:]
+                c = self.seq_cost(cand)
+                if c < cur_cost:
+                    return True, c, cand
+            return False, cur_cost, cur_seq
+
+        def adjacent_swaps(cur_seq, cur_cost):
+            L = len(cur_seq)
+            for i in range(L - 1):
+                cand = cur_seq[:]
+                cand[i], cand[i + 1] = cand[i + 1], cand[i]
+                c = self.seq_cost(cand)
+                if c < cur_cost:
+                    return True, c, cand
+            return False, cur_cost, cur_seq
+
+        adj_rounds = 0
+        improved_outer = True
+        while improved_outer:
+            improved_outer = False
+
+            # Or-opt blocks (3,2,1)
+            for blk in (3, 2, 1):
+                changed, best_cost, best_seq = try_or_opt(best_seq, best_cost, blk)
+                if changed:
+                    improved_outer = True
+                    break
+            if improved_outer:
+                continue
+
+            # Reinsertion (k=1)
+            changed, best_cost, best_seq = try_reinsertion(best_seq, best_cost)
+            if changed:
+                improved_outer = True
+                continue
+
+            # Adjacent swaps limited passes
+            if adj_rounds < self.ls_adj_rounds_max:
+                changed, best_cost, best_seq = adjacent_swaps(best_seq, best_cost)
+                adj_rounds += 1
+                if changed:
+                    improved_outer = True
+                    continue
+
+            # 2-opt segment reversals
+            changed, best_cost, best_seq = two_opt_segment_reverse(best_seq, best_cost)
+            if changed:
+                improved_outer = True
+
+        return best_cost, best_seq
+
+    # ---------------- Perturbation and LNS ----------------
+    def perturb(self, seq):
+        s = seq[:]
+        mode = random.random()
+        if mode < 0.5:
+            # Random swaps
+            for _ in range(self.perturb_swap_count):
+                i = random.randint(0, self.n - 1)
+                j = random.randint(0, self.n - 1)
+                if i != j:
+                    s[i], s[j] = s[j], s[i]
+        else:
+            # Block relocation
+            if self.n > self.perturb_block_len + 2:
+                start = random.randint(0, self.n - self.perturb_block_len - 1)
+                block = s[start:start + self.perturb_block_len]
+                del s[start:start + self.perturb_block_len]
+                insert_pos = random.randint(0, len(s))
+                s = s[:insert_pos] + block + s[insert_pos:]
+        return s
+
+    def lns_attempt(self, seq, focus_items=None):
+        cur = seq[:]
+        n = self.n
+        # Choose destroy size
+        frac = random.uniform(*self.destroy_frac_range)
+        m = max(4, min(n // 2, int(frac * n)))
+        if focus_items:
+            pos = {t: i for i, t in enumerate(cur)}
+            focus_idxs = [pos[t] for t in focus_items if t in pos]
+            remove_idxs = set()
+            for idx in focus_idxs:
+                if len(remove_idxs) >= m:
+                    break
+                start = max(0, idx - 1)
+                for j in range(start, min(n, start + 3)):
+                    if len(remove_idxs) < m:
+                        remove_idxs.add(j)
+            remain = list(set(range(n)) - remove_idxs)
+            random.shuffle(remain)
+            for j in remain:
+                if len(remove_idxs) >= m:
+                    break
+                remove_idxs.add(j)
+            remove_idxs = sorted(list(remove_idxs))
+        else:
+            if random.random() < 0.5:
+                remove_idxs = sorted(random.sample(range(n), m))
+            else:
+                start = random.randint(0, n - m)
+                remove_idxs = list(range(start, start + m))
+
+        removed = [cur[i] for i in remove_idxs]
+        remain_seq = [cur[i] for i in range(n) if i not in set(remove_idxs)]
+
+        # Repair via surrogate-limited best-two with regret
+        seq_rep = remain_seq[:]
+        rem_list = removed[:]
+        while rem_list:
+            cand_txns = rem_list if len(rem_list) <= self.k_txn_sample else random.sample(rem_list, self.k_txn_sample)
+            best_overall = (float('inf'), None, None)
+            best_by_regret = (float('-inf'), None, None)
+            use_all = (len(rem_list) <= self.endgame_all_pos_threshold) or (len(seq_rep) <= 18)
+            for t in cand_txns:
+                b, p, s2 = self.best_two_insertion_surrogate(seq_rep, t, use_all=use_all, limit_M=self.surr_positions_cap)
+                regret = (s2 - b) if s2 < float('inf') else 0.0
+                if b < best_overall[0]:
+                    best_overall = (b, t, p)
+                if regret > best_by_regret[0]:
+                    best_by_regret = (regret, t, p)
+            pick_regret = (random.random() < 0.6)
+            chosen = best_by_regret if pick_regret and best_by_regret[1] is not None else best_overall
+            t = chosen[1] if chosen[1] is not None else random.choice(rem_list)
+            p = chosen[2] if chosen[2] is not None else len(seq_rep)
+            seq_rep = seq_rep[:p] + [t] + seq_rep[p:]
+            rem_list.remove(t)
+
+        return self.local_refine(seq_rep)
+
+    # ---------------- Path relinking (surrogate-aware) ----------------
+    def path_relink(self, source_seq, target_seq, max_moves=12):
+        pos_in_target = {t: i for i, t in enumerate(target_seq)}
+        s = source_seq[:]
+        best_c = self.seq_cost(s)
+        best_s = s[:]
+        n = len(s)
+        displacement = [(abs(i - pos_in_target.get(s[i], i)), i) for i in range(n)]
+        displacement.sort(reverse=True)
+        moves = 0
+        for _, idx in displacement:
+            if moves >= max_moves:
+                break
+            item = s[idx]
+            desired = pos_in_target.get(item, idx)
+            if desired == idx:
+                continue
+            base = s[:idx] + s[idx + 1:]
+            use_all = len(base) <= 20
+            # Use surrogate-limited best-two around desired
+            b, p, _ = self.best_two_block_surrogate(base, [item], use_all=use_all, focus_idx=desired, limit_M=self.k_pos_sample)
+            cand = base[:p] + [item] + base[p:]
+            c = self.seq_cost(cand)
+            if c < best_c:
+                best_c = c
+                best_s = cand[:]
+                s = cand
+                moves += 1
+        return best_c, best_s
+
+    # ---------------- High-level solve ----------------
+    def solve(self):
+        n = self.n
+        all_txns = self.all_txns
+
+        # Seeding: singleton evaluation + one Borda-ranked full sequence
+        singleton_scores = [(self.seq_cost([t]), t) for t in all_txns]
+        singleton_scores.sort(key=lambda x: x[0])
+        seed_txns = [t for _, t in singleton_scores[:self.seed_elite_singletons]]
+        remaining = [t for t in all_txns if t not in seed_txns]
+        if remaining and self.seed_random_additional > 0:
+            seed_txns.extend(random.sample(remaining, min(self.seed_random_additional, len(remaining))))
+
+        # Elite pool
+        elite = []  # list of (cost, seq)
+        def add_elite(c, s):
+            nonlocal elite
+            elite.append((c, s))
+            elite.sort(key=lambda x: x[0])
+            uniq = []
+            seen_sig = set()
+            for c1, s1 in elite:
+                sig = tuple(s1[-self.diversity_suffix_k:]) if len(s1) >= self.diversity_suffix_k else tuple(s1)
+                if sig in seen_sig:
+                    continue
+                seen_sig.add(sig)
+                uniq.append((c1, s1))
+                if len(uniq) >= self.elite_size:
+                    break
+            elite = uniq
+
+        # Try Borda-ranked seed once
+        if n <= 200:
+            try:
+                borda_seq = self.conflict_borda_seed(sample_k=min(12, max(6, self.num_seqs + 4)))
+                c_borda, s_borda = self.local_refine(borda_seq)
+                add_elite(c_borda, s_borda)
+            except Exception:
+                pass
+
+        # Construct and refine from seeds
+        for _seed in seed_txns:
+            seq0 = self.construct_schedule(elite_ref=elite if elite else None)
+            c1, s1 = self.local_refine(seq0)
+            add_elite(c1, s1)
+
+        # Fallback if no elite
+        if not elite:
+            base = all_txns[:]
+            random.shuffle(base)
+            elite = [(self.seq_cost(base), base)]
+
+        best_overall_cost, best_overall_seq = elite[0]
+
+        # Iterated Local Search
+        cur_cost, cur_seq = best_overall_cost, best_overall_seq[:]
+        for _ in range(self.ils_rounds):
+            pert = self.perturb(cur_seq)
+            c2, s2 = self.local_refine(pert)
+            if c2 < cur_cost:
+                cur_cost, cur_seq = c2, s2
+                add_elite(c2, s2)
+                if c2 < best_overall_cost:
+                    best_overall_cost, best_overall_seq = c2, s2
+
+        # LNS: ruin-and-repair
+        for _ in range(self.lns_iters):
+            focus_items = None
+            if len(elite) >= 2:
+                target_seq = elite[random.randint(1, min(len(elite) - 1, self.elite_size - 1))][1]
+                pos_t = {t: i for i, t in enumerate(target_seq)}
+                disp = [(abs(i - pos_t.get(best_overall_seq[i], i)), best_overall_seq[i]) for i in range(n)]
+                disp.sort(reverse=True)
+                focus_items = [t for _, t in disp[:max(4, n // 12)]]
+            c3, s3 = self.lns_attempt(best_overall_seq, focus_items=focus_items)
+            if c3 < best_overall_cost:
+                best_overall_cost, best_overall_seq = c3, s3
+                add_elite(c3, s3)
+
+        # Path Relinking among elites
+        if len(elite) >= 2:
+            base_cost, base_seq = best_overall_cost, best_overall_seq
+            partners = elite[1:min(len(elite), self.elite_size)]
+            for c_t, s_t in partners:
+                pr1_c, pr1_s = self.path_relink(base_seq, s_t, max_moves=max(8, min(16, n // 6)))
+                if pr1_c < best_overall_cost:
+                    # Quick polish
+                    q_c, q_s = self.lns_attempt(pr1_s, focus_items=None)
+                    if q_c < best_overall_cost:
+                        best_overall_cost, best_overall_seq = q_c, q_s
+                    else:
+                        best_overall_cost, best_overall_seq = pr1_c, pr1_s
+                pr2_c, pr2_s = self.path_relink(s_t, base_seq, max_moves=max(8, min(16, n // 6)))
+                if pr2_c < best_overall_cost:
+                    q_c2, q_s2 = self.lns_attempt(pr2_s, focus_items=None)
+                    if q_c2 < best_overall_cost:
+                        best_overall_cost, best_overall_seq = q_c2, q_s2
+                    else:
+                        best_overall_cost, best_overall_seq = pr2_c, pr2_s
+
+        return best_overall_cost, best_overall_seq
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Find a low-makespan schedule using a conflict-aware solver with:
+    - Pairwise precedence oracle and surrogate-pruned best-two evaluation
+    - Regret-adaptive beam construction
+    - Exact endgame branch-and-bound
+    - VND (Or-opt + reinsertion + 2-opt) guided by the surrogate
+    - Iterated Local Search, LNS repair, and surrogate-aware path relinking
+    """
+    solver = SchedulerSolver(workload, num_seqs)
+    return solver.solve()
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    workload_size = 100
+
+    # Workload 1: Complex mixed read/write transactions
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, 10)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

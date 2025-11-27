@@ -1,0 +1,346 @@
+<NAME>
+targeted_router_focus_and_clip
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements to the router-level correction stage to increase counter repair accuracy and preserve calibration:
+
+1) Confidence-focused router scaling: concentrate conservation adjustments on the lowest-confidence interfaces first. I add a focus mechanism that identifies the subset of RX/TX variables covering 70% of the “correctable capacity” f_i = (1 − conf_i) * max(rate_i, ZERO_THRESH) and upweight the rest so they move less. This aligns with the two-tier targeted scaling concept, reducing unnecessary changes to strong signals and improving both accuracy and confidence calibration.
+
+2) Per-variable relative change clipping: cap any single variable’s router-stage change to ±10% relative to its current value, with a global scaling factor to keep all deltas within cap. Combined with the existing dominance cap (≤50% of correction per variable), this prevents over-reliance on one interface and avoids large, potentially harmful moves, further improving accuracy and calibration.
+
+Additionally, I add an adaptive router-imbalance threshold check to skip WLS projection when a router is already sufficiently balanced, avoiding small, noisy corrections. I introduced new hyperparameters to control focus and clipping. All changes are localized to the WLS stage and hyperparameter section, leaving the rest of the pipeline unchanged.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Hyperparameters
+    TAU_H_BASE = 0.02           # ~2% hardening threshold
+    TAU_H_HIGH = 0.015          # tighter tolerance for high-rate pairs
+    TAU_H_LOW = 0.03            # looser tolerance for low/near-zero pairs
+    ZERO_THRESH = 1.0           # Mbps soft-zero threshold
+    ZERO_EPS = 1e-6
+    DAMP_ROUTER = 0.60          # router projection damping on lambda
+    DOMINANCE_CAP = 0.50        # ≤ 50% share cap for any single interface correction
+    PEER_SMOOTH = 0.10          # confidence peer smoothing fraction
+    STRONG_SCALE_GUARD = 0.08   # guard threshold for re-sync skipping
+    RESYNC_MAX_F = 0.40         # max fraction for one-sided nudge toward mean
+    BUNDLE_DOM_FRAC = 0.60      # bundle dominance threshold on a side’s traffic
+    INTRA_BUNDLE_CLIP = 0.05    # ±5% intra-bundle smoothing cap
+    UNTOUCHED_BOOST = 0.02      # confidence boost for untouched well-synced counters
+    CLIP_HIT_PENALTY = 0.95     # multiplicative penalty when strong scaling/clipping hit
+=======
+    # Hyperparameters
+    TAU_H_BASE = 0.02           # ~2% hardening threshold
+    TAU_H_HIGH = 0.015          # tighter tolerance for high-rate pairs
+    TAU_H_LOW = 0.03            # looser tolerance for low/near-zero pairs
+    ZERO_THRESH = 1.0           # Mbps soft-zero threshold
+    ZERO_EPS = 1e-6
+    DAMP_ROUTER = 0.60          # router projection damping on lambda
+    DOMINANCE_CAP = 0.50        # ≤ 50% share cap for any single interface correction
+    PEER_SMOOTH = 0.10          # confidence peer smoothing fraction
+    STRONG_SCALE_GUARD = 0.08   # guard threshold for re-sync skipping
+    RESYNC_MAX_F = 0.40         # max fraction for one-sided nudge toward mean
+    BUNDLE_DOM_FRAC = 0.60      # bundle dominance threshold on a side’s traffic
+    INTRA_BUNDLE_CLIP = 0.05    # ±5% intra-bundle smoothing cap
+    UNTOUCHED_BOOST = 0.02      # confidence boost for untouched well-synced counters
+    CLIP_HIT_PENALTY = 0.95     # multiplicative penalty when strong scaling/clipping hit
+
+    # Targeted router correction focus and clipping
+    WEIGHT_FOCUS = 0.70         # focus on lowest-confidence 70% capacity
+    MID_TIER_BOOST = 1.5        # weight boost for 0.70–0.85 confidence (moves less)
+    OUTSIDE_FOCUS_BOOST = 2.0   # weight boost for ≥0.85 confidence (moves least)
+    PER_VAR_REL_CLIP = 0.10     # ±10% relative change cap per variable in router stage
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+
+        # Build variable vectors
+        vals: List[float] = []
+        signs: List[int] = []  # +1 for rx, -1 for tx
+        idx_map: List[Tuple[str, str]] = []  # (interface_id, 'rx'/'tx')
+        weights: List[float] = []
+
+        # Compose rx variables
+        for i in up_ifs:
+            v = rx[i]
+            vals.append(v)
+            signs.append(+1)
+            idx_map.append((i, 'rx'))
+            # Trust weight: higher for confident and high-rate counters
+            c = clamp01(conf_rx.get(i, 0.7))
+            # Two-tier adjustment (low and mid confidence make smaller weights => larger correction)
+            tier = 1.0
+            if c < 0.70:
+                tier = 0.6
+            elif c < 0.85:
+                tier = 0.8
+            # Weight proportional to confidence^2 and inversely to magnitude (to make relative changes)
+            w = max(1e-6, (c**2) * tier / max(v, ZERO_THRESH))
+            # Protect near-zero from taking huge absolute correction
+            if v < ZERO_THRESH:
+                w *= 3.0
+            weights.append(w)
+
+        # Compose tx variables
+        for i in up_ifs:
+            v = tx[i]
+            vals.append(v)
+            signs.append(-1)
+            idx_map.append((i, 'tx'))
+            c = clamp01(conf_tx.get(i, 0.7))
+            tier = 1.0
+            if c < 0.70:
+                tier = 0.6
+            elif c < 0.85:
+                tier = 0.8
+            w = max(1e-6, (c**2) * tier / max(v, ZERO_THRESH))
+            if v < ZERO_THRESH:
+                w *= 3.0
+            weights.append(w)
+
+        # Compute lambda for weighted projection
+        # a^T x0 = sum(signs[i] * vals[i])
+        ax0 = 0.0
+        denom = 0.0  # a^T W^{-1} a = sum( (sign^2)/w_i ) = sum(1/w_i)
+        inv_weights = [1.0 / max(1e-12, w) for w in weights]
+        for sgn, v, invw in zip(signs, vals, inv_weights):
+            ax0 += sgn * v
+            denom += invw  # since sgn^2 = 1
+
+        if denom <= 1e-12:
+            continue
+
+        # Damped Lagrange multiplier
+        lam = 2.0 * ax0 / denom
+        lam *= DAMP_ROUTER
+
+        # Initial deltas
+        deltas = [-(invw) * sgn * lam * 0.5 for sgn, invw in zip(signs, inv_weights)]
+        # Note: derived from x* = x0 - 0.5 W^{-1} λ a, with λ as above (post damping)
+
+        # Dominance cap iteration: avoid one interface taking >50% of correction
+        def apply_dominance_cap(deltas_in: List[float], invw_in: List[float]) -> List[float]:
+            # Compute shares by absolute delta proportional to invw (since all deltas share same lam)
+            for _ in range(3):
+                absd = [abs(d) for d in deltas_in]
+                total = sum(absd) + 1e-12
+                shares = [d / total for d in absd]
+                max_share = max(shares)
+                if max_share <= DOMINANCE_CAP + 1e-6:
+                    break
+                k = shares.index(max_share)
+                # Increase weight (decrease inv weight) for offender
+                invw_in[k] *= (max_share / DOMINANCE_CAP)  # reduce its share
+                # Recompute deltas with modified inverse weights
+                denom_new = sum(invw_in)
+                if denom_new <= 1e-12:
+                    break
+                lam_new = 2.0 * ax0 / denom_new
+                lam_new *= DAMP_ROUTER
+                deltas_in = [-(invw) * sgn * lam_new * 0.5 for sgn, invw in zip(signs, invw_in)]
+            return deltas_in
+
+        deltas = apply_dominance_cap(deltas, inv_weights[:])
+
+        # Apply deltas
+        for (i, side), dv, v_old in zip(idx_map, deltas, vals):
+            v_new = max(0.0, v_old + dv)
+            if side == 'rx':
+                prev = rx[i]
+                rx[i] = v_new
+                if prev > ZERO_EPS and v_new >= 0.0:
+                    scl = v_new / prev if prev > 0 else 1.0
+                    scaled_rx_factor[i] *= scl
+                    if abs(scl - 1.0) >= 0.10:
+                        clip_hit[i] = True
+            else:
+                prev = tx[i]
+                tx[i] = v_new
+                if prev > ZERO_EPS and v_new >= 0.0:
+                    scl = v_new / prev if prev > 0 else 1.0
+                    scaled_tx_factor[i] *= scl
+                    if abs(scl - 1.0) >= 0.10:
+                        clip_hit[i] = True
+=======
+    # Stage 2: Exact per-router WLS projection onto Σ(in)=Σ(out)
+    router_residual_pre = compute_router_residuals(rx, tx)
+
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+
+        # Skip projection if router already close to balanced (adaptive tolerance)
+        sum_rx_r = sum(rx[i] for i in up_ifs)
+        sum_tx_r = sum(tx[i] for i in up_ifs)
+        denom_r = max(1.0, sum_rx_r, sum_tx_r)
+        rel_gap_r = abs(sum_rx_r - sum_tx_r) / denom_r
+        n_active = len(up_ifs)
+        tau_router = min(0.07, max(0.03, 0.05 * math.sqrt(2.0 / max(2, n_active))))
+        if rel_gap_r <= tau_router:
+            continue
+
+        # Build variable vectors
+        vals: List[float] = []
+        signs: List[int] = []  # +1 for rx, -1 for tx
+        idx_map: List[Tuple[str, str]] = []  # (interface_id, 'rx'/'tx')
+        weights: List[float] = []
+
+        # Compose rx variables
+        for i in up_ifs:
+            v = rx[i]
+            vals.append(v)
+            signs.append(+1)
+            idx_map.append((i, 'rx'))
+            # Trust weight: higher for confident and high-rate counters
+            c = clamp01(conf_rx.get(i, 0.7))
+            # Two-tier adjustment (low and mid confidence make smaller weights => larger correction)
+            tier = 1.0
+            if c < 0.70:
+                tier = 0.6
+            elif c < 0.85:
+                tier = 0.8
+            # Weight proportional to confidence^2 and inversely to magnitude (to make relative changes)
+            w = max(1e-6, (c**2) * tier / max(v, ZERO_THRESH))
+            # Protect near-zero from taking huge absolute correction
+            if v < ZERO_THRESH:
+                w *= 3.0
+            weights.append(w)
+
+        # Compose tx variables
+        for i in up_ifs:
+            v = tx[i]
+            vals.append(v)
+            signs.append(-1)
+            idx_map.append((i, 'tx'))
+            c = clamp01(conf_tx.get(i, 0.7))
+            tier = 1.0
+            if c < 0.70:
+                tier = 0.6
+            elif c < 0.85:
+                tier = 0.8
+            w = max(1e-6, (c**2) * tier / max(v, ZERO_THRESH))
+            if v < ZERO_THRESH:
+                w *= 3.0
+            weights.append(w)
+
+        # Confidence-focused adjustment: boost weights outside the low-confidence focus set
+        # so they move less; concentrate corrections on low-confidence/high-rate variables.
+        # Compute correctable capacity per variable
+        capacities: List[float] = []
+        for (i, side), v in zip(idx_map, vals):
+            cdir = conf_rx.get(i, 0.7) if side == 'rx' else conf_tx.get(i, 0.7)
+            capacities.append((1.0 - clamp01(cdir)) * max(v, ZERO_THRESH) + 1e-12)
+        total_cap = sum(capacities)
+        # Determine focus set covering WEIGHT_FOCUS of capacity
+        order = sorted(range(len(capacities)), key=lambda k: capacities[k], reverse=True)
+        focus_set = set()
+        acc = 0.0
+        for k in order:
+            if total_cap > 0 and acc / total_cap >= WEIGHT_FOCUS:
+                break
+            focus_set.add(k)
+            acc += capacities[k]
+        if not focus_set:
+            focus_set = set(range(len(capacities)))
+
+        # Apply boosts: mid-tier and high confidence outside focus move less
+        for idx in range(len(weights)):
+            if idx not in focus_set:
+                i, side = idx_map[idx]
+                cdir = conf_rx.get(i, 0.7) if side == 'rx' else conf_tx.get(i, 0.7)
+                if cdir >= 0.85:
+                    weights[idx] *= OUTSIDE_FOCUS_BOOST
+                elif cdir >= 0.70:
+                    weights[idx] *= MID_TIER_BOOST
+
+        # Compute lambda for weighted projection
+        # a^T x0 = sum(signs[i] * vals[i])
+        ax0 = 0.0
+        denom = 0.0  # a^T W^{-1} a = sum( (sign^2)/w_i ) = sum(1/w_i)
+        inv_weights = [1.0 / max(1e-12, w) for w in weights]
+        for sgn, v, invw in zip(signs, vals, inv_weights):
+            ax0 += sgn * v
+            denom += invw  # since sgn^2 = 1
+
+        if denom <= 1e-12:
+            continue
+
+        # Damped Lagrange multiplier
+        lam = 2.0 * ax0 / denom
+        lam *= DAMP_ROUTER
+
+        # Initial deltas
+        deltas = [-(invw) * sgn * lam * 0.5 for sgn, invw in zip(signs, inv_weights)]
+        # Note: derived from x* = x0 - 0.5 W^{-1} λ a, with λ as above (post damping)
+
+        # Dominance cap iteration: avoid one interface taking >50% of correction
+        def apply_dominance_cap(deltas_in: List[float], invw_in: List[float]) -> List[float]:
+            # Compute shares by absolute delta proportional to invw (since all deltas share same lam)
+            for _ in range(3):
+                absd = [abs(d) for d in deltas_in]
+                total = sum(absd) + 1e-12
+                shares = [d / total for d in absd]
+                max_share = max(shares)
+                if max_share <= DOMINANCE_CAP + 1e-6:
+                    break
+                k = shares.index(max_share)
+                # Increase weight (decrease inv weight) for offender
+                invw_in[k] *= (max_share / DOMINANCE_CAP)  # reduce its share
+                # Recompute deltas with modified inverse weights
+                denom_new = sum(invw_in)
+                if denom_new <= 1e-12:
+                    break
+                lam_new = 2.0 * ax0 / denom_new
+                lam_new *= DAMP_ROUTER
+                deltas_in = [-(invw) * sgn * lam_new * 0.5 for sgn, invw in zip(signs, invw_in)]
+            return deltas_in
+
+        deltas = apply_dominance_cap(deltas, inv_weights[:])
+
+        # Per-variable relative change clipping (±10%); scale all deltas if needed
+        gamma = 1.0
+        for dv, v_old in zip(deltas, vals):
+            if abs(dv) <= 0.0:
+                continue
+            cap_abs = PER_VAR_REL_CLIP * max(v_old, ZERO_THRESH)
+            if abs(dv) > cap_abs:
+                gamma = min(gamma, cap_abs / max(abs(dv), 1e-12))
+        if gamma < 1.0:
+            deltas = [dv * gamma for dv in deltas]
+
+        # Apply deltas
+        for (i, side), dv, v_old in zip(idx_map, deltas, vals):
+            # Mark clip hits if we reached the cap
+            if abs(dv) >= PER_VAR_REL_CLIP * max(v_old, ZERO_THRESH) - 1e-12:
+                clip_hit[i] = True
+            v_new = max(0.0, v_old + dv)
+            if side == 'rx':
+                prev = rx[i]
+                rx[i] = v_new
+                if prev > ZERO_EPS and v_new >= 0.0:
+                    scl = v_new / prev if prev > 0 else 1.0
+                    scaled_rx_factor[i] *= scl
+                    if abs(scl - 1.0) >= 0.10:
+                        clip_hit[i] = True
+            else:
+                prev = tx[i]
+                tx[i] = v_new
+                if prev > ZERO_EPS and v_new >= 0.0:
+                    scl = v_new / prev if prev > 0 else 1.0
+                    scaled_tx_factor[i] *= scl
+                    if abs(scl - 1.0) >= 0.10:
+                        clip_hit[i] = True
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,242 @@
+<NAME>
+lns_ruin_recreate
+</NAME>
+
+<DESCRIPTION>
+Replace the Simulated Annealing refinement with a Large Neighborhood Search (LNS) using a "Ruin and Recreate" strategy.
+This strategy specifically targets the bottleneck GPU and a few random GPUs, removes their models, and re-inserts them using a "Min-Max KVPR" greedy heuristic. This structural perturbation is more effective at escaping local optima caused by fragmentation than single-item moves or swaps.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Simulated Annealing Refinement
+    final_placement = _simulated_annealing_refinement(gpu_num, placement_map)
+
+    return final_placement
+
+def _check_feasibility_robust(gpu_num, items, K):
+=======
+    # 3. Large Neighborhood Search Refinement (Ruin & Recreate)
+    final_placement = _large_neighborhood_search(gpu_num, placement_map)
+
+    return final_placement
+
+def _check_feasibility_robust(gpu_num, items, K):
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _simulated_annealing_refinement(gpu_num, placement):
+    """
+    Refines placement using Simulated Annealing.
+    Energy Function: E = Max(K) + Variance_Penalty.
+    The variance penalty acts as a tie-breaker and landscape smoother.
+    """
+    # Initialize State Cache
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(s, w):
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-7: return 1e9 # Penalty for full/overflow
+        return w / rem
+
+    current_ks = [get_k(gpu_s[i], gpu_w[i]) for i in range(gpu_num)]
+
+    cur_max = max(current_ks)
+    cur_sum_sq = sum(k*k for k in current_ks)
+
+    best_max = cur_max
+    # Use shallow copy for speed (models are objects, lists are structure)
+    best_placement = {i: list(placement[i]) for i in range(gpu_num)}
+
+    # SA Parameters
+    T = max(1.0, cur_max * 0.1)
+    alpha = 0.98
+    steps = 1000
+
+    for step in range(steps):
+        # 1. Source Selection: Bias towards bottleneck
+        # Identify bottleneck indices
+        sorted_indices = sorted(range(gpu_num), key=lambda i: current_ks[i], reverse=True)
+
+        # 50% chance bottleneck, 30% second bottleneck, 20% random
+        r = random.random()
+        if r < 0.5: src = sorted_indices[0]
+        elif r < 0.8 and gpu_num > 1: src = sorted_indices[1]
+        else: src = random.randint(0, gpu_num - 1)
+
+        if not placement[src]: continue
+
+        # 2. Move Generation: Move (70%) or Swap (30%)
+        move_type = 'swap' if random.random() < 0.3 else 'move'
+        accepted = False
+
+        if move_type == 'move':
+            m_idx = random.randint(0, len(placement[src])-1)
+            m = placement[src][m_idx]
+            dst = random.randint(0, gpu_num - 1)
+            if src == dst: continue
+
+            # Check Physical Feasibility
+            if gpu_s[dst] + m.model_size <= GPU_MEM_SIZE:
+                # Calculate new states
+                new_s_src = gpu_s[src] - m.model_size
+                new_w_src = gpu_w[src] - (m.req_rate/m.slo)
+                new_k_src = get_k(new_s_src, new_w_src)
+
+                new_s_dst = gpu_s[dst] + m.model_size
+                new_w_dst = gpu_w[dst] + (m.req_rate/m.slo)
+                new_k_dst = get_k(new_s_dst, new_w_dst)
+
+                # Delta evaluation
+                old_k_src = current_ks[src]
+                old_k_dst = current_ks[dst]
+
+                # Update temp
+                current_ks[src] = new_k_src
+                current_ks[dst] = new_k_dst
+                new_max = max(current_ks)
+
+                delta_max = new_max - cur_max
+
+                # Sum of squares change
+                new_sum_sq = cur_sum_sq - old_k_src**2 - old_k_dst**2 + new_k_src**2 + new_k_dst**2
+                delta_sq = new_sum_sq - cur_sum_sq
+
+                # Acceptance Logic
+                if delta_max < -1e-7:
+                    accepted = True
+                elif delta_max < 1e-7:
+                    # Tie-breaking with variance
+                    if delta_sq < 0:
+                        accepted = True
+                    else:
+                        # Allow slightly higher variance if temp is high
+                        prob = math.exp(-delta_sq / (T * cur_max * 10))
+                        if random.random() < prob: accepted = True
+                else:
+                    # Allow worsening max
+                    prob = math.exp(-delta_max / T)
+                    if random.random() < prob: accepted = True
+
+                if accepted:
+                    placement[dst].append(m)
+                    placement[src].pop(m_idx)
+                    gpu_s[src] = new_s_src; gpu_w[src] = new_w_src
+                    gpu_s[dst] = new_s_dst; gpu_w[dst] = new_w_dst
+                    cur_max = new_max
+                    cur_sum_sq = new_sum_sq
+                else:
+                    # Revert temp
+                    current_ks[src] = old_k_src
+                    current_ks[dst] = old_k_dst
+
+        elif move_type == 'swap':
+            m1_idx = random.randint(0, len(placement[src])-1)
+            m1 = placement[src][m1_idx]
+
+            dst = random.randint(0, gpu_num - 1)
+            if src == dst or not placement[dst]: continue
+
+            m2_idx = random.randint(0, len(placement[dst])-1)
+            m2 = placement[dst][m2_idx]
+
+            new_s_src = gpu_s[src] - m1.model_size + m2.model_size
+            new_s_dst = gpu_s[dst] - m2.model_size + m1.model_size
+
+            if new_s_src <= GPU_MEM_SIZE and new_s_dst <= GPU_MEM_SIZE:
+                w_change = (m2.req_rate/m2.slo) - (m1.req_rate/m1.slo)
+                new_w_src = gpu_w[src] + w_change
+                new_w_dst = gpu_w[dst] - w_change
+
+                new_k_src = get_k(new_s_src, new_w_src)
+                new_k_dst = get_k(new_s_dst, new_w_dst)
+
+                old_k_src = current_ks[src]
+                old_k_dst = current_ks[dst]
+
+                current_ks[src] = new_k_src
+                current_ks[dst] = new_k_dst
+                new_max = max(current_ks)
+
+                delta_max = new_max - cur_max
+                new_sum_sq = cur_sum_sq - old_k_src**2 - old_k_dst**2 + new_k_src**2 + new_k_dst**2
+                delta_sq = new_sum_sq - cur_sum_sq
+
+                if delta_max < -1e-7:
+                    accepted = True
+                elif delta_max < 1e-7:
+                    if delta_sq < 0:
+                        accepted = True
+                    else:
+                        prob = math.exp(-delta_sq / (T * cur_max * 10))
+                        if random.random() < prob: accepted = True
+                else:
+                    prob = math.exp(-delta_max / T)
+                    if random.random() < prob: accepted = True
+
+                if accepted:
+                    placement[src][m1_idx] = m2
+                    placement[dst][m2_idx] = m1
+                    gpu_s[src] = new_s_src; gpu_w[src] = new_w_src
+                    gpu_s[dst] = new_s_dst; gpu_w[dst] = new_w_dst
+                    cur_max = new_max
+                    cur_sum_sq = new_sum_sq
+                else:
+                    current_ks[src] = old_k_src
+                    current_ks[dst] = old_k_dst
+
+        # Update Global Best
+        if cur_max < best_max - 1e-7:
+            best_max = cur_max
+            best_placement = {i: list(placement[i]) for i in range(gpu_num)}
+
+        T *= alpha
+        if T < 1e-4: break
+
+    return best_placement
+=======
+def _large_neighborhood_search(gpu_num, placement):
+    """
+    Refines placement using Large Neighborhood Search (Ruin & Recreate).
+    Target: Minimize Max KVPR.
+    """
+    # Initialize State
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(s, w):
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-7: return 1e9
+        return w / rem
+
+    current_ks = [get_k(gpu_s[i], gpu_w[i]) for i in range(gpu_num)]
+
+    best_max_k = max(current_ks)
+    best_placement = copy.deepcopy(placement)
+
+    no_improve = 0
+    max_steps = 400
+    patience = 40
+
+    for step in range(max_steps):
+        # Identify bottleneck
+        max_k = -1.0
+        src = -1
+        for i in range(gpu_num):
+            if current_ks[i] > max_k:
+                max_k = current_ks[i]
+                src = i
+
+        # Update global best
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_placement = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # Strategy Decision
+        # If progress is stalling, use Ruin & Recreate (LNS).
+        # Otherwise, try simple greedy moves/swaps (Local Search) which are faster.
+
+        if no_improve > patience or random.random() < 0

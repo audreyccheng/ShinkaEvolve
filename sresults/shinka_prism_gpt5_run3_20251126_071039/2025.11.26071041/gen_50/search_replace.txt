@@ -1,0 +1,308 @@
+<NAME>
+preplace_zero_demand_and_seeded_pack
+</NAME>
+
+<DESCRIPTION>
+I introduce a zero-demand pre-placement step and seeded packing to improve KVPR. Models with n=0 (req_rate/slo=0) only consume memory and do not increase the numerator in KVPR; if placed poorly they can significantly reduce remaining memory on already high-pressure GPUs. The change first distributes all zero-demand models largest-first to GPUs with the most free memory (pure memory balancing). Then the parametric T-based packing is run on the remaining nonzero-demand models using the seed (preplaced) state, so the transformed capacity and memory feasibility correctly account for the preplacement. To preserve feasibility and robustness, all feasibility checks and candidate generation attempt both with and without the seed, avoiding false infeasibility due to unlucky zero-placement. Additionally, candidate generation explores a slightly wider T-neighborhood and includes more policy/order combinations to harvest extra KVPR improvements. These targeted edits respect the existing structure, add minimal overhead, and can reduce the maximum KVPR by better balancing memory-only items across GPUs.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    total_capacity_mem = gpu_num * GPU_MEM_SIZE
+    if total_mem - total_capacity_mem > 1e-9:
+        raise ValueError("Total model memory exceeds total GPU memory")
+
+    # ---------- Lower bound on T ----------
+=======
+    total_capacity_mem = gpu_num * GPU_MEM_SIZE
+    if total_mem - total_capacity_mem > 1e-9:
+        raise ValueError("Total model memory exceeds total GPU memory")
+
+    # ---------- Pre-place zero-demand (memory-only) models to balance memory ----------
+    # Split items into zero-demand and nonzero-demand
+    z_items = [it for it in items if it[3] == 0.0]
+    nz_items = [it for it in items if it[3] != 0.0]
+
+    # Seed placement for zero-demand items (largest-first to GPU with max free memory)
+    seed_plc = {g: [] for g in range(gpu_num)}
+    seed_m = [0.0] * gpu_num
+    seed_n = [0.0] * gpu_num  # remains zeros
+    if z_items:
+        for _, mdl, ms, _ in sorted(z_items, key=lambda it: it[2], reverse=True):
+            # Choose GPU with most remaining memory that can fit
+            candidates = [(g, GPU_MEM_SIZE - seed_m[g]) for g in range(gpu_num) if seed_m[g] + ms <= GPU_MEM_SIZE + 1e-12]
+            if not candidates:
+                # If we cannot place with this heuristic, skip seeding to avoid infeasibility
+                seed_plc = {g: [] for g in range(gpu_num)}
+                seed_m = [0.0] * gpu_num
+                break
+            best_g = max(candidates, key=lambda x: (x[1], -x[0]))[0]
+            seed_plc[best_g].append(mdl)
+            seed_m[best_g] += ms
+
+    # Pack will attempt with this seed first, then also without it to stay robust
+    seed = (seed_plc, seed_m, seed_n) if any(seed_plc[g] for g in range(gpu_num)) else None
+
+    # ---------- Lower bound on T ----------
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def try_pack(T, order_variant=0, policy="resid", return_placement=False):
+        cap = GPU_MEM_SIZE * T
+        eps = 1e-12
+
+        # Build sorted order
+        if order_variant == 0:
+            ordered = sorted(items, key=lambda it: (it[3] + T * it[2], it[3], it[2]), reverse=True)
+        elif order_variant == 1:
+            ordered = sorted(items, key=lambda it: (safe_div(it[3], max(GPU_MEM_SIZE - it[2], 1e-9)), it[2]), reverse=True)
+        else:
+            ordered = sorted(items, key=lambda it: (safe_div(it[3], max(it[2], 1e-9)), it[3]), reverse=True)
+
+        # Per-GPU state
+        n_sum = [0.0] * gpu_num
+        m_sum = [0.0] * gpu_num
+        used_cap = [0.0] * gpu_num  # equals n_sum + T * m_sum
+        placement = [[] for _ in range(gpu_num)]
+
+        for _, mdl, ms, n in ordered:
+            w = n + T * ms
+            candidates = []
+            # Precompute current kvprs
+            cur_kvprs = [kvpr_val(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)]
+
+            # Precompute globals for hybrid memory balance
+            total_m_after = sum(m_sum) + ms
+            avg_mem_frac = total_m_after / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+            Tnorm = max(T, 1e-12)
+            alpha = 0.2
+            beta = 0.05
+
+            for g in range(gpu_num):
+                if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                    continue
+                residual = cap - (used_cap[g] + w)
+                if residual < -eps:
+                    continue
+                if policy == "resid":
+                    candidates.append((g, residual, None, None, None))
+                else:
+                    new_n = n_sum[g] + n
+                    new_m = m_sum[g] + ms
+                    new_local = kvpr_val(new_n, GPU_MEM_SIZE - new_m)
+                    # New global max if placed on g
+                    new_max = new_local
+                    for k in range(gpu_num):
+                        if k != g and cur_kvprs[k] > new_max:
+                            new_max = cur_kvprs[k]
+                    if policy == "hybrid":
+                        mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                        mem_imb = abs(mem_frac_after - avg_mem_frac)
+                        J = (new_max / Tnorm) + alpha * (new_local / Tnorm) + beta * mem_imb
+                        candidates.append((g, residual, new_max, new_local, J))
+                    else:
+                        candidates.append((g, residual, new_max, new_local, None))
+
+            if not candidates:
+                return (False, None) if return_placement else False
+
+            if policy == "resid":
+                # Best-fit: minimize transformed residual; tie by more remaining mem then gpu id
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+            elif policy == "hybrid":
+                # Blend projected max KVPR, local KVPR, and memory imbalance
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[4], c[2], c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+            else:
+                # Minimize global new max KVPR; tie-break by local KVPR then residual then more remaining mem then id
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[2], c[3], c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+
+            # Place
+            placement[chosen].append(mdl)
+            n_sum[chosen] += n
+            m_sum[chosen] += ms
+            used_cap[chosen] += w
+
+        if return_placement:
+            return True, {g: placement[g] for g in range(gpu_num)}
+        return True
+=======
+    def try_pack(T, order_variant=0, policy="resid", return_placement=False, seed=None):
+        cap = GPU_MEM_SIZE * T
+        eps = 1e-12
+
+        # Choose nonzero-demand items to pack; zero-demand items are handled via seed
+        base_items = nz_items
+
+        # Build sorted order over base_items
+        if order_variant == 0:
+            ordered = sorted(base_items, key=lambda it: (it[3] + T * it[2], it[3], it[2]), reverse=True)
+        elif order_variant == 1:
+            ordered = sorted(base_items, key=lambda it: (safe_div(it[3], max(GPU_MEM_SIZE - it[2], 1e-9)), it[2]), reverse=True)
+        else:
+            ordered = sorted(base_items, key=lambda it: (safe_div(it[3], max(it[2], 1e-9)), it[3]), reverse=True)
+
+        # Per-GPU state, potentially seeded by zero-demand placement
+        if seed is not None:
+            seed_plc, seed_m, seed_n = seed
+            placement = [list(seed_plc.get(g, [])) for g in range(gpu_num)]
+            m_sum = list(seed_m)
+            n_sum = list(seed_n)
+            used_cap = [n_sum[g] + T * m_sum[g] for g in range(gpu_num)]
+        else:
+            placement = [[] for _ in range(gpu_num)]
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num  # equals n_sum + T * m_sum
+
+        # If there are no nonzero-demand items, we're done
+        if not ordered:
+            if return_placement:
+                return True, {g: placement[g] for g in range(gpu_num)}
+            return True
+
+        for _, mdl, ms, n in ordered:
+            w = n + T * ms
+            candidates = []
+            # Precompute current kvprs
+            cur_kvprs = [kvpr_val(n_sum[g], GPU_MEM_SIZE - m_sum[g]) for g in range(gpu_num)]
+
+            # Precompute globals for hybrid memory balance
+            total_m_after = sum(m_sum) + ms
+            avg_mem_frac = total_m_after / (gpu_num * GPU_MEM_SIZE) if gpu_num > 0 else 0.0
+            Tnorm = max(T, 1e-12)
+            alpha = 0.2
+            beta = 0.05
+
+            for g in range(gpu_num):
+                if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                    continue
+                residual = cap - (used_cap[g] + w)
+                if residual < -eps:
+                    continue
+                if policy == "resid":
+                    candidates.append((g, residual, None, None, None))
+                else:
+                    new_n = n_sum[g] + n
+                    new_m = m_sum[g] + ms
+                    new_local = kvpr_val(new_n, GPU_MEM_SIZE - new_m)
+                    # New global max if placed on g
+                    new_max = new_local
+                    for k in range(gpu_num):
+                        if k != g and cur_kvprs[k] > new_max:
+                            new_max = cur_kvprs[k]
+                    if policy == "hybrid":
+                        mem_frac_after = (m_sum[g] + ms) / GPU_MEM_SIZE
+                        mem_imb = abs(mem_frac_after - avg_mem_frac)
+                        J = (new_max / Tnorm) + alpha * (new_local / Tnorm) + beta * mem_imb
+                        candidates.append((g, residual, new_max, new_local, J))
+                    else:
+                        candidates.append((g, residual, new_max, new_local, None))
+
+            if not candidates:
+                return (False, None) if return_placement else False
+
+            if policy == "resid":
+                # Best-fit: minimize transformed residual; tie by more remaining mem then gpu id
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+            elif policy == "hybrid":
+                # Blend projected max KVPR, local KVPR, and memory imbalance
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[4], c[2], c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+            else:
+                # Minimize global new max KVPR; tie-break by local KVPR then residual then more remaining mem then id
+                chosen = min(
+                    candidates,
+                    key=lambda c: (c[2], c[3], c[1], -(GPU_MEM_SIZE - (m_sum[c[0]] + ms)), c[0])
+                )[0]
+
+            # Place
+            placement[chosen].append(mdl)
+            n_sum[chosen] += n
+            m_sum[chosen] += ms
+            used_cap[chosen] += w
+
+        if return_placement:
+            return True, {g: placement[g] for g in range(gpu_num)}
+        return True
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    def try_pack_any(T, need_placement=False):
+        variants = [(0, "resid"), (1, "resid"), (0, "hybrid")]
+        feasibles = []
+        for ov, pol in variants:
+            if need_placement:
+                ok, plc = try_pack(T, ov, pol, True)
+                if ok:
+                    feasibles.append(plc)
+            else:
+                if try_pack(T, ov, pol, False):
+                    return True
+        if need_placement:
+            return (len(feasibles) > 0), feasibles
+        return False
+=======
+    def try_pack_any(T, need_placement=False):
+        variants = [(0, "resid"), (1, "resid"), (0, "hybrid")]
+        feasibles = []
+        # Try with seed first, then without seed to avoid false infeasibility
+        seed_options = [seed, None] if 'seed' in locals() and seed is not None else [None]
+        for ov, pol in variants:
+            for s in seed_options:
+                if need_placement:
+                    ok, plc = try_pack(T, ov, pol, True, s)
+                    if ok:
+                        feasibles.append(plc)
+                else:
+                    if try_pack(T, ov, pol, False, s):
+                        return True
+        if need_placement:
+            return (len(feasibles) > 0), feasibles
+        return False
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    Ts = [high, high * 0.995, high * 1.005]
+    combos = [(0, "resid"), (1, "resid"), (2, "resid"), (0, "minmax"), (1, "minmax"), (0, "hybrid"), (1, "hybrid")]
+    for Tv in Ts:
+        for ov, pol in combos:
+            ok, plc = try_pack(Tv, ov, pol, True)
+            if ok:
+                candidates.append(plc)
+=======
+    Ts = [high, high * 0.995, high * 1.005, high * 0.99, high * 1.01]
+    combos = [
+        (0, "resid"), (1, "resid"), (2, "resid"),
+        (0, "minmax"), (1, "minmax"), (2, "minmax"),
+        (0, "hybrid"), (1, "hybrid"), (2, "hybrid")
+    ]
+    seed_options = [seed, None] if 'seed' in locals() and seed is not None else [None]
+    for Tv in Ts:
+        for ov, pol in combos:
+            for s in seed_options:
+                ok, plc = try_pack(Tv, ov, pol, True, s)
+                if ok:
+                    candidates.append(plc)
+>>>>>>> REPLACE
+
+</DIFF>

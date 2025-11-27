@@ -1,0 +1,159 @@
+<NAME>
+directional_micro_adjust_and_conf_floor_tune
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted enhancements to improve counter accuracy and confidence calibration:
+
+1) Magnitude-aware confidence floors tuning: When link symmetry is within tolerance, raise confidence more cautiously on tiny flows. Specifically, keep the 0.99 floor for strong high-rate agreements, but reduce the floor to 0.97 for low-rate cases (<10 Mbps) instead of 0.98. This better reflects uncertainty on small signals and should improve calibration.
+
+2) Directional micro-adjustments for dangling interfaces that dominate router imbalance: After initial link-level hardening, compute router-level flow residuals. For routers with high mismatch (≥10%), if an unpaired, up interface contributes ≥50% of traffic in the dominant direction, nudge its dominant counter toward flow conservation by up to 10% of that counter and at most half the residual. This only applies to interfaces lacking peer redundancy to avoid fighting symmetry. We lower confidence on adjusted counters (≤0.65) to reflect uncertainty. We then recompute router mismatch and apply direction-aware confidence penalties based on these updated residuals. This can improve counter accuracy while maintaining calibrated confidence.
+
+These changes are conservative and topology-aware, aligning with the Hodor principles of signal hardening and flow conservation without over-correcting.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+                    if max_rx >= 10.0 and d_rx <= 0.005:
+                        rx_confidence = max(rx_confidence, 0.99)
+                    else:
+                        rx_confidence = max(rx_confidence, 0.98)
+=======
+                    if max_rx >= 10.0 and d_rx <= 0.005:
+                        rx_confidence = max(rx_confidence, 0.99)
+                    else:
+                        rx_confidence = max(rx_confidence, 0.97 if max_rx < 10.0 else 0.98)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+                    if max_tx >= 10.0 and d_tx <= 0.005:
+                        tx_confidence = max(tx_confidence, 0.99)
+                    else:
+                        tx_confidence = max(tx_confidence, 0.98)
+=======
+                    if max_tx >= 10.0 and d_tx <= 0.005:
+                        tx_confidence = max(tx_confidence, 0.99)
+                    else:
+                        tx_confidence = max(tx_confidence, 0.97 if max_tx < 10.0 else 0.98)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Compute router-level residual mismatches from repaired counters
+    router_mismatch: Dict[str, float] = {}
+    for router, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in interim:
+                sum_tx += float(interim[if_id]['repaired_tx'])
+                sum_rx += float(interim[if_id]['repaired_rx'])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_mismatch[router] = abs(sum_tx - sum_rx) / denom
+
+    # Direction-aware confidence attenuation based on flow conservation residuals
+    for if_id, item in interim.items():
+        lr = item.get('local_router')
+        rr = item.get('remote_router')
+        resid_local = router_mismatch.get(lr, 0.0)
+        resid_remote = router_mismatch.get(rr, 0.0)
+
+        penalty_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.5, 1.0)
+        penalty_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.5, 1.0)
+
+        item['rx_conf'] = clamp(item['rx_conf'] * penalty_rx)
+        item['tx_conf'] = clamp(item['tx_conf'] * penalty_tx)
+        # Slight status confidence reduction under high residuals
+        item['status_conf'] = clamp(item['status_conf'] * (1.0 - 0.3 * max(resid_local, resid_remote)))
+=======
+    # Compute router-level residual mismatches from repaired counters
+    router_mismatch: Dict[str, float] = {}
+    router_totals: Dict[str, Tuple[float, float]] = {}
+    for router, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in interim:
+                sum_tx += float(interim[if_id]['repaired_tx'])
+                sum_rx += float(interim[if_id]['repaired_rx'])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_mismatch[router] = abs(sum_tx - sum_rx) / denom
+        router_totals[router] = (sum_tx, sum_rx)
+
+    # Targeted micro-adjustments on dangling interfaces that dominate imbalance
+    RESID_TRIGGER = 0.10       # trigger micro-adjustment at >=10% residual
+    SHARE_TRIGGER = 0.50       # interface must contribute >=50% of direction
+    MAX_ADJUST_FRAC = 0.10     # cap change to 10% of that interface counter
+    ALPHA = 0.50               # nudge by 50% of router residual at most
+
+    for router, if_list in router_ifaces.items():
+        sum_tx, sum_rx = router_totals.get(router, (0.0, 0.0))
+        denom = max(1.0, sum_tx, sum_rx)
+        delta = sum_tx - sum_rx
+        resid = abs(delta) / denom
+        if resid < RESID_TRIGGER or not if_list:
+            continue
+
+        # Candidates: unpaired, up interfaces only (no redundant peer to trust)
+        candidates = [
+            if_id for if_id in if_list
+            if if_id in interim
+            and interim[if_id]['repaired_status'] != 'down'
+            and (peers.get(if_id) is None)
+        ]
+        if not candidates:
+            continue
+
+        if delta > 0.0:
+            # Too much TX at router: reduce TX on dominant dangling interface
+            best = max(candidates, key=lambda iid: float(interim[iid]['repaired_tx']))
+            tx_val = float(interim[best]['repaired_tx'])
+            share = tx_val / max(1.0, sum_tx)
+            if tx_val > 0.0 and share >= SHARE_TRIGGER:
+                adjust = min(delta * ALPHA, tx_val * MAX_ADJUST_FRAC)
+                adjust = max(0.0, adjust)
+                interim[best]['repaired_tx'] = max(0.0, tx_val - adjust)
+                # Lower confidence to reflect heuristic adjustment
+                interim[best]['tx_conf'] = min(float(interim[best]['tx_conf']), 0.65)
+        elif delta < 0.0:
+            # Too much RX at router: reduce RX on dominant dangling interface
+            best = max(candidates, key=lambda iid: float(interim[iid]['repaired_rx']))
+            rx_val = float(interim[best]['repaired_rx'])
+            share = rx_val / max(1.0, sum_rx)
+            if rx_val > 0.0 and share >= SHARE_TRIGGER:
+                adjust = min(abs(delta) * ALPHA, rx_val * MAX_ADJUST_FRAC)
+                adjust = max(0.0, adjust)
+                interim[best]['repaired_rx'] = max(0.0, rx_val - adjust)
+                interim[best]['rx_conf'] = min(float(interim[best]['rx_conf']), 0.65)
+
+    # Recompute router-level residual mismatches after micro-adjustments
+    router_mismatch2: Dict[str, float] = {}
+    for router, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in interim:
+                sum_tx += float(interim[if_id]['repaired_tx'])
+                sum_rx += float(interim[if_id]['repaired_rx'])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_mismatch2[router] = abs(sum_tx - sum_rx) / denom
+
+    # Direction-aware confidence attenuation based on updated residuals
+    for if_id, item in interim.items():
+        lr = item.get('local_router')
+        rr = item.get('remote_router')
+        resid_local = router_mismatch2.get(lr, 0.0)
+        resid_remote = router_mismatch2.get(rr, 0.0)
+
+        penalty_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.5, 1.0)
+        penalty_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.5, 1.0)
+
+        item['rx_conf'] = clamp(item['rx_conf'] * penalty_rx)
+        item['tx_conf'] = clamp(item['tx_conf'] * penalty_tx)
+        # Slight status confidence reduction under high residuals
+        item['status_conf'] = clamp(item['status_conf'] * (1.0 - 0.3 * max(resid_local, resid_remote)))
+>>>>>>> REPLACE
+</DIFF>

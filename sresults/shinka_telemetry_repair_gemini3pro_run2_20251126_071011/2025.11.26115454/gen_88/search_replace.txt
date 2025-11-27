@@ -1,0 +1,332 @@
+<NAME>
+symmetric_consensus_and_residual_penalty
+</NAME>
+
+<DESCRIPTION>
+1. Implements Symmetric "Golden Truth" verification: explicitly calculates flow targets for both Local and Remote routers. If a value satisfies both flow conservation constraints simultaneously, it is prioritized as the repair value.
+2. Implements Dominant Quality Arbitration: If the Remote router is significantly healthier than the Local router, the algorithm trusts the Peer's value over Local Flow arbitration, preventing a noisy local router from corrupting valid data.
+3. Refines Confidence Calibration: Introduces a stricter penalty model based on residual router quality (`local_q`). Confidence scores are now composed of a base plus a significant component derived from flow quality, ensuring low confidence when repairs fail to balance the router.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        for if_id, s in state.items():
+            if s['status'] != 'up':
+                next_values[if_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = s['peer']
+            r_id = s['router']
+            has_peer = peer_id and peer_id in state
+
+            # Get Context
+            rs = router_stats.get(r_id, {'imbalance': 0.0, 'quality': 0.5})
+            # Local Imbalance targets
+            flow_rx_target = max(0.0, s['rx'] - rs['imbalance'])
+            flow_tx_target = max(0.0, s['tx'] + rs['imbalance'])
+
+            # Remote Context
+            remote_r_id = s['remote_router']
+            remote_qual = 0.5
+            if remote_r_id and remote_r_id in router_stats:
+                remote_qual = router_stats[remote_r_id]['quality']
+
+            # --- RX Repair ---
+            # Constraint: RX <= Peer TX
+            val_self = s['rx']
+            val_peer = state[peer_id]['tx'] if has_peer else None
+
+            final_rx = val_self
+
+            if val_peer is not None:
+                # 1. Physics Violation (RX > Peer TX)
+                if val_self > val_peer * (1.0 + STRICT_THRESHOLD):
+                    # Impossible state.
+                    # Rare exception: If Self matches Flow perfectly and Peer is from a bad router?
+                    # Generally, Phantom Traffic (Surplus RX) is the cause.
+                    # Check if RX is "surplus" (contributes to imbalance).
+                    # If RX helps balance, rs['imbalance'] would be negative (Missing RX).
+                    # If rs['imbalance'] is positive (Surplus RX), then RX is likely the cause.
+                    if rs['imbalance'] > 0:
+                        final_rx = val_peer # Clamp Phantom
+                    else:
+                        # RX is needed for balance, but Peer says no.
+                        # Could be Peer TX under-reporting.
+                        # If Remote Quality is bad, distrust Peer.
+                        if remote_qual < 0.5:
+                            final_rx = val_self
+                        else:
+                            final_rx = val_peer
+
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    # Converge to average
+                    final_rx = (val_self + val_peer) / 2.0
+
+                # 3. Disagreement (RX < Peer TX usually)
+                else:
+                    # Arbitration
+                    d_peer = calc_error(val_peer, flow_rx_target)
+                    d_self = calc_error(val_self, flow_rx_target)
+
+                    if d_peer < d_self:
+                        # Peer balances Local Router better
+                        final_rx = val_peer
+                    elif d_self < d_peer:
+                        # Self balances Local Router better
+                        final_rx = val_self
+                    else:
+                        # Ambiguous: Trust Peer (Source Truth)
+                        final_rx = val_peer
+
+            # --- TX Repair ---
+            # Constraint: TX >= Peer RX
+            val_self = s['tx']
+            val_peer = state[peer_id]['rx'] if has_peer else None
+
+            final_tx = val_self
+
+            if val_peer is not None:
+                # 1. Physics Violation (TX < Peer RX)
+                if val_self < val_peer * (1.0 - STRICT_THRESHOLD):
+                     final_tx = val_peer
+
+                # 2. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_tx = (val_self + val_peer) / 2.0
+
+                # 3. Disagreement (TX > Peer RX usually)
+                else:
+                    d_peer = calc_error(val_peer, flow_tx_target)
+                    d_self = calc_error(val_self, flow_tx_target)
+
+                    if d_peer < d_self:
+                        final_tx = val_peer
+                    elif d_self < d_peer:
+                        final_tx = val_self
+                    else:
+                        final_tx = val_peer
+
+            next_values[if_id] = {'rx': final_rx, 'tx': final_tx}
+=======
+        for if_id, s in state.items():
+            if s['status'] != 'up':
+                next_values[if_id] = {'rx': 0.0, 'tx': 0.0}
+                continue
+
+            peer_id = s['peer']
+            r_id = s['router']
+            has_peer = peer_id and peer_id in state
+
+            # --- Flow Consensus Preparation ---
+            rs_local = router_stats.get(r_id, {'imbalance': 0.0, 'quality': 0.5})
+
+            remote_r_id = s['remote_router']
+            rs_remote = router_stats.get(remote_r_id, {'imbalance': 0.0, 'quality': 0.5}) if remote_r_id else {'imbalance': 0.0, 'quality': 0.5}
+
+            # 1. Local Flow Targets (What makes my router balanced?)
+            # RX Implied: Current_RX - Imbalance (Since Imb = RX - TX)
+            local_target_rx = max(0.0, s['rx'] - rs_local['imbalance'])
+            # TX Implied: Current_TX + Imbalance
+            local_target_tx = max(0.0, s['tx'] + rs_local['imbalance'])
+
+            # 2. Remote Flow Targets (What makes peer router balanced?)
+            # Remote TX target (corresponds to my RX)
+            # Remote Imbalance = Rem_RX - Rem_TX. To fix, Rem_TX = Rem_Old_TX + Rem_Imb
+            remote_target_tx = None
+            remote_target_rx = None
+
+            if has_peer:
+                peer_tx_val = state[peer_id]['tx']
+                peer_rx_val = state[peer_id]['rx']
+
+                remote_target_tx = max(0.0, peer_tx_val + rs_remote['imbalance'])
+                remote_target_rx = max(0.0, peer_rx_val - rs_remote['imbalance'])
+
+            # --- RX Repair ---
+            # Signals: Self(RX), Peer(TX), LocalTarget, RemoteTarget
+            val_self = s['rx']
+            val_peer = state[peer_id]['tx'] if has_peer else None
+
+            final_rx = val_self
+
+            if val_peer is not None:
+                # A. Golden Truth Check (Symmetric Consensus)
+                # If Local Target and Remote Target agree, that value satisfies BOTH routers.
+                golden_val = None
+                if remote_target_tx is not None:
+                    if calc_error(local_target_rx, remote_target_tx) < HARDENING_THRESHOLD:
+                        golden_val = (local_target_rx + remote_target_tx) / 2.0
+
+                # B. Decision Logic
+                if golden_val is not None:
+                    final_rx = golden_val
+
+                # C. Physics Violation (RX > Peer TX)
+                elif val_self > val_peer * (1.0 + STRICT_THRESHOLD):
+                    # Impossible surplus.
+                    # Exceptions: Peer is broken (Low Quality) AND Local is good.
+                    if rs_remote['quality'] < 0.5 and rs_local['quality'] > 0.8:
+                        final_rx = val_self
+                    else:
+                        final_rx = val_peer # Clamp
+
+                # D. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_rx = (val_self + val_peer) / 2.0
+
+                # E. Disagreement (RX < Peer TX, Loss or Error)
+                else:
+                    # Arbitration:
+                    # If Remote is "Golden" (High Quality) and Local is "Garbage" (Low Quality), trust Peer.
+                    if rs_remote['quality'] > 0.9 and rs_local['quality'] < 0.6:
+                        final_rx = val_peer
+                    else:
+                        # Otherwise, check which value satisfies Local Flow better
+                        d_peer = calc_error(val_peer, local_target_rx)
+                        d_self = calc_error(val_self, local_target_rx)
+
+                        if d_peer < d_self:
+                            final_rx = val_peer
+                        elif d_self < d_peer:
+                            final_rx = val_self
+                        else:
+                            final_rx = val_peer
+
+            # --- TX Repair ---
+            # Signals: Self(TX), Peer(RX), LocalTarget, RemoteTarget
+            val_self = s['tx']
+            val_peer = state[peer_id]['rx'] if has_peer else None
+
+            final_tx = val_self
+
+            if val_peer is not None:
+                # A. Golden Truth
+                golden_val = None
+                if remote_target_rx is not None:
+                    if calc_error(local_target_tx, remote_target_rx) < HARDENING_THRESHOLD:
+                        golden_val = (local_target_tx + remote_target_rx) / 2.0
+
+                if golden_val is not None:
+                    final_tx = golden_val
+
+                # C. Physics Violation (TX < Peer RX)
+                elif val_self < val_peer * (1.0 - STRICT_THRESHOLD):
+                    # Impossible deficit.
+                    if rs_remote['quality'] < 0.5 and rs_local['quality'] > 0.8:
+                        final_tx = val_self
+                    else:
+                        final_tx = val_peer
+
+                # D. Agreement
+                elif calc_error(val_self, val_peer) < HARDENING_THRESHOLD:
+                    final_tx = (val_self + val_peer) / 2.0
+
+                # E. Disagreement (TX > Peer RX)
+                else:
+                    # Dominant Quality Override
+                    if rs_remote['quality'] > 0.9 and rs_local['quality'] < 0.6:
+                        final_tx = val_peer
+                    else:
+                        d_peer = calc_error(val_peer, local_target_tx)
+                        d_self = calc_error(val_self, local_target_tx)
+
+                        if d_peer < d_self:
+                            final_tx = val_peer
+                        elif d_self < d_peer:
+                            final_tx = val_self
+                        else:
+                            final_tx = val_peer
+
+            next_values[if_id] = {'rx': final_rx, 'tx': final_tx}
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        def get_confidence(final, orig, peer_val, local_q, remote_q):
+            err_orig = calc_error(final, orig)
+
+            matches_peer = False
+            if peer_val is not None and calc_error(final, peer_val) < HARDENING_THRESHOLD:
+                matches_peer = True
+
+            # Base Score Strategy
+            # Start 1.0
+            # If Repaired -> Check Peer Match.
+            #   Match Peer: Very High (0.95). Boost if Remote Q is high.
+            #   No Match Peer: Low (0.60). Boost if Local Q is high.
+            # If Kept Original -> Check Peer Match.
+            #   No Match Peer: Dangerous (0.75). Boost if Local Q is high.
+
+            if err_orig > HARDENING_THRESHOLD:
+                # REPAIRED
+                if matches_peer:
+                    # Consensus with Link.
+                    # Verify with Flow.
+                    # Score = Base + (LocalQ weight) + (RemoteQ weight)
+                    # Ideally: 0.90 + 0.05*L + 0.04*R -> Max 0.99
+                    score = 0.90 + (0.05 * local_q) + (0.04 * remote_q)
+                else:
+                    # Repaired, but not to Peer? (Flow arbitration)
+                    # Depends entirely on Local Quality
+                    if local_q > 0.9:
+                        score = 0.85
+                    else:
+                        score = 0.60
+            else:
+                # KEPT ORIGINAL
+                if peer_val is not None and not matches_peer:
+                    # Disagreement.
+                    # We defied Peer. Only safe if Local Flow is perfect.
+                    if local_q > 0.9:
+                        # Strong Local Flow.
+                        # If Remote is bad, we are very confident.
+                        if remote_q < 0.8:
+                            score = 0.95
+                        else:
+                            # Stalemate (Both good).
+                            score = 0.85
+                    elif local_q > 0.7:
+                        score = 0.75
+                    else:
+                        score = 0.60 # Ambiguous
+                else:
+                    # Agreement or No Peer
+                    score = 1.0
+
+            return max(0.0, min(1.0, score))
+=======
+        def get_confidence(final, orig, peer_val, local_q, remote_q):
+            err_orig = calc_error(final, orig)
+
+            matches_peer = False
+            if peer_val is not None and calc_error(final, peer_val) < HARDENING_THRESHOLD:
+                matches_peer = True
+
+            score = 1.0
+
+            if err_orig > HARDENING_THRESHOLD:
+                # REPAIRED
+                if matches_peer:
+                    # Consensus (Link Agreement).
+                    # Base confidence is high, but penalized by poor router health.
+                    # Base 0.80. Max ~0.99.
+                    score = 0.80 + (0.10 * local_q) + (0.09 * remote_q)
+                else:
+                    # Repaired to Flow (Disagree with Peer).
+                    # Must rely entirely on Local Quality.
+                    score = 0.50 + (0.40 * local_q)
+            else:
+                # KEPT ORIGINAL
+                if peer_val is not None and not matches_peer:
+                    # Disagreement (Self != Peer).
+                    # Valid only if Local Quality is high.
+                    score = 0.50 + (0.45 * local_q)
+                    # Bonus: If Remote is bad, we trust ourselves more.
+                    if remote_q < 0.5:
+                        score += 0.04
+                else:
+                    # Agreement or No Peer.
+                    score = 0.95 + (0.05 * local_q)
+
+            return max(0.0, min(1.0, score))
+>>>>>>> REPLACE
+</DIFF>

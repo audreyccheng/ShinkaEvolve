@@ -1,0 +1,192 @@
+<NAME>
+lns_ils
+</NAME>
+
+<DESCRIPTION>
+Replace the random burst kicks in the Iterated Local Search with a targeted Large Neighborhood Search (Ruin & Recreate) mechanism. This strategy selects the bottleneck GPU and a few random partners, removes their assigned models, and greedily repacks them to minimize local KVPR. This allows the algorithm to perform complex, multi-item rearrangements to escape local optima that simple moves or swaps cannot resolve, while maintaining the steep descent convergence properties.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _iterated_local_search(gpu_num, placement):
+    """
+    Refines placement using Steepest Descent with Variance Tie-Breaking and Burst Kicks.
+    """
+    # Initialize state
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(i):
+        rem = GPU_MEM_SIZE - gpu_s[i]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[i] / rem
+
+    current_ks = [get_k(i) for i in range(gpu_num)]
+    best_max_k = max(current_ks)
+    best_placement = copy.deepcopy(placement)
+
+    # Calculate initial sum of squared pressures (variance proxy)
+    current_sum_sq = sum(k*k for k in current_ks)
+
+    max_steps = 500
+    patience = 20
+    no_improve = 0
+
+    for step in range(max_steps):
+        # 1. Identify bottleneck
+        max_k = -1.0
+        src = -1
+        for i in range(gpu_num):
+            if current_ks[i] > max_k:
+                max_k = current_ks[i]
+                src = i
+
+        # Check global improvement
+        if max_k < best_max_k - 1e-7:
+            best_max_k = max_k
+            best_placement = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Burst Kicks (if stuck)
+        if no_improve > patience:
+            # Perform a burst of random moves to escape local optimum
+            n_kicks = random.randint(3, 5)
+            for _ in range(n_kicks):
+                for _ in range(10): # retry limit for valid move
+                    s = random.randint(0, gpu_num - 1)
+                    if not placement[s]: continue
+                    d = random.randint(0, gpu_num - 1)
+                    if s == d: continue
+
+                    m_idx = random.randint(0, len(placement[s]) - 1)
+                    m = placement[s][m_idx]
+
+                    if gpu_s[d] + m.model_size <= GPU_MEM_SIZE:
+                        placement[d].append(m)
+                        placement[s].pop(m_idx)
+                        gpu_s[d] += m.model_size; gpu_w[d] += m.req_rate/m.slo
+                        gpu_s[s] -= m.model_size; gpu_w[s] -= m.req_rate/m.slo
+
+                        current_ks[s] = get_k(s)
+                        current_ks[d] = get_k(d)
+                        current_sum_sq = sum(k*k for k in current_ks)
+                        break
+            no_improve = 0 # Reset patience after kick
+            continue
+
+        # 3. Steepest Descent (Greedy)
+=======
+def _iterated_local_search(gpu_num, placement):
+    """
+    Refines placement using Steepest Descent with Variance Tie-Breaking and LNS (Ruin & Recreate) Kicks.
+    """
+    # Initialize state
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(i):
+        rem = GPU_MEM_SIZE - gpu_s[i]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[i] / rem
+
+    current_ks = [get_k(i) for i in range(gpu_num)]
+    best_max_k = max(current_ks)
+    best_placement = copy.deepcopy(placement)
+
+    # Calculate initial sum of squared pressures (variance proxy)
+    current_sum_sq = sum(k*k for k in current_ks)
+
+    max_steps = 1000  # Increased steps for LNS
+    patience = 50
+    no_improve = 0
+
+    for step in range(max_steps):
+        # 1. Identify bottleneck with tie-breaking
+        max_k = -1.0
+        src = -1
+        candidates = []
+        for i in range(gpu_num):
+            if current_ks[i] > max_k - 1e-9:
+                if current_ks[i] > max_k + 1e-9:
+                    max_k = current_ks[i]
+                    candidates = [i]
+                else:
+                    candidates.append(i)
+        src = random.choice(candidates) if candidates else 0
+
+        # Check global improvement
+        if max_k < best_max_k - 1e-7:
+            best_max_k = max_k
+            best_placement = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. LNS Kick (Ruin & Recreate) if stuck
+        if no_improve > patience:
+            # Select subset: Bottleneck + Randoms
+            subset = {src}
+            n_others = random.randint(2, 3)
+            others = list(range(gpu_num))
+            random.shuffle(others)
+            for o in others:
+                if len(subset) >= n_others + 1: break
+                if o != src: subset.add(o)
+
+            subset = list(subset)
+
+            # Backup state
+            backup = {}
+            repack_models = []
+            for idx in subset:
+                backup[idx] = (list(placement[idx]), gpu_s[idx], gpu_w[idx])
+                repack_models.extend(placement[idx])
+                # Clear GPU
+                placement[idx] = []
+                gpu_s[idx] = 0.0
+                gpu_w[idx] = 0.0
+
+            # Sort for packing: Size Descending (Constraints) then Load (Objective)
+            repack_models.sort(key=lambda m: (m.model_size, m.req_rate/m.slo), reverse=True)
+
+            feasible = True
+            for m in repack_models:
+                best_idx = -1
+                best_val = float('inf')
+
+                # Greedy Best-Fit: Minimize resulting local KVPR
+                for idx in subset:
+                    if gpu_s[idx] + m.model_size <= GPU_MEM_SIZE:
+                        rem = GPU_MEM_SIZE - (gpu_s[idx] + m.model_size)
+                        pk = (gpu_w[idx] + m.req_rate/m.slo) / rem if rem > 1e-7 else 1e9
+                        if pk < best_val:
+                            best_val = pk
+                            best_idx = idx
+
+                if best_idx != -1:
+                    placement[best_idx].append(m)
+                    gpu_s[best_idx] += m.model_size
+                    gpu_w[best_idx] += m.req_rate/m.slo
+                else:
+                    feasible = False
+                    break
+
+            if feasible:
+                # Update derived state
+                for idx in subset:
+                    current_ks[idx] = get_k(idx)
+                current_sum_sq = sum(k*k for k in current_ks)
+                no_improve = 0
+            else:
+                # Revert
+                for idx in subset:
+                    placement[idx], gpu_s[idx], gpu_w[idx] = backup[idx]
+                    current_ks[idx] = get_k(idx)
+
+            continue
+
+        # 3. Steepest Descent (Greedy)
+>>>>>>> REPLACE
+</DIFF>

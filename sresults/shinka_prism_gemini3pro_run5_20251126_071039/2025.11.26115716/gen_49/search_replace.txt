@@ -1,0 +1,266 @@
+<NAME>
+randomized_packing_and_swap_kicks
+</NAME>
+
+<DESCRIPTION>
+1.  **Randomized Packing in Binary Search**: Update `_check_feasibility_robust` to include randomized shuffles. This increases the probability of finding a valid packing for tight KVPR constraints during the binary search initialization, potentially lowering the starting `max_k`.
+2.  **Swap Kicks in ILS**: Modify the perturbation phase in `_variance_smoothing_ils` to perform random swaps in addition to moves. Swaps are essential for escaping local optima when GPU memories are nearly full and simple moves are infeasible.
+3.  **Increased Iterations**: Increase `max_steps` to 1000 to utilize the low execution time (currently ~0.01s) for deeper exploration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _check_feasibility_robust(gpu_num, items, K):
+    """
+    Checks feasibility using Best-Fit Decreasing with multiple sorting keys.
+    """
+    virtual_cap = K * GPU_MEM_SIZE
+
+    # Augment items with virtual size
+    pack_items = []
+    for x in items:
+        # Virtual Size: w + K*s
+        v = x['w'] + K * x['s']
+        pack_items.append({'v': v, 's': x['s'], 'w': x['w'], 'd': x['d'], 'm': x['m']})
+
+    # Heuristics: (Sort Key Lambda, Reverse)
+    heuristics = [
+        (lambda x: x['v'], True),  # Virtual Size Descending (Standard)
+        (lambda x: x['s'], True),  # Physical Size Descending
+        (lambda x: x['w'], True),  # Load Descending
+        (lambda x: x['d'], True),  # Density Descending
+    ]
+
+    for key_func, rev in heuristics:
+        pack_items.sort(key=key_func, reverse=rev)
+
+        # Best Fit Decreasing (Minimizes Residual Virtual Capacity)
+        if res := _pack_bfd(gpu_num, pack_items, virtual_cap):
+            return True, res
+
+    return False, None
+=======
+def _check_feasibility_robust(gpu_num, items, K):
+    """
+    Checks feasibility using Best-Fit Decreasing with multiple sorting keys
+    and randomized trials.
+    """
+    virtual_cap = K * GPU_MEM_SIZE
+
+    # Augment items with virtual size
+    pack_items = []
+    for x in items:
+        # Virtual Size: v = w + K*s
+        v = x['w'] + K * x['s']
+        pack_items.append({'v': v, 's': x['s'], 'w': x['w'], 'd': x['d'], 'm': x['m']})
+
+    # 1. Deterministic Heuristics
+    heuristics = [
+        (lambda x: x['v'], True),  # Virtual Size Descending (Standard)
+        (lambda x: x['s'], True),  # Physical Size Descending
+        (lambda x: x['w'], True),  # Load Descending
+        (lambda x: x['d'], True),  # Density Descending
+    ]
+
+    for key_func, rev in heuristics:
+        pack_items.sort(key=key_func, reverse=rev)
+        if res := _pack_bfd(gpu_num, pack_items, virtual_cap):
+            return True, res
+
+    # 2. Randomized Heuristics
+    # Try random orderings to break specific pathological cases
+    temp_items = pack_items[:]
+    for _ in range(8):
+        random.shuffle(temp_items)
+        if res := _pack_bfd(gpu_num, temp_items, virtual_cap):
+            return True, res
+
+    return False, None
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _variance_smoothing_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Variance Tie-Breaking and Burst Kicks.
+    """
+    # State initialization
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    best_max_k = max(get_k(i) for i in range(gpu_num))
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 500
+    patience = 25
+    no_improve = 0
+
+    # Pre-calculate initial sum of squares
+    current_ks = [get_k(i) for i in range(gpu_num)]
+
+    for _ in range(max_steps):
+        # 1. Status Check
+        max_k = -1.0
+        src = -1
+        sum_sq = 0.0
+
+        for i in range(gpu_num):
+            k = get_k(i)
+            current_ks[i] = k
+            if k > max_k:
+                max_k = k
+                src = i
+            sum_sq += k*k
+
+        # Update Global Best
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Burst Kick (Escape Local Optima)
+        if no_improve > patience:
+            moves_done = 0
+            # Perform a burst of 3-5 random moves
+            burst_size = random.randint(3, 5)
+            for _ in range(burst_size):
+                # Try to move from a high-load GPU
+                candidates = [i for i in range(gpu_num) if current_ks[i] > max_k * 0.7]
+                if not candidates: candidates = list(range(gpu_num))
+
+                s_idx = random.choice(candidates)
+                if not placement[s_idx]: continue
+
+                # To random destination
+                d_idx = random.randint(0, gpu_num - 1)
+                if s_idx == d_idx: continue
+
+                m_idx = random.randint(0, len(placement[s_idx]) - 1)
+                m = placement[s_idx][m_idx]
+
+                if gpu_s[d_idx] + m.model_size <= GPU_MEM_SIZE:
+                    placement[d_idx].append(m)
+                    placement[s_idx].pop(m_idx)
+
+                    gpu_s[d_idx] += m.model_size; gpu_w[d_idx] += m.req_rate/m.slo
+                    gpu_s[s_idx] -= m.model_size; gpu_w[s_idx] -= m.req_rate/m.slo
+                    # Update cache slightly for next kick step
+                    current_ks[s_idx] = get_k(s_idx)
+                    current_ks[d_idx] = get_k(d_idx)
+                    moves_done += 1
+
+            if moves_done > 0:
+                # Reset patience partially to allow settling
+                no_improve = max(0, patience - 10)
+            continue
+
+        # 3. Steepest Descent with Variance Tie-Breaking
+=======
+def _variance_smoothing_ils(gpu_num, placement):
+    """
+    Iterated Local Search with Variance Tie-Breaking and Burst Kicks (Moves & Swaps).
+    """
+    # State initialization
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate / m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_k(idx):
+        rem = GPU_MEM_SIZE - gpu_s[idx]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[idx] / rem
+
+    best_max_k = max(get_k(i) for i in range(gpu_num))
+    best_sol = copy.deepcopy(placement)
+
+    max_steps = 1000
+    patience = 20
+    no_improve = 0
+
+    # Pre-calculate initial sum of squares
+    current_ks = [get_k(i) for i in range(gpu_num)]
+
+    for _ in range(max_steps):
+        # 1. Status Check
+        max_k = -1.0
+        src = -1
+        sum_sq = 0.0
+
+        for i in range(gpu_num):
+            k = get_k(i)
+            current_ks[i] = k
+            if k > max_k:
+                max_k = k
+                src = i
+            sum_sq += k*k
+
+        # Update Global Best
+        if max_k < best_max_k - 1e-6:
+            best_max_k = max_k
+            best_sol = copy.deepcopy(placement)
+            no_improve = 0
+        else:
+            no_improve += 1
+
+        # 2. Burst Kick (Escape Local Optima)
+        if no_improve > patience:
+            moves_done = 0
+            # Perform a burst of perturbations
+            burst_size = random.randint(3, 6)
+            for _ in range(burst_size):
+                # Bias source towards high-load GPUs
+                candidates = [i for i in range(gpu_num) if current_ks[i] > max_k * 0.7]
+                if not candidates: candidates = list(range(gpu_num))
+                s_idx = random.choice(candidates)
+
+                if not placement[s_idx]: continue
+
+                d_idx = random.randint(0, gpu_num - 1)
+                if s_idx == d_idx: continue
+
+                # 50% Move, 50% Swap
+                if random.random() < 0.5:
+                    # Try Move
+                    m_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m = placement[s_idx][m_idx]
+
+                    if gpu_s[d_idx] + m.model_size <= GPU_MEM_SIZE:
+                        placement[d_idx].append(m)
+                        placement[s_idx].pop(m_idx)
+                        gpu_s[d_idx] += m.model_size; gpu_w[d_idx] += m.req_rate/m.slo
+                        gpu_s[s_idx] -= m.model_size; gpu_w[s_idx] -= m.req_rate/m.slo
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+                else:
+                    # Try Swap
+                    if not placement[d_idx]: continue
+                    m1_idx = random.randint(0, len(placement[s_idx]) - 1)
+                    m1 = placement[s_idx][m1_idx]
+                    m2_idx = random.randint(0, len(placement[d_idx]) - 1)
+                    m2 = placement[d_idx][m2_idx]
+
+                    ns_s = gpu_s[s_idx] - m1.model_size + m2.model_size
+                    ns_d = gpu_s[d_idx] - m2.model_size + m1.model_size
+
+                    if ns_s <= GPU_MEM_SIZE and ns_d <= GPU_MEM_SIZE:
+                        placement[s_idx][m1_idx] = m2
+                        placement[d_idx][m2_idx] = m1
+                        gpu_s[s_idx] = ns_s; gpu_w[s_idx] = gpu_w[s_idx] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+                        gpu_s[d_idx] = ns_d; gpu_w[d_idx] = gpu_w[d_idx] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+                        current_ks[s_idx] = get_k(s_idx)
+                        current_ks[d_idx] = get_k(d_idx)
+                        moves_done += 1
+
+            if moves_done > 0:
+                # Reset patience partially
+                no_improve = max(0, patience - 8)
+            continue
+
+        # 3. Steepest Descent with Variance Tie-Breaking
+>>>>>>> REPLACE
+</DIFF>

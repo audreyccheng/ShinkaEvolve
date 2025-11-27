@@ -1,0 +1,272 @@
+<NAME>
+rate_synthesis_and_continuous_scoring
+</NAME>
+
+<DESCRIPTION>
+Introduces a candidate synthesis mechanism based on flow conservation constraints to generate potential correct values for corrupted links (e.g., when both ends are zero/erroneous).
+Replaces the discrete voting system with a continuous scoring function that penalizes flow errors proportionally, allowing the algorithm to distinguish between "perfect" repairs and "marginally acceptable" ones.
+Adds a continuous decay to confidence scores based on residual flow errors to improve calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Rate Repair (Iterative Consensus) ---
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            # We want to find the consensus value for this traffic flow
+
+            val_tx = s['tx']              # Local view
+            val_rx = state[peer_id]['rx'] # Remote view
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                # Agreement: Just smooth out noise
+                new_val = avg
+            else:
+                # Disagreement: Resolve conflict using Flow Conservation constraints
+                rid_local = s['local_router']
+                rid_remote = s['remote_router']
+
+                # Calculate errors if we chose TX value
+                err_local_tx = get_flow_error(rid_local, if_id, 'tx', val_tx)
+                err_remote_tx = get_flow_error(rid_remote, peer_id, 'rx', val_tx)
+
+                # Calculate errors if we chose RX value
+                err_local_rx = get_flow_error(rid_local, if_id, 'tx', val_rx)
+                err_remote_rx = get_flow_error(rid_remote, peer_id, 'rx', val_rx)
+
+                # Scoring (Lower is better)
+                # 0.0 = Verified Good, 0.5 = Unverifiable, 1.0 = Verified Bad
+                def get_vote(err):
+                    if err is None: return 0.5
+                    if err < FLOW_TOLERANCE: return 0.0
+                    return 1.0
+
+                score_tx = get_vote(err_local_tx) + get_vote(err_remote_tx)
+                score_rx = get_vote(err_local_rx) + get_vote(err_remote_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                if val_tx < MIN_ACTIVITY and val_rx > MIN_ACTIVITY: score_tx += 0.4
+                if val_rx < MIN_ACTIVITY and val_tx > MIN_ACTIVITY: score_rx += 0.4
+
+                # Selection
+                if score_tx < score_rx:
+                    new_val = val_tx
+                elif score_rx < score_tx:
+                    new_val = val_rx
+                else:
+                    new_val = avg # Tie -> Average
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+=======
+    # --- 3. Rate Repair (Iterative Consensus) ---
+
+    # Helper for synthesis
+    def get_balance_value(rid, if_target, field):
+        if rid not in verifiable_routers: return None
+        sum_rx, sum_tx = 0.0, 0.0
+        for iface in router_map[rid]:
+            if iface == if_target: continue
+            sum_rx += state[iface]['rx']
+            sum_tx += state[iface]['tx']
+        return max(0.0, sum_rx - sum_tx) if field == 'tx' else max(0.0, sum_tx - sum_rx)
+
+    # Run multiple passes to allow flow corrections to propagate
+    for _ in range(3):
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state: continue
+
+            # The link connects Local(Tx) -> Remote(Rx)
+            val_tx = s['tx']
+            val_rx = state[peer_id]['rx']
+
+            # Check for Agreement
+            diff = abs(val_tx - val_rx)
+            avg = (val_tx + val_rx) / 2.0
+
+            if diff < max(avg * TOLERANCE, MIN_ACTIVITY):
+                new_val = avg
+            else:
+                # Disagreement: Candidate generation and Scoring
+                candidates = {val_tx, val_rx}
+
+                # Synthesize candidates from flow conservation
+                synth_tx = get_balance_value(s['local_router'], if_id, 'tx')
+                if synth_tx is not None: candidates.add(synth_tx)
+
+                synth_rx = get_balance_value(s['remote_router'], peer_id, 'rx')
+                if synth_rx is not None: candidates.add(synth_rx)
+
+                # Filter and Round
+                valid_candidates = sorted(list({round(c, 4) for c in candidates if c >= 0}))
+                if not valid_candidates: valid_candidates = [avg]
+
+                best_val = avg
+                best_score = float('inf')
+
+                for cand in valid_candidates:
+                    err_loc = get_flow_error(s['local_router'], if_id, 'tx', cand)
+                    err_rem = get_flow_error(s['remote_router'], peer_id, 'rx', cand)
+
+                    # Continuous Scoring Function
+                    # Prioritize verifiable low error > unverifiable > verified high error
+                    def get_cost(err):
+                        if err is None: return 0.05       # Unverifiable: neutral small cost
+                        if err < FLOW_TOLERANCE: return err # Good: cost is the actual error
+                        return 1.0 + err                  # Bad: heavy penalty + error
+
+                    score = get_cost(err_loc) + get_cost(err_rem)
+
+                    # Heuristic: Penalize zero if alternatives imply activity
+                    if cand < MIN_ACTIVITY and max(valid_candidates) > MIN_ACTIVITY:
+                        score += 0.5
+
+                    if score < best_score:
+                        best_score = score
+                        best_val = cand
+
+                new_val = best_val
+
+            # Update state immediately (Gauss-Seidel style)
+            state[if_id]['tx'] = new_val
+            state[peer_id]['rx'] = new_val
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    for if_id, s in state.items():
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+
+        rid = s['local_router']
+        peer_id = s['connected_to']
+
+        def calculate_confidence(orig, final, field):
+            # 1. Verification Status
+            # Local
+            local_err = final_router_errors.get(rid)
+            local_verified = (local_err is not None and local_err < FLOW_TOLERANCE)
+
+            # Remote
+            remote_verified = False
+            rem_rid = s['remote_router']
+            if rem_rid in final_router_errors:
+                 if final_router_errors[rem_rid] < FLOW_TOLERANCE:
+                     remote_verified = True
+
+            # 2. Change Analysis
+            changed = abs(orig - final) > max(orig * 0.001, 0.001)
+            # Smoothing = Changed, but within 5%
+            is_smoothing = changed and (abs(orig - final) < max(orig * 0.05, 0.1))
+
+            # 3. Peer Consistency (Symmetry)
+            peer_consistent = True
+            if peer_id in state:
+                # If checking Rx, compare with Peer Tx
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+
+            # --- Scoring ---
+
+            if not changed:
+                # Unchanged
+                if local_verified and remote_verified: return 1.0
+                if local_verified: return 0.98
+                if not peer_consistent: return 0.7 # Kept original despite conflict
+                return 0.9 # Default for unchanged
+
+            if is_smoothing:
+                return 0.95 # High confidence in smoothing
+
+            # Significant Correction
+            if local_verified and remote_verified:
+                return 0.98 # Validated by both ends
+            if local_verified:
+                return 0.95 # Validated by local math
+            if remote_verified:
+                return 0.90 # Validated by remote math
+
+            # Unverified Corrections
+            # Repairing a "Dead" counter (0 -> Active)
+            if orig < MIN_ACTIVITY and final > MIN_ACTIVITY:
+                return 0.85
+
+            # Total guess / forced agreement
+            return 0.6
+
+        rx_conf = calculate_confidence(orig_rx, final_rx, 'rx')
+        tx_conf = calculate_confidence(orig_tx, final_tx, 'tx')
+        st_conf = status_confidence.get(if_id, 1.0)
+=======
+    for if_id, s in state.items():
+        orig_rx, final_rx = s['orig_rx'], s['rx']
+        orig_tx, final_tx = s['orig_tx'], s['tx']
+
+        rid = s['local_router']
+        peer_id = s['connected_to']
+
+        def calculate_confidence(orig, final, field):
+            # 1. Verification Status
+            local_err = final_router_errors.get(rid)
+            local_verified = (local_err is not None and local_err < FLOW_TOLERANCE)
+
+            rem_rid = s['remote_router']
+            remote_err = final_router_errors.get(rem_rid)
+            remote_verified = (remote_err is not None and remote_err < FLOW_TOLERANCE)
+
+            # 2. Change Analysis
+            changed = abs(orig - final) > max(orig * 0.001, 0.001)
+            is_smoothing = changed and (abs(orig - final) < max(orig * 0.05, 0.1))
+
+            # 3. Peer Consistency
+            peer_consistent = True
+            if peer_id in state:
+                peer_val = state[peer_id]['tx'] if field == 'rx' else state[peer_id]['rx']
+                if abs(final - peer_val) > max(final, peer_val, 1.0) * TOLERANCE:
+                    peer_consistent = False
+
+            # --- Base Scoring ---
+            conf = 0.9
+
+            if not changed:
+                if local_verified and remote_verified: conf = 1.0
+                elif local_verified: conf = 0.98
+                elif not peer_consistent: conf = 0.7
+                else: conf = 0.9
+            elif is_smoothing:
+                conf = 0.95
+            else:
+                if local_verified and remote_verified: conf = 0.99
+                elif local_verified: conf = 0.96
+                elif remote_verified: conf = 0.92
+                elif orig < MIN_ACTIVITY and final > MIN_ACTIVITY: conf = 0.85
+                else: conf = 0.6
+
+            # --- Continuous Decay based on Residual Error ---
+            # If the router is still imbalanced, reduce confidence slightly
+            if local_err is not None and local_err > FLOW_TOLERANCE:
+                # Decay factor: dampen confidence by up to 20% for large errors
+                penalty = min(0.2, (local_err - FLOW_TOLERANCE))
+                conf *= (1.0 - penalty)
+
+            return float(conf)
+
+        rx_conf = calculate_confidence(orig_rx, final_rx, 'rx')
+        tx_conf = calculate_confidence(orig_tx, final_tx, 'tx')
+        st_conf = status_confidence.get(if_id, 1.0)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,130 @@
+<NAME>
+expected_penalty_and_staged_smoothing
+</NAME>
+
+<DESCRIPTION>
+I am improving two critical areas to boost repair accuracy and confidence calibration:
+
+1) Router-side selection: Replace the simplistic “lower average confidence” decision with an expected-penalty simulation that is dominance-aware and weight-focused. This mirrors our stronger previous variants and research guidance. It simulates the impact of applying a damped router correction on either RX or TX, considering confidence-weighted rates, caps (±10%), and concentration (HHI). We choose the side with the lower expected penalty, falling back to the average-confidence method only when penalties are within 5%. This should better avoid concentrating changes on the worse side and reduce mis-scalings, improving counter_repair_accuracy and calibration.
+
+2) Peer confidence smoothing: Make smoothing order-independent by staging updates into new_conf_rx/tx instead of in-place sequential mixing, which can introduce subtle asymmetries. This improves confidence_calibration without altering repaired values.
+
+Additionally, I adjusted the final router residual computation to only include “up” interfaces, aligning with earlier conservative steps and improving calibration signal quality for confidence scoring.
+
+These are targeted edits, consistent with existing hyperparameters and data structures, and should increase the combined score by improving both accuracy and confidence calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Choose side with lower aggregate confidence to adjust
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+=======
+        # Expected-penalty router-side selection with dominance awareness
+        def side_penalty(side: str) -> float:
+            # Build side-specific values and confidences
+            vals = [(i, (hardened_rx[i] if side == 'rx' else hardened_tx[i]),
+                     clamp01(conf_rx[i] if side == 'rx' else conf_tx[i]))
+                    for i in up_ifs]
+            # weights w_i = (1 - conf_i) * rate_i
+            w = {i: (1.0 - c) * max(v, ZERO_THRESH) for (i, v, c) in vals}
+            total_w = sum(w.values()) or 1.0
+            # Focused subset covering WEIGHT_FOCUS of total weight
+            order = sorted(up_ifs, key=lambda x: w[x], reverse=True)
+            focus: List[str] = []
+            acc_w = 0.0
+            for i2 in order:
+                if acc_w / total_w >= WEIGHT_FOCUS:
+                    break
+                focus.append(i2)
+                acc_w += w[i2]
+            if not focus:
+                focus = list(up_ifs)
+                acc_w = total_w
+            # Dominance-aware cap on weight shares within focus
+            cap_per = DOMINANCE_CAP * acc_w
+            eff_w = {i3: min(w[i3], cap_per) for i3 in focus}
+            eff_total = sum(eff_w.values()) or 1.0
+            # Simulated adjustment magnitude distributed on this side
+            sim_total = ((-imbalance) if side == 'rx' else imbalance) * DAMP_ROUTER
+            # Penalty accumulation with clip and concentration cost
+            penalty = 0.0
+            hhi = sum((eff_w[i4] / eff_total) ** 2 for i4 in focus)
+            for i5 in focus:
+                vi = hardened_rx[i5] if side == 'rx' else hardened_tx[i5]
+                wi = eff_w[i5] / eff_total
+                adj_raw = sim_total * wi
+                cap = PER_LINK_CLIP * max(vi, ZERO_THRESH)
+                adj = max(-cap, min(cap, adj_raw))
+                ci = clamp01(conf_rx[i5] if side == 'rx' else conf_tx[i5])
+                penalty += abs(adj) / max(1.0, abs(vi)) + 0.5 * (1.0 - ci)
+            penalty += 0.05 * hhi * len(focus)
+            return penalty
+
+        pen_rx = side_penalty('rx')
+        pen_tx = side_penalty('tx')
+        if pen_rx + 1e-9 < 0.95 * (pen_tx + 1e-9):
+            adjust_side = 'rx'
+        elif pen_tx + 1e-9 < 0.95 * (pen_rx + 1e-9):
+            adjust_side = 'tx'
+        else:
+            # Fallback to lower aggregate confidence
+            avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+            avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+            adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Compute router residuals after all adjustments (for confidence calibration)
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if i in telemetry]
+        if not up_ifs:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+=======
+    # Compute router residuals after all adjustments (for confidence calibration)
+    router_residual: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        ups = [i for i in ifs if status.get(i) == 'up']
+        if not ups:
+            router_residual[r] = 0.0
+            continue
+        sum_rx = sum(hardened_rx[i] for i in ups)
+        sum_tx = sum(hardened_tx[i] for i in ups)
+        denom = max(1.0, sum_rx, sum_tx)
+        router_residual[r] = abs(sum_rx - sum_tx) / denom
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Peer smoothing
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            conf_tx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[a] + PEER_SMOOTH * conf_rx[b])
+            conf_rx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[b] + PEER_SMOOTH * conf_tx[a])
+            conf_rx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[a] + PEER_SMOOTH * conf_tx[b])
+            conf_tx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[b] + PEER_SMOOTH * conf_rx[a])
+=======
+    # Peer smoothing (order-independent via staged update)
+    new_conf_rx = dict(conf_rx)
+    new_conf_tx = dict(conf_tx)
+    for a, b in link_pairs:
+        if status.get(a) == 'up' and status.get(b) == 'up':
+            new_conf_tx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[a] + PEER_SMOOTH * conf_rx[b])
+            new_conf_rx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[b] + PEER_SMOOTH * conf_tx[a])
+            new_conf_rx[a] = clamp01((1.0 - PEER_SMOOTH) * conf_rx[a] + PEER_SMOOTH * conf_tx[b])
+            new_conf_tx[b] = clamp01((1.0 - PEER_SMOOTH) * conf_tx[b] + PEER_SMOOTH * conf_rx[a])
+    conf_rx, conf_tx = new_conf_rx, new_conf_tx
+>>>>>>> REPLACE
+</DIFF>

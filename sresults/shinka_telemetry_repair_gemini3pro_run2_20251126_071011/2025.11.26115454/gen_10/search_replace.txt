@@ -1,0 +1,279 @@
+<NAME>
+symmetric_flow_repair
+</NAME>
+
+<DESCRIPTION>
+Implements a global iterative repair strategy that treats link directions symmetrically.
+1. Identifies symmetric links first and marks them as high confidence (1.0).
+2. For asymmetric links, uses flow conservation from BOTH connected routers to vote on the correct value.
+3. Scores candidates based on total violation error across both routers.
+4. Calibrates confidence based on the residual error of the winner (low error = high confidence).
+This replaces the asymmetric "local-only" check and improves confidence calibration by linking it to model fit quality.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Pass 2: Fix Rates using Symmetry & Flow Conservation
+    # We iterate over interfaces and check for symmetry violations
+    for if_id, s in state.items():
+        if s['status'] == 'down':
+            continue
+
+        peer_id = s['orig'].get('connected_to')
+        if not peer_id or peer_id not in state:
+            continue
+        peer = state[peer_id]
+
+        # --- Check RX (should match Peer TX) ---
+        diff_rx = abs(s['rx'] - peer['tx'])
+        denom_rx = max(s['rx'], peer['tx'], 1.0)
+
+        if diff_rx / denom_rx > HARDENING_THRESHOLD:
+            # Symmetry Violation. Try to use Flow Conservation to pick winner.
+            local_router = s['orig'].get('local_router')
+            use_peer = True # Default fallback
+
+            # Calculate target RX for this interface to balance local router
+            if local_router and local_router in topology:
+                sum_tx_all = 0.0
+                sum_rx_other = 0.0
+                valid_topology = True
+
+                for rid in topology[local_router]:
+                    if rid not in state:
+                        valid_topology = False; break
+                    sum_tx_all += state[rid]['tx']
+                    if rid != if_id:
+                        sum_rx_other += state[rid]['rx']
+
+                if valid_topology:
+                    target_rx = max(0.0, sum_tx_all - sum_rx_other)
+                    dist_local = abs(s['rx'] - target_rx)
+                    dist_peer = abs(peer['tx'] - target_rx)
+
+                    if dist_local < dist_peer:
+                        use_peer = False
+                        # We trust local, but it disagrees with peer.
+                        # Confidence low unless very close to target
+                        match_q = dist_local / max(target_rx, 1.0)
+                        s['rx_conf'] = max(0.5, 1.0 - match_q)
+                    else:
+                        use_peer = True
+                        # We trust peer because it balances flow
+                        match_q = dist_peer / max(target_rx, 1.0)
+                        # Boost confidence if flow conservation confirms it
+                        s['rx_conf'] = max(0.8, 1.0 - match_q)
+                else:
+                    # No topology validation possible, fallback to peer + diff penalty
+                    s['rx_conf'] = max(0.0, 1.0 - (diff_rx / denom_rx))
+            else:
+                 s['rx_conf'] = max(0.0, 1.0 - (diff_rx / denom_rx))
+
+            if use_peer:
+                s['rx'] = peer['tx']
+
+        # --- Check TX (should match Peer RX) ---
+        diff_tx = abs(s['tx'] - peer['rx'])
+        denom_tx = max(s['tx'], peer['rx'], 1.0)
+
+        if diff_tx / denom_tx > HARDENING_THRESHOLD:
+            local_router = s['orig'].get('local_router')
+            use_peer = True
+
+            # Target TX = Sum(RX_all) - Sum(TX_other)
+            if local_router and local_router in topology:
+                sum_rx_all = 0.0
+                sum_tx_other = 0.0
+                valid_topology = True
+
+                for rid in topology[local_router]:
+                    if rid not in state:
+                        valid_topology = False; break
+                    sum_rx_all += state[rid]['rx']
+                    if rid != if_id:
+                        sum_tx_other += state[rid]['tx']
+
+                if valid_topology:
+                    target_tx = max(0.0, sum_rx_all - sum_tx_other)
+                    dist_local = abs(s['tx'] - target_tx)
+                    dist_peer = abs(peer['rx'] - target_tx)
+
+                    if dist_local < dist_peer:
+                        use_peer = False
+                        match_q = dist_local / max(target_tx, 1.0)
+                        s['tx_conf'] = max(0.5, 1.0 - match_q)
+                    else:
+                        use_peer = True
+                        match_q = dist_peer / max(target_tx, 1.0)
+                        s['tx_conf'] = max(0.8, 1.0 - match_q)
+                else:
+                    s['tx_conf'] = max(0.0, 1.0 - (diff_tx / denom_tx))
+            else:
+                s['tx_conf'] = max(0.0, 1.0 - (diff_tx / denom_tx))
+
+            if use_peer:
+                s['tx'] = peer['rx']
+=======
+    # Pass 2: Symmetry Check & Initial Fix
+    # Identify links that are symmetric and trust them (High Confidence)
+    # Identify links that are asymmetric and mark them for Flow Repair (Low Confidence)
+    processed_pairs = set()
+
+    # Pre-sort to ensure deterministic order
+    for if_id in sorted(state.keys()):
+        s = state[if_id]
+        if s['status'] == 'down':
+            continue
+
+        peer_id = s['orig'].get('connected_to')
+        if not peer_id or peer_id not in state:
+            continue
+
+        # Canonical pair ID to avoid double processing
+        pair = tuple(sorted([if_id, peer_id]))
+        if pair in processed_pairs:
+            continue
+        processed_pairs.add(pair)
+
+        peer = state[peer_id]
+        if peer['status'] == 'down':
+            continue
+
+        # 1. Check TX -> Peer RX
+        tx_val = s['tx']
+        peer_rx_val = peer['rx']
+        denom = max(tx_val, peer_rx_val, 1.0)
+
+        if abs(tx_val - peer_rx_val) / denom <= HARDENING_THRESHOLD:
+            # Symmetric - assume correct
+            avg = (tx_val + peer_rx_val) / 2.0
+            s['tx'] = avg
+            peer['rx'] = avg
+            s['tx_conf'] = 1.0
+            peer['rx_conf'] = 1.0
+        else:
+            # Asymmetric - flag for repair with low confidence initially
+            s['tx_conf'] = 0.5
+            peer['rx_conf'] = 0.5
+
+        # 2. Check RX <- Peer TX
+        rx_val = s['rx']
+        peer_tx_val = peer['tx']
+        denom = max(rx_val, peer_tx_val, 1.0)
+
+        if abs(rx_val - peer_tx_val) / denom <= HARDENING_THRESHOLD:
+            avg = (rx_val + peer_tx_val) / 2.0
+            s['rx'] = avg
+            peer['tx'] = avg
+            s['rx_conf'] = 1.0
+            peer['tx_conf'] = 1.0
+        else:
+            s['rx_conf'] = 0.5
+            peer['tx_conf'] = 0.5
+
+    # Pass 3: Flow Conservation Repair
+    # Resolve asymmetric links by checking flow conservation at BOTH ends
+
+    def get_flow_target(router_id, exclude_if, flow_type):
+        """
+        Calculate expected flow rate for 'exclude_if' to balance 'router_id'.
+        flow_type 'in': we want to know expected RX on exclude_if
+        flow_type 'out': we want to know expected TX on exclude_if
+        """
+        if not router_id or router_id not in topology:
+            return None
+
+        sum_in = 0.0
+        sum_out = 0.0
+
+        for rid in topology[router_id]:
+            if rid not in state:
+                return None
+            # Use current best estimates
+            sum_in += state[rid]['rx']
+            sum_out += state[rid]['tx']
+
+        curr_vals = state[exclude_if]
+
+        if flow_type == 'in':
+            # Target RX = Sum_TX - Sum_RX_others
+            sum_in_others = sum_in - curr_vals['rx']
+            return max(0.0, sum_out - sum_in_others)
+        else: # flow_type == 'out'
+            # Target TX = Sum_RX - Sum_TX_others
+            sum_out_others = sum_out - curr_vals['tx']
+            return max(0.0, sum_in - sum_out_others)
+
+    # Iterative repair to propagate constraints (Gauss-Seidel)
+    # 2 passes is usually enough for local constraints
+    for _ in range(2):
+        for if_id in sorted(state.keys()):
+            s = state[if_id]
+            if s['status'] == 'down':
+                continue
+
+            # Check RX (Incoming to Local)
+            # We process RX for every interface, which handles the link's flow direction
+            if s['rx_conf'] < 0.9:
+                peer_id = s['orig'].get('connected_to')
+                if not peer_id or peer_id not in state:
+                    continue
+                peer = state[peer_id]
+
+                # Candidates: Local RX measurement vs Peer TX measurement
+                # We use current state values as candidates to allow convergence
+                c1 = s['rx']
+                c2 = peer['tx']
+
+                # Targets
+                # 1. Local Router: wants 's' RX to balance
+                t_local = get_flow_target(s['orig'].get('local_router'), if_id, 'in')
+
+                # 2. Remote Router: wants 'peer' TX to balance
+                t_remote = get_flow_target(peer['orig'].get('local_router'), peer_id, 'out')
+
+                # Score candidates: Sum of errors at both ends
+                def score(val):
+                    err = 0.0
+                    count = 0
+                    if t_local is not None:
+                        err += abs(val - t_local)
+                        count += 1
+                    if t_remote is not None:
+                        err += abs(val - t_remote)
+                        count += 1
+                    return err, count
+
+                err1, n1 = score(c1)
+                err2, n2 = score(c2)
+
+                best_val = c1
+                conf = 0.5
+
+                if n1 == 0 and n2 == 0:
+                    # No topology info, fallback to average
+                    best_val = (c1 + c2) / 2.0
+                    conf = 0.5
+                else:
+                    # Pick winner with lowest error
+                    if err1 < err2:
+                        best_val = c1
+                        winner_err = err1
+                    else:
+                        best_val = c2
+                        winner_err = err2
+
+                    # Calculate confidence based on fit quality
+                    # Relative error: error / magnitude
+                    rel_err = winner_err / max(best_val, 1.0)
+
+                    # Calibration: 0 error -> 1.0 conf; 50% error -> 0.5 conf
+                    conf = 1.0 - min(0.5, rel_err)
+
+                # Update state
+                s['rx'] = best_val
+                peer['tx'] = best_val
+                s['rx_conf'] = conf
+                peer['tx_conf'] = conf
+>>>>>>> REPLACE
+</DIFF>

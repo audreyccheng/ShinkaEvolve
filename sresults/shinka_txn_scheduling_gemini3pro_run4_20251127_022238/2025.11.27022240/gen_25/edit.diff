@@ -1,0 +1,375 @@
+--- a/original.py
++++ b/original.py
+@@ -1,276 +1,281 @@
+ # EVOLVE-BLOCK-START
+ """Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+ 
+ import time
+ import random
+ import sys
+ import os
+ import math
++import re
+ 
+ # Add the openevolve_examples directory to the path to import txn_simulator and workloads
+ # Find the repository root by looking for the openevolve_examples directory
+ def find_repo_root(start_path):
+     """Find the repository root by looking for openevolve_examples directory."""
+     current = os.path.abspath(start_path)
+     # Search up the directory tree
+     while current != os.path.dirname(current):  # Stop at filesystem root
+         candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return current
+         current = os.path.dirname(current)
+ 
+     # If not found by searching up, try common locations relative to known paths
+     # This handles when the program is copied to a results directory
+     script_dir = os.path.dirname(os.path.abspath(__file__))
+     possible_roots = [
+         script_dir,  # Current directory
+         os.path.dirname(script_dir),  # Parent
+         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+         '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+         '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+     ]
+     for root in possible_roots:
+         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return root
+ 
+     raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+ 
+ repo_root = find_repo_root(os.path.dirname(__file__))
+ sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+-    Get optimal schedule using "Big Rocks" Greedy Construction and Late Acceptance Hill Climbing.
+-
++    Hybrid schedule optimizer: 'Big Rocks' Greedy + Simulated Annealing with Block Moves.
++    
+     Algorithm:
+-    1.  **Txn Analysis**: Pre-compute transaction lengths (ops count) and sort for priority.
++    1.  **Metric Analysis**: Pre-compute transaction lengths (ops count) to identify "Big Rocks".
+     2.  **Greedy Phase**: Generate `num_seqs` candidates.
+-        - Sample Strategy: At each step, consider a mix of:
+-          - Top K longest remaining transactions ("Big Rocks").
+-          - Random sample of others.
+-        - Objective: Minimize `(cost, -length)` (Best Fit Descending).
+-        - **Descent**: Apply adjacent swap descent to locally optimize each candidate.
+-    3.  **Refinement Phase (LAHC)**:
+-        - Select best candidate from greedy phase.
+-        - Apply Late Acceptance Hill Climbing (LAHC) which is robust for escaping local optima.
+-        - Operators:
+-          - Single Shift (Insert): 60%
+-          - Block Shift (Move 2-3 txns): 30%
+-          - Adjacent Swap: 10%
++        -   **Sample Strategy**: Mix of Top K longest remaining ("Big Rocks") and Random samples.
++            This ensures difficult transactions are scheduled early/optimally while maintaining diversity.
++        -   **Objective**: Minimize `(cost, -length)` (Best Fit Descending).
++        -   **Descent**: Immediate Adjacent Swap Descent (Hill Climbing) on every candidate.
++    3.  **Refinement Phase (SA)**:
++        -   Apply Simulated Annealing to the best candidate from the greedy phase.
++        -   **Operators**:
++            -   Shift (Insertion): 50%
++            -   Block Shift (Chunk Move): 30%. Preserves local dependency chains.
++            -   Swap: 20%.
++        -   Cooling: Slow geometric decay to allow fine-tuning.
+ 
+     Args:
+         workload: Workload object
+         num_seqs: Number of independent random starts
+ 
+     Returns:
+         Tuple of (lowest makespan, corresponding schedule)
+     """
+-    import re
+ 
+     # --- Pre-computation ---
+     txn_lens = {}
+     try:
+         for i in range(workload.num_txns):
+             raw_txn = workload.txns[i]
+             if isinstance(raw_txn, (list, tuple)):
+                 raw_txn = raw_txn[0]
+             txn_str = str(raw_txn)
+             ops = len(re.findall(r'[rw]-\d+', txn_str))
+             txn_lens[i] = ops
+     except Exception:
+         for i in range(workload.num_txns):
+             txn_lens[i] = 1
+ 
+-    # Sorted indices for "Big Rocks" strategy
++    # Sorted by length descending
+     sorted_txns = sorted(range(workload.num_txns), key=lambda i: txn_lens[i], reverse=True)
+ 
+-    SAMPLE_SIZE = 15      # Size of random sample
+-    BIG_ROCKS_COUNT = 3   # Number of top longest txns to always include
+-
++    # Greedy Parameters
++    SAMPLE_SIZE = 18          # Combined sample size (Rocks + Random)
++    BIG_ROCKS_COUNT = 4       # Number of top longest txns to prioritize
++    
++    # SA Parameters
++    SA_ITERS = 2500
++    T_START = 2.0
++    T_MIN = 0.05
++    ALPHA = 0.995 
++    
+     candidates = []
+ 
+-    # --- Phase 1: Greedy Construction ---
++    # --- Phase 1: Diverse Greedy Construction ---
+     for _ in range(num_seqs):
+         remaining = set(range(workload.num_txns))
+-        # Start random
++        
++        # Random start
+         start_txn = random.choice(list(remaining))
+         current_seq = [start_txn]
+         remaining.remove(start_txn)
+ 
+         while remaining:
+             pool = []
+-
++            
+             # A. Big Rocks: Check longest remaining
+             added_rocks = 0
+             for t in sorted_txns:
+                 if t in remaining:
+                     pool.append(t)
+                     added_rocks += 1
+                     if added_rocks >= BIG_ROCKS_COUNT:
+                         break
+-
++            
+             # B. Random Sample
+-            # Filter remaining to exclude what we just picked (optional, but cleaner)
+-            # Just sampling from list(remaining) is easier, duplicates in pool handled by evaluation logic
++            # Fill the rest of the sample size with random picks
++            needed = SAMPLE_SIZE - len(pool)
+             rem_list = list(remaining)
+-            if len(rem_list) > SAMPLE_SIZE:
+-                pool.extend(random.sample(rem_list, SAMPLE_SIZE))
+-            else:
+-                pool.extend(rem_list)
+-
+-            # Deduplicate pool
++            
++            if needed > 0:
++                # If we have fewer remaining than needed, just take all
++                if len(rem_list) <= needed:
++                    pool.extend(rem_list)
++                else:
++                    pool.extend(random.sample(rem_list, needed))
++            
+             pool = list(set(pool))
+-
++            
+             best_cand = -1
+             best_score = (float('inf'), 0)
+-
++            
+             for t in pool:
+                 # Evaluate (cost, -length)
++                # Note: This is the bottleneck, so limiting pool size is crucial
+                 cost = workload.get_opt_seq_cost(current_seq + [t])
+                 score = (cost, -txn_lens[t])
+-
++                
+                 if score < best_score:
+                     best_score = score
+                     best_cand = t
+-
++            
+             current_seq.append(best_cand)
+             remaining.remove(best_cand)
+ 
+-        # Quick Polish (Hill Climbing)
+-        # Necessary to normalize the quality of greedy constructions
++        # Immediate Polish (Hill Climbing)
++        # Essential to reach local minimum for accurate comparison
+         current_cost = workload.get_opt_seq_cost(current_seq)
+         improved = True
+         while improved:
+             improved = False
+             for i in range(len(current_seq) - 1):
+                 current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+                 new_cost = workload.get_opt_seq_cost(current_seq)
+                 if new_cost < current_cost:
+                     current_cost = new_cost
+                     improved = True
+                 else:
+                     current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+-
++                    
+         candidates.append((current_cost, current_seq))
+ 
+-    # --- Phase 2: Refinement (LAHC) ---
+-    # Late Acceptance Hill Climbing
++    # --- Phase 2: Refinement (Simulated Annealing) ---
+     candidates.sort(key=lambda x: x[0])
+     best_overall_cost, best_overall_seq = candidates[0]
+-
++    
+     current_seq = list(best_overall_seq)
+     current_cost = best_overall_cost
+-
+-    # LAHC Parameters
+-    LAHC_HISTORY_LEN = 50
+-    history = [current_cost] * LAHC_HISTORY_LEN
+-    MAX_ITER = 1500
+-
+-    for i in range(MAX_ITER):
+-        # Mutation
+-        r = random.random()
++    
++    T = T_START
++    
++    for _ in range(SA_ITERS):
++        if T < T_MIN:
++            # Reheat or simple termination
++            break
++            
+         neighbor_seq = list(current_seq)
+         seq_len = len(neighbor_seq)
+-
+-        if r < 0.6:
+-            # Single Shift (Insertion)
+-            if seq_len < 2: continue
+-            idx_from = random.randint(0, seq_len - 1)
+-            idx_to = random.randint(0, seq_len - 1)
+-            if idx_from == idx_to: continue
+-            txn = neighbor_seq.pop(idx_from)
+-            neighbor_seq.insert(idx_to, txn)
+-
+-        elif r < 0.9:
+-            # Block Shift (Move 2-3 items)
+-            if seq_len < 4: continue
+-            block_size = random.randint(2, 3)
+-            # Ensure indices
+-            idx_from = random.randint(0, seq_len - block_size)
+-            # Extract block
+-            block = neighbor_seq[idx_from : idx_from + block_size]
+-            del neighbor_seq[idx_from : idx_from + block_size]
+-            # Insert block
+-            idx_to = random.randint(0, len(neighbor_seq)) # len is smaller now
+-            neighbor_seq[idx_to:idx_to] = block
+-
++        r = random.random()
++        
++        # Operators
++        if r < 0.5:
++            # Shift (Insertion)
++            if seq_len > 1:
++                idx_from = random.randint(0, seq_len - 1)
++                idx_to = random.randint(0, seq_len - 1)
++                if idx_from != idx_to:
++                    val = neighbor_seq.pop(idx_from)
++                    neighbor_seq.insert(idx_to, val)
++                    
++        elif r < 0.8:
++            # Block Shift (Move 2-4 items)
++            if seq_len > 4:
++                block_size = random.randint(2, 4)
++                idx_from = random.randint(0, seq_len - block_size)
++                # Extract
++                block = neighbor_seq[idx_from : idx_from + block_size]
++                del neighbor_seq[idx_from : idx_from + block_size]
++                # Insert
++                idx_to = random.randint(0, len(neighbor_seq))
++                neighbor_seq[idx_to:idx_to] = block
++                
+         else:
+             # Swap Adjacent
+-            if seq_len < 2: continue
+-            idx = random.randint(0, seq_len - 2)
+-            neighbor_seq[idx], neighbor_seq[idx+1] = neighbor_seq[idx+1], neighbor_seq[idx]
+-
+-        # Evaluation
++            if seq_len > 1:
++                idx = random.randint(0, seq_len - 2)
++                neighbor_seq[idx], neighbor_seq[idx+1] = neighbor_seq[idx+1], neighbor_seq[idx]
++                
++        # Evaluate
+         neighbor_cost = workload.get_opt_seq_cost(neighbor_seq)
+-
+-        # LAHC Acceptance
+-        history_idx = i % LAHC_HISTORY_LEN
+-
+-        # Accept if better/equal to current OR better/equal to history
+-        if neighbor_cost <= current_cost or neighbor_cost <= history[history_idx]:
++        delta = neighbor_cost - current_cost
++        
++        # Acceptance
++        if delta < 0 or random.random() < math.exp(-delta / T):
+             current_seq = neighbor_seq
+             current_cost = neighbor_cost
+-
++            
+             if current_cost < best_overall_cost:
+                 best_overall_cost = current_cost
+                 best_overall_seq = list(current_seq)
+-
+-        # Update history
+-        history[history_idx] = current_cost
++                
++        T *= ALPHA
+ 
+     return best_overall_cost, best_overall_seq
+ 
+ 
+ def get_random_costs():
+     """
+     Evaluate scheduling algorithm on three different workloads.
+ 
+     Returns:
+         Tuple of (total_makespan, list_of_schedules, execution_time)
+     """
+     start_time = time.time()
+-    # NUM_SEQS = 10 provides a good balance between exploration (multiple starts)
+-    # and exploitation (Simulated Annealing on the best candidate).
++    # NUM_SEQS = 10 for broad exploration
+     NUM_SEQS = 10
+ 
+     # Workload 1: Complex mixed read/write transactions
+     workload = Workload(WORKLOAD_1)
+     makespan1, schedule1 = get_best_schedule(workload, NUM_SEQS)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     # Workload 2: Simple read-then-write pattern
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, NUM_SEQS)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     # Workload 3: Minimal read/write operations
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, NUM_SEQS)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+ 
+     total_makespan = cost1 + cost2 + cost3
+     schedules = [schedule1, schedule2, schedule3]
+     execution_time = time.time() - start_time
+ 
+     return total_makespan, schedules, execution_time
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_scheduling():
+     """Run the transaction scheduling algorithm for all workloads"""
+     total_makespan, schedules, execution_time = get_random_costs()
+     return total_makespan, schedules, execution_time
+ 
+ 
+ if __name__ == "__main__":
+     total_makespan, schedules, execution_time = run_scheduling()
+     print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+     print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

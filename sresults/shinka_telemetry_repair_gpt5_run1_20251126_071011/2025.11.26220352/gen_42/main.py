@@ -1,0 +1,608 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm that detects and corrects inconsistencies
+in network interface telemetry data using topology relationships.
+
+Redesigned as a multi-stage pipeline:
+  1) Signal collection and normalization
+  2) Link hardening (pairwise redundancy)
+  3) Router balancing (bounded multiplicative step + confidence-weighted additive redistribution)
+  4) Targeted pair reconciliation for edited links
+  5) Confidence calibration and output assembly
+"""
+from typing import Dict, Any, Tuple, List, Optional
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Constants
+    TOL = 0.02  # hardening threshold (≈2%)
+    EPS = 1e-9
+
+    # ------------------------
+    # Helpers
+    # ------------------------
+    def norm_status(s: Any) -> str:
+        s = str(s).lower()
+        return s if s in ("up", "down") else "up"
+
+    def nz_float(x: Any) -> float:
+        try:
+            v = float(x)
+        except Exception:
+            v = 0.0
+        return max(0.0, v)
+
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def get_peer(iface_id: str) -> Optional[str]:
+        return peers.get(iface_id)
+
+    # ------------------------
+    # Signal collection
+    # ------------------------
+    # Build peer mapping
+    peers: Dict[str, str] = {iface: data.get("connected_to") for iface, data in telemetry.items()}
+
+    # Build per-router index
+    router_ifaces: Dict[str, List[str]] = {}
+    for r, ifs in topology.items():
+        router_ifaces[r] = [i for i in ifs if i in telemetry]
+
+    # Working state per interface
+    state: Dict[str, Dict[str, Any]] = {}
+    for iface, data in telemetry.items():
+        status = norm_status(data.get("interface_status", "unknown"))
+        rx0 = nz_float(data.get("rx_rate", 0.0))
+        tx0 = nz_float(data.get("tx_rate", 0.0))
+        if status == "down":
+            rx = 0.0
+            tx = 0.0
+        else:
+            rx = rx0
+            tx = tx0
+
+        # Peer info
+        pid = get_peer(iface)
+        peer_present = bool(pid and pid in telemetry)
+        peer_status = norm_status(telemetry[pid]["interface_status"]) if peer_present else "unknown"
+        peer_rx0 = nz_float(telemetry[pid]["rx_rate"]) if peer_present else 0.0
+        peer_tx0 = nz_float(telemetry[pid]["tx_rate"]) if peer_present else 0.0
+
+        # Initial link residuals (using original measurements)
+        rx_resid0 = rel_diff(rx0, peer_tx0) if peer_present else 0.0
+        tx_resid0 = rel_diff(tx0, peer_rx0) if peer_present else 0.0
+        conf_rx0 = max(0.0, 1.0 - rx_resid0) if peer_present else 0.6
+        conf_tx0 = max(0.0, 1.0 - tx_resid0) if peer_present else 0.6
+
+        state[iface] = {
+            "status": status,
+            "rx0": rx0,
+            "tx0": tx0,
+            "rx": rx,
+            "tx": tx,
+            "peer_id": pid,
+            "peer_present": peer_present,
+            "peer_status": peer_status,
+            "local_router": data.get("local_router"),
+            "remote_router": data.get("remote_router"),
+            "conf_rx0": conf_rx0,
+            "conf_tx0": conf_tx0,
+            "rx_resid0": rx_resid0,
+            "tx_resid0": tx_resid0,
+            # edit tracking
+            "delta_rx": 0.0,
+            "delta_tx": 0.0,
+            "cap_hit_rx": False,
+            "cap_hit_tx": False,
+            "scaled_rx": 1.0,  # multiplicative footprint for penalties
+            "scaled_tx": 1.0,
+        }
+
+    # ------------------------
+    # Link hardening (pairwise redundancy)
+    # ------------------------
+    # For each bidirectional pair, gently move violating directions toward peer counters.
+    visited_pairs = set()
+    for iface, s in state.items():
+        pid = s["peer_id"]
+        if not (pid and pid in state):
+            continue
+        key = tuple(sorted([iface, pid]))
+        if key in visited_pairs:
+            continue
+        visited_pairs.add(key)
+
+        a = state[iface]
+        b = state[pid]
+        # Only consider when both local statuses are up
+        if a["status"] != "up" or b["status"] != "up":
+            continue
+
+        # A.rx should match B.tx; A.tx should match B.rx
+        resid_a_rx = rel_diff(a["rx"], b["tx"])
+        resid_a_tx = rel_diff(a["tx"], b["rx"])
+        # Move fractions based on violation magnitude (bounded)
+        def move_frac(resid: float) -> float:
+            if resid <= TOL:
+                return 0.0
+            return min(0.7, max(0.3, resid / 0.2))
+
+        f_rx = move_frac(resid_a_rx)
+        f_tx = move_frac(resid_a_tx)
+
+        # Apply symmetric nudges toward counterparts
+        if f_rx > 0.0:
+            target_arx = (1.0 - f_rx) * a["rx"] + f_rx * b["tx"]
+            a["delta_rx"] += target_arx - a["rx"]
+            a["rx"] = target_arx
+
+            target_btx = (1.0 - f_rx) * b["tx"] + f_rx * a["rx"]  # slight re-eval with updated a["rx"]
+            b["delta_tx"] += target_btx - b["tx"]
+            b["tx"] = target_btx
+
+        if f_tx > 0.0:
+            target_atx = (1.0 - f_tx) * a["tx"] + f_tx * b["rx"]
+            a["delta_tx"] += target_atx - a["tx"]
+            a["tx"] = target_atx
+
+            target_brx = (1.0 - f_tx) * b["rx"] + f_tx * a["tx"]
+            b["delta_rx"] += target_brx - b["rx"]
+            b["rx"] = target_brx
+
+    # Ensure non-negative
+    for s in state.values():
+        s["rx"] = max(0.0, s["rx"])
+        s["tx"] = max(0.0, s["tx"])
+
+    # ------------------------
+    # Router balancing
+    # ------------------------
+    def router_totals(router_id: str):
+        ifaces = [i for i in router_ifaces.get(router_id, []) if state[i]["status"] == "up"]
+        sum_rx = sum(state[i]["rx"] for i in ifaces)
+        sum_tx = sum(state[i]["tx"] for i in ifaces)
+        return ifaces, sum_rx, sum_tx
+
+    # Multiplicative pre-step (bounded)
+    router_imbalance: Dict[str, float] = {}
+    for r in router_ifaces.keys():
+        ifaces, sum_rx, sum_tx = router_totals(r)
+        if not ifaces or (sum_rx + sum_tx) <= 1e-9:
+            router_imbalance[r] = 0.0
+            continue
+        imb = abs(sum_tx - sum_rx) / max(sum_rx, sum_tx, 1.0)
+        router_imbalance[r] = imb
+        if imb <= TOL:
+            continue
+
+        # Choose less-trusted direction across router (avg confidence)
+        avg_conf_rx = sum(state[i]["conf_rx0"] for i in ifaces) / max(len(ifaces), 1)
+        avg_conf_tx = sum(state[i]["conf_tx0"] for i in ifaces) / max(len(ifaces), 1)
+        # Prefer to move the less-trusted direction toward the other side total
+        adjust_dir = "rx" if avg_conf_rx < avg_conf_tx else "tx"
+
+        # sums for chosen direction
+        sum_this = sum_rx if adjust_dir == "rx" else sum_tx
+        sum_other = sum_tx if adjust_dir == "rx" else sum_rx
+        # Tie-break when avg confidences are very close: move the larger absolute side
+        if abs(avg_conf_rx - avg_conf_tx) <= 0.05:
+            adjust_dir = "tx" if sum_tx > sum_rx else "rx"
+
+        if sum_this <= 0.0:
+            continue  # nothing to scale
+
+        s_ratio = sum_other / max(sum_this, EPS)
+        s_bounded = min(2.0, max(0.5, s_ratio))
+        alpha = min(0.6, max(0.25, imb / 0.15))  # more imbalance => stronger move
+        target_scale = 1.0 + alpha * (s_bounded - 1.0)
+        # Per-interface ±15% multiplicative cap (and absolute delta cap 0.15*max(v,1.0))
+        for i in ifaces:
+            v = state[i][adjust_dir]
+            if v <= 0.0:
+                continue
+            scaled = v * target_scale
+            # Multiplicative cap
+            upper = v * 1.15
+            lower = v * 0.85
+            scaled = min(max(scaled, lower), upper)
+            # Absolute delta cap
+            abs_cap = 0.15 * max(v, 1.0)
+            scaled = min(max(scaled, v - abs_cap), v + abs_cap)
+            delta = scaled - v
+            state[i][adjust_dir] = max(0.0, scaled)
+            state[i]["delta_" + adjust_dir] += delta
+            if adjust_dir == "rx":
+                state[i]["scaled_rx"] *= scaled / max(v, EPS)
+                state[i]["cap_hit_rx"] = state[i]["cap_hit_rx"] or (abs(delta) >= abs_cap - 1e-9)
+            else:
+                state[i]["scaled_tx"] *= scaled / max(v, EPS)
+                state[i]["cap_hit_tx"] = state[i]["cap_hit_tx"] or (abs(delta) >= abs_cap - 1e-9)
+
+    # Confidence-weighted additive redistribution with adaptive caps and router total delta guard
+    def additive_redistribution(router_id: str):
+        ifaces, sum_rx, sum_tx = router_totals(router_id)
+        if not ifaces or (sum_rx + sum_tx) <= 1e-9:
+            return
+        imb = abs(sum_tx - sum_rx) / max(sum_rx, sum_tx, 1.0)
+        if imb <= TOL:
+            router_imbalance[router_id] = imb
+            return
+
+        # Determine direction to adjust (less-trusted; tie-break by larger absolute imbalance)
+        avg_conf_rx = sum(state[i]["conf_rx0"] for i in ifaces) / max(len(ifaces), 1)
+        avg_conf_tx = sum(state[i]["conf_tx0"] for i in ifaces) / max(len(ifaces), 1)
+        if abs(avg_conf_rx - avg_conf_tx) <= 0.05:
+            adjust_dir = "tx" if sum_tx > sum_rx else "rx"
+        else:
+            adjust_dir = "rx" if avg_conf_rx < avg_conf_tx else "tx"
+
+        sum_this = sum_rx if adjust_dir == "rx" else sum_tx
+        sum_other = sum_tx if adjust_dir == "rx" else sum_rx
+        need = sum_other - sum_this  # positive means need to increase this direction
+        if abs(need) <= max(TOL * max(sum_rx, sum_tx, 1.0), 1e-9):
+            router_imbalance[router_id] = imb
+            return
+
+        # Router total delta guard (≤ 25% of avg traffic)
+        router_guard = 0.25 * ((sum_rx + sum_tx) / 2.0)
+        # Clip need to guard
+        if abs(need) > router_guard:
+            need = router_guard if need > 0 else -router_guard
+
+        # Track per-interface accumulated in this additive phase
+        acc: Dict[str, float] = {i: 0.0 for i in ifaces}
+
+        def pair_residual(i: str, direction: str) -> float:
+            pid = state[i]["peer_id"]
+            if not (pid and pid in state):
+                return 0.0
+            if direction == "tx":
+                return rel_diff(state[i]["tx"], state[pid]["rx"])
+            else:
+                return rel_diff(state[i]["rx"], state[pid]["tx"])
+
+        # Three staged passes with caps: 0.25, 0.35, optional 0.45
+        passes = [0.25, 0.35]
+        # Optional third pass only for low-conf or small baseline links
+        low_conf_or_small = any(((state[i]["conf_rx0"] if adjust_dir == "rx" else state[i]["conf_tx0"]) < 0.6) or
+                                (state[i][adjust_dir] < 5.0) for i in ifaces)
+        if low_conf_or_small:
+            passes.append(0.45)
+
+        remaining_need = need
+        for p_idx, cap_ratio in enumerate(passes):
+            if abs(remaining_need) <= 1e-9:
+                break
+            # Eligible interfaces and remaining cap
+            caps: Dict[str, float] = {}
+            for i in ifaces:
+                v = state[i][adjust_dir]
+                cap = cap_ratio * v
+                # Remaining cap after previous passes
+                rem = max(0.0, cap - abs(acc[i]))
+                caps[i] = rem
+
+            # Freeze interfaces that already used >80% of their cap unless no other capacity exists
+            total_capacity = sum(caps.values())
+            if total_capacity <= 1e-12:
+                break
+
+            # Eligible
+            eligible = [i for i in ifaces if caps[i] > 1e-12]
+            if not eligible:
+                break
+
+            # Build weights
+            weights: Dict[str, float] = {}
+            sum_v = sum(state[i][adjust_dir] for i in eligible) + EPS
+            for i in eligible:
+                conf_dir = state[i]["conf_rx0"] if adjust_dir == "rx" else state[i]["conf_tx0"]
+                resid = pair_residual(i, adjust_dir)
+                w = 0.6 * (1.0 - conf_dir) + 0.25 * (resid / max(TOL, 1e-9)) + 0.15 * (state[i][adjust_dir] / sum_v)
+                # Protect near-zero links
+                if state[i][adjust_dir] < 1.0:
+                    w *= 0.5
+                # Reduce weight on later passes if cap-stressed in prior pass
+                if p_idx > 0 and abs(acc[i]) >= 0.7 * (passes[p_idx - 1] * state[i][adjust_dir]):
+                    w *= 0.7
+                weights[i] = max(w, 1e-6)
+
+            sum_w = sum(weights.values())
+            if sum_w <= 1e-12:
+                break
+
+            # Distribute remaining_need across eligible with caps
+            # Iteratively allocate respecting caps
+            alloc_remaining = remaining_need
+            # Sign for increase/decrease
+            sign = 1.0 if alloc_remaining > 0 else -1.0
+
+            # Allow multiple mini-iterations to deal with cap clipping
+            for _ in range(5):
+                if abs(alloc_remaining) <= 1e-12:
+                    break
+                # Compute provisional deltas
+                deltas: Dict[str, float] = {}
+                sum_w_active = sum(weights[i] for i in eligible if caps[i] > 1e-12)
+                if sum_w_active <= 1e-12:
+                    break
+                used = 0.0
+                for i in eligible:
+                    if caps[i] <= 1e-12:
+                        deltas[i] = 0.0
+                        continue
+                    target = alloc_remaining * (weights[i] / sum_w_active)
+                    # Cap per-interface
+                    target = max(-caps[i], min(caps[i], target))
+                    # Also enforce non-negativity of value
+                    v_now = state[i][adjust_dir] + acc[i]
+                    # Proposed new value (after applying all accumulated and this delta)
+                    v_prop = v_now + target
+                    if v_prop < 0.0:
+                        # trim to non-negative
+                        target = -v_now
+                    deltas[i] = target
+                    used += target
+                # Apply deltas
+                for i in eligible:
+                    d = deltas[i]
+                    acc[i] += d
+                alloc_remaining -= used
+                # Shrink caps for remaining iter
+                for i in eligible:
+                    caps[i] = max(0.0, caps[i] - abs(deltas[i]))
+                # Remove exhausted
+                eligible = [i for i in eligible if caps[i] > 1e-12]
+
+            # End of pass; remaining need carries over
+
+        # Apply accumulated changes
+        for i, d in acc.items():
+            if abs(d) <= 1e-12:
+                continue
+            old = state[i][adjust_dir]
+            newv = max(0.0, old + d)
+            state[i][adjust_dir] = newv
+            state[i]["delta_" + adjust_dir] += (newv - old)
+            # Mark cap-hit if we hit last pass cap
+            cap_bound = passes[-1] * old
+            if abs(d) >= 0.99 * cap_bound:
+                if adjust_dir == "rx":
+                    state[i]["cap_hit_rx"] = True
+                else:
+                    state[i]["cap_hit_tx"] = True
+
+        # Update router imbalance after redistribution
+        ifaces2, sum_rx2, sum_tx2 = router_totals(router_id)
+        new_imb = abs(sum_tx2 - sum_rx2) / max(sum_rx2, sum_tx2, 1.0)
+        router_imbalance[router_id] = new_imb
+
+    for r in router_ifaces.keys():
+        additive_redistribution(r)
+
+    # ------------------------
+    # Targeted post-redistribution pair reconcile
+    # ------------------------
+    edited_ifaces = {i for i, s in state.items() if abs(s["delta_rx"]) > 0.0 or abs(s["delta_tx"]) > 0.0}
+    # Reconcile only pairs touched by router edits
+    visited_pairs.clear()
+    for iface in edited_ifaces:
+        pid = state[iface]["peer_id"]
+        if not (pid and pid in state):
+            continue
+        key = tuple(sorted([iface, pid]))
+        if key in visited_pairs:
+            continue
+        visited_pairs.add(key)
+
+        a = state[iface]
+        b = state[pid]
+        if a["status"] != "up" or b["status"] != "up":
+            continue
+
+        # Compute residuals post-redistribution
+        resid_tx = rel_diff(a["tx"], b["rx"])  # A.tx vs B.rx
+        resid_rx = rel_diff(a["rx"], b["tx"])  # A.rx vs B.tx
+
+        # Adaptive tolerance for post step
+        def tol_post(traffic_val: float) -> float:
+            return max(0.02, 2.5 / max(traffic_val, 1.0))
+
+        # Reconcile directionally with a 20–30% pull
+        def pull_toward_each_other(val_a, val_b, cap_a, cap_b, frac=0.25):
+            # Move both values towards their midpoint by fraction frac
+            mid = 0.5 * (val_a + val_b)
+            move_a = (mid - val_a) * frac
+            move_b = (mid - val_b) * frac
+            # Respect remaining caps (≤ 0.2 * current value)
+            move_a = max(-cap_a, min(cap_a, move_a))
+            move_b = max(-cap_b, min(cap_b, move_b))
+            return val_a + move_a, val_b + move_b, move_a, move_b
+
+        # TX direction reconcile (A.tx vs B.rx)
+        traffic_scale_tx = max(a["tx"], b["rx"], 1.0)
+        if resid_tx > tol_post(traffic_scale_tx):
+            cap_a_tx = 0.2 * max(a["tx"], 0.0)
+            cap_b_rx = 0.2 * max(b["rx"], 0.0)
+            new_atx, new_brx, da, db = pull_toward_each_other(a["tx"], b["rx"], cap_a_tx, cap_b_rx, frac=0.28)
+            a["delta_tx"] += (new_atx - a["tx"])
+            b["delta_rx"] += (new_brx - b["rx"])
+            a["tx"] = max(0.0, new_atx)
+            b["rx"] = max(0.0, new_brx)
+            # Confidence penalty hint: mark cap hit if we hit cap
+            if abs(da) >= 0.99 * cap_a_tx:
+                a["cap_hit_tx"] = True
+            if abs(db) >= 0.99 * cap_b_rx:
+                b["cap_hit_rx"] = True
+
+        # RX direction reconcile (A.rx vs B.tx)
+        traffic_scale_rx = max(a["rx"], b["tx"], 1.0)
+        if resid_rx > tol_post(traffic_scale_rx):
+            cap_a_rx = 0.2 * max(a["rx"], 0.0)
+            cap_b_tx = 0.2 * max(b["tx"], 0.0)
+            new_arx, new_btx, da, db = pull_toward_each_other(a["rx"], b["tx"], cap_a_rx, cap_b_tx, frac=0.22)
+            a["delta_rx"] += (new_arx - a["rx"])
+            b["delta_tx"] += (new_btx - b["tx"])
+            a["rx"] = max(0.0, new_arx)
+            b["tx"] = max(0.0, new_btx)
+            if abs(da) >= 0.99 * cap_a_rx:
+                a["cap_hit_rx"] = True
+            if abs(db) >= 0.99 * cap_b_tx:
+                b["cap_hit_tx"] = True
+
+    # ------------------------
+    # Confidence calibration and output assembly
+    # ------------------------
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    # Recompute final router imbalance for use in confidence
+    for r in router_ifaces.keys():
+        ifaces, sum_rx, sum_tx = router_totals(r)
+        if (sum_rx + sum_tx) <= 1e-9:
+            router_imbalance[r] = 0.0
+        else:
+            router_imbalance[r] = abs(sum_tx - sum_rx) / max(sum_rx, sum_tx, 1.0)
+
+    for iface, data in telemetry.items():
+        s = state[iface]
+        rx_orig = s["rx0"]
+        tx_orig = s["tx0"]
+        rx_rep = s["rx"] if s["status"] == "up" else 0.0
+        tx_rep = s["tx"] if s["status"] == "up" else 0.0
+
+        # Confidence from post-repair pair residuals
+        pid = s["peer_id"]
+        if s["peer_present"] and pid in state and s["status"] == "up" and state[pid]["status"] == "up":
+            rx_resid = rel_diff(rx_rep, state[pid]["tx"])
+            tx_resid = rel_diff(tx_rep, state[pid]["rx"])
+        else:
+            rx_resid = 0.0 if s["status"] == "down" else 0.4  # more uncertainty without peer
+            tx_resid = 0.0 if s["status"] == "down" else 0.4
+
+        # Two-slope residual mapping
+        def map_conf(resid: float) -> float:
+            x = resid / max(TOL, 1e-9)
+            base = 1.0 - min(1.0, x / 5.0)
+            if x > 3.0:
+                base -= 0.1 * ((x - 3.0) / 2.0)
+            return max(0.0, min(1.0, base))
+
+        rx_conf = map_conf(rx_resid)
+        tx_conf = map_conf(tx_resid)
+
+        # Router imbalance factor (post)
+        rid = s["local_router"]
+        imb = router_imbalance.get(rid, 0.0)
+        router_factor = max(0.2, 1.0 - 0.6 * imb)  # stronger penalty on imbalanced routers
+        rx_conf *= router_factor
+        tx_conf *= router_factor
+
+        # Change penalty
+        rx_change = rel_diff(rx_orig, rx_rep)
+        tx_change = rel_diff(tx_orig, tx_rep)
+        rx_conf *= max(0.2, 1.0 - 0.5 * min(1.0, rx_change))
+        tx_conf *= max(0.2, 1.0 - 0.5 * min(1.0, tx_change))
+
+        # Cap-hit and scaling penalties
+        if s["cap_hit_rx"] or s["scaled_rx"] > 1.15 or s["scaled_rx"] < 0.85:
+            rx_conf *= 0.9
+        if s["cap_hit_tx"] or s["scaled_tx"] > 1.15 or s["scaled_tx"] < 0.85:
+            tx_conf *= 0.9
+
+        # No-edit bonus (when value unchanged within 1%)
+        if rel_diff(rx_orig, rx_rep) <= 0.01:
+            rx_conf = min(1.0, rx_conf + 0.05)
+        if rel_diff(tx_orig, tx_rep) <= 0.01:
+            tx_conf = min(1.0, tx_conf + 0.05)
+
+        # Status handling and confidence
+        repaired_status = data.get("interface_status", "unknown")
+        status_conf = 1.0
+        # If peer status differs, reduce confidence
+        if s["peer_present"]:
+            peer_status_raw = norm_status(telemetry[s["peer_id"]].get("interface_status", "unknown"))
+            if norm_status(repaired_status) != peer_status_raw:
+                status_conf = min(status_conf, 0.5)
+        # If reports down but had non-zero original counters, lower status confidence
+        if norm_status(repaired_status) == "down" and (rx_orig > 0.0 or tx_orig > 0.0):
+            status_conf = min(status_conf, 0.6)
+
+        # Ensure down interfaces emit zero rates
+        if norm_status(repaired_status) == "down":
+            rx_rep = 0.0
+            tx_rep = 0.0
+            # High confidence that zeros are correct for down
+            rx_conf = 0.9
+            tx_conf = 0.9
+
+        # Assemble output entry
+        out: Dict[str, Tuple] = {}
+        out["rx_rate"] = (rx_orig, rx_rep, max(0.0, min(1.0, rx_conf)))
+        out["tx_rate"] = (tx_orig, tx_rep, max(0.0, min(1.0, tx_conf)))
+        out["interface_status"] = (data.get("interface_status", "unknown"), repaired_status, status_conf)
+
+        # Copy metadata unchanged
+        out["connected_to"] = data.get("connected_to")
+        out["local_router"] = data.get("local_router")
+        out["remote_router"] = data.get("remote_router")
+
+        result[iface] = out
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+
+    result = run_repair(test_telemetry, test_topology)
+
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")

@@ -1,0 +1,169 @@
+<NAME>
+optimize_flow_conservation_solver
+</NAME>
+
+<DESCRIPTION>
+Replaces the greedy, threshold-limited flow conservation repair with a combinatorial optimization approach.
+Previously, the algorithm would only correct an unreliable link (Peer -> Local) if it reduced the router's flow imbalance AND the resulting imbalance was < 5% of total flow. This prevented partial repairs that significantly improved the situation but didn't reach perfection. It also processed links in an arbitrary order, potentially missing optimal combinations.
+The new approach treats this as a minimization problem (Subset Sum variation). For routers with a small number of unreliable links (<= 12), it exhaustively checks all combinations of {Local, Peer} values to minimize |Inputs - Outputs|. For larger cases, it falls back to a sorted greedy approach that purely minimizes imbalance without artificial thresholds. This improves counter repair accuracy by finding the global optimum for flow conservation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 2b. Resolve Unreliable Interfaces
+        # We try to pick candidates (Local vs Peer) for unreliable flows that balance the router.
+        # Imbalance equation: Reliable_In + Sum(Unreliable_In) ≈ Reliable_Out + Sum(Unreliable_Out)
+
+        # Baseline: Assume "Peer" measurements are correct for unreliable links (External Observer Principle)
+        # This is our H0 hypothesis.
+        h0_inputs = reliable_inputs
+        h0_outputs = reliable_outputs
+
+        decisions = {} # (if_id, type) -> val
+
+        for if_id, metric in unreliable_ifs:
+            candidates = link_analysis[if_id][metric]['candidates']
+            # Default to peer if available, else local
+            val = candidates.get('peer', candidates['local'])
+            decisions[(if_id, metric)] = val
+            if metric == 'rx': h0_inputs += val
+            else: h0_outputs += val
+
+        baseline_imbalance = abs(h0_inputs - h0_outputs)
+
+        # 2c. Optimization / Correction
+        # Check if swapping any decision from Peer -> Local improves balance significantly
+
+        for if_id, metric in unreliable_ifs:
+            candidates = link_analysis[if_id][metric]['candidates']
+            if 'peer' not in candidates: continue # Can't swap if only local exists
+
+            local_val = candidates['local']
+            peer_val = candidates['peer']
+
+            # If we switch this specific interface to Local, how does balance change?
+            current_diff = local_val - peer_val
+
+            # If metric is RX, it adds to Inputs. Change = +diff
+            # If metric is TX, it adds to Outputs. Change = +diff (on the output side) -> effectively -diff to Net Flow
+
+            if metric == 'rx':
+                # New imbalance = |(In + diff) - Out| = |(In - Out) + diff|
+                # Current Net = h0_inputs - h0_outputs
+                new_imbalance = abs((h0_inputs - h0_outputs) + current_diff)
+            else:
+                # New imbalance = |In - (Out + diff)| = |(In - Out) - diff|
+                new_imbalance = abs((h0_inputs - h0_outputs) - current_diff)
+
+            # Decision Rule: If Local reduces imbalance significantly compared to Peer, pick Local.
+            # "Significantly" means better balance and the imbalance is < 5% of total flow
+            total_flow = max(h0_inputs, h0_outputs, 1.0)
+
+            # We prefer Local if it fixes the conservation problem
+            if new_imbalance < baseline_imbalance and new_imbalance < (total_flow * 0.05):
+                decisions[(if_id, metric)] = local_val
+                # Update running sums to reflect the swap (greedy approach)
+                if metric == 'rx': h0_inputs += current_diff
+                else: h0_outputs += current_diff
+                baseline_imbalance = new_imbalance
+=======
+        # 2b. Resolve Unreliable Interfaces with Combinatorial Optimization
+        # We want to select candidates (Local vs Peer) to minimize |Inputs - Outputs|.
+
+        # Calculate Base State: Reliable Flow + Unreliable(Peer/Default)
+        current_in = reliable_inputs
+        current_out = reliable_outputs
+
+        # Setup optimization candidates
+        # Each candidate represents a potential swap from Peer(Default) to Local
+        # We store: (key, impact_on_net_flow, local_val)
+        swap_candidates = []
+
+        decisions = {} # Stores final selected values
+
+        for if_id, metric in unreliable_ifs:
+            cands = link_analysis[if_id][metric]['candidates']
+
+            # Default to Peer (or Local if Peer missing)
+            default_val = cands.get('peer', cands['local'])
+            decisions[(if_id, metric)] = default_val # Initialize with default
+
+            if metric == 'rx':
+                current_in += default_val
+            else:
+                current_out += default_val
+
+            # If we have both, we can consider swapping to Local
+            if 'peer' in cands and 'local' in cands:
+                local_val = cands['local']
+                peer_val = cands['peer']
+
+                # Calculate impact of swapping to Local on NetFlow (In - Out)
+                # If RX: In increases by (Local - Peer) -> NetFlow increases by (Local - Peer)
+                # If TX: Out increases by (Local - Peer) -> NetFlow decreases by (Local - Peer)
+                diff = local_val - peer_val
+                if metric == 'rx':
+                    impact = diff
+                else:
+                    impact = -diff
+
+                swap_candidates.append({
+                    'key': (if_id, metric),
+                    'impact': impact,
+                    'val_local': local_val
+                })
+
+        # Base Imbalance (NetFlow = In - Out)
+        base_net_flow = current_in - current_out
+
+        # Optimize: Find subset of swap_candidates to minimize |base_net_flow + sum(impacts)|
+
+        best_mask = 0
+        min_imbalance = abs(base_net_flow)
+        n_cands = len(swap_candidates)
+
+        if n_cands > 0:
+            # If N is small enough, brute force all combinations (2^N)
+            # N=12 -> 4096 iters, very fast for per-router logic.
+            if n_cands <= 12:
+                for mask in range(1 << n_cands):
+                    current_impact = 0.0
+                    for i in range(n_cands):
+                        if (mask >> i) & 1:
+                            current_impact += swap_candidates[i]['impact']
+
+                    imbalance = abs(base_net_flow + current_impact)
+                    if imbalance < min_imbalance:
+                        min_imbalance = imbalance
+                        best_mask = mask
+            else:
+                # If N is large, greedy heuristic
+                # Sort by absolute impact to prioritize large corrections
+                sorted_cands = sorted(swap_candidates, key=lambda x: abs(x['impact']), reverse=True)
+
+                # Greedy pass
+                current_impact = 0.0
+                for cand in sorted_cands:
+                    new_impact = current_impact + cand['impact']
+                    if abs(base_net_flow + new_impact) < abs(base_net_flow + current_impact):
+                        current_impact = new_impact
+                        decisions[cand['key']] = cand['val_local']
+
+                # Disable the mask loop below
+                n_cands = 0
+
+        # Apply best swaps (for small N case)
+        for i in range(n_cands):
+            if (best_mask >> i) & 1:
+                cand = swap_candidates[i]
+                decisions[cand['key']] = cand['val_local']
+
+        # Re-calculate final sums for conservation score
+        h0_inputs = reliable_inputs
+        h0_outputs = reliable_outputs
+        for if_id, metric in unreliable_ifs:
+            val = decisions[(if_id, metric)]
+            if metric == 'rx': h0_inputs += val
+            else: h0_outputs += val
+>>>>>>> REPLACE
+</DIFF>

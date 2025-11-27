@@ -1,0 +1,227 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Deduplicated Beam Search with Local Refinement.
+    
+    Combines the randomness and beam structure of high-performing beam search
+    with strict state deduplication and windowed local optimization.
+    
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Used to scale the beam width
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # Beam Search configuration
+    # Width of the beam - ensures we track enough distinct paths
+    BEAM_WIDTH = max(8, num_seqs)
+    SAMPLES_PER_NODE = 20          # Number of next-step candidates to sample per node
+    
+    num_txns = workload.num_txns
+    
+    # Pre-calculate individual costs for tie-breaking
+    # Priority: Minimize Makespan, then Maximize individual Txn Duration (LPT heuristic)
+    txn_costs = {t: workload.get_opt_seq_cost([t]) for t in range(num_txns)}
+
+    # Initialize Beam with random starts 
+    # (Random is better than shortest-first to allow long txns to anchor the schedule)
+    start_candidates = list(range(num_txns))
+    random.shuffle(start_candidates)
+    
+    beam = []
+    # Seed beam
+    for t in start_candidates[:BEAM_WIDTH]:
+        rem = set(range(num_txns))
+        rem.remove(t)
+        beam.append({
+            'cost': txn_costs[t],
+            'seq': [t],
+            'rem': rem,
+            'p_rem': None # No parent
+        })
+    
+    # Beam Search Main Loop
+    for _ in range(num_txns - 1):
+        candidates = []
+        
+        for parent in beam:
+            rem_list = list(parent['rem'])
+            
+            # Sample next transactions
+            if len(rem_list) <= SAMPLES_PER_NODE:
+                samples = rem_list
+            else:
+                samples = random.sample(rem_list, SAMPLES_PER_NODE)
+            
+            for t in samples:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                
+                # Priority: Minimize Cost, then Maximize individual Txn Duration
+                candidates.append({
+                    'priority': (new_cost, -txn_costs[t]),
+                    'cost': new_cost,
+                    'seq': new_seq,
+                    'added': t,
+                    'p_rem': parent['rem']
+                })
+        
+        # Sort candidates by priority
+        candidates.sort(key=lambda x: x['priority'])
+        
+        new_beam = []
+        seen_states = set()
+        
+        for cand in candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+                
+            # Create the new remaining set
+            new_rem = cand['p_rem'].copy()
+            new_rem.remove(cand['added'])
+            
+            # State Deduplication:
+            # We use the set of remaining transactions as the state key.
+            # If two paths have the same remaining transactions, they are equivalent
+            # for future scheduling potential (ignoring specific resource lock times, 
+            # which we approximate by preferring lower makespan).
+            # Sorting the list is fast enough for ~100 items.
+            state_key = tuple(sorted(list(new_rem)))
+            
+            if state_key not in seen_states:
+                seen_states.add(state_key)
+                new_beam.append({
+                    'cost': cand['cost'], 
+                    'seq': cand['seq'], 
+                    'rem': new_rem
+                })
+        
+        if not new_beam:
+            break
+        beam = new_beam
+
+    # Get best result from final beam
+    best_result = min(beam, key=lambda x: x['cost'])
+    best_cost = best_result['cost']
+    best_seq = best_result['seq']
+
+    # Windowed Local Search Refinement
+    # Try swapping transactions within a small window to fix local ordering issues
+    # that greedy expansion might have missed.
+    WINDOW = 4
+    for _ in range(3): # Max 3 passes to limit execution time
+        improved = False
+        for i in range(num_txns - 1):
+            # Check swaps with neighbors up to WINDOW distance
+            for offset in range(1, WINDOW + 1):
+                j = i + offset
+                if j >= num_txns:
+                    break
+                
+                # Perform swap
+                best_seq[i], best_seq[j] = best_seq[j], best_seq[i]
+                new_c = workload.get_opt_seq_cost(best_seq)
+                
+                if new_c < best_cost:
+                    best_cost = new_c
+                    improved = True
+                    # Keep swap and look for more improvements
+                else:
+                    # Revert swap
+                    best_seq[i], best_seq[j] = best_seq[j], best_seq[i]
+        
+        if not improved:
+            break
+
+    return best_cost, best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+    
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    
+    # Run with slightly higher sequence count to utilize the improved beam
+    # Workload 1: Complex mixed read/write transactions
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, 12)
+    cost1 = workload1.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 12)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 12)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

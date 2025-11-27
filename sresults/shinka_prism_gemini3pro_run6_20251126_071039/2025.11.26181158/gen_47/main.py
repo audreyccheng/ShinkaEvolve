@@ -1,0 +1,374 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+import time
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Algorithm:
+    1. Multi-Start Randomized Initialization:
+       - Runs Binary Search multiple times with randomized sorting weights.
+       - Transforms the problem into Bin Packing with dynamic item weights (L + K*S).
+       - Selects the initialization with the lowest starting Max KVPR.
+    2. Steepest Descent Local Search:
+       - Focuses on bottleneck GPUs (those defining the Max KVPR).
+       - Evaluates all valid moves (Move, Swap1-1, Swap2-1) from bottlenecks.
+       - Selects the move that maximizes the reduction of the global Max KVPR.
+    3. Iterated Local Search (ILS):
+       - If local search stagnates, applies a perturbation (random move from bottleneck).
+       - Repeats local search to explore new areas of the search space.
+    """
+    
+    # Pre-calculate model properties for efficiency
+    model_data = []
+    for i, m in enumerate(models):
+        model_data.append({
+            'model': m,
+            'l': m.req_rate / m.slo,
+            's': m.model_size,
+            'id': i
+        })
+
+    def get_kvpr(l, s):
+        if s >= GPU_MEM_SIZE - 1e-7: return 1e15
+        return l / (GPU_MEM_SIZE - s)
+
+    # --- Phase 1: Randomized Binary Search Initialization ---
+    
+    def solve_packing(target_k, seed=None):
+        capacity = target_k * GPU_MEM_SIZE
+        
+        # Sort items based on linearized weight with optional noise
+        items = list(model_data)
+        if seed is not None:
+            rng = random.Random(seed)
+            # Add noise to weights to explore different packings
+            # Weight w = l + K*s. Noise factor: uniform(0.9, 1.1)
+            items.sort(key=lambda x: (x['l'] + target_k * x['s']) * rng.uniform(0.9, 1.1), reverse=True)
+        else:
+            # Deterministic: pure linearized weight
+            items.sort(key=lambda x: x['l'] + target_k * x['s'], reverse=True)
+            
+        gpu_l = [0.0] * gpu_num
+        gpu_s = [0.0] * gpu_num
+        gpu_items = [[] for _ in range(gpu_num)]
+        
+        # Best Fit logic
+        for item in items:
+            best_idx = -1
+            min_rem = float('inf')
+            w_item = item['l'] + target_k * item['s']
+            
+            # Check all bins
+            # Random shuffling of bins for tie-breaking could be added, but sorting noise usually suffices
+            for i in range(gpu_num):
+                if gpu_s[i] + item['s'] >= GPU_MEM_SIZE - 1e-6:
+                    continue
+                
+                curr_w = gpu_l[i] + target_k * gpu_s[i]
+                if curr_w + w_item <= capacity + 1e-9:
+                    rem = capacity - (curr_w + w_item)
+                    if rem < min_rem:
+                        min_rem = rem
+                        best_idx = i
+            
+            if best_idx != -1:
+                gpu_l[best_idx] += item['l']
+                gpu_s[best_idx] += item['s']
+                gpu_items[best_idx].append(item)
+            else:
+                return None
+        return gpu_items
+
+    best_init_placement = None
+    best_init_k = float('inf')
+    
+    # Run 1 Deterministic + 9 Randomized starts
+    # This finds a good basin of attraction
+    seeds = [None] + [random.randint(0, 10000) for _ in range(9)]
+    
+    for seed in seeds:
+        low, high = 0.0, 1.0
+        # Find feasible upper bound
+        for _ in range(10):
+            if solve_packing(high, seed) is not None: break
+            low = high; high *= 2.0
+        else:
+            high = 1e9 # Fallback
+            
+        current_res = None
+        # Binary Search Refinement
+        for _ in range(15):
+            mid = (low + high) / 2
+            res = solve_packing(mid, seed)
+            if res:
+                current_res = res
+                high = mid
+            else:
+                low = mid
+        
+        if current_res is None:
+            current_res = solve_packing(high, seed)
+            
+        if current_res:
+            # Evaluate exact Max KVPR
+            max_k = 0
+            for g in range(gpu_num):
+                l = sum(x['l'] for x in current_res[g])
+                s = sum(x['s'] for x in current_res[g])
+                k = get_kvpr(l, s)
+                if k > max_k: max_k = k
+            
+            if max_k < best_init_k:
+                best_init_k = max_k
+                best_init_placement = current_res
+
+    if best_init_placement is None:
+        raise ValueError("Unable to place models.")
+
+    # Convert to mutable structure
+    current_plc = [list(best_init_placement[i]) for i in range(gpu_num)]
+    
+    # Maintain cached stats to avoid recomputing sums in inner loops
+    gpu_stats = []
+    for g in range(gpu_num):
+        l = sum(x['l'] for x in current_plc[g])
+        s = sum(x['s'] for x in current_plc[g])
+        gpu_stats.append({'l': l, 's': s})
+
+    # --- Phase 2: Steepest Descent Local Search (ILS) ---
+    
+    global_best_plc = [list(x) for x in current_plc]
+    global_best_score = best_init_k
+    
+    start_time = time.time()
+    
+    # Iterated Local Search Loop
+    while time.time() - start_time < 0.2:
+        
+        # Hill Climbing: Repeat until local optima
+        while True:
+            # Identify Bottlenecks
+            max_k = -1.0
+            bottlenecks = []
+            
+            for g in range(gpu_num):
+                k = get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s'])
+                if k > max_k:
+                    max_k = k
+                    bottlenecks = [g]
+                elif abs(k - max_k) < 1e-9:
+                    bottlenecks.append(g)
+            
+            if max_k < 1e-9: break
+            
+            best_move = None
+            best_imp = 0.0
+            
+            # Evaluate neighborhoods for all bottleneck GPUs
+            for b_idx in bottlenecks:
+                src_items = current_plc[b_idx]
+                src_l = gpu_stats[b_idx]['l']
+                src_s = gpu_stats[b_idx]['s']
+                
+                # Potential targets: non-bottleneck GPUs
+                targets = [t for t in range(gpu_num) if t not in bottlenecks]
+                if not targets: 
+                    # If all are bottlenecks, try to target any GPU to break symmetry
+                    # But usually improvement requires targeting a lower-load GPU
+                    continue
+
+                # 1. Move
+                for i, item in enumerate(src_items):
+                    for t in targets:
+                        tgt_s = gpu_stats[t]['s']
+                        if tgt_s + item['s'] >= GPU_MEM_SIZE: continue
+                        
+                        nk_src = get_kvpr(src_l - item['l'], src_s - item['s'])
+                        nk_tgt = get_kvpr(gpu_stats[t]['l'] + item['l'], tgt_s + item['s'])
+                        
+                        local_max = max(nk_src, nk_tgt)
+                        if local_max < max_k - 1e-7:
+                            imp = max_k - local_max
+                            if imp > best_imp:
+                                best_imp = imp
+                                best_move = ('move', b_idx, i, t)
+
+                # 2. Swap 1-1
+                for i, s_item in enumerate(src_items):
+                    for t in targets:
+                        tgt_items = current_plc[t]
+                        for j, t_item in enumerate(tgt_items):
+                            ns_s = src_s - s_item['s'] + t_item['s']
+                            nt_s = gpu_stats[t]['s'] - t_item['s'] + s_item['s']
+                            if ns_s >= GPU_MEM_SIZE or nt_s >= GPU_MEM_SIZE: continue
+                            
+                            nk_src = get_kvpr(src_l - s_item['l'] + t_item['l'], ns_s)
+                            nk_tgt = get_kvpr(gpu_stats[t]['l'] - t_item['l'] + s_item['l'], nt_s)
+                            
+                            local_max = max(nk_src, nk_tgt)
+                            if local_max < max_k - 1e-7:
+                                imp = max_k - local_max
+                                if imp > best_imp:
+                                    best_imp = imp
+                                    best_move = ('swap11', b_idx, i, t, j)
+
+                # 3. Swap 2-1
+                if len(src_items) >= 2:
+                    for i1 in range(len(src_items)):
+                        for i2 in range(i1 + 1, len(src_items)):
+                            m1 = src_items[i1]
+                            m2 = src_items[i2]
+                            pair_l = m1['l'] + m2['l']
+                            pair_s = m1['s'] + m2['s']
+                            
+                            for t in targets:
+                                tgt_items = current_plc[t]
+                                for j, m3 in enumerate(tgt_items):
+                                    ns_s = src_s - pair_s + m3['s']
+                                    nt_s = gpu_stats[t]['s'] - m3['s'] + pair_s
+                                    
+                                    if ns_s >= GPU_MEM_SIZE or nt_s >= GPU_MEM_SIZE: continue
+                                    
+                                    nk_src = get_kvpr(src_l - pair_l + m3['l'], ns_s)
+                                    nk_tgt = get_kvpr(gpu_stats[t]['l'] - m3['l'] + pair_l, nt_s)
+                                    
+                                    local_max = max(nk_src, nk_tgt)
+                                    if local_max < max_k - 1e-7:
+                                        imp = max_k - local_max
+                                        if imp > best_imp:
+                                            best_imp = imp
+                                            best_move = ('swap21', b_idx, i1, i2, t, j)
+
+            # Apply Best Move
+            if best_move:
+                mtype = best_move[0]
+                if mtype == 'move':
+                    _, b, i, t = best_move
+                    item = current_plc[b].pop(i)
+                    current_plc[t].append(item)
+                    gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+                    gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+                    
+                elif mtype == 'swap11':
+                    _, b, i, t, j = best_move
+                    m1 = current_plc[b][i]
+                    m2 = current_plc[t][j]
+                    current_plc[b][i] = m2
+                    current_plc[t][j] = m1
+                    dl = m2['l'] - m1['l']; ds = m2['s'] - m1['s']
+                    gpu_stats[b]['l'] += dl; gpu_stats[b]['s'] += ds
+                    gpu_stats[t]['l'] -= dl; gpu_stats[t]['s'] -= ds
+                    
+                elif mtype == 'swap21':
+                    _, b, i1, i2, t, j = best_move
+                    m2 = current_plc[b].pop(i2)
+                    m1 = current_plc[b].pop(i1)
+                    m3 = current_plc[t].pop(j)
+                    current_plc[b].append(m3)
+                    current_plc[t].append(m1)
+                    current_plc[t].append(m2)
+                    
+                    pl = m1['l'] + m2['l']; ps = m1['s'] + m2['s']
+                    gpu_stats[b]['l'] += m3['l'] - pl; gpu_stats[b]['s'] += m3['s'] - ps
+                    gpu_stats[t]['l'] += pl - m3['l']; gpu_stats[t]['s'] += ps - m3['s']
+            else:
+                break # Local Optima
+
+        # Update Global Best
+        cur_max = max(get_kvpr(g['l'], g['s']) for g in gpu_stats)
+        if cur_max < global_best_score:
+            global_best_score = cur_max
+            global_best_plc = [list(x) for x in current_plc]
+            
+        # Perturbation: Force a move from a bottleneck
+        # Re-identify bottlenecks
+        max_k = -1.0
+        bottlenecks = []
+        for g in range(gpu_num):
+            k = get_kvpr(gpu_stats[g]['l'], gpu_stats[g]['s'])
+            if k > max_k: max_k = k; bottlenecks = [g]
+            elif abs(k - max_k) < 1e-9: bottlenecks.append(g)
+        
+        if not bottlenecks: break
+        
+        # Perturb
+        b = random.choice(bottlenecks)
+        if current_plc[b]:
+            idx = random.randrange(len(current_plc[b]))
+            item = current_plc[b][idx]
+            
+            # Find valid targets
+            targets = []
+            for t in range(gpu_num):
+                if t == b: continue
+                if gpu_stats[t]['s'] + item['s'] < GPU_MEM_SIZE:
+                    targets.append(t)
+            
+            if targets:
+                t = random.choice(targets)
+                current_plc[b].pop(idx)
+                current_plc[t].append(item)
+                gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+                gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+            else:
+                # If cannot move, try swap?
+                break
+
+    return {i: [x['model'] for x in global_best_plc[i]] for i in range(gpu_num)}
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+    
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+    
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+    
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+    
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")
+

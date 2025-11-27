@@ -1,0 +1,483 @@
+<NAME>
+peakaware_fixup_and_diversity_guard
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements:
+
+1) Peak-aware fix-up: Strengthen the donor→receiver post water-filling step by expanding the candidate set (top-3 donors and bottom-3 receivers) and adding a lexicographic tie-break on the second-highest average load. This keeps the step bounded and fast while more consistently reducing the global peak and smoothing the tail, improving balancedness.
+
+2) Small efficiency and correctness tweaks in packing:
+   - Add a tie-break by item count in balanced_packing to avoid early pack overfill when loads tie.
+   - In pack_diverse_heap, avoid constructing label bookkeeping when all labels are unique, and guard label-duplicate penalties and label_count updates under the same condition. This reduces overhead in common unique-label cases and avoids unnecessary data structures, preserving speed.
+
+These edits aim to improve the combined score by increasing balancedness without sacrificing speed.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    for i in range(num_layers):
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load
+            best_p = None
+            best_load = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if best_load is None or pack_loads[p] < best_load:
+                    best_load = pack_loads[p]
+                    best_p = p
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+=======
+    for i in range(num_layers):
+        pack_loads = [0.0] * num_packs
+        pack_counts = [0] * num_packs
+        for g in indices[i].tolist():
+            # choose pack with capacity and minimal load (tie-break by fewer items)
+            best_p = None
+            best_load = None
+            best_cnt = None
+            for p in range(num_packs):
+                if pack_counts[p] >= groups_per_pack:
+                    continue
+                if (best_load is None or pack_loads[p] < best_load or
+                    (abs(pack_loads[p] - (best_load if best_load is not None else 0.0)) <= 1e-12 and
+                     (best_cnt is None or pack_counts[p] < best_cnt))):
+                    best_p = p
+                    best_load = pack_loads[p]
+                    best_cnt = pack_counts[p]
+            pack_index[i, g] = best_p
+            rank_in_pack[i, g] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += float(weight[i, g].item())
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Iterative small fix-up: up to 2 best donor->receiver moves
+        if num_log > 1:
+            max_iters = 2
+            for _ in range(max_iters):
+                counts_safe = torch.clamp(counts, min=1)
+                avg = w / counts_safe.to(w.dtype)
+                cur_peak = float(avg.max().item())
+
+                # donors: top-2 by avg with count>1
+                can_donate = (counts > 1)
+                if not bool(can_donate.any()):
+                    break
+                k_d = int(min(2, int(can_donate.sum().item())))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=k_d).indices.tolist()
+
+                # receivers: bottom-2 by avg
+                k_r = int(min(2, num_log))
+                receivers = torch.topk(-avg, k=k_r).indices.tolist()
+
+                best_pair = None
+                best_peak = cur_peak
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = counts.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        avg_try = w / c_try.to(w.dtype)
+                        peak = float(avg_try.max().item())
+                        if peak + 1e-9 < best_peak:
+                            best_peak = peak
+                            best_pair = (d, r)
+
+                if best_pair is None:
+                    break
+                d, r = best_pair
+                counts[d] -= 1
+                counts[r] += 1
+=======
+        # Iterative small fix-up: up to 2 best donor->receiver moves (peak-aware with second-order tie-break)
+        if num_log > 1:
+            max_iters = 2
+            for _ in range(max_iters):
+                counts_safe = torch.clamp(counts, min=1)
+                avg = w / counts_safe.to(w.dtype)
+                cur_peak = float(avg.max().item())
+                # current second-highest average for lexicographic tie-break
+                if num_log >= 2:
+                    cur_top2 = torch.topk(avg, k=2).values
+                    cur_second = float(cur_top2[1].item())
+                else:
+                    cur_second = float("-inf")
+
+                # donors: top-3 by avg with count>1
+                can_donate = (counts > 1)
+                if not bool(can_donate.any()):
+                    break
+                k_d = int(min(3, int(can_donate.sum().item())))
+                avg_mask = avg.clone()
+                avg_mask[~can_donate] = float("-inf")
+                donors = torch.topk(avg_mask, k=k_d).indices.tolist()
+
+                # receivers: bottom-3 by avg
+                k_r = int(min(3, num_log))
+                receivers = torch.topk(-avg, k=k_r).indices.tolist()
+
+                best_pair = None
+                best_peak = cur_peak
+                best_second = cur_second
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = counts.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        avg_try = w / c_try.to(w.dtype)
+                        peak = float(avg_try.max().item())
+                        # compute second-highest avg after the move
+                        if num_log >= 2:
+                            topk_vals = torch.topk(avg_try, k=min(2, num_log)).values
+                            second_val = float(topk_vals[-1].item()) if topk_vals.numel() >= 2 else float("-inf")
+                        else:
+                            second_val = float("-inf")
+                        if (peak + 1e-9 < best_peak or
+                            (abs(peak - best_peak) <= 1e-9 and second_val + 1e-9 < best_second)):
+                            best_peak = peak
+                            best_second = second_val
+                            best_pair = (d, r)
+
+                if best_pair is None or (best_peak + 1e-9 >= cur_peak and best_second + 1e-9 >= cur_second):
+                    break
+                d, r = best_pair
+                counts[d] -= 1
+                counts[r] += 1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        loads = [0.0] * num_packs
+        counts = [0] * num_packs
+        label_counts = [defaultdict(int) for _ in range(num_packs)]
+        pack_groups = [[] for _ in range(num_packs)]
+        assigned = [False] * n_items
+
+        # Check duplicates quickly
+        # Use sort + unique_consecutive to be slightly faster than full unique on larger rows
+        lbl_sorted, _ = torch.sort(row_labels)
+        all_unique = (torch.unique_consecutive(lbl_sorted).numel() == row_labels.numel())
+=======
+        loads = [0.0] * num_packs
+        counts = [0] * num_packs
+        pack_groups = [[] for _ in range(num_packs)]
+
+        # Check duplicates quickly
+        # Use sort + unique_consecutive to be slightly faster than full unique on larger rows
+        lbl_sorted, _ = torch.sort(row_labels)
+        all_unique = (torch.unique_consecutive(lbl_sorted).numel() == row_labels.numel())
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            # Phase 1: label-spreading seed (one heaviest item per label)
+            # Build per-label item lists (descending by weight) by scanning sorted_idx
+            label_items = defaultdict(list)  # lab -> [g_heaviest_first...]
+            for g in sorted_idx:
+                lab = int(row_labels[g].item())
+                label_items[lab].append(g)
+
+            # Sort labels by their top item's weight (heaviest first)
+            label_order = sorted(
+                label_items.keys(),
+                key=lambda lab: float(row_w[label_items[lab][0]].item()),
+                reverse=True,
+            )
+
+            # Place one item per label, preferring packs without that label and min load
+            for lab in label_order:
+                if counts.count(cap) == num_packs:
+                    break  # all packs full
+                # choose the heaviest unassigned item for this label
+                g = None
+                for cand in label_items[lab]:
+                    if not assigned[cand]:
+                        g = cand
+                        break
+                if g is None:
+                    continue
+                wv = float(row_w[g].item())
+
+                best_p = None
+                best_load = None
+                best_cnt = None
+                # First try packs without this label
+                for p in range(num_packs):
+                    if counts[p] >= cap:
+                        continue
+                    if label_counts[p].get(lab, 0) > 0:
+                        continue
+                    if (best_load is None or loads[p] < best_load or
+                        (abs(loads[p] - best_load) <= 1e-12 and counts[p] < best_cnt)):
+                        best_p = p
+                        best_load = loads[p]
+                        best_cnt = counts[p]
+                # If none found, fall back to any pack with capacity
+                if best_p is None:
+                    for p in range(num_packs):
+                        if counts[p] >= cap:
+                            continue
+                        if (best_load is None or loads[p] < best_load or
+                            (abs(loads[p] - best_load) <= 1e-12 and counts[p] < best_cnt)):
+                            best_p = p
+                            best_load = loads[p]
+                            best_cnt = counts[p]
+
+                if best_p is not None:
+                    pack_index[i, g] = best_p
+                    rank_in_pack[i, g] = counts[best_p]
+                    counts[best_p] += 1
+                    loads[best_p] += wv
+                    label_counts[best_p][lab] += 1
+                    pack_groups[best_p].append(g)
+                    assigned[g] = True
+
+            # Phase 2: regular diversity-aware greedy fill for remaining items
+            eps = 1e-6 * float(row_w.mean().item() if row_w.numel() > 0 else 1.0)
+            for g in sorted_idx:
+                if assigned[g]:
+                    continue
+                lab = int(row_labels[g].item())
+                wv = float(row_w[g].item())
+
+                best_p = None
+                best_base = None
+                best_rep = None
+                best_cnt = None
+                for p in range(num_packs):
+                    if counts[p] >= cap:
+                        continue
+                    base = loads[p] + wv  # projected load if we place g in p
+                    rep = label_counts[p].get(lab, 0)
+
+                    if best_p is None:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = counts[p]
+                        continue
+
+                    # Prefer smaller projected load; if near-tie within eps, prefer fewer repeats, then fewer items
+                    if base + eps < best_base:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = counts[p]
+                    elif abs(base - best_base) <= eps:
+                        if rep < best_rep or (rep == best_rep and counts[p] < best_cnt):
+                            best_p = p
+                            best_base = base
+                            best_rep = rep
+                            best_cnt = counts[p]
+
+                pack_index[i, g] = best_p
+                rank_in_pack[i, g] = counts[best_p]
+                counts[best_p] += 1
+                loads[best_p] += wv
+                label_counts[best_p][lab] += 1
+                pack_groups[best_p].append(g)
+                assigned[g] = True
+=======
+        else:
+            # Phase 1: label-spreading seed (one heaviest item per label)
+            # Build per-label item lists (descending by weight) by scanning sorted_idx
+            label_counts = [defaultdict(int) for _ in range(num_packs)]
+            assigned = [False] * num_items
+
+            label_items = defaultdict(list)  # lab -> [g_heaviest_first...]
+            for g in sorted_idx:
+                lab = int(row_labels[g].item())
+                label_items[lab].append(g)
+
+            # Sort labels by their top item's weight (heaviest first)
+            label_order = sorted(
+                label_items.keys(),
+                key=lambda lab: float(row_w[label_items[lab][0]].item()),
+                reverse=True,
+            )
+
+            # Place one item per label, preferring packs without that label and min load
+            for lab in label_order:
+                if counts.count(cap) == num_packs:
+                    break  # all packs full
+                # choose the heaviest unassigned item for this label
+                g = None
+                for cand in label_items[lab]:
+                    if not assigned[cand]:
+                        g = cand
+                        break
+                if g is None:
+                    continue
+                wv = float(row_w[g].item())
+
+                best_p = None
+                best_load = None
+                best_cnt = None
+                # First try packs without this label
+                for p in range(num_packs):
+                    if counts[p] >= cap:
+                        continue
+                    if label_counts[p].get(lab, 0) > 0:
+                        continue
+                    if (best_load is None or loads[p] < best_load or
+                        (abs(loads[p] - best_load) <= 1e-12 and counts[p] < best_cnt)):
+                        best_p = p
+                        best_load = loads[p]
+                        best_cnt = counts[p]
+                # If none found, fall back to any pack with capacity
+                if best_p is None:
+                    for p in range(num_packs):
+                        if counts[p] >= cap:
+                            continue
+                        if (best_load is None or loads[p] < best_load or
+                            (abs(loads[p] - best_load) <= 1e-12 and counts[p] < best_cnt)):
+                            best_p = p
+                            best_load = loads[p]
+                            best_cnt = counts[p]
+
+                if best_p is not None:
+                    pack_index[i, g] = best_p
+                    rank_in_pack[i, g] = counts[best_p]
+                    counts[best_p] += 1
+                    loads[best_p] += wv
+                    label_counts[best_p][lab] += 1
+                    pack_groups[best_p].append(g)
+                    assigned[g] = True
+
+            # Phase 2: regular diversity-aware greedy fill for remaining items
+            eps = 1e-6 * float(row_w.mean().item() if row_w.numel() > 0 else 1.0)
+            for g in sorted_idx:
+                if assigned[g]:
+                    continue
+                lab = int(row_labels[g].item())
+                wv = float(row_w[g].item())
+
+                best_p = None
+                best_base = None
+                best_rep = None
+                best_cnt = None
+                for p in range(num_packs):
+                    if counts[p] >= cap:
+                        continue
+                    base = loads[p] + wv  # projected load if we place g in p
+                    rep = label_counts[p].get(lab, 0)
+
+                    if best_p is None:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = counts[p]
+                        continue
+
+                    # Prefer smaller projected load; if near-tie within eps, prefer fewer repeats, then fewer items
+                    if base + eps < best_base:
+                        best_p = p
+                        best_base = base
+                        best_rep = rep
+                        best_cnt = counts[p]
+                    elif abs(base - best_base) <= eps:
+                        if rep < best_rep or (rep == best_rep and counts[p] < best_cnt):
+                            best_p = p
+                            best_base = base
+                            best_rep = rep
+                            best_cnt = counts[p]
+
+                pack_index[i, g] = best_p
+                rank_in_pack[i, g] = counts[best_p]
+                counts[best_p] += 1
+                loads[best_p] += wv
+                label_counts[best_p][lab] += 1
+                pack_groups[best_p].append(g)
+                assigned[g] = True
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                            penalty = 0
+                            penalty += 1 if label_counts[d].get(lb, 0) > 0 else 0
+                            penalty += 1 if label_counts[r].get(la, 0) > 0 else 0
+                            cand = (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+=======
+                            penalty = 0
+                            if not all_unique:
+                                penalty += 1 if label_counts[d].get(lb, 0) > 0 else 0
+                                penalty += 1 if label_counts[r].get(la, 0) > 0 else 0
+                            cand = (new_peak, new_imb, penalty, d, r, ai, bi, a_item, b_item, wa, wb, la, lb)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                        penalty2 = 0
+                        la_i = int(row_labels[a_items[0]].item())
+                        la_j = int(row_labels[a_items[1]].item())
+                        lb_i = int(row_labels[b_items[0]].item())
+                        lb_j = int(row_labels[b_items[1]].item())
+                        penalty2 += (1 if label_counts[h1].get(lb_i, 0) > 0 else 0)
+                        penalty2 += (1 if label_counts[h1].get(lb_j, 0) > 0 else 0)
+                        penalty2 += (1 if label_counts[l1].get(la_i, 0) > 0 else 0)
+                        penalty2 += (1 if label_counts[l1].get(la_j, 0) > 0 else 0)
+                        best2 = (new_peak2, new_imb2, h1, l1, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum, penalty2)
+=======
+                        penalty2 = 0
+                        if not all_unique:
+                            la_i = int(row_labels[a_items[0]].item())
+                            la_j = int(row_labels[a_items[1]].item())
+                            lb_i = int(row_labels[b_items[0]].item())
+                            lb_j = int(row_labels[b_items[1]].item())
+                            penalty2 += (1 if label_counts[h1].get(lb_i, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[h1].get(lb_j, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[l1].get(la_i, 0) > 0 else 0)
+                            penalty2 += (1 if label_counts[l1].get(la_j, 0) > 0 else 0)
+                        best2 = (new_peak2, new_imb2, h1, l1, ai, aj, bi, bj, a_items, b_items, wa_sum, wb_sum, penalty2)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                    # update label counts
+                    label_counts[d][la] -= 1
+                    if label_counts[d][la] == 0:
+                        del label_counts[d][la]
+                    label_counts[d][lb] = label_counts[d].get(lb, 0) + 1
+
+                    label_counts[r][lb] -= 1
+                    if label_counts[r][lb] == 0:
+                        del label_counts[r][lb]
+                    label_counts[r][la] = label_counts[r].get(la, 0) + 1
+                    applied = True
+=======
+                    # update label counts only when duplicates exist
+                    if not all_unique:
+                        label_counts[d][la] -= 1
+                        if label_counts[d][la] == 0:
+                            del label_counts[d][la]
+                        label_counts[d][lb] = label_counts[d].get(lb, 0) + 1
+
+                        label_counts[r][lb] -= 1
+                        if label_counts[r][lb] == 0:
+                            del label_counts[r][lb]
+                        label_counts[r][la] = label_counts[r].get(la, 0) + 1
+                    applied = True
+>>>>>>> REPLACE
+
+</DIFF>

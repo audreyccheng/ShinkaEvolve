@@ -1,0 +1,364 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import random
+
+GPU_MEM_SIZE = 80.0
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Algorithm:
+    1. Preprocessing: Calculate item metrics (w, s) and a theoretical Lower Bound for K.
+    2. Binary Search for optimal K:
+       - Check function: Tries to pack items into GPUs such that KVPR <= K.
+         - Uses 'Best Fit Decreasing' logic on linearized cost (w + K*s).
+         - Uses deterministic strategies and randomized strategies with 
+           'Failure-Driven Prioritization' (prioritizing items that failed in previous tries).
+       - Valid solutions are immediately refined using 'Local Search' (Hill Climbing) 
+         to reduce the actual max KVPR further, allowing the binary search upper bound 
+         to drop more aggressively.
+    3. Final Optimization: Extended Local Search on the best found placement.
+    """
+
+    # --- 1. Preprocessing ---
+    items = []
+    total_w = 0.0
+    total_s = 0.0
+
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        items.append({
+            'model': m,
+            'w': w,
+            's': s,
+            'id': i
+        })
+        total_w += w
+        total_s += s
+
+    # Global Lower Bound Calculation
+    # Theoretical min K if memory was perfectly fluid
+    global_rem = (gpu_num * GPU_MEM_SIZE) - total_s
+    lb = 0.0
+    if global_rem > 1e-9:
+        lb = total_w / global_rem
+    
+    # Update LB with single-item constraints
+    for it in items:
+        rem = GPU_MEM_SIZE - it['s']
+        if rem > 1e-9:
+            lb = max(lb, it['w'] / rem)
+
+    # --- Helper Functions ---
+    def calc_kvpr(w, s):
+        """Calculate KVPR for a bin with load w and usage s."""
+        rem = GPU_MEM_SIZE - s
+        if rem <= 1e-9:
+            return float('inf') if w > 1e-9 else 0.0
+        return w / rem
+
+    def get_max_kvpr(bins):
+        """Get max KVPR across a list of bin states."""
+        mx = 0.0
+        for b in bins:
+            val = calc_kvpr(b['w'], b['s'])
+            if val > mx: mx = val
+        return mx
+
+    def optimize_placement(bins, iterations=50):
+        """
+        Hill Climbing Local Search.
+        Input: List of bin dicts {'w', 's', 'items': [...]}.
+        Modifies bins in-place or returns them.
+        """
+        # We work on the bins list directly
+        
+        for _ in range(iterations):
+            # 1. Identify Bottleneck
+            max_k = -1.0
+            src_idx = -1
+            
+            # Cache Ks for this iteration to avoid recomputing inside inner loops too much
+            bin_ks = []
+            for i, b in enumerate(bins):
+                k = calc_kvpr(b['w'], b['s'])
+                bin_ks.append(k)
+                if k > max_k:
+                    max_k = k
+                    src_idx = i
+            
+            if max_k <= 1e-9: break
+            
+            src = bins[src_idx]
+            improved = False
+            
+            # 2. Try Move (Src -> Dst)
+            for i, item in enumerate(src['items']):
+                # State of Src if we remove item
+                ns_w = src['w'] - item['w']
+                ns_s = src['s'] - item['s']
+                # We don't need to check ns_k strictly, as Src always improves or stays same.
+                # Key is Dst must not exceed current max_k.
+                
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = bins[dst_idx]
+                    
+                    if dst['s'] + item['s'] > GPU_MEM_SIZE: continue
+                    
+                    nd_w = dst['w'] + item['w']
+                    nd_s = dst['s'] + item['s']
+                    nd_k = calc_kvpr(nd_w, nd_s)
+                    
+                    # Acceptance: New Dest K must be strictly better than current bottleneck
+                    # (or if bottleneck was unique, effectively reducing global max)
+                    if nd_k < max_k - 1e-9:
+                        # Apply Move
+                        src['items'].pop(i)
+                        src['w'] = ns_w
+                        src['s'] = ns_s
+                        dst['items'].append(item)
+                        dst['w'] = nd_w
+                        dst['s'] = nd_s
+                        improved = True
+                        break
+                if improved: break
+            
+            if improved: continue
+            
+            # 3. Try Swap (Src <-> Dst)
+            for i, item1 in enumerate(src['items']):
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    # Optimization: Skip swapping with bins that are already stressed
+                    if bin_ks[dst_idx] > max_k * 0.95: continue
+                    
+                    dst = bins[dst_idx]
+                    for j, item2 in enumerate(dst['items']):
+                        # New Src state
+                        ns_s = src['s'] - item1['s'] + item2['s']
+                        if ns_s > GPU_MEM_SIZE: continue
+                        ns_w = src['w'] - item1['w'] + item2['w']
+                        
+                        # New Dst state
+                        nd_s = dst['s'] - item2['s'] + item1['s']
+                        if nd_s > GPU_MEM_SIZE: continue
+                        nd_w = dst['w'] - item2['w'] + item1['w']
+                        
+                        ns_k = calc_kvpr(ns_w, ns_s)
+                        nd_k = calc_kvpr(nd_w, nd_s)
+                        
+                        # Acceptance: Both resulting bins must be better than current bottleneck
+                        if max(ns_k, nd_k) < max_k - 1e-9:
+                            # Apply Swap
+                            src['items'][i] = item2
+                            src['w'] = ns_w
+                            src['s'] = ns_s
+                            dst['items'][j] = item1
+                            dst['w'] = nd_w
+                            dst['s'] = nd_s
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+            
+            if not improved: break
+            
+        return bins
+
+    def check_placement(k_target, attempts=10):
+        """
+        Feasibility check using Bin Packing.
+        Constraint: w + k*s <= k*C (Linearized Capacity)
+        Strategy: Best Fit Decreasing + Failure-Driven Randomization.
+        """
+        limit_cost = k_target * GPU_MEM_SIZE
+        
+        def pack(ordered_items):
+            """
+            Try to pack items.
+            Returns: (bins, None) if success, (None, failed_item) if fail.
+            """
+            # Initialize bins with 'lin' (linearized load) tracking for speed
+            current_bins = [{'w': 0.0, 's': 0.0, 'lin': 0.0, 'items': []} for _ in range(gpu_num)]
+            
+            for item in ordered_items:
+                w, s = item['w'], item['s']
+                cost = w + k_target * s
+                
+                best_idx = -1
+                best_fill = -1.0
+                
+                for i in range(gpu_num):
+                    b = current_bins[i]
+                    if b['s'] + s > GPU_MEM_SIZE: continue
+                    
+                    if b['lin'] + cost > limit_cost + 1e-7: continue
+                    
+                    # Best Fit: Maximize linearized fill
+                    if b['lin'] > best_fill:
+                        best_fill = b['lin']
+                        best_idx = i
+                
+                if best_idx != -1:
+                    b = current_bins[best_idx]
+                    b['w'] += w
+                    b['s'] += s
+                    b['lin'] += cost
+                    b['items'].append(item)
+                else:
+                    return None, item
+            return current_bins, None
+
+        # A. Deterministic Sorts
+        strategies = [
+            lambda x: x['w'] + k_target * x['s'],   # Linearized Cost (Descending)
+            lambda x: x['s'],                       # Size
+            lambda x: x['w']                        # Weight
+        ]
+        
+        for key in strategies:
+            res, _ = pack(sorted(items, key=key, reverse=True))
+            if res: return res
+
+        # B. Randomized with Failure Prioritization
+        if attempts > 0:
+            rng = random.Random(42 + int(k_target))
+            failed_ids = set()
+            
+            for _ in range(attempts):
+                # Construct ordering
+                prio_items = []
+                other_items = []
+                
+                for it in items:
+                    if it['id'] in failed_ids:
+                        prio_items.append(it)
+                    else:
+                        other_items.append(it)
+                
+                # Sort priority items by Size (hardest first)
+                prio_items.sort(key=lambda x: x['s'], reverse=True)
+                
+                # Sort others by perturbed heuristic
+                # (w + k*s) * noise
+                other_items.sort(key=lambda x: (x['w'] + k_target * x['s']) * rng.uniform(0.85, 1.15), 
+                                 reverse=True)
+                
+                current_order = prio_items + other_items
+                
+                res, fail_item = pack(current_order)
+                if res: return res
+                
+                # Update failure set
+                if fail_item:
+                    failed_ids.add(fail_item['id'])
+                    # Avoid set getting too big/stale
+                    if len(failed_ids) > 6:
+                        failed_ids = {fail_item['id']}
+        
+        return None
+
+    # --- 2. Binary Search Loop ---
+    high = 1e9
+    
+    # Initial Feasibility Check
+    # Try deterministic first (attempts=0), then random
+    best_bins = check_placement(high, attempts=0)
+    if not best_bins:
+        best_bins = check_placement(high, attempts=20)
+        if not best_bins:
+            raise ValueError("Unable to place models on GPUs (insufficient total memory).")
+    
+    # Initial Optimization
+    best_bins = optimize_placement(best_bins, iterations=50)
+    high = get_max_kvpr(best_bins)
+    low = lb
+    
+    # Search
+    for i in range(25):
+        if high - low < 1e-4: break
+        
+        mid = (low + high) / 2
+        
+        # Adaptive attempts: Increase effort in later stages or if range is tight
+        atts = 20 if i < 10 else 40
+        
+        res = check_placement(mid, attempts=atts)
+        
+        if res:
+            # Found a valid placement. 
+            # Run local search to squash the max KVPR further down.
+            res = optimize_placement(res, iterations=25)
+            actual_max = get_max_kvpr(res)
+            
+            if actual_max < get_max_kvpr(best_bins):
+                best_bins = res
+            
+            # We can update high to the actual achieved max, which might be << mid
+            high = min(mid, actual_max)
+        else:
+            low = mid
+
+    # --- 3. Final Polish ---
+    best_bins = optimize_placement(best_bins, iterations=200)
+
+    # Format result
+    result = {}
+    for i, b in enumerate(best_bins):
+        result[i] = [it['model'] for it in b['items']]
+        
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

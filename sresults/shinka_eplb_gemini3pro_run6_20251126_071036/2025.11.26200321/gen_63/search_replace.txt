@@ -1,0 +1,111 @@
+Based on the analysis of the current best program and the recommendations, I propose a targeted improvement to the `balanced_packing` function. The key bottleneck is that while the algorithm explores 128 candidates, it treats them all equally during refinement. A **Two-Stage "Zoom-In" Search** strategy can significantly improve results by identifying the most promising "basins of attraction" (elite candidates) from the initial greedy packing, and then focusing the computational power on exploring the neighborhoods of these elites.
+
+Specifically, I will:
+1.  **Evaluate** all 128 candidates after the Greedy Packing phase.
+2.  **Select** the Top-16 candidates per layer (those with the lowest max load).
+3.  **Replicate** these 16 elites 8 times each to restore the full batch size of 128.
+4.  **Perturb** the replicas (keeping the original elite pristine) by applying random swaps to their pack assignments. This acts as a "kick" to escape local optima, similar to Large Neighborhood Search or Basin Hopping.
+5.  **Refine** this optimized and diversified candidate pool using the existing Vectorized Local Search.
+
+This approach leverages the parallel capacity of the GPU to perform a deeper search around the best solutions found so far.
+
+<NAME>
+zoom_in_perturbation
+</NAME>
+
+<DESCRIPTION>
+Implement a Two-Stage "Zoom-In" search strategy with diversity preservation.
+After the initial Greedy Packing on 128 candidates:
+1. Evaluate all candidates and select the Top-16 "Elite" candidates per layer.
+2. Replicate these Elites 8 times to fill the candidate pool back to 128.
+3. Apply random perturbation (random swaps) to the replicas (keeping the original elites intact) to explore the neighborhood of good solutions.
+4. Proceed to the Vectorized Local Search refinement on this optimized candidate pool.
+This focuses computational resources on refining the most promising packing configurations while escaping local optima via stochastic perturbation.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Construct structured pack contents for local search
+    # We need to rearrange items into [Batch, Packs, GroupsPerPack]
+
+    # Map assignments back to original item indices to sort them by pack ID
+    # assignments maps: sorted_index_i -> pack_id
+    temp_pack_index = torch.empty_like(assignments)
+    temp_pack_index.scatter_(1, sorted_indices, assignments)
+
+    # Sort original items by their assigned pack
+    _, item_order = temp_pack_index.sort(dim=1, stable=True)
+
+    # pack_contents now holds the indices of items (0..N-1) grouped by pack
+    pack_contents = item_order.view(num_problems, num_packs, groups_per_pack)
+
+    # --- Local Search ---
+=======
+    # --- Zoom-In: Filter & Perturb ---
+    # 1. Evaluate current candidates
+    # pack_weights: [LC, M]
+    current_max_loads = pack_weights.max(dim=1).values.view(num_layers, num_candidates)
+
+    # 2. Select Elites (Top 16)
+    num_elites = 16
+    num_replicas = num_candidates // num_elites # 8
+
+    # Get indices of best candidates
+    _, best_indices_local = current_max_loads.topk(num_elites, dim=1, largest=False)
+
+    # Map local indices [0..127] to global flattened indices [LC]
+    offset = (torch.arange(num_layers, device=device) * num_candidates).view(-1, 1)
+    best_indices_flat = (best_indices_local + offset).view(-1)
+
+    # 3. Gather Elite Data
+    # assignments: [LC, N] (Pack IDs for sorted items)
+    # sorted_indices: [LC, N] (Item IDs)
+    elite_assignments = assignments[best_indices_flat]
+    elite_sorted_indices = sorted_indices[best_indices_flat]
+
+    # 4. Replicate & Perturb
+    # Expand to fill batch size
+    assignments = elite_assignments.repeat_interleave(num_replicas, dim=0)
+    sorted_indices = elite_sorted_indices.repeat_interleave(num_replicas, dim=0)
+
+    # Perturbation: Random Swaps of Pack Assignments on replicas
+    # 0, 8, 16... are kept pristine (Elites). Others are perturbed.
+    cand_idx = torch.arange(num_problems, device=device)
+    mask_perturb = (cand_idx % num_replicas) != 0
+
+    if mask_perturb.any():
+        n_items = weight.shape[1]
+        # Number of random swaps (~2% of items)
+        n_swaps = max(1, n_items // 50)
+
+        subset_idx = torch.nonzero(mask_perturb).squeeze(1)
+        num_subset = subset_idx.size(0)
+
+        for _ in range(n_swaps):
+            # Pick two random items (columns) per candidate
+            idx1 = torch.randint(0, n_items, (num_subset,), device=device)
+            idx2 = torch.randint(0, n_items, (num_subset,), device=device)
+
+            # Get current pack assignments
+            val1 = assignments[subset_idx, idx1]
+            val2 = assignments[subset_idx, idx2]
+
+            # Swap pack assignments
+            assignments[subset_idx, idx1] = val2
+            assignments[subset_idx, idx2] = val1
+
+    # 5. Reconstruct structured pack contents for local search
+    # Map assignments back to original item indices to sort them by pack ID
+    temp_pack_index = torch.empty_like(assignments)
+    temp_pack_index.scatter_(1, sorted_indices, assignments)
+
+    # Sort original items by their assigned pack
+    # item_order contains indices 0..N-1 sorted by their pack ID.
+    _, item_order = temp_pack_index.sort(dim=1, stable=True)
+
+    # pack_contents now holds the indices of items (0..N-1) grouped by pack
+    pack_contents = item_order.view(num_problems, num_packs, groups_per_pack)
+
+    # --- Local Search ---
+>>>>>>> REPLACE
+</DIFF>

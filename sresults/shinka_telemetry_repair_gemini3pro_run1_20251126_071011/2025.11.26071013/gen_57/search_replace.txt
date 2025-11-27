@@ -1,0 +1,184 @@
+<NAME>
+residual_imputation_and_cleanup
+</NAME>
+
+<DESCRIPTION>
+1. Introduced `get_flow_residual` to calculate inferred traffic rates based on router flow conservation. This allows the algorithm to synthesize a "third option" when local and remote measurements disagree, particularly useful when both measurements are erroneous (e.g., zero).
+2. Updated the repair loop to evaluate a set of candidates (`cand_tx`, `cand_rx`, `res_local`, `res_remote`) using a consistent scoring function and heuristics.
+3. Removed the "Global Consistency Penalty" block from the confidence phase, as it was double-penalizing successful repairs on otherwise noisy routers, hurting calibration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Run 3 passes to allow corrections to propagate across the network
+    for _ in range(3):
+        # Iterate over all interfaces to check Link Symmetry
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state:
+                continue
+
+            # We process the "outgoing" link: Tx(Local) -> Rx(Peer)
+            cand_tx = s['tx']              # Candidate 1: Local Tx
+            cand_rx = state[peer_id]['rx'] # Candidate 2: Peer Rx
+
+            # 3a. Check for agreement
+            diff = abs(cand_tx - cand_rx)
+            mag = max(cand_tx, cand_rx, 1.0)
+
+            best_val = cand_tx # Default to local
+
+            if diff < max(mag * TOLERANCE, MIN_ACTIVITY):
+                # Agree: Average to smooth out small noise
+                best_val = (cand_tx + cand_rx) / 2.0
+            else:
+                # Disagree: Conflict Resolution using Flow Conservation
+                rid_a = s['local_router']
+                rid_b = state[peer_id]['local_router']
+
+                def get_penalty(val):
+                    # Calculate flow errors if we chose this value
+                    err_a = calc_flow_error(rid_a, if_id, 'tx', val)
+                    err_b = calc_flow_error(rid_b, peer_id, 'rx', val)
+
+                    score = 0.0
+                    # Penalty for Local
+                    if err_a is None: score += 0.03 # Small penalty for uncertainty
+                    else: score += err_a            # Linear penalty for error
+
+                    # Penalty for Remote
+                    if err_b is None: score += 0.03
+                    else: score += err_b
+
+                    return score
+
+                score_tx = get_penalty(cand_tx)
+                score_rx = get_penalty(cand_rx)
+
+                # Heuristic: Dead counters (0) are often wrong if the other side is active
+                if cand_tx < MIN_ACTIVITY and cand_rx > MIN_ACTIVITY: score_tx += 0.5
+                if cand_rx < MIN_ACTIVITY and cand_tx > MIN_ACTIVITY: score_rx += 0.5
+
+                if score_tx < score_rx:
+                    best_val = cand_tx
+                elif score_rx < score_tx:
+                    best_val = cand_rx
+                else:
+                    best_val = (cand_tx + cand_rx) / 2.0
+
+            # Apply repair to state
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+=======
+    # Helper: Calculate what value would balance the router flow (Residual)
+    def get_flow_residual(rid, exclude_if, field):
+        if rid not in verifiable_routers:
+            return None
+
+        sum_in = sum(state[i]['rx'] for i in router_interfaces[rid])
+        sum_out = sum(state[i]['tx'] for i in router_interfaces[rid])
+        current_val = state[exclude_if][field]
+
+        # Calculate target value to achieve balance (SumIn == SumOut)
+        if field == 'tx':
+            # (sum_out - current + target) = sum_in  =>  target = sum_in - sum_out + current
+            val = sum_in - sum_out + current_val
+        else: # rx
+            # (sum_in - current + target) = sum_out  =>  target = sum_out - sum_in + current
+            val = sum_out - sum_in + current_val
+
+        return val if val > 0.0 else 0.0
+
+    # Run 3 passes to allow corrections to propagate across the network
+    for _ in range(3):
+        # Iterate over all interfaces to check Link Symmetry
+        for if_id, s in state.items():
+            if s['status'] == 'down': continue
+
+            peer_id = s['connected_to']
+            if not peer_id or peer_id not in state:
+                continue
+
+            # We process the "outgoing" link: Tx(Local) -> Rx(Peer)
+            cand_tx = s['tx']              # Candidate 1: Local Tx
+            cand_rx = state[peer_id]['rx'] # Candidate 2: Peer Rx
+
+            # 3a. Check for agreement
+            diff = abs(cand_tx - cand_rx)
+            mag = max(cand_tx, cand_rx, 1.0)
+
+            best_val = cand_tx # Default to local
+
+            if diff < max(mag * TOLERANCE, MIN_ACTIVITY):
+                # Agree: Average to smooth out small noise
+                best_val = (cand_tx + cand_rx) / 2.0
+            else:
+                # Disagree: Conflict Resolution using Flow Conservation
+                rid_a = s['local_router']
+                rid_b = state[peer_id]['local_router']
+
+                def get_penalty(val):
+                    # Calculate flow errors if we chose this value
+                    err_a = calc_flow_error(rid_a, if_id, 'tx', val)
+                    err_b = calc_flow_error(rid_b, peer_id, 'rx', val)
+
+                    score = 0.0
+                    # Penalty for Local
+                    if err_a is None: score += 0.03 # Small penalty for uncertainty
+                    else: score += min(err_a, 2.0)  # Cap error penalty
+
+                    # Penalty for Remote
+                    if err_b is None: score += 0.03
+                    else: score += min(err_b, 2.0)
+
+                    return score
+
+                # Gather candidates: Measured values + Inferred residuals
+                candidates = {cand_tx, cand_rx}
+
+                res_local = get_flow_residual(rid_a, if_id, 'tx')
+                if res_local is not None: candidates.add(res_local)
+
+                res_remote = get_flow_residual(rid_b, peer_id, 'rx')
+                if res_remote is not None: candidates.add(res_remote)
+
+                # Evaluate all candidates
+                min_score = float('inf')
+                best_val = (cand_tx + cand_rx) / 2.0
+
+                # Evidence of activity on the link (from either side)
+                has_activity = (cand_tx > MIN_ACTIVITY) or (cand_rx > MIN_ACTIVITY)
+
+                for val in candidates:
+                    score = get_penalty(val)
+
+                    # Heuristic: Dead counters (0) are often wrong if the other side is active
+                    # If we pick a value near 0, but there is evidence of activity, penalize it.
+                    if val < MIN_ACTIVITY and has_activity:
+                        score += 0.5
+
+                    if score < min_score:
+                        min_score = score
+                        best_val = val
+                    elif score == min_score:
+                        # Tie-breaking: prefer values closer to measured data
+                        if abs(val - cand_tx) < abs(best_val - cand_tx):
+                            best_val = val
+
+            # Apply repair to state
+            state[if_id]['tx'] = best_val
+            state[peer_id]['rx'] = best_val
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # Global Consistency Penalty: If router is broken, trust nothing from it fully
+        if rid in final_router_errors and final_router_errors[rid] > FLOW_TOLERANCE:
+            rx_conf *= 0.8
+            tx_conf *= 0.8
+
+        # Construct Output Tuple
+=======
+        # Construct Output Tuple
+>>>>>>> REPLACE
+</DIFF>

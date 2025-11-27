@@ -1,0 +1,255 @@
+<NAME>
+hybrid_tail_waterfill_and_peak_tiebreaks
+</NAME>
+
+<DESCRIPTION>
+I improved the replication allocation by adding a hybrid tail allocator that blends D’Hondt and Sainte–Laguë methods for the final 10% of extra replicas. This tail, chosen adaptively per row, explicitly minimizes the predicted new peak average at each step (with a secondary tie-break by the second-highest average), achieving better peak smoothing without significant runtime overhead. For the bulk of extras, we keep the efficient D’Hondt-style block assignment.
+
+I also strengthened the donor→receiver replication fix-up tie-breaking to use the second-highest per-replica average as a lexicographic tie-breaker when peak ties occur, yielding more robust peak reductions with the same bounded candidate set and iterations.
+
+Finally, I optimized a small hot path in GPU packing by replacing a full unique() call with sort + unique_consecutive to detect duplicate labels faster, preserving speed while maintaining correctness.
+
+These changes target better balancedness while keeping the algorithm fast, adhering to the NP-hard nature of perfect balancing.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _waterfill_counts_row(w: torch.Tensor, target_total: int) -> torch.Tensor:
+    """
+    Compute integer replica counts c_i >= 1 that approximately minimize max_i w_i / c_i
+    subject to sum c_i == target_total using water-filling + greedy fill.
+
+    Parameters:
+        w: [num_log], float tensor (on CPU)
+        target_total: int, total replicas to allocate
+
+    Returns:
+        counts: [num_log], int64
+    """
+    num_log = w.numel()
+    assert target_total >= num_log  # at least one per expert
+
+    if target_total == num_log:
+        return torch.ones(num_log, dtype=torch.int64, device=w.device)
+
+    maxw = float(w.max().item()) if num_log > 0 else 0.0
+    # Binary search T such that sum max(1, ceil(w_i / T)) <= target_total
+    lo = 0.0
+    hi = max(maxw, 1.0)
+    # Handle all-zero quickly
+    if maxw == 0.0:
+        counts = torch.ones(num_log, dtype=torch.int64, device=w.device)
+        extras = target_total - num_log
+        if extras > 0:
+            base_add = extras // num_log
+            rem = extras % num_log
+            if base_add > 0:
+                counts += base_add
+            if rem > 0:
+                counts[:rem] += 1
+        return counts
+
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        # counts_i = max(1, ceil(w_i / mid))
+        c = torch.ceil(w / mid).to(torch.int64)
+        c = torch.maximum(c, torch.ones_like(c))
+        s = int(c.sum().item())
+        if s <= target_total:
+            hi = mid
+        else:
+            lo = mid
+
+    # Base counts from hi guarantee <= target_total
+    counts = torch.ceil(w / hi).to(torch.int64)
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    s = int(counts.sum().item())
+
+    # Greedy water-filling for remaining extras
+    extras = target_total - s
+    while extras > 0:
+        k = min(extras, num_log)
+        # Select top-k by current w_i / c_i
+        scores = w / counts.to(w.dtype)
+        topk_idx = torch.argsort(scores, descending=True)[:k]
+        counts[topk_idx] += 1
+        extras -= k
+    return counts
+=======
+def _waterfill_counts_row(w: torch.Tensor, target_total: int) -> torch.Tensor:
+    """
+    Compute integer replica counts c_i >= 1 that approximately minimize max_i w_i / c_i
+    subject to sum c_i == target_total using water-filling + greedy fill, with a
+    small hybrid tail allocator that picks between D’Hondt and Sainte–Laguë to
+    reduce the peak average.
+    """
+    num_log = w.numel()
+    assert target_total >= num_log  # at least one per expert
+
+    if target_total == num_log:
+        return torch.ones(num_log, dtype=torch.int64, device=w.device)
+
+    maxw = float(w.max().item()) if num_log > 0 else 0.0
+    # Binary search T such that sum max(1, ceil(w_i / T)) <= target_total
+    lo = 0.0
+    hi = max(maxw, 1.0)
+    # Handle all-zero quickly
+    if maxw == 0.0:
+        counts = torch.ones(num_log, dtype=torch.int64, device=w.device)
+        extras = target_total - num_log
+        if extras > 0:
+            base_add = extras // num_log
+            rem = extras % num_log
+            if base_add > 0:
+                counts += base_add
+            if rem > 0:
+                counts[:rem] += 1
+        return counts
+
+    for _ in range(40):
+        mid = 0.5 * (lo + hi)
+        # counts_i = max(1, ceil(w_i / mid))
+        c = torch.ceil(w / mid).to(torch.int64)
+        c = torch.maximum(c, torch.ones_like(c))
+        s = int(c.sum().item())
+        if s <= target_total:
+            hi = mid
+        else:
+            lo = mid
+
+    # Base counts from hi guarantee <= target_total
+    counts = torch.ceil(w / hi).to(torch.int64)
+    counts = torch.maximum(counts, torch.ones_like(counts))
+    s = int(counts.sum().item())
+
+    # Greedy water-filling for remaining extras with a hybrid tail
+    extras = target_total - s
+    if extras <= 0:
+        return counts
+
+    # Determine tail size adaptively per row
+    num_redundant = target_total - num_log
+    T = int(max(1, round(0.1 * num_redundant))) if num_redundant > 0 else 0
+
+    # Bulk fill (D’Hondt-style) in blocks for speed
+    bulk = max(0, extras - T)
+    while bulk > 0:
+        k = min(bulk, num_log)
+        scores = w / counts.to(w.dtype)
+        topk_idx = torch.argsort(scores, descending=True)[:k]
+        counts[topk_idx] += 1
+        bulk -= k
+        extras -= k
+
+    # Tail: at each step, choose between D’Hondt and Sainte–Laguë by predicting new peak
+    for _ in range(extras):
+        # D’Hondt candidate (maximize w / c)
+        scores_d = w / counts.to(w.dtype)
+        idx_d = int(torch.argmax(scores_d).item())
+
+        # Sainte–Laguë candidate (maximize w / (2c + 1))
+        denom_sl = counts.to(w.dtype) * 2 + 1.0
+        scores_s = w / denom_sl
+        idx_s = int(torch.argmax(scores_s).item())
+
+        # Evaluate both candidates by new global peak (tie-break by second-highest)
+        # Candidate D
+        c_d = counts.clone()
+        c_d[idx_d] += 1
+        avg_d = w / c_d.to(w.dtype)
+        peak_d = float(avg_d.max().item())
+        if num_log >= 2:
+            vals_d = torch.topk(avg_d, k=min(2, num_log)).values
+            second_d = float(vals_d[-1].item()) if vals_d.numel() >= 2 else peak_d
+        else:
+            second_d = peak_d
+
+        # Candidate S
+        c_s = counts.clone()
+        c_s[idx_s] += 1
+        avg_s = w / c_s.to(w.dtype)
+        peak_s = float(avg_s.max().item())
+        if num_log >= 2:
+            vals_s = torch.topk(avg_s, k=min(2, num_log)).values
+            second_s = float(vals_s[-1].item()) if vals_s.numel() >= 2 else peak_s
+        else:
+            second_s = peak_s
+
+        # Commit the better candidate
+        if peak_d + 1e-9 < peak_s or (abs(peak_d - peak_s) <= 1e-9 and second_d + 1e-9 < second_s):
+            counts = c_d
+        elif peak_s + 1e-9 < peak_d or (abs(peak_s - peak_d) <= 1e-9 and second_s + 1e-9 < second_d):
+            counts = c_s
+        else:
+            # Fall back to D’Hondt increment on tie
+            counts[idx_d] += 1
+
+    return counts
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Fast path: if all labels are unique, diversity bookkeeping is unnecessary
+        unique_labels = torch.unique(row_labels)
+        all_unique = (unique_labels.numel() == row_labels.numel())
+=======
+        # Fast path: if all labels are unique, diversity bookkeeping is unnecessary
+        # Use sort + unique_consecutive for faster duplicate detection than full unique
+        lbl_sorted, _ = torch.sort(row_labels)
+        all_unique = (torch.unique_consecutive(lbl_sorted).numel() == row_labels.numel())
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+                best_pair = None
+                best_peak = cur_peak
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = counts.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        avg_try = w / c_try.to(w.dtype)
+                        peak = float(avg_try.max().item())
+                        if peak + 1e-9 < best_peak:
+                            best_peak = peak
+                            best_pair = (d, r)
+
+                if best_pair is None:
+                    break
+                d, r = best_pair
+                counts[d] -= 1
+                counts[r] += 1
+=======
+                best = None  # (peak, second_highest, d, r)
+                for d in donors:
+                    for r in receivers:
+                        if d == r:
+                            continue
+                        c_try = counts.clone()
+                        c_try[d] -= 1
+                        c_try[r] += 1
+                        avg_try = w / c_try.to(w.dtype)
+                        peak = float(avg_try.max().item())
+                        if num_log >= 2:
+                            top2_vals = torch.topk(avg_try, k=min(2, num_log)).values
+                            second = float(top2_vals[-1].item()) if top2_vals.numel() >= 2 else peak
+                        else:
+                            second = peak
+                        cand = (peak, second, d, r)
+                        if (best is None or
+                            cand[0] + 1e-9 < best[0] or
+                            (abs(cand[0] - best[0]) <= 1e-9 and cand[1] + 1e-9 < best[1])):
+                            best = cand
+
+                if best is None or best[0] + 1e-9 >= cur_peak:
+                    break
+                _, _, d, r = best
+                counts[d] -= 1
+                counts[r] += 1
+>>>>>>> REPLACE
+
+</DIFF>

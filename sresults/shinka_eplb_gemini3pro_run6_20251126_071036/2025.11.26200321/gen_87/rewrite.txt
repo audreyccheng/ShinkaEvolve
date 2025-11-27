@@ -1,0 +1,464 @@
+# EVOLVE-BLOCK-START
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module implements the core rearrangement algorithm.
+
+The rearrangement algorithm is adapted from
+[DeepSeek EPLB](https://github.com/deepseek-ai/eplb).
+
+Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
+on how the EPLB algorithm works.
+"""
+
+import torch
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Algorithm: Vortex Search with Quad-Pooling
+    1. Parallel Initialization (LPT, Noise, Interleaved).
+    2. Greedy Packing.
+    3. Multi-stage Refinement:
+       a. Max-Any Swap (Target Max Pack).
+       b. Quad-Pooling (Destruct-Reconstruct Top-2 Max and Top-2 Min).
+       c. Final Polish.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+    K = groups_per_pack
+
+    # Trivial case
+    if K == 1:
+        pack_index = torch.arange(num_packs, dtype=torch.int64, device=device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- 1. Vortex Initialization ---
+    num_candidates = 256
+    num_problems = num_layers * num_candidates
+    
+    # Expand input
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0) # [LC, N]
+    
+    # Generate Sort Keys
+    # Strategy 1: LPT with varying noise (0-159)
+    # Scale varies from 0.0 (Pure LPT) to 0.5 (High Noise)
+    scales = torch.linspace(0, 0.5, 160, device=device)
+    noise_scale = scales.repeat(num_layers).view(-1, 1)
+    noise = torch.rand_like(w_expanded[:num_layers*160]) * w_expanded[:num_layers*160] * noise_scale
+    # Ensure cand 0 is pure LPT
+    noise.view(num_layers, 160, num_groups)[:, 0, :] = 0
+    
+    keys_lpt = w_expanded[:num_layers*160] + noise
+    
+    # Strategy 2: Interleaved (160-223) - handled by permutation later
+    
+    # Strategy 3: Random (224-255)
+    keys_random = torch.rand_like(w_expanded[num_layers*224:])
+    
+    # Combine keys for sorting
+    all_keys = torch.empty_like(w_expanded)
+    all_keys[:num_layers*160] = keys_lpt
+    all_keys[num_layers*160:num_layers*224] = w_expanded[num_layers*160:num_layers*224] # Base LPT
+    all_keys[num_layers*224:] = keys_random
+    
+    # Sort
+    _, sorted_indices = all_keys.sort(dim=-1, descending=True)
+    
+    # Apply Interleave Permutation for 160-223
+    c_ids = torch.arange(num_candidates, device=device).repeat_interleave(num_layers)
+    mask_inter = (c_ids >= 160) & (c_ids < 224)
+    
+    if mask_inter.any():
+        # Permutation: 0, N-1, 1, N-2...
+        perm = torch.empty(num_groups, dtype=torch.long, device=device)
+        half = (num_groups + 1) // 2
+        perm[0::2] = torch.arange(half, device=device)
+        perm[1::2] = torch.arange(num_groups - 1, half - 1, -1, device=device)
+        
+        subset = sorted_indices[mask_inter]
+        sorted_indices[mask_inter] = subset[:, perm]
+
+    # Gather weights
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+    
+    # --- 2. Vectorized Greedy Construction ---
+    # Standard min-load greedy
+    pack_weights = torch.zeros(num_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_problems, num_packs, device=device, dtype=torch.int64)
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+    
+    inf_val = torch.tensor(float('inf'), device=device)
+    ones = torch.ones(num_problems, 1, device=device, dtype=torch.int64)
+    
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1]
+        
+        is_full = (pack_counts >= K)
+        costs = torch.where(is_full, inf_val, pack_weights)
+        
+        chosen = costs.argmin(dim=1, keepdim=True)
+        sorted_pack_index[:, i:i+1] = chosen
+        
+        pack_weights.scatter_add_(1, chosen, w_item)
+        pack_counts.scatter_add_(1, chosen, ones)
+        
+    # Convert to Pack Contents [LC, M, K]
+    # This tensor holds indices into `sorted_weight`
+    _, pack_content_sort_idx = sorted_pack_index.sort(dim=1, stable=True)
+    pack_contents = pack_content_sort_idx.view(num_problems, num_packs, K)
+    
+    # --- 3. Refinement Pipeline ---
+    
+    # Helper: Get current pack weights
+    def get_pack_sums(contents):
+        flat = contents.view(num_problems, -1)
+        w = torch.gather(sorted_weight, 1, flat).view(num_problems, num_packs, K)
+        return w.sum(dim=2), w
+
+    # Phase A: Max-Any Swap (Iterative)
+    num_iters_swap = 15
+    for _ in range(num_iters_swap):
+        pack_sums, curr_w = get_pack_sums(pack_contents)
+        
+        val_max, p_max = pack_sums.max(dim=1)
+        
+        # Max Items
+        gather_max = p_max.view(-1, 1, 1).expand(-1, 1, K)
+        w_max_items = torch.gather(curr_w, 1, gather_max).squeeze(1)
+        
+        # Diffs [LC, 1, K, 1] - [LC, M, 1, K]
+        diffs = w_max_items.view(num_problems, 1, K, 1) - curr_w.view(num_problems, num_packs, 1, K)
+        
+        val_max_exp = val_max.view(num_problems, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_problems, num_packs, 1, 1)
+        
+        new_pair_max = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_pair_max
+        
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == p_max.view(-1, 1))
+        mask_self = mask_self.view(num_problems, num_packs, 1, 1)
+        
+        valid = (diffs > 0) & (improvement > 1e-6) & (~mask_self)
+        
+        scores = torch.where(valid, improvement, torch.tensor(float('-inf'), device=device))
+        best_imp, flat_idx = scores.view(num_problems, -1).max(dim=1)
+        
+        if not (best_imp > 0).any():
+            break
+            
+        active = torch.nonzero(best_imp > 0).squeeze(1)
+        if len(active) == 0: break
+        
+        idx_flat = flat_idx[active]
+        K2 = K*K
+        p_target = idx_flat // K2
+        rem = idx_flat % K2
+        k_max = rem // K
+        k_target = rem % K
+        
+        p_max_act = p_max[active]
+        
+        v_max = pack_contents[active, p_max_act, k_max].clone()
+        v_tgt = pack_contents[active, p_target, k_target].clone()
+        pack_contents[active, p_max_act, k_max] = v_tgt
+        pack_contents[active, p_target, k_target] = v_max
+
+    # Phase B: Quad-Pooling (Top-2 / Bottom-2 Destruct-Reconstruct)
+    if num_packs >= 4:
+        num_iters_quad = 10
+        batch_idx_range = torch.arange(num_problems, device=device)
+        
+        for _ in range(num_iters_quad):
+            pack_sums, curr_w = get_pack_sums(pack_contents)
+            
+            # Find Top-2 and Bottom-2
+            _, p_sorted = pack_sums.sort(dim=1, descending=True)
+            
+            p_top2 = p_sorted[:, :2] # [LC, 2]
+            p_bot2 = p_sorted[:, -2:] # [LC, 2]
+            
+            # Combine indices: [LC, 4] -> [Max1, Max2, Min2, Min1]
+            p_target = torch.cat([p_top2, p_bot2], dim=1)
+            
+            # Gather items from these 4 packs: [LC, 4, K]
+            gather_idx = p_target.unsqueeze(2).expand(-1, -1, K)
+            items_idx = torch.gather(pack_contents, 1, gather_idx) # [LC, 4, K]
+            
+            # Flatten to [LC, 4K]
+            items_flat = items_idx.view(num_problems, -1)
+            w_flat = torch.gather(sorted_weight, 1, items_flat)
+            
+            # Sort items descending
+            _, sort_order = w_flat.sort(dim=1, descending=True)
+            items_sorted = torch.gather(items_flat, 1, sort_order)
+            
+            # Redistribute to 4 packs using Snake pattern: 0,1,2,3, 3,2,1,0
+            # Reshape sorted items to [LC, K, 4]
+            reshaped = items_sorted.view(num_problems, K, 4)
+            
+            # Flip odd rows (1, 3, 5...) to achieve snake pattern
+            final_assignment = reshaped.clone()
+            final_assignment[:, 1::2, :] = final_assignment[:, 1::2, :].flip(dims=[2])
+            
+            # Transpose to [LC, 4, K] matching p_target order
+            final_assignment = final_assignment.transpose(1, 2)
+            
+            # Scatter back to pack_contents
+            # Iterate the 4 columns of p_target
+            for j in range(4):
+                p_idx = p_target[:, j] # [LC]
+                vals = final_assignment[:, j, :] # [LC, K]
+                pack_contents[batch_idx_range, p_idx, :] = vals
+
+    # Phase C: Final Max-Any Polish
+    for _ in range(5):
+        pack_sums, curr_w = get_pack_sums(pack_contents)
+        val_max, p_max = pack_sums.max(dim=1)
+        gather_max = p_max.view(-1, 1, 1).expand(-1, 1, K)
+        w_max_items = torch.gather(curr_w, 1, gather_max).squeeze(1)
+        diffs = w_max_items.view(num_problems, 1, K, 1) - curr_w.view(num_problems, num_packs, 1, K)
+        val_max_exp = val_max.view(num_problems, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_problems, num_packs, 1, 1)
+        new_pair_max = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_pair_max
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == p_max.view(-1, 1)).view(num_problems, num_packs, 1, 1)
+        valid = (diffs > 0) & (improvement > 1e-6) & (~mask_self)
+        scores = torch.where(valid, improvement, torch.tensor(float('-inf'), device=device))
+        best_imp, flat_idx = scores.view(num_problems, -1).max(dim=1)
+        if not (best_imp > 0).any(): break
+        active = torch.nonzero(best_imp > 0).squeeze(1)
+        idx_flat = flat_idx[active]
+        K2 = K*K
+        p_target = idx_flat // K2
+        rem = idx_flat % K2
+        k_max = rem // K
+        k_target = rem % K
+        p_max_act = p_max[active]
+        v_max = pack_contents[active, p_max_act, k_max].clone()
+        v_tgt = pack_contents[active, p_target, k_target].clone()
+        pack_contents[active, p_max_act, k_max] = v_tgt
+        pack_contents[active, p_target, k_target] = v_max
+
+    # --- 4. Selection & Output ---
+    pack_sums, _ = get_pack_sums(pack_contents)
+    final_max = pack_sums.max(dim=1).values
+    
+    final_max = final_max.view(num_layers, num_candidates)
+    best_cand = final_max.argmin(dim=1)
+    
+    best_offset = torch.arange(num_layers, device=device) * num_candidates + best_cand
+    best_contents = pack_contents[best_offset] # [L, M, K]
+    best_sorted_idx = sorted_indices[best_offset] # [L, N]
+    
+    flat_best = best_contents.view(num_layers, -1)
+    original_idx = torch.gather(best_sorted_idx, 1, flat_best)
+    
+    # Construct results
+    pack_index = torch.empty(num_layers, num_groups, dtype=torch.long, device=device)
+    rank_in_pack = torch.empty(num_layers, num_groups, dtype=torch.long, device=device)
+    
+    p_pat = torch.arange(num_packs, device=device).view(1, num_packs, 1).expand(num_layers, -1, K).reshape(num_layers, -1)
+    r_pat = torch.arange(K, device=device).view(1, 1, K).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+    
+    pack_index.scatter_(1, original_idx, p_pat)
+    rank_in_pack.scatter_(1, original_idx, r_pat)
+    
+    return pack_index, rank_in_pack
+
+
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+
+    # Initialize with 1 replica per expert
+    phy2log = torch.arange(num_phy, dtype=torch.int64, device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+
+    # Greedily add replicas to the expert with highest current load per replica
+    for i in range(num_log, num_phy):
+        # Metric: current load per replica = weight / count
+        metrics = weight / logcnt
+        redundant_indices = metrics.max(dim=-1).indices
+
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+
+    return phy2log, rank, logcnt
+
+
+def rebalance_experts_hierarchical(
+    weight: torch.Tensor,
+    num_physical_experts: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+):
+    """
+    Parameters:
+        weight: [num_moe_layers, num_logical_experts]
+        num_physical_experts: number of physical experts after replication
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network
+        (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [num_moe_layers, num_physical_experts]
+        logical_to_physical_map: [num_moe_layers, num_logical_experts, X]
+        logical_count: [num_moe_layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
+    assert num_logical_experts % num_groups == 0
+    group_size = num_logical_experts // num_groups
+    assert num_groups % num_nodes == 0
+    groups_per_node = num_groups // num_nodes
+    assert num_gpus % num_nodes == 0
+    assert num_physical_experts % num_gpus == 0
+    phy_experts_per_gpu = num_physical_experts // num_gpus
+
+    def inverse(perm: torch.Tensor) -> torch.Tensor:
+        inv = torch.empty_like(perm)
+        inv.scatter_(
+            1,
+            perm,
+            torch.arange(perm.size(1), dtype=torch.int64,
+                         device=perm.device).expand(perm.shape),
+        )
+        return inv
+
+    # Step 1: pack groups to nodes
+    tokens_per_group = weight.unflatten(-1, (num_groups, group_size)).sum(-1)
+
+    group_pack_index, group_rank_in_pack = balanced_packing(
+        tokens_per_group, num_nodes)
+
+    log2mlog = (((group_pack_index * groups_per_node + group_rank_in_pack) *
+                 group_size).unsqueeze(-1) +
+                torch.arange(group_size,
+                             dtype=torch.int64,
+                             device=group_pack_index.device)).flatten(-2)
+    mlog2log = inverse(log2mlog)
+
+    # Step 2: construct redundant experts within nodes
+    tokens_per_mlog = weight.gather(-1, mlog2log).view(
+        -1, num_logical_experts // num_nodes)
+
+    phy2mlog, phyrank, mlogcnt = replicate_experts(
+        tokens_per_mlog, num_physical_experts // num_nodes)
+
+    # Step 3: pack physical_experts to GPUs
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    pphy2phy = inverse(phy2pphy)
+
+    pphy2mlog = phy2mlog.gather(
+        -1, pphy2phy)
+    pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + torch.arange(
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+    logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer.
+
+    Parameters:
+        weight: [layers, num_logical_experts], the load statistics for all
+            logical experts
+        num_replicas: number of physical experts, must be a multiple of
+            `num_gpus`
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network
+            (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas], the expert index of
+            each replica
+        logical_to_physical_map: [layers, num_logical_experts, X], the replica
+            indices for each expert
+        expert_count: [layers, num_logical_experts], number of physical
+            replicas for each logical expert
+    """
+    num_layers, num_logical_experts = weight.shape
+    # Ensure weight is float for calculations. Keep on original device for speed.
+    weight = weight.float()
+
+    if num_groups % num_nodes == 0:
+        # use hierarchical load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, num_groups, num_nodes, num_gpus)
+    else:
+        # use global load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, 1, 1, num_gpus)
+
+    num_redundant_experts = num_replicas - num_logical_experts
+    maxlogcnt = num_redundant_experts + 1
+    log2phy: torch.Tensor = torch.full(
+        (num_layers, num_logical_experts, maxlogcnt),
+        -1,
+        dtype=torch.int64,
+        device=logcnt.device,
+    )
+
+    log2phy.view(num_layers, -1).scatter_(
+        -1,
+        phy2log * maxlogcnt + phyrank,
+        torch.arange(num_replicas, dtype=torch.int64,
+                     device=log2phy.device).expand(num_layers, -1),
+    )
+    return phy2log, log2phy, logcnt
+# EVOLVE-BLOCK-END

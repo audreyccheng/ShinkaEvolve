@@ -1,0 +1,305 @@
+<NAME>
+dynamic_beam_search
+</NAME>
+
+<DESCRIPTION>
+Replacing the Multi-Start Greedy strategy with a Dynamic Beam Search.
+Beam search was shown to be highly effective (Gen 18). This improved version uses a tapered beam width (starts at 1.5x base width, ends at 0.5x) to allocate more computational resources to the critical early scheduling decisions where dependencies are established. It retains the LPT heuristic weighting and the Local Search refinement phase.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Weighted Probabilistic Greedy Construction and Biased Local Search.
+
+    Method:
+    1. Construction Phase: Builds multiple candidate schedules.
+       - Selection uses weighted probability (weights = txn duration) to favor LPT (Longest Processing Time) items.
+       - Includes pure random candidates for diversity.
+       - Switches to exhaustive search at the tail (last 20 items) to perfect the schedule's end.
+       - Tie-breaking: Amongst candidates yielding equal minimal makespan, pick the longest duration transaction.
+    2. Local Search Phase:
+       - Starts from the best constructed schedule.
+       - Uses Shift (Insert) operator heavily (80%) as it is more effective for sequencing.
+       - Uses Swap operator (20%) for perturbation.
+
+    Args:
+        workload: Workload object
+        num_seqs: Number of construction iterations (restarts)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    # 1. Analyze Workload: Duration Heuristic
+    # Pre-calculate duration for each transaction to use as weight/heuristic
+    txn_metrics = {}
+    try:
+        for t in range(workload.num_txns):
+            # Access duration from the transaction structure
+            # Structure assumed: txns[t] -> list of sequences -> [0] -> [3] is duration
+            duration = workload.txns[t][0][3]
+            txn_metrics[t] = duration
+    except (IndexError, AttributeError, TypeError):
+        # Fallback
+        for t in range(workload.num_txns):
+            txn_metrics[t] = 1.0
+
+    def generate_weighted_schedule():
+        """Generates a single schedule using weighted greedy strategy."""
+        remaining = list(range(workload.num_txns))
+        schedule = []
+
+        # Random start node to diversify the sequence beginning
+        start_node = random.choice(remaining)
+        schedule.append(start_node)
+        remaining.remove(start_node)
+
+        while remaining:
+            candidates = set()
+
+            # ADAPTIVE TAIL: Exhaustive search when problem size is small
+            # This ensures optimal packing for the end of the schedule where dependencies accumulate
+            if len(remaining) <= 20:
+                candidates.update(remaining)
+            else:
+                # WEIGHTED SAMPLING: Prioritize long transactions
+                # Probability of checking a transaction is proportional to its duration.
+                # Heuristic: Harder/Longer items should be placed earlier or carefully.
+                weights = [txn_metrics[t] for t in remaining]
+
+                # Sample k candidates based on weights
+                # Using random.choices (with replacement) then set() to unique-ify
+                biased_samples = random.choices(remaining, weights=weights, k=6)
+                candidates.update(biased_samples)
+
+                # UNIFORM SAMPLING: Add pure random candidates to escape local greedy traps
+                # Ensures we don't ignore small items that might fit perfectly
+                random_samples = random.sample(remaining, min(len(remaining), 2))
+                candidates.update(random_samples)
+
+            # GREEDY SELECTION
+            best_c_list = []
+            best_c_cost = float('inf')
+
+            # Evaluate all candidates
+            for c in candidates:
+                # Simulator calculates full makespan of the sequence so far
+                cost = workload.get_opt_seq_cost(schedule + [c])
+
+                if cost < best_c_cost:
+                    best_c_cost = cost
+                    best_c_list = [c]
+                elif cost == best_c_cost:
+                    best_c_list.append(c)
+
+            # TIE-BREAKING: Pick the "heaviest" (longest duration) among the best
+            # If multiple candidates add the same amount to the makespan, pick the one
+            # that is longest. This "hides" the long transaction in the available parallelism.
+            if best_c_list:
+                best_c = max(best_c_list, key=lambda x: txn_metrics.get(x, 0))
+            else:
+                # Fallback (should not happen)
+                best_c = remaining[0]
+
+            schedule.append(best_c)
+            remaining.remove(best_c)
+
+        return workload.get_opt_seq_cost(schedule), schedule
+
+    # Phase 1: Multi-Start Construction
+    best_overall_cost = float('inf')
+    best_overall_schedule = []
+
+    # Ensure a minimum number of iterations for stability
+    # 10 is a good balance between diversity and time
+    iterations = max(10, num_seqs)
+
+    for _ in range(iterations):
+        cost, sched = generate_weighted_schedule()
+        if cost < best_overall_cost:
+            best_overall_cost = cost
+            best_overall_schedule = sched
+
+    # Phase 2: Local Search Intensification
+    # Focuses on the best candidate found so far
+    current_schedule = list(best_overall_schedule)
+    current_cost = best_overall_cost
+
+    search_steps = 600
+    max_no_improv = 100
+    no_improv = 0
+
+    for _ in range(search_steps):
+        if no_improv >= max_no_improv:
+            break
+
+        neighbor = list(current_schedule)
+
+        # Operator Selection:
+        # Shift (Insertion) is generally more effective than Swap for scheduling (80% prob)
+        if random.random() < 0.8:
+            # Shift Operator
+            src = random.randint(0, len(neighbor) - 1)
+            dst = random.randint(0, len(neighbor) - 1)
+            if src == dst:
+                continue
+            txn = neighbor.pop(src)
+            neighbor.insert(dst, txn)
+        else:
+            # Swap Operator
+            i = random.randint(0, len(neighbor) - 1)
+            j = random.randint(0, len(neighbor) - 1)
+            if i == j:
+                continue
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+
+        new_cost = workload.get_opt_seq_cost(neighbor)
+
+        if new_cost < current_cost:
+            current_cost = new_cost
+            current_schedule = neighbor
+            no_improv = 0
+        else:
+            no_improv += 1
+
+    return current_cost, current_schedule
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Dynamic Beam Search followed by Local Search.
+
+    Method:
+    1. Beam Search Construction:
+       - Maintains multiple parallel partial schedules.
+       - Uses 'Dynamic Beam Width': Starts wide to explore early structural choices,
+         then narrows (tapers) as the schedule fills up.
+       - Expansion uses weighted sampling (LPT heuristic) and tail optimization.
+       - Selection uses a composite metric (Cost, -Duration) to prioritize "filling gaps"
+         with larger transactions when costs are equal.
+    2. Local Search Refinement:
+       - Intensifies around the best found schedule using Shift (80%) and Swap (20%) operators.
+
+    Args:
+        workload: Workload object
+        num_seqs: Determines the computational budget (base beam width)
+
+    Returns:
+        (lowest_makespan, schedule)
+    """
+
+    # 1. Metric Precomputation
+    txn_metrics = {}
+    try:
+        for t in range(workload.num_txns):
+            # Assumed structure: txns[t] -> list of sequences -> [0] -> [3] is duration
+            txn_metrics[t] = workload.txns[t][0][3]
+    except (IndexError, AttributeError, TypeError):
+        for t in range(workload.num_txns):
+            txn_metrics[t] = 1.0
+
+    # 2. Beam Search Setup
+    # Set base width roughly equal to num_seqs (e.g. 10)
+    BASE_BEAM_WIDTH = max(4, int(num_seqs))
+
+    # Beam State: (cost, schedule_list, remaining_indices_list)
+    current_beam = [(0, [], list(range(workload.num_txns)))]
+
+    # 3. Construction Loop
+    num_txns = workload.num_txns
+    for step in range(num_txns):
+        candidates_pool = []
+
+        # DYNAMIC BEAM WIDTH: Taper from 1.5x to 0.5x of base width
+        # Allocates more search to early critical decisions
+        progress = step / num_txns
+        # Formula: width decays linearly
+        width_factor = 1.5 - progress
+        current_width = int(BASE_BEAM_WIDTH * width_factor)
+        current_width = max(2, current_width)  # Ensure minimum width
+
+        # Expand each partial schedule in the beam
+        for parent_cost, parent_sched, parent_remaining in current_beam:
+            next_candidates = set()
+
+            # OPTIMIZATION: Exhaustive Tail
+            if len(parent_remaining) <= 20:
+                next_candidates.update(parent_remaining)
+            else:
+                # OPTIMIZATION: Weighted Sampling (LPT)
+                weights = [txn_metrics[t] for t in parent_remaining]
+
+                # Sample based on weights
+                # k=6 provides good lookahead
+                samples = random.choices(parent_remaining, weights=weights, k=6)
+                next_candidates.update(samples)
+
+                # Diversity: Pure random samples
+                random_samples = random.sample(parent_remaining, min(len(parent_remaining), 2))
+                next_candidates.update(random_samples)
+
+            # Evaluate candidates
+            for txn_idx in next_candidates:
+                new_sched = parent_sched + [txn_idx]
+                new_cost = workload.get_opt_seq_cost(new_sched)
+
+                # Metric: (Cost, -Duration)
+                # Primary: Minimize Makespan.
+                # Secondary: Maximize Duration (LPT tie-breaking).
+                sort_metric = (new_cost, -txn_metrics.get(txn_idx, 0))
+
+                new_remaining = list(parent_remaining)
+                new_remaining.remove(txn_idx)
+
+                candidates_pool.append((sort_metric, new_sched, new_remaining))
+
+        # Pruning: Keep best K candidates
+        candidates_pool.sort(key=lambda x: x[0])
+
+        # Create next beam
+        current_beam = [ (x[0][0], x[1], x[2]) for x in candidates_pool[:current_width] ]
+
+    # 4. Extract Best Schedule
+    best_beam_state = current_beam[0]
+    current_cost = best_beam_state[0]
+    current_schedule = best_beam_state[1]
+
+    # 5. Local Search Refinement
+    search_steps = 800
+    no_improv_limit = 150
+    no_improv = 0
+
+    for _ in range(search_steps):
+        if no_improv >= no_improv_limit:
+            break
+
+        neighbor = list(current_schedule)
+
+        # Operator: 80% Shift, 20% Swap
+        if random.random() < 0.8:
+            src = random.randint(0, len(neighbor) - 1)
+            dst = random.randint(0, len(neighbor) - 1)
+            if src == dst:
+                continue
+            txn = neighbor.pop(src)
+            neighbor.insert(dst, txn)
+        else:
+            i = random.randint(0, len(neighbor) - 1)
+            j = random.randint(0, len(neighbor) - 1)
+            if i == j:
+                continue
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+
+        new_cost = workload.get_opt_seq_cost(neighbor)
+
+        if new_cost < current_cost:
+            current_cost = new_cost
+            current_schedule = neighbor
+            no_improv = 0
+        else:
+            no_improv += 1
+
+    return current_cost, current_schedule
+>>>>>>> REPLACE
+</DIFF>

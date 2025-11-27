@@ -1,0 +1,162 @@
+<NAME>
+router_microbalance_and_symmetry_propagation
+</NAME>
+
+<DESCRIPTION>
+I propose adding a targeted router micro-balance step between pairwise link hardening and the final residual computation. This step leverages the flow conservation invariant (R1) by nudging the smaller side (RX or TX) at each router to reduce local imbalance when it exceeds the hardening threshold (≈2%). To preserve link symmetry (R3), any local adjustment is propagated to the peer’s corresponding counter (e.g., increasing a local RX also sets the peer’s TX to the same value). Adjustments are distributed proportionally to per-interface traffic, minimizing relative changes and improving counter repair accuracy.
+
+To maintain proper confidence calibration, the confidence scores of modified counters are reduced proportionally to the magnitude of the change relative to the original observations. This ensures higher confidence when little change is needed and lower confidence when larger repairs are applied, improving calibration.
+
+This change uses the provided topology to group interfaces per router and applies only when the router-level imbalance is significant. It leaves down interfaces at zero, and it does not override the earlier pairwise harmonization logic; instead, it complements it by using router-level information to refine counters.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Handle interfaces without a valid peer (dangling or missing peer data)
+    for if_id, data in telemetry.items():
+        if if_id in per_if_repair:
+            continue
+        status = data.get('interface_status', 'unknown')
+        rx = float(data.get('rx_rate', 0.0))
+        tx = float(data.get('tx_rate', 0.0))
+        if status == 'down':
+            # Enforce no traffic on down interfaces
+            per_if_repair[if_id] = {
+                'repaired_rx': 0.0,
+                'repaired_tx': 0.0,
+                'rx_conf': 0.9,
+                'tx_conf': 0.9,
+                'repaired_status': 'down',
+                'status_conf': 0.95
+            }
+        else:
+            # No peer to cross-check; keep values but lower confidence slightly.
+            per_if_repair[if_id] = {
+                'repaired_rx': rx,
+                'repaired_tx': tx,
+                'rx_conf': 0.6,
+                'tx_conf': 0.6,
+                'repaired_status': status if status in ('up', 'down') else 'up',
+                'status_conf': 0.6
+            }
+
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+=======
+    # Handle interfaces without a valid peer (dangling or missing peer data)
+    for if_id, data in telemetry.items():
+        if if_id in per_if_repair:
+            continue
+        status = data.get('interface_status', 'unknown')
+        rx = float(data.get('rx_rate', 0.0))
+        tx = float(data.get('tx_rate', 0.0))
+        if status == 'down':
+            # Enforce no traffic on down interfaces
+            per_if_repair[if_id] = {
+                'repaired_rx': 0.0,
+                'repaired_tx': 0.0,
+                'rx_conf': 0.9,
+                'tx_conf': 0.9,
+                'repaired_status': 'down',
+                'status_conf': 0.95
+            }
+        else:
+            # No peer to cross-check; keep values but lower confidence slightly.
+            per_if_repair[if_id] = {
+                'repaired_rx': rx,
+                'repaired_tx': tx,
+                'rx_conf': 0.6,
+                'tx_conf': 0.6,
+                'repaired_status': status if status in ('up', 'down') else 'up',
+                'status_conf': 0.6
+            }
+
+    # Router micro-balance: adjust the smaller side (rx or tx) per router to reduce R1 residuals.
+    # Propagate adjustments to peers to preserve link symmetry (R3).
+    def change_ratio(orig: float, rep: float) -> float:
+        denom = max(abs(orig), abs(rep), 1.0)
+        return abs(rep - orig) / denom
+
+    iface_peer = {iid: d.get('connected_to') for iid, d in telemetry.items()}
+
+    for router, if_list in topology.items():
+        # Interfaces present in our repairs
+        present = [iid for iid in if_list if iid in per_if_repair]
+        if not present:
+            continue
+        # Only adjust interfaces that are up after harmonization
+        active = [iid for iid in present if per_if_repair[iid].get('repaired_status', 'up') != 'down']
+        if not active:
+            continue
+
+        sum_tx = sum(float(per_if_repair[iid]['repaired_tx']) for iid in active)
+        sum_rx = sum(float(per_if_repair[iid]['repaired_rx']) for iid in active)
+        scale = max(sum_tx, sum_rx, 1.0)
+        delta = sum_tx - sum_rx
+
+        # Only adjust if imbalance exceeds the hardening threshold
+        if abs(delta) <= HARDENING_THRESHOLD * scale:
+            continue
+
+        if delta > 0.0:
+            # Too much TX -> increase RX locally, propagate to peer TX
+            weights = []
+            sum_w = 0.0
+            for iid in active:
+                w = float(per_if_repair[iid]['repaired_rx']) + EPS
+                weights.append((iid, w))
+                sum_w += w
+            if sum_w <= 0.0:
+                sum_w = EPS * len(active)
+                weights = [(iid, EPS) for iid in active]
+
+            for iid, w in weights:
+                inc = delta * (w / sum_w)
+                old_rx = float(per_if_repair[iid]['repaired_rx'])
+                new_rx = old_rx + inc
+                per_if_repair[iid]['repaired_rx'] = new_rx
+                # Calibrate confidence by magnitude of change from original
+                rx_orig = float(telemetry.get(iid, {}).get('rx_rate', 0.0))
+                cr = change_ratio(rx_orig, new_rx)
+                per_if_repair[iid]['rx_conf'] = max(0.0, min(float(per_if_repair[iid].get('rx_conf', 0.6)), 1.0 - cr))
+
+                # Propagate to peer TX to maintain A.tx == B.rx symmetry for this direction
+                pid = iface_peer.get(iid)
+                if pid and pid in per_if_repair:
+                    per_if_repair[pid]['repaired_tx'] = new_rx
+                    tx_orig_p = float(telemetry.get(pid, {}).get('tx_rate', 0.0))
+                    crp = change_ratio(tx_orig_p, new_rx)
+                    per_if_repair[pid]['tx_conf'] = max(0.0, min(float(per_if_repair[pid].get('tx_conf', 0.6)), 1.0 - crp))
+        else:
+            # Too much RX -> increase TX locally, propagate to peer RX
+            need = -delta
+            weights = []
+            sum_w = 0.0
+            for iid in active:
+                w = float(per_if_repair[iid]['repaired_tx']) + EPS
+                weights.append((iid, w))
+                sum_w += w
+            if sum_w <= 0.0:
+                sum_w = EPS * len(active)
+                weights = [(iid, EPS) for iid in active]
+
+            for iid, w in weights:
+                inc = need * (w / sum_w)
+                old_tx = float(per_if_repair[iid]['repaired_tx'])
+                new_tx = old_tx + inc
+                per_if_repair[iid]['repaired_tx'] = new_tx
+                tx_orig = float(telemetry.get(iid, {}).get('tx_rate', 0.0))
+                cr = change_ratio(tx_orig, new_tx)
+                per_if_repair[iid]['tx_conf'] = max(0.0, min(float(per_if_repair[iid].get('tx_conf', 0.6)), 1.0 - cr))
+
+                # Propagate to peer RX to maintain B.tx == A.rx symmetry for this direction
+                pid = iface_peer.get(iid)
+                if pid and pid in per_if_repair:
+                    per_if_repair[pid]['repaired_rx'] = new_tx
+                    rx_orig_p = float(telemetry.get(pid, {}).get('rx_rate', 0.0))
+                    crp = change_ratio(rx_orig_p, new_tx)
+                    per_if_repair[pid]['rx_conf'] = max(0.0, min(float(per_if_repair[pid].get('rx_conf', 0.6)), 1.0 - crp))
+
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+>>>>>>> REPLACE
+
+</DIFF>

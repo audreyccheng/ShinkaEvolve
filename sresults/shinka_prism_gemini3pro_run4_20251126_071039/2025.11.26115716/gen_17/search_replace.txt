@@ -1,0 +1,205 @@
+<NAME>
+improved_local_search
+</NAME>
+
+<DESCRIPTION>
+Enhance the Local Search Refinement phase to include "Swap" operations in addition to "Move" operations.
+The previous implementation only attempted to move a model from the bottleneck GPU to another GPU. This often fails when other GPUs are near capacity (fragmentation).
+By allowing swaps (exchanging a model from the bottleneck GPU with a model from another GPU), we can balance the load even when total free space is low.
+The algorithm iteratively identifies the GPU with the maximum KVPR and attempts to lower it by moving a model or swapping a model, ensuring the destination GPU does not become a new, worse bottleneck.
+We also cache GPU states to avoid redundant calculations.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------------------------------------------------
+    # 3. Local Search Refinement
+    # ---------------------------------------------------------
+    # Iteratively move models from the bottleneck GPU to others to reduce peak
+    for _ in range(50):
+        # Find bottleneck GPU
+        max_p = -1.0
+        src_gpu = -1
+        gpu_stats = []
+
+        for i in range(gpu_num):
+            assigned = best_placement[i]
+            if not assigned:
+                gpu_stats.append({'w': 0, 's': 0, 'p': 0})
+                continue
+            w = sum(m.req_rate / m.slo for m in assigned)
+            s = sum(m.model_size for m in assigned)
+            rem = GPU_MEM_SIZE - s
+            p = w / rem if rem > 1e-9 else float('inf')
+            gpu_stats.append({'w': w, 's': s, 'p': p})
+
+            if p > max_p:
+                max_p = p
+                src_gpu = i
+
+        if src_gpu == -1 or max_p < 1e-9: break
+
+        improved = False
+        src_models = best_placement[src_gpu]
+
+        # Try to move one model
+        for m_idx, model in enumerate(src_models):
+            w = model.req_rate / model.slo
+            s = model.model_size
+
+            # Predict source pressure if moved
+            # (src_w - w) / (src_rem + s)
+            src_rem = GPU_MEM_SIZE - gpu_stats[src_gpu]['s']
+            new_src_rem = src_rem + s
+            new_src_p = (gpu_stats[src_gpu]['w'] - w) / new_src_rem
+
+            best_dst = None
+            # We want to move to a destination such that max(new_src_p, new_dst_p) < max_p
+            # And ideally minimize new_dst_p
+
+            for dst in range(gpu_num):
+                if dst == src_gpu: continue
+                if gpu_stats[dst]['s'] + s > GPU_MEM_SIZE: continue
+
+                dst_rem = GPU_MEM_SIZE - gpu_stats[dst]['s']
+                new_dst_rem = dst_rem - s
+                if new_dst_rem <= 1e-9: continue # Avoid full GPU if w>0
+
+                new_dst_p = (gpu_stats[dst]['w'] + w) / new_dst_rem
+
+                if max(new_src_p, new_dst_p) < max_p - 1e-5:
+                    best_dst = dst
+                    break # First fit is enough for local search
+
+            if best_dst is not None:
+                # Apply move
+                moved_model = src_models.pop(m_idx)
+                best_placement[best_dst].append(moved_model)
+                improved = True
+                break
+
+        if not improved: break
+
+    return best_placement
+=======
+    # ---------------------------------------------------------
+    # 3. Local Search Refinement
+    # ---------------------------------------------------------
+    # Iteratively move or swap models to reduce the peak KVPR
+
+    # Calculate initial states
+    gpu_states = []
+    current_kvpr = []
+    for i in range(gpu_num):
+        assigned = best_placement[i]
+        w = sum(m.req_rate / m.slo for m in assigned)
+        s = sum(m.model_size for m in assigned)
+        gpu_states.append({'w': w, 's': s})
+        rem = GPU_MEM_SIZE - s
+        p = w / rem if rem > 1e-9 else float('inf')
+        current_kvpr.append(p)
+
+    for _ in range(100):
+        # Find current global max pressure
+        max_p = max(current_kvpr)
+        if max_p < 1e-9: break
+
+        # Identify bottleneck GPUs
+        src_gpus = [i for i, p in enumerate(current_kvpr) if abs(p - max_p) < 1e-9]
+        # Pick one to optimize
+        src_gpu = src_gpus[0]
+        src_models = best_placement[src_gpu]
+
+        improved = False
+
+        # 1. Try MOVE (src -> dst)
+        for m_idx, model in enumerate(src_models):
+            w = model.req_rate / model.slo
+            s = model.model_size
+
+            # Hypothetical Src State
+            new_src_s = gpu_states[src_gpu]['s'] - s
+            new_src_w = gpu_states[src_gpu]['w'] - w
+            new_src_rem = GPU_MEM_SIZE - new_src_s
+            new_src_p = new_src_w / new_src_rem if new_src_rem > 1e-9 else float('inf')
+
+            for dst_gpu in range(gpu_num):
+                if dst_gpu == src_gpu: continue
+
+                if gpu_states[dst_gpu]['s'] + s > GPU_MEM_SIZE: continue
+
+                new_dst_s = gpu_states[dst_gpu]['s'] + s
+                new_dst_w = gpu_states[dst_gpu]['w'] + w
+                new_dst_rem = GPU_MEM_SIZE - new_dst_s
+                new_dst_p = new_dst_w / new_dst_rem if new_dst_rem > 1e-9 else float('inf')
+
+                # Check if this move reduces the pressure of the bottleneck
+                # and doesn't create a new bottleneck worse than current max_p
+                if max(new_src_p, new_dst_p) < max_p - 1e-6:
+                    # Apply Move
+                    moved_model = src_models.pop(m_idx)
+                    best_placement[dst_gpu].append(moved_model)
+
+                    gpu_states[src_gpu] = {'w': new_src_w, 's': new_src_s}
+                    gpu_states[dst_gpu] = {'w': new_dst_w, 's': new_dst_s}
+                    current_kvpr[src_gpu] = new_src_p
+                    current_kvpr[dst_gpu] = new_dst_p
+                    improved = True
+                    break
+            if improved: break
+
+        if improved: continue
+
+        # 2. Try SWAP (src <-> dst)
+        # Iterate over all models in src and all models in other GPUs
+        for m_idx, m_src in enumerate(src_models):
+            w_src = m_src.req_rate / m_src.slo
+            s_src = m_src.model_size
+
+            for dst_gpu in range(gpu_num):
+                if dst_gpu == src_gpu: continue
+
+                dst_models = best_placement[dst_gpu]
+                for d_idx, m_dst in enumerate(dst_models):
+                    w_dst = m_dst.req_rate / m_dst.slo
+                    s_dst = m_dst.model_size
+
+                    # Check Capacity
+                    new_src_s = gpu_states[src_gpu]['s'] - s_src + s_dst
+                    if new_src_s > GPU_MEM_SIZE: continue
+
+                    new_dst_s = gpu_states[dst_gpu]['s'] - s_dst + s_src
+                    if new_dst_s > GPU_MEM_SIZE: continue
+
+                    # Check Pressure
+                    new_src_w = gpu_states[src_gpu]['w'] - w_src + w_dst
+                    new_src_rem = GPU_MEM_SIZE - new_src_s
+                    new_src_p = new_src_w / new_src_rem if new_src_rem > 1e-9 else float('inf')
+
+                    new_dst_w = gpu_states[dst_gpu]['w'] - w_dst + w_src
+                    new_dst_rem = GPU_MEM_SIZE - new_dst_s
+                    new_dst_p = new_dst_w / new_dst_rem if new_dst_rem > 1e-9 else float('inf')
+
+                    if max(new_src_p, new_dst_p) < max_p - 1e-6:
+                        # Apply Swap
+                        mod_src = src_models.pop(m_idx)
+                        mod_dst = dst_models.pop(d_idx)
+
+                        src_models.append(mod_dst) # Put dst model into src list
+                        dst_models.append(mod_src) # Put src model into dst list
+
+                        gpu_states[src_gpu] = {'w': new_src_w, 's': new_src_s}
+                        gpu_states[dst_gpu] = {'w': new_dst_w, 's': new_dst_s}
+                        current_kvpr[src_gpu] = new_src_p
+                        current_kvpr[dst_gpu] = new_dst_p
+                        improved = True
+                        break
+                if improved: break
+            if improved: break
+
+        if not improved:
+            break
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,136 @@
+<NAME>
+router_balancing_step_and_conf_calibration
+</NAME>
+
+<DESCRIPTION>
+I propose adding a targeted router-level flow-conservation balancing step after the pairwise link-symmetry hardening, and improving confidence calibration accordingly. The current algorithm enforces link symmetry but only uses flow conservation to penalize confidence, not to repair counters. Using expert knowledge of flow invariants, we can perform a single, small, topology-aware adjustment that reduces each router’s TX-RX imbalance without breaking link symmetry: we operate on per-direction “flows” (A→B and B→A) and adjust them by a router-specific offset s_r computed from each router’s imbalance. This keeps flows equal across link endpoints while moving router sums toward conservation.
+
+To keep the repair safe and calibrated:
+- We only apply balancing at routers whose residual exceeds the hardening threshold (~2%).
+- Adjustments are distributed evenly across a router’s inbound and outbound flows, ensuring a single step would zero the imbalance in the linear model while clamping to non-negative values.
+- After balancing, we recompute change magnitudes from the original telemetry and decrease per-interface confidences accordingly, avoiding overconfidence.
+
+This design preserves the strong prior (link symmetry), improves counter accuracy by leveraging flow conservation (R1), and strengthens confidence calibration by reflecting total applied change.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (float(d.get('rx_rate', 0.0)) > EPS) or (float(d.get('tx_rate', 0.0)) > EPS)
+=======
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (float(d.get('rx_rate', 0.0)) > EPS) or (float(d.get('tx_rate', 0.0)) > EPS)
+
+    def change_ratio(orig: float, rep: float) -> float:
+        denom = max(abs(orig), abs(rep), 1.0)
+        return abs(rep - orig) / denom
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        # Confidence refinement: penalize by magnitude of applied change
+        # This improves calibration by lowering confidence when we make large adjustments.
+        def change_ratio(orig: float, rep: float) -> float:
+            denom = max(abs(orig), abs(rep), 1.0)
+            return abs(rep - orig) / denom
+
+        a_rx_change = change_ratio(a_rx, rep_a_rx)
+        a_tx_change = change_ratio(a_tx, rep_a_tx)
+        b_rx_change = change_ratio(b_rx, rep_b_rx)
+        b_tx_change = change_ratio(b_tx, rep_b_tx)
+=======
+        # Confidence refinement: penalize by magnitude of applied change
+        # This improves calibration by lowering confidence when we make large adjustments.
+        a_rx_change = change_ratio(a_rx, rep_a_rx)
+        a_tx_change = change_ratio(a_tx, rep_a_tx)
+        b_rx_change = change_ratio(b_rx, rep_b_rx)
+        b_tx_change = change_ratio(b_tx, rep_b_tx)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+=======
+    # Router-level flow conservation repair (small balancing step preserving link equality)
+    # Build per-direction flows from pairwise-hardened values and adjust to reduce router imbalance.
+    # This uses local_router metadata; if missing for some interfaces, those flows are skipped.
+    flows = []  # list of dicts: {'tx_if': str, 'rx_if': str, 'tx_r': router, 'rx_r': router, 'val': float}
+    # Map of router -> indices of flows where router is tx or rx endpoint
+    flows_tx_by_router: Dict[Any, List[int]] = {}
+    flows_rx_by_router: Dict[Any, List[int]] = {}
+
+    for _, (a_id, b_id) in pairs.items():
+        # Skip if pair was determined down
+        if a_id not in per_if_repair or b_id not in per_if_repair:
+            continue
+        if per_if_repair[a_id].get('repaired_status') == 'down':
+            continue
+
+        a_lr = telemetry[a_id].get('local_router')
+        b_lr = telemetry[b_id].get('local_router')
+
+        # Direction A -> B
+        val_ab = float(per_if_repair[a_id]['repaired_tx'])
+        idx_ab = len(flows)
+        flows.append({'tx_if': a_id, 'rx_if': b_id, 'tx_r': a_lr, 'rx_r': b_lr, 'val': val_ab})
+        flows_tx_by_router.setdefault(a_lr, []).append(idx_ab)
+        flows_rx_by_router.setdefault(b_lr, []).append(idx_ab)
+
+        # Direction B -> A
+        val_ba = float(per_if_repair[b_id]['repaired_tx'])
+        idx_ba = len(flows)
+        flows.append({'tx_if': b_id, 'rx_if': a_id, 'tx_r': b_lr, 'rx_r': a_lr, 'val': val_ba})
+        flows_tx_by_router.setdefault(b_lr, []).append(idx_ba)
+        flows_rx_by_router.setdefault(a_lr, []).append(idx_ba)
+
+    # Compute per-router imbalance and balancing steps
+    s_by_router: Dict[Any, float] = {}
+    for r in set(list(flows_tx_by_router.keys()) + list(flows_rx_by_router.keys())):
+        tx_indices = flows_tx_by_router.get(r, [])
+        rx_indices = flows_rx_by_router.get(r, [])
+        sum_tx_r = sum(flows[i]['val'] for i in tx_indices)
+        sum_rx_r = sum(flows[i]['val'] for i in rx_indices)
+        delta_r = sum_tx_r - sum_rx_r
+        resid_r = abs(delta_r) / max(sum_tx_r, sum_rx_r, 1.0)
+        denom = len(tx_indices) + len(rx_indices)
+        if denom == 0 or resid_r <= HARDENING_THRESHOLD:
+            s_by_router[r] = 0.0
+        else:
+            s_by_router[r] = delta_r / float(denom)
+
+    # Apply balancing: v' = v - s_tx_router + s_rx_router, clamp non-negative
+    if s_by_router:
+        for i, f in enumerate(flows):
+            s_tx = s_by_router.get(f['tx_r'], 0.0)
+            s_rx = s_by_router.get(f['rx_r'], 0.0)
+            new_val = f['val'] - s_tx + s_rx
+            if new_val < 0.0:
+                new_val = 0.0
+            flows[i]['val'] = new_val
+
+        # Push adjusted flow values back to per-interface repaired counters
+        for f in flows:
+            tx_if = f['tx_if']
+            rx_if = f['rx_if']
+            v = f['val']
+            if tx_if in per_if_repair:
+                per_if_repair[tx_if]['repaired_tx'] = v
+            if rx_if in per_if_repair:
+                per_if_repair[rx_if]['repaired_rx'] = v
+
+        # Update confidences based on total change from the original observation
+        for if_id, rep in per_if_repair.items():
+            rx_orig = float(telemetry.get(if_id, {}).get('rx_rate', 0.0) or 0.0)
+            tx_orig = float(telemetry.get(if_id, {}).get('tx_rate', 0.0) or 0.0)
+            rx_change = change_ratio(rx_orig, float(rep['repaired_rx']))
+            tx_change = change_ratio(tx_orig, float(rep['repaired_tx']))
+            rep['rx_conf'] = max(0.0, min(1.0, min(rep.get('rx_conf', 0.6), 1.0 - rx_change)))
+            rep['tx_conf'] = max(0.0, min(1.0, min(rep.get('tx_conf', 0.6), 1.0 - tx_change)))
+
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+>>>>>>> REPLACE
+
+</DIFF>

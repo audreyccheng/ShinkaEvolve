@@ -1,0 +1,253 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm using Beam Search and Conflict Analysis"""
+
+import time
+import random
+import sys
+import os
+import re
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    while current != os.path.dirname(current):
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+    
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,
+        os.path.dirname(script_dir),
+        os.path.dirname(os.path.dirname(script_dir)),
+        '/home/ubuntu/ShinkaEvolve',
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+    
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Beam Search with Local Improvement.
+    
+    This approach maintains multiple candidate schedules (beam) and explores 
+    the search space more broadly than a simple greedy algorithm. It also 
+    attempts to infer conflicts to guide the search.
+
+    Args:
+        workload: Workload object
+        num_seqs: Used as a budget factor for the search width
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    
+    # --- Helper: Conflict Analysis ---
+    # Attempt to pre-process transactions to understand conflicts.
+    # This allows us to use a cheap heuristic before the expensive simulation.
+    txn_access_sets = []
+    try:
+        # Inspect the first transaction to deduce structure
+        # We expect workload.txns to be a list where each item contains the ops string/list
+        for i in range(workload.num_txns):
+            # Try accessing element 0 if structure is [data, ...]
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            
+            # Convert to string to parse standard format "w-17 r-5"
+            txn_str = str(raw_txn)
+            
+            # Parse read/write sets using regex
+            reads = set()
+            writes = set()
+            
+            matches = re.findall(r'([rw])-(\d+)', txn_str)
+            for op_type, key in matches:
+                key = int(key)
+                if op_type == 'r':
+                    reads.add(key)
+                else:
+                    writes.add(key)
+            
+            txn_access_sets.append((reads, writes))
+            
+    except Exception:
+        # Fallback if parsing fails: empty sets mean no heuristic guidance
+        txn_access_sets = [ (set(), set()) for _ in range(workload.num_txns) ]
+
+    def get_conflict_score(last_txn_idx, candidate_txn_idx):
+        """Calculate a conflict score between two transactions based on key overlaps."""
+        if not txn_access_sets or last_txn_idx == -1:
+            return 0
+        
+        r1, w1 = txn_access_sets[last_txn_idx]
+        r2, w2 = txn_access_sets[candidate_txn_idx]
+        
+        # Conflict exists if intersection of (R1, W2) or (W1, R2) or (W1, W2) is non-empty
+        score = 0
+        if not r1.isdisjoint(w2): score += 1
+        if not w1.isdisjoint(r2): score += 1
+        if not w1.isdisjoint(w2): score += 2 # Write-Write conflicts might be more severe
+        
+        return score
+
+    # --- Beam Search Parameters ---
+    # Adjust beam width based on problem size to manage runtime.
+    # BEAM_WIDTH=4 allows tracking 4 promising paths.
+    BEAM_WIDTH = 4
+    # SAMPLE_SIZE defines how many children to evaluate per parent node
+    SAMPLE_SIZE = 8  
+    
+    # Initialize beam with random start nodes
+    # State: {'cost': float, 'seq': list, 'used': set}
+    initial_candidates = random.sample(range(workload.num_txns), min(BEAM_WIDTH, workload.num_txns))
+    beam = []
+    for start_node in initial_candidates:
+        seq = [start_node]
+        cost = workload.get_opt_seq_cost(seq)
+        beam.append({
+            'cost': cost,
+            'seq': seq,
+            'used': {start_node}
+        })
+
+    # Construct schedules iteratively
+    # Total steps = N - 1 (since we already picked start node)
+    for _ in range(workload.num_txns - 1):
+        next_beam_candidates = []
+        
+        for state in beam:
+            current_seq = state['seq']
+            used = state['used']
+            last_txn = current_seq[-1]
+            
+            # Identify remaining transactions
+            remaining = [t for t in range(workload.num_txns) if t not in used]
+            
+            if not remaining:
+                break
+                
+            # Heuristic Pre-selection:
+            # 1. Sample more candidates than we can simulate (pre_sample_size)
+            # 2. Rank them by conflict score with the tail of the schedule
+            # 3. Pick top SAMPLE_SIZE to run full simulation
+            
+            pre_sample_size = min(len(remaining), SAMPLE_SIZE * 3)
+            pre_samples = random.sample(remaining, pre_sample_size)
+            
+            # Sort by conflict score (ascending: lower conflict is better)
+            pre_samples.sort(key=lambda t: get_conflict_score(last_txn, t))
+            
+            # Take the best few for expensive simulation
+            candidates_to_eval = pre_samples[:SAMPLE_SIZE]
+            
+            for next_txn in candidates_to_eval:
+                new_seq = current_seq + [next_txn]
+                # Expensive call to simulator
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                
+                next_beam_candidates.append({
+                    'cost': new_cost,
+                    'seq': new_seq,
+                    'used': used | {next_txn}
+                })
+        
+        if not next_beam_candidates:
+            break
+
+        # Pruning: Keep top BEAM_WIDTH states with lowest cost
+        next_beam_candidates.sort(key=lambda x: x['cost'])
+        beam = next_beam_candidates[:BEAM_WIDTH]
+
+    # --- Post-Processing: Local Descent ---
+    # Take the best schedule from beam and try to improve it by swapping adjacent nodes.
+    
+    best_state = beam[0]
+    best_seq = best_state['seq']
+    best_cost = best_state['cost']
+    
+    improved = True
+    passes = 0
+    MAX_PASSES = 2 # Limit optimization passes to manage execution time
+    
+    while improved and passes < MAX_PASSES:
+        improved = False
+        passes += 1
+        
+        # Identify pairs to swap
+        indices = list(range(len(best_seq) - 1))
+        random.shuffle(indices)
+        
+        # Check a subset of swaps to keep runtime reasonable
+        check_budget = 25 
+        
+        for i in indices[:check_budget]:
+            # Create swapped sequence
+            test_seq = best_seq.copy()
+            test_seq[i], test_seq[i+1] = test_seq[i+1], test_seq[i]
+            
+            # Check cost
+            cost = workload.get_opt_seq_cost(test_seq)
+            if cost < best_cost:
+                best_cost = cost
+                best_seq = test_seq
+                improved = True
+                # Optimization: Can break early or continue searching this pass
+    
+    return best_cost, best_seq
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+    """
+    start_time = time.time()
+    
+    # Workload 1
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, 10)
+    cost1 = workload1.get_opt_seq_cost(schedule1)
+
+    # Workload 2
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+    
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+    
+    return total_makespan, schedules, execution_time
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

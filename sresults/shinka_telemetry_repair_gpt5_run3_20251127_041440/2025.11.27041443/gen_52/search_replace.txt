@@ -1,0 +1,216 @@
+<NAME>
+adaptive_fusion_micro_finish_and_conf_smoothing
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements to boost counter repair accuracy and tighten confidence calibration without destabilizing previously strong behavior:
+
+1) Adaptive large-mismatch fusion on links: In fuse_direction, replace the fixed 30/70 peer bias with an adaptive beta that increases toward the peer as mismatch grows, and incorporates status/near-zero hints. This resolves severe asymmetries more decisively while staying conservative for smaller mismatches, improving link hardening accuracy.
+
+2) Micro high-confidence finishing tier at routers: After the two-tier targeted scaling and small uniform pass, if a router’s residual imbalance still exceeds 60% of its adaptive tolerance, apply a tiny, damped (≤3% clip, 0.25 damping) uniform scale to only high-confidence (≥0.85) active interfaces on the less-trustworthy side. This closes stubborn small gaps with minimal impact, improving flow conservation and counter accuracy.
+
+3) Confidence calibration refinements: Add a small confidence penalty when any direction underwent “strong” scaling (>8%) to guard against overconfidence, and perform a final 10% peer confidence smoothing when both ends are up. This aligns reported confidence more tightly with actual repair behavior.
+
+These changes are small, consistent with the current structure, and aim to raise the combined score via better counter alignment and better-calibrated confidences.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def fuse_direction(v_local: float, v_peer: float, s_local: str, s_peer: str) -> Tuple[float, float]:
+        mismatch = rel_diff(v_local, v_peer)
+        th = tau_h_dir(v_local, v_peer)
+
+        # Both near-zero => zero with high confidence
+        if max(v_local, v_peer) < ZERO_THRESH:
+            return 0.0, 0.95
+
+        # If within adaptive hardening tolerance, keep local reading (minimal change)
+        if mismatch <= th:
+            return v_local, 0.95
+
+        # Moderate mismatch: average
+        if mismatch <= 0.10:
+            fused = 0.5 * v_local + 0.5 * v_peer
+            return fused, clamp01(1.0 - mismatch)
+
+        # Large mismatch: prefer the more plausible side
+        # If one is near-zero and the other is not, take the non-zero
+        if v_local < ZERO_THRESH and v_peer >= ZERO_THRESH:
+            return v_peer, clamp01(1.0 - mismatch)
+        if v_peer < ZERO_THRESH and v_local >= ZERO_THRESH:
+            return v_local, clamp01(1.0 - mismatch)
+
+        # Status-aware bias
+        if s_local == "down" and s_peer == "up":
+            return v_peer, clamp01(1.0 - mismatch)
+        if s_peer == "down" and s_local == "up":
+            return v_local, clamp01(1.0 - mismatch)
+
+        # Otherwise, snap mostly to peer to resolve asymmetry decisively
+        fused = 0.3 * v_local + 0.7 * v_peer
+        return fused, clamp01(1.0 - mismatch)
+=======
+    def fuse_direction(v_local: float, v_peer: float, s_local: str, s_peer: str) -> Tuple[float, float]:
+        mismatch = rel_diff(v_local, v_peer)
+        th = tau_h_dir(v_local, v_peer)
+
+        # Both near-zero => zero with high confidence
+        if max(v_local, v_peer) < ZERO_THRESH:
+            return 0.0, 0.95
+
+        # If within adaptive hardening tolerance, keep local reading (minimal change)
+        if mismatch <= th:
+            return v_local, 0.95
+
+        # Moderate mismatch: average
+        if mismatch <= 0.10:
+            fused = 0.5 * v_local + 0.5 * v_peer
+            return fused, clamp01(1.0 - mismatch)
+
+        # Large mismatch: prefer the more plausible side
+        # If one is near-zero and the other is not, take the non-zero
+        if v_local < ZERO_THRESH and v_peer >= ZERO_THRESH:
+            return v_peer, clamp01(1.0 - mismatch)
+        if v_peer < ZERO_THRESH and v_local >= ZERO_THRESH:
+            return v_local, clamp01(1.0 - mismatch)
+
+        # Status-aware bias
+        if s_local == "down" and s_peer == "up":
+            return v_peer, clamp01(1.0 - mismatch)
+        if s_peer == "down" and s_local == "up":
+            return v_local, clamp01(1.0 - mismatch)
+
+        # Otherwise, use adaptive peer-biased fusion for decisive reconciliation
+        # beta increases with mismatch severity and leans to peer when local is down/near-zero; slightly away if peer is down
+        # beta in [0.7, 0.9]
+        mm = max(0.0, min(1.0, (mismatch - 0.10) / 0.20))  # normalized beyond 10% up to 30%
+        bias_up_local_down = 1.0 if (s_local == "down" or (v_local < ZERO_THRESH and v_peer >= ZERO_THRESH)) else 0.0
+        bias_peer_down = 1.0 if (s_peer == "down") else 0.0
+        beta = 0.7 + 0.2 * mm + 0.1 * bias_up_local_down - 0.1 * bias_peer_down
+        beta = max(0.7, min(0.9, beta))
+        fused = (1.0 - beta) * v_local + beta * v_peer
+        return fused, clamp01(1.0 - mismatch)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 2.5: Post-projection gentle link re-sync (only adjust lower-confidence side)
+=======
+    # Stage 2.7: Micro high-confidence finishing tier to close stubborn router gaps
+    for router, if_list in router_ifaces.items():
+        if len(if_list) <= 1:
+            continue
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        if max(sum_tx, sum_rx) < EPS:
+            continue
+        n_active_tx = sum(1 for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+        n_active_rx = sum(1 for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+        TAU_ROUTER_LOCAL = tau_router(max(n_active_tx, n_active_rx))
+        mismatch = rel_diff(sum_tx, sum_rx)
+        if mismatch <= 0.6 * TAU_ROUTER_LOCAL:
+            continue
+        # Adjust the side with lower aggregate confidence using tiny, damped, uniform scaling on high-confidence links
+        c_tx_total = sum(clamp01(conf_tx_link.get(i, 0.6)) for i in if_list)
+        c_rx_total = sum(clamp01(conf_rx_link.get(i, 0.6)) for i in if_list)
+        adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+        if adjust_side == "tx":
+            elig = [i for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH and clamp01(conf_tx_link.get(i, 0.6)) >= 0.85]
+            if not elig:
+                pass
+            else:
+                total_elig = sum(hard_tx.get(i, 0.0) for i in elig)
+                if total_elig >= EPS:
+                    delta = sum_rx - sum_tx
+                    alpha_raw = 1.0 + delta / max(total_elig, EPS)
+                    alpha_raw = max(0.97, min(1.03, alpha_raw))
+                    alpha_eff = 1.0 + 0.25 * (alpha_raw - 1.0)
+                    for i in elig:
+                        v = hard_tx.get(i, 0.0)
+                        hard_tx[i] = v * alpha_eff
+                        scaled_tx_factor[i] *= alpha_eff
+                        pen = clamp01(abs(alpha_eff - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.15 * pen)
+        else:
+            elig = [i for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH and clamp01(conf_rx_link.get(i, 0.6)) >= 0.85]
+            if not elig:
+                pass
+            else:
+                total_elig = sum(hard_rx.get(i, 0.0) for i in elig)
+                if total_elig >= EPS:
+                    delta = sum_tx - sum_rx
+                    alpha_raw = 1.0 + delta / max(total_elig, EPS)
+                    alpha_raw = max(0.97, min(1.03, alpha_raw))
+                    alpha_eff = 1.0 + 0.25 * (alpha_raw - 1.0)
+                    for i in elig:
+                        v = hard_rx.get(i, 0.0)
+                        hard_rx[i] = v * alpha_eff
+                        scaled_rx_factor[i] *= alpha_eff
+                        pen = clamp01(abs(alpha_eff - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.15 * pen)
+
+    # Stage 2.5: Post-projection gentle link re-sync (only adjust lower-confidence side)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Confidence refinements: clip-hit penalty and untouched boost
+        if abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - TAU_H):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - TAU_H):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+=======
+        # Confidence refinements: clip-hit penalty, strong-scale guard, and untouched boost
+        if abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        # Strong-scale guard: additional small penalty when any strong scaling (>8%) occurred
+        if strong_scaled_tx.get(if_id, False):
+            conf_tx_final *= 0.97
+        if strong_scaled_rx.get(if_id, False):
+            conf_rx_final *= 0.97
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - TAU_H):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - TAU_H):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    return result
+=======
+    # Peer confidence smoothing (10%) when both ends are up
+    for i, data in telemetry.items():
+        p = data.get('connected_to')
+        if not isinstance(p, str) or p not in telemetry:
+            continue
+        if i not in result or p not in result:
+            continue
+        if result[i]['interface_status'][1] != 'up' or result[p]['interface_status'][1] != 'up':
+            continue
+        my_tx_c = clamp01(result[i]['tx_rate'][2])
+        my_rx_c = clamp01(result[i]['rx_rate'][2])
+        peer_rx_c = clamp01(result[p]['rx_rate'][2])
+        peer_tx_c = clamp01(result[p]['tx_rate'][2])
+        result[i]['tx_rate'] = (
+            result[i]['tx_rate'][0],
+            result[i]['tx_rate'][1],
+            clamp01(0.90 * my_tx_c + 0.10 * peer_rx_c)
+        )
+        result[i]['rx_rate'] = (
+            result[i]['rx_rate'][0],
+            result[i]['rx_rate'][1],
+            clamp01(0.90 * my_rx_c + 0.10 * peer_tx_c)
+        )
+
+    return result
+>>>>>>> REPLACE
+</DIFF>

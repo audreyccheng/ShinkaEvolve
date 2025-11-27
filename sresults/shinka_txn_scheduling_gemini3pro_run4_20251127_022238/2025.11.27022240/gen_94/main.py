@@ -1,0 +1,407 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import sys
+import os
+import re
+import math
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Dynamic Decay Scheduler with Multi-Scale LAHC.
+
+    Features:
+    1.  **Non-Linear Greedy Decay**: Uses a randomized power function to decay the 'length' weight (alpha)
+        during construction. This creates diverse schedules that switch from "packing big rocks" 
+        to "filling gaps" at different rates.
+    2.  **Dynamic Mutation Probabilities**: In the Marathon phase, disruptive mutations (Macro-Shift, 
+        Sampled Best-Fit) are frequent early on but decay to zero, replaced by fine-tuning (Shift, Swap).
+    3.  **Dynamic History Compression**: The LAHC history length linearly decreases during the 
+        Marathon phase, gradually tightening the acceptance criterion from Late Acceptance to 
+        almost strict Hill Climbing.
+    4.  **Block Reversal**: A dedicated mutation operator to fix local ordering inversions.
+    5.  **Stagnation Kick**: Shuffles a segment if search progress stalls.
+    """
+
+    # --- Pre-computation ---
+    txn_lens = {}
+    try:
+        for i in range(workload.num_txns):
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            ops = len(re.findall(r'[rw]-\d+', txn_str))
+            txn_lens[i] = ops
+    except Exception:
+        for i in range(workload.num_txns):
+            txn_lens[i] = 1
+
+    # --- LAHC Engine ---
+    def run_lahc(start_seq, start_cost, iterations, start_hist_len=50, mode='sprint'):
+        curr_s = list(start_seq)
+        curr_c = start_cost
+        best_s = list(start_seq)
+        best_c = start_cost
+
+        # Initialize history
+        history = [curr_c] * start_hist_len
+        last_imp_iter = 0
+
+        for i in range(iterations):
+            progress = i / iterations
+            
+            # --- Dynamic History Length (Marathon) ---
+            if mode == 'marathon':
+                # Linearly decay effective history length from 100% to ~10%
+                # This tightens the acceptance criterion over time
+                decay_factor = max(0.1, 1.0 - (progress * 1.1)) 
+                eff_hist_len = max(1, int(start_hist_len * decay_factor))
+            else:
+                eff_hist_len = start_hist_len
+
+            # --- Stagnation Kick ---
+            # If enabled (Marathon) and stuck for long time
+            if mode == 'marathon' and (i - last_imp_iter > 600):
+                # Don't kick if we are near the end (final 15%)
+                if progress < 0.85:
+                    slen = len(curr_s)
+                    if slen > 15:
+                        seg_len = random.randint(10, 20)
+                        idx = random.randint(0, slen - seg_len)
+                        # Shuffle segment
+                        segment = curr_s[idx:idx+seg_len]
+                        random.shuffle(segment)
+                        curr_s[idx:idx+seg_len] = segment
+                        
+                        curr_c = workload.get_opt_seq_cost(curr_s)
+                        # Fill history to prevent immediate rejection, but use current cost
+                        history = [curr_c] * start_hist_len 
+                        last_imp_iter = i
+                        continue
+
+            # --- Dynamic Mutation Probabilities ---
+            if mode == 'marathon':
+                # Disruptive moves decay with progress
+                # Macro Shift: 12% -> 0%
+                p_macro = max(0.0, 0.12 * (1.0 - (progress / 0.7)))
+                # Sampled Best Fit: 4% -> 0%
+                p_sbf = max(0.0, 0.04 * (1.0 - (progress / 0.5)))
+                # Reverse: Constant 5%
+                p_rev = 0.05
+                
+                remaining = 1.0 - p_macro - p_sbf - p_rev
+                # Distribute remainder
+                p_shift = remaining * 0.45
+                p_micro = remaining * 0.30
+                # p_swap = remainder
+            else:
+                # Fixed for Sprint
+                p_macro = 0.0
+                p_sbf = 0.0
+                p_rev = 0.0
+                p_shift = 0.50
+                p_micro = 0.30
+                # p_swap = 0.20
+
+            # --- Mutation Execution ---
+            op = random.random()
+            neigh_s = list(curr_s)
+            slen = len(neigh_s)
+            neigh_c = -1
+
+            cum_p = 0.0
+            
+            # 1. Sampled Best Fit (Expensive, High Quality)
+            cum_p += p_sbf
+            if op < cum_p:
+                if slen < 5: 
+                    pass # Fall through to swap
+                else:
+                    idx = random.randint(0, slen-1)
+                    item = neigh_s.pop(idx)
+                    
+                    best_loc_c = float('inf')
+                    best_loc_s = None
+                    # Sample 5 positions
+                    for _ in range(5):
+                        ins = random.randint(0, len(neigh_s))
+                        tmp = list(neigh_s)
+                        tmp.insert(ins, item)
+                        c = workload.get_opt_seq_cost(tmp)
+                        if c < best_loc_c:
+                            best_loc_c = c
+                            best_loc_s = tmp
+                    neigh_s = best_loc_s
+                    neigh_c = best_loc_c
+            
+            # 2. Macro Block Shift
+            if neigh_c == -1:
+                cum_p += p_macro
+                if op < cum_p:
+                    if slen < 15: pass
+                    else:
+                        bsize = random.randint(6, 12)
+                        f = random.randint(0, slen-bsize)
+                        block = neigh_s[f:f+bsize]
+                        del neigh_s[f:f+bsize]
+                        t = random.randint(0, len(neigh_s))
+                        neigh_s[t:t] = block
+
+            # 3. Block Reverse
+            if neigh_c == -1:
+                cum_p += p_rev
+                if op < cum_p:
+                    if slen < 5: pass
+                    else:
+                        bsize = random.randint(3, 8)
+                        f = random.randint(0, slen-bsize)
+                        neigh_s[f:f+bsize] = neigh_s[f:f+bsize][::-1]
+
+            # 4. Micro Block Shift
+            if neigh_c == -1:
+                cum_p += p_micro
+                if op < cum_p:
+                    if slen < 5: pass
+                    else:
+                        bsize = random.randint(2, 4)
+                        f = random.randint(0, slen-bsize)
+                        block = neigh_s[f:f+bsize]
+                        del neigh_s[f:f+bsize]
+                        t = random.randint(0, len(neigh_s))
+                        neigh_s[t:t] = block
+
+            # 5. Single Shift
+            if neigh_c == -1:
+                cum_p += p_shift
+                if op < cum_p:
+                    if slen < 2: pass
+                    else:
+                        f, t = random.randint(0, slen-1), random.randint(0, slen-1)
+                        if f != t:
+                            item = neigh_s.pop(f)
+                            neigh_s.insert(t, item)
+            
+            # 6. Swap (Default fallback)
+            if neigh_c == -1:
+                if slen >= 2:
+                    idx = random.randint(0, slen-2)
+                    neigh_s[idx], neigh_s[idx+1] = neigh_s[idx+1], neigh_s[idx]
+
+            # Calculate cost
+            if neigh_c == -1:
+                neigh_c = workload.get_opt_seq_cost(neigh_s)
+
+            # --- Acceptance ---
+            # Use dynamic history length
+            h_idx = i % eff_hist_len
+            
+            accept = False
+            # Late Acceptance or Better
+            if neigh_c <= curr_c or neigh_c <= history[h_idx]:
+                accept = True
+            
+            if accept:
+                curr_s = neigh_s
+                curr_c = neigh_c
+                if curr_c < best_c:
+                    best_c = curr_c
+                    best_s = list(curr_s)
+                    last_imp_iter = i
+            
+            # Update history
+            history[h_idx] = curr_c
+        
+        return best_c, best_s
+
+    # Configuration
+    SAMPLE_SIZE = 16
+    candidates = []
+
+    # --- Phase 1: Diverse Greedy Construction ---
+    total_txns = workload.num_txns
+    
+    for _ in range(num_seqs):
+        # Parameters for diversity
+        # Start Alpha: [0.1, 0.5]
+        start_alpha = random.uniform(0.10, 0.50)
+        # Threshold: [0.85, 0.98]
+        threshold_ratio = random.uniform(0.85, 0.98)
+        # Decay Power: [0.6, 2.0] - Determines shape of decay curve
+        # < 1.0: convex (slow decay then fast)
+        # > 1.0: concave (fast decay then slow)
+        decay_power = random.uniform(0.6, 2.0)
+
+        remaining = set(range(workload.num_txns))
+        
+        # Random start
+        start_txn = random.choice(list(remaining))
+        curr_seq = [start_txn]
+        remaining.remove(start_txn)
+
+        while remaining:
+            progress = len(curr_seq) / total_txns
+            
+            # Non-linear Alpha Decay
+            eff_alpha = start_alpha * ((1.0 - progress) ** decay_power)
+
+            # Dynamic Pool
+            rem_lens = [txn_lens[t] for t in remaining]
+            max_rem_len = max(rem_lens) if rem_lens else 0
+            limit = max_rem_len * threshold_ratio
+
+            big_rocks = [t for t in remaining if txn_lens[t] >= limit]
+            pool = list(big_rocks)
+            
+            needed = SAMPLE_SIZE - len(pool)
+            if needed > 0:
+                others = [t for t in remaining if t not in big_rocks]
+                if len(others) > needed:
+                    pool.extend(random.sample(others, needed))
+                else:
+                    pool.extend(others)
+            
+            pool = list(set(pool))
+            
+            # Selection
+            best_cand = -1
+            best_score = float('inf')
+
+            for t in pool:
+                cost = workload.get_opt_seq_cost(curr_seq + [t])
+                # Score: Cost minus (weighted length)
+                score = cost - (eff_alpha * txn_lens[t])
+                
+                if score < best_score:
+                    best_score = score
+                    best_cand = t
+            
+            curr_seq.append(best_cand)
+            remaining.remove(best_cand)
+        
+        # Quick Polish (Deterministic Adjacent Swap)
+        curr_cost = workload.get_opt_seq_cost(curr_seq)
+        improved = True
+        while improved:
+            improved = False
+            for j in range(len(curr_seq) - 1):
+                curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
+                nc = workload.get_opt_seq_cost(curr_seq)
+                if nc < curr_cost:
+                    curr_cost = nc
+                    improved = True
+                else:
+                    curr_seq[j], curr_seq[j+1] = curr_seq[j+1], curr_seq[j]
+        
+        candidates.append((curr_cost, curr_seq))
+
+    # --- Phase 2: Sprint (Multi-Candidate Refinement) ---
+    candidates.sort(key=lambda x: x[0])
+    
+    unique_candidates = []
+    seen = set()
+    for c, s in candidates:
+        if c not in seen:
+            unique_candidates.append((c, list(s)))
+            seen.add(c)
+        if len(unique_candidates) >= 3:
+            break
+    if not unique_candidates:
+        unique_candidates = [candidates[0]]
+
+    sprint_results = []
+    # Short Sprint
+    for c, s in unique_candidates:
+        res = run_lahc(s, c, 300, start_hist_len=30, mode='sprint')
+        sprint_results.append(res)
+
+    # --- Phase 3: Marathon (Deep Optimization) ---
+    sprint_results.sort(key=lambda x: x[0])
+    champ_c, champ_s = sprint_results[0]
+    
+    # Long Marathon
+    final_c, final_s = run_lahc(champ_s, champ_c, 4000, start_hist_len=100, mode='marathon')
+
+    return final_c, final_s
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+    # Number of initial candidates to generate
+    NUM_SEQS = 10
+
+    workload = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload, NUM_SEQS)
+    cost1 = workload.get_opt_seq_cost(schedule1)
+
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, NUM_SEQS)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, NUM_SEQS)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

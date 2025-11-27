@@ -1,0 +1,228 @@
+<NAME>
+beam_search_quadratic_efficiency
+</NAME>
+
+<DESCRIPTION>
+Replace the linear weight heuristic in Beam Search with a "Quadratic Efficiency" heuristic.
+This heuristic rewards transactions that "hide" their latency behind existing operations (parallelism).
+- `efficiency = (weight - marginal_cost) / weight`
+- `bonus = gamma * weight * (efficiency^2)`
+- Gamma decays from 4.0 to 1.0 to favor aggressive packing early and stability later.
+This encourages building a dense schedule structure from the start, providing a better starting point for the SA and Polish phases.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 1: Density-Aware Beam Search ---
+    candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        score = cost - (0.002 * txn_weights[t])
+        candidates.append({'score': score, 'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
+
+    candidates.sort(key=lambda x: x['score'])
+    beam = candidates[:BEAM_WIDTH]
+
+    for _ in range(workload.num_txns - 1):
+        next_candidates = []
+        for node in beam:
+            b_seq = node['seq']
+            b_rem = node['rem']
+
+            for cand in b_rem:
+                new_seq = b_seq + [cand]
+                new_cost = get_cost(new_seq)
+                score = new_cost - (0.002 * txn_weights[cand])
+                next_candidates.append((score, new_cost, new_seq, b_rem, cand))
+
+        next_candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_score, c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            new_rem = c_parent_rem.copy()
+            new_rem.remove(c_cand)
+            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+
+        beam = new_beam
+=======
+    # --- Phase 1: Efficiency-Squared Beam Search ---
+    # Heuristic: Score = Cost - Gamma * Weight * (Efficiency^2)
+    # Encourages "hiding" transactions in parallel slots.
+    GAMMA_START = 4.0
+    GAMMA_END = 1.0
+
+    candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        w = txn_weights[t]
+        # Initial: Prefer heavier anchors
+        score = cost - (0.01 * w)
+        candidates.append({'score': score, 'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
+
+    candidates.sort(key=lambda x: x['score'])
+    beam = candidates[:BEAM_WIDTH]
+
+    total_txns = workload.num_txns
+
+    for _ in range(total_txns - 1):
+        next_candidates = []
+
+        # Dynamic Gamma
+        current_len = len(beam[0]['seq'])
+        progress = current_len / total_txns
+        gamma = GAMMA_START * (1.0 - progress) + GAMMA_END * progress
+
+        for node in beam:
+            b_seq = node['seq']
+            b_rem = node['rem']
+            b_cost = node['cost']
+
+            for cand in b_rem:
+                new_seq = b_seq + [cand]
+                new_cost = get_cost(new_seq)
+
+                delta = new_cost - b_cost
+                w = txn_weights[cand]
+
+                # Efficiency: fraction of cost hidden
+                efficiency = 0.0
+                if w > 1e-9:
+                    if delta < w:
+                        efficiency = (w - delta) / w
+
+                # Quadratic bonus strongly rewards near-perfect packing
+                bonus = gamma * w * (efficiency ** 2)
+                score = new_cost - bonus
+
+                next_candidates.append((score, new_cost, new_seq, b_rem, cand))
+
+        next_candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_score, c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            new_rem = c_parent_rem.copy()
+            new_rem.remove(c_cand)
+            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+
+        beam = new_beam
+>>>>>>> REPLACE
+</DIFF>
+
+<NAME>
+polish_alternating_lpt_spt
+</NAME>
+
+<DESCRIPTION>
+Refine the Polish phase to alternate between LPT (Longest Processing Time) and SPT (Shortest Processing Time) ordering.
+- LPT passes optimize the placement of large, difficult transactions ("Big Rocks").
+- SPT passes optimize the filling of gaps with small transactions ("Sand").
+- Increases pass limit to 20 to allow convergence.
+- Adds logic to continue searching if structural changes occur (position shift) even if cost is constant, helping escape plateaus.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- Phase 3: Deterministic Polish (LPT Ordered) ---
+    # Sort transactions by weight descending (Longest Processing Time)
+    sorted_txns = sorted(range(workload.num_txns), key=lambda x: txn_weights[x], reverse=True)
+
+    polish_seq = list(best_schedule)
+    current_polish_cost = best_cost
+
+    # Iterate a few passes to allow settling
+    MAX_PASSES = 8
+    for pass_idx in range(MAX_PASSES):
+        improved_in_pass = False
+
+        for item in sorted_txns:
+            try:
+                curr_idx = polish_seq.index(item)
+            except ValueError:
+                continue
+
+            polish_seq.pop(curr_idx)
+            best_pos = -1
+            min_c = float('inf')
+
+            # Exhaustive scan for best position
+            for j in range(len(polish_seq) + 1):
+                polish_seq.insert(j, item)
+                c = get_cost(polish_seq)
+                if c < min_c:
+                    min_c = c
+                    best_pos = j
+                polish_seq.pop(j)
+
+            polish_seq.insert(best_pos, item)
+
+            if min_c < current_polish_cost:
+                current_polish_cost = min_c
+                improved_in_pass = True
+
+        if current_polish_cost < best_cost:
+            best_cost = current_polish_cost
+            best_schedule = list(polish_seq)
+
+        if not improved_in_pass:
+            break
+=======
+    # --- Phase 3: Alternating Polish (LPT/SPT) ---
+    # Alternate between optimizing large items (LPT) and small filling items (SPT).
+    txns_lpt = sorted(range(workload.num_txns), key=lambda x: txn_weights[x], reverse=True)
+    txns_spt = sorted(range(workload.num_txns), key=lambda x: txn_weights[x], reverse=False)
+
+    polish_seq = list(best_schedule)
+    current_polish_cost = best_cost
+
+    MAX_PASSES = 20
+    for pass_idx in range(MAX_PASSES):
+        search_active = False
+
+        # Alternate sorting order
+        current_order = txns_lpt if pass_idx % 2 == 0 else txns_spt
+
+        for item in current_order:
+            try:
+                curr_idx = polish_seq.index(item)
+            except ValueError:
+                continue
+
+            polish_seq.pop(curr_idx)
+            best_pos = -1
+            min_c = float('inf')
+
+            # Exhaustive scan.
+            # Strict inequality (<) favors earlier positions for equal cost (Left-Packing)
+            for j in range(len(polish_seq) + 1):
+                polish_seq.insert(j, item)
+                c = get_cost(polish_seq)
+                if c < min_c:
+                    min_c = c
+                    best_pos = j
+                polish_seq.pop(j)
+
+            polish_seq.insert(best_pos, item)
+
+            if min_c < current_polish_cost:
+                current_polish_cost = min_c
+                search_active = True
+            elif min_c == current_polish_cost and best_pos != curr_idx:
+                # Structural change helps escape plateaus
+                search_active = True
+
+        if current_polish_cost < best_cost:
+            best_cost = current_polish_cost
+            best_schedule = list(polish_seq)
+
+        if not search_active:
+            break
+>>>>>>> REPLACE
+</DIFF>

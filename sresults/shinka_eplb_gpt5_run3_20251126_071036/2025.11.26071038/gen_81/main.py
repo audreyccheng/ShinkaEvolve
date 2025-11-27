@@ -1,0 +1,676 @@
+# EVOLVE-BLOCK-START
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module implements the core rearrangement algorithm.
+
+The rearrangement algorithm is adapted from
+[DeepSeek EPLB](https://github.com/deepseek-ai/eplb).
+
+Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
+on how the EPLB algorithm works.
+"""
+
+import torch
+
+
+class PermOps:
+    @staticmethod
+    def inverse(perm: torch.Tensor) -> torch.Tensor:
+        """
+        Compute inverse permutation row-wise.
+
+        perm: [L, N]
+        returns inv_perm where inv_perm[g, perm[g, i]] = i
+        """
+        L, N = perm.shape
+        inv = torch.empty_like(perm)
+        inv.scatter_(1, perm, torch.arange(N, dtype=torch.int64, device=perm.device).expand(L, -1))
+        return inv
+
+
+def _rank_from_packidx_row(pack_idx: torch.Tensor, num_packs: int) -> torch.Tensor:
+    """
+    Deterministic rank assignment within each pack by ascending original id.
+    pack_idx: [N] int64
+    returns rank_in_pack: [N] int64
+    """
+    N = pack_idx.numel()
+    device = pack_idx.device
+    out = torch.empty(N, dtype=torch.int64, device=device)
+    for p in range(num_packs):
+        ids = torch.nonzero(pack_idx == p, as_tuple=False).flatten()
+        if ids.numel() == 0:
+            continue
+        ids_sorted = torch.sort(ids).values
+        out[ids_sorted] = torch.arange(ids_sorted.numel(), dtype=torch.int64, device=device)
+    return out
+
+
+def _pack_loads(weights: torch.Tensor, pack_idx: torch.Tensor, num_packs: int) -> torch.Tensor:
+    """Compute per-pack loads: [num_packs]"""
+    pack_w = torch.zeros(num_packs, dtype=weights.dtype, device=weights.device)
+    pack_w.scatter_add_(0, pack_idx, weights)
+    return pack_w
+
+
+def _best_1x1_swap(weights: torch.Tensor,
+                   pack_idx: torch.Tensor,
+                   pack_w: torch.Tensor,
+                   heavy: int,
+                   light: int) -> tuple[bool, int, int, float]:
+    """
+    Find the best 1x1 swap between heavy and light packs to minimize delta.
+    Returns (found, hi, lj, new_delta).
+    """
+    if heavy == light:
+        return False, -1, -1, 0.0
+    heavy_idx = torch.nonzero(pack_idx == heavy, as_tuple=False).squeeze(1)
+    light_idx = torch.nonzero(pack_idx == light, as_tuple=False).squeeze(1)
+    if heavy_idx.numel() == 0 or light_idx.numel() == 0:
+        return False, -1, -1, 0.0
+
+    w = weights
+    hw = w[heavy_idx]
+    lw = w[light_idx]
+    delta = float((pack_w[heavy] - pack_w[light]).item())
+    if delta <= 1e-12:
+        return False, -1, -1, 0.0
+
+    # Sort light pack ascending and search for target = hw - delta/2
+    lw_sorted, lw_perm = torch.sort(lw)
+    target = hw - (delta / 2.0)
+    pos = torch.searchsorted(lw_sorted, target)
+    pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+    cand_pos = torch.stack([pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1)
+    cand_lw = lw_sorted[cand_pos]  # [H, 2]
+    resid = (delta - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+    best_flat = int(torch.argmin(resid).item())
+    i = best_flat // 2
+    j = best_flat % 2
+    j_sorted = int(cand_pos[i, j].item())
+
+    wi = float(hw[i].item())
+    wj = float(lw_sorted[j_sorted].item())
+    new_delta = abs(delta - 2.0 * (wi - wj))
+    hi = int(heavy_idx[i].item())
+    lj = int(light_idx[lw_perm[j_sorted]].item())
+
+    if new_delta < delta - 1e-12:
+        return True, hi, lj, new_delta
+    return False, -1, -1, new_delta
+
+
+def _try_2x2_swap(weights: torch.Tensor,
+                  pack_idx: torch.Tensor,
+                  pack_w: torch.Tensor,
+                  heavy: int,
+                  light: int) -> tuple[bool, list[tuple[int, int]]]:
+    """
+    Evaluate a single 2x2 swap between the top-2 items from the heaviest pack
+    and the bottom-2 items from the lightest pack. Commit only if it reduces
+    the peak strictly. Returns (apply, [(hi, lj), ... up to 2 pairs]).
+    """
+    if heavy == light:
+        return False, []
+    heavy_idx = torch.nonzero(pack_idx == heavy, as_tuple=False).squeeze(1)
+    light_idx = torch.nonzero(pack_idx == light, as_tuple=False).squeeze(1)
+    if heavy_idx.numel() < 2 or light_idx.numel() < 2:
+        return False, []
+
+    hw = weights[heavy_idx]
+    lw = weights[light_idx]
+    top2_h_vals, top2_h_pos = torch.topk(hw, k=2, largest=True)
+    bottom2_l_vals, bottom2_l_pos = torch.topk(-lw, k=2, largest=True)
+    bottom2_l_vals = -bottom2_l_vals
+
+    delta = float((pack_w[heavy] - pack_w[light]).item())
+    if delta <= 1e-12:
+        return False, []
+
+    # predicted new delta after exchanging both pairs
+    sum_h = float(top2_h_vals.sum().item())
+    sum_l = float(bottom2_l_vals.sum().item())
+    new_delta = abs(delta - 2.0 * (sum_h - sum_l))
+
+    # compute new heavy/light loads to check peak
+    new_h = float(pack_w[heavy].item()) - sum_h + sum_l
+    new_l = float(pack_w[light].item()) - sum_l + sum_h
+    # the overall peak among other packs
+    other_peak = float((pack_w.clone().scatter(0, torch.tensor([heavy, light]), torch.tensor([float('-inf'), float('-inf')]))).max().item()) if pack_w.numel() > 2 else float('-inf')
+    cand_peak = max(other_peak, new_h, new_l)
+    cur_peak = float(pack_w.max().item())
+
+    if cand_peak + 1e-12 < cur_peak:
+        # map local positions to global indices
+        hi1 = int(heavy_idx[top2_h_pos[0]].item())
+        lj1 = int(light_idx[bottom2_l_pos[0]].item())
+        hi2 = int(heavy_idx[top2_h_pos[1]].item())
+        lj2 = int(light_idx[bottom2_l_pos[1]].item())
+        return True, [(hi1, lj1), (hi2, lj2)]
+    return False, []
+
+
+def _refine_row(weights: torch.Tensor,
+                pack_idx: torch.Tensor,
+                num_packs: int,
+                max_steps: int = 1,
+                enable_2x2: bool = True) -> torch.Tensor:
+    """
+    Bounded refinement:
+      - Try best 1x1 heaviest↔lightest swap.
+      - If stalled and enable_2x2, try a single 2x2 swap.
+      - Apply only strict peak-reducing moves.
+    """
+    if max_steps <= 0 or num_packs <= 1:
+        return pack_idx
+
+    w = weights
+    pack_w = _pack_loads(w, pack_idx, num_packs)
+
+    for _ in range(max_steps):
+        h = int(torch.argmax(pack_w).item())
+        l = int(torch.argmin(pack_w).item())
+        if h == l:
+            break
+        cur_peak = float(pack_w.max().item())
+
+        # 1x1 attempt
+        ok, hi, lj, _new_delta = _best_1x1_swap(w, pack_idx, pack_w, h, l)
+        if ok:
+            wi = float(w[hi].item())
+            wj = float(w[lj].item())
+            # apply
+            pack_idx[hi] = l
+            pack_idx[lj] = h
+            pack_w[h] = pack_w[h] - wi + wj
+            pack_w[l] = pack_w[l] - wj + wi
+            if float(pack_w.max().item()) + 1e-12 < cur_peak:
+                continue
+            else:
+                # rollback if it did not reduce peak (should not happen with strict check, but safe)
+                pack_idx[hi] = h
+                pack_idx[lj] = l
+                pack_w[h] = pack_w[h] + wi - wj
+                pack_w[l] = pack_w[l] + wj - wi
+
+        # 2x2 fallback
+        if enable_2x2:
+            ok22, pairs = _try_2x2_swap(w, pack_idx, pack_w, h, l)
+            if ok22 and len(pairs) > 0:
+                # apply both pairs
+                old_pack_w = pack_w.clone()
+                old_idx = pack_idx.clone()
+                for (hi, lj) in pairs:
+                    wi = float(w[hi].item())
+                    wj = float(w[lj].item())
+                    pack_idx[hi] = l
+                    pack_idx[lj] = h
+                    pack_w[h] = pack_w[h] - wi + wj
+                    pack_w[l] = pack_w[l] - wj + wi
+                if float(pack_w.max().item()) + 1e-12 < cur_peak:
+                    continue
+                else:
+                    pack_idx = old_idx
+                    pack_w = old_pack_w
+
+        # no improving move
+        break
+
+    return pack_idx
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     refine_steps: int = 1) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Capacity-constrained greedy packing with bounded refinement.
+
+    Parameters:
+        weight: [L, N]
+        num_packs: int
+        refine_steps: int (small)
+
+    Returns:
+        pack_index: [L, N], int64
+        rank_in_pack: [L, N], int64
+    """
+    L, N = weight.shape
+    assert N % num_packs == 0
+    cap = N // num_packs
+
+    if cap == 1:
+        pack_index = torch.arange(N, dtype=torch.int64, device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(pack_index, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    w_cpu = weight.float().cpu()
+    pack_index = torch.full((L, N), -1, dtype=torch.int64)
+    rank_in_pack = torch.full_like(pack_index, -1)
+
+    for li in range(L):
+        w = w_cpu[li]
+        order = torch.argsort(w, descending=True)
+        loads = [0.0] * num_packs
+        counts = [0] * num_packs
+        pidx = torch.empty(N, dtype=torch.int64)
+
+        for g in order.tolist():
+            # choose lightest pack with remaining capacity
+            best_p = None
+            best_load = None
+            for p in range(num_packs):
+                if counts[p] < cap:
+                    ld = loads[p]
+                    if best_load is None or ld < best_load:
+                        best_p = p
+                        best_load = ld
+            pidx[g] = best_p
+            loads[best_p] += float(w[g].item())
+            counts[best_p] += 1
+
+        # bounded refinement with 2x2 fallback
+        pidx = _refine_row(w, pidx, num_packs, max_steps=int(refine_steps), enable_2x2=True)
+
+        # ranks
+        rnk = _rank_from_packidx_row(pidx, num_packs)
+        pack_index[li] = pidx
+        rank_in_pack[li] = rnk
+
+    return pack_index.to(weight.device), rank_in_pack.to(weight.device)
+
+
+def _balanced_packing_diverse(weights: torch.Tensor,
+                              labels: torch.Tensor,
+                              num_packs: int,
+                              refine_steps_default: int = 2) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Diversity-aware tie-breaking for GPU packing.
+    - Greedy lightest-pack placement.
+    - When loads are near-equal, prefer the pack where item's label is least frequent.
+    - Adaptive refinement depth based on residual imbalance; includes 2x2 fallback.
+    """
+    L, N = weights.shape
+    assert N % num_packs == 0
+    cap = N // num_packs
+
+    if cap == 1:
+        pack_index = torch.arange(N, dtype=torch.int64, device=weights.device).expand(weights.shape)
+        rank_in_pack = torch.zeros_like(pack_index, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    w_cpu = weights.float().cpu()
+    lab_cpu = labels.long().cpu()
+    pack_index = torch.full((L, N), -1, dtype=torch.int64)
+    rank_in_pack = torch.full_like(pack_index, -1)
+
+    for li in range(L):
+        w = w_cpu[li]
+        labs = lab_cpu[li]
+        order = torch.argsort(w, descending=True)
+        loads = [0.0] * num_packs
+        counts = [0] * num_packs
+        label_count = [dict() for _ in range(num_packs)]
+        pidx = torch.empty(N, dtype=torch.int64)
+
+        mean_w = float(w.mean().item()) if N > 0 else 0.0
+        eps = 1e-6 * max(1.0, mean_w)
+        lam = 1e-8 * max(1.0, mean_w)
+
+        for g in order.tolist():
+            cand = [p for p in range(num_packs) if counts[p] < cap]
+            min_load = min(loads[p] for p in cand)
+            eff = []
+            lbl = int(labs[g].item())
+            for p in cand:
+                ld = loads[p]
+                if ld - min_load <= eps:
+                    same = label_count[p].get(lbl, 0)
+                    eff.append(ld + lam * same)
+                else:
+                    eff.append(ld)
+            best_idx = int(torch.argmin(torch.tensor(eff)).item())
+            best_p = cand[best_idx]
+
+            pidx[g] = best_p
+            loads[best_p] += float(w[g].item())
+            counts[best_p] += 1
+            label_count[best_p][lbl] = label_count[best_p].get(lbl, 0) + 1
+
+        # adapt refinement depth to residual imbalance
+        pack_w = _pack_loads(w, pidx, num_packs)
+        delta = float((pack_w.max() - pack_w.min()).item())
+        mean_ld = float(pack_w.mean().item())
+        ratio = delta / max(mean_ld, 1e-12)
+        steps = 3 if ratio > 0.02 else refine_steps_default
+
+        pidx = _refine_row(w, pidx, num_packs, max_steps=int(steps), enable_2x2=True)
+        rnk = _rank_from_packidx_row(pidx, num_packs)
+        pack_index[li] = pidx
+        rank_in_pack[li] = rnk
+
+    return pack_index.to(weights.device), rank_in_pack.to(weights.device)
+
+
+def replicate_experts(weight: torch.Tensor,
+                      num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas to minimize the maximum per-replica load.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of physical replicas
+
+    Returns:
+        phy2log: [X, num_phy] int64
+        rank:   [X, num_phy] int64
+        logcnt: [X, num_log] int64
+    """
+    L, num_log = weight.shape
+    extra = num_phy - num_log
+    assert extra >= 0
+    device = weight.device
+    dtype_i64 = torch.int64
+    dtype_f = weight.dtype
+
+    # Initialize mapping: first num_log columns are base one-per-logical, rank=0
+    phy2log = torch.empty((L, num_phy), dtype=dtype_i64, device=device)
+    rank = torch.empty((L, num_phy), dtype=dtype_i64, device=device)
+    base = torch.arange(num_log, dtype=dtype_i64, device=device).unsqueeze(0).expand(L, -1)
+    phy2log[:, :num_log] = base
+    rank[:, :num_log] = 0
+    logcnt = torch.ones((L, num_log), dtype=dtype_i64, device=device)
+
+    if extra == 0:
+        return phy2log, rank, logcnt
+
+    rows = torch.arange(L, dtype=dtype_i64, device=device)
+    col = num_log
+
+    # Bulk + tail: bulk via D'Hondt; tail via stepwise peak-aware chooser
+    tail = max(1, int(round(0.10 * extra)))
+    bulk = extra - tail
+
+    # Bulk: D'Hondt (benefit = w / r)
+    for _ in range(max(0, bulk)):
+        r_f = logcnt.to(dtype_f)
+        benefit = weight / r_f
+        best = benefit.argmax(dim=-1)
+        phy2log[:, col] = best
+        rank[:, col] = logcnt[rows, best]
+        logcnt[rows, best] += 1
+        col += 1
+
+    # Helper to compute new peak/second after awarding one replica to idx
+    def _predict_after(count_row: torch.Tensor,
+                       w_row: torch.Tensor,
+                       idx: int) -> tuple[float, float, int]:
+        """
+        count_row: [num_log] int64
+        w_row:     [num_log] float
+        idx:       int
+        returns (new_peak, new_second_peak, new_count_receiver)
+        """
+        r = count_row.to(w_row.dtype)
+        avg = w_row / r
+        # top-2 among 'others' (exclude idx)
+        # To keep cheap, compute top-3 and derive others; num_log typically small
+        # Simple approach: mask idx then take top-2
+        mask = torch.ones_like(avg, dtype=torch.bool)
+        mask[idx] = False
+        others = avg[mask]
+        if others.numel() == 0:
+            others_max = float('-inf')
+            others_second = float('-inf')
+        elif others.numel() == 1:
+            others_max = float(others.max().item())
+            others_second = float('-inf')
+        else:
+            top2 = torch.topk(others, k=2, largest=True).values
+            others_max = float(top2[0].item())
+            others_second = float(top2[1].item())
+        new_receiver = float(w_row[idx].item()) / float(r[idx].item() + 1.0)
+        new_peak = max(others_max, new_receiver)
+        # new second peak to break ties
+        # if receiver becomes the peak, second is max(others_max, something lower); else second between receiver and others_second
+        if new_receiver >= others_max:
+            new_second = others_max
+        else:
+            new_second = max(new_receiver, others_second)
+        return new_peak, new_second, int(count_row[idx].item() + 1)
+
+    # Tail: per-step, per-row choice between D'Hondt and Sainte–Laguë to minimize (peak, second, receiver_count)
+    for _ in range(max(0, tail)):
+        r_f = logcnt.to(dtype_f)
+        benef_D = weight / r_f
+        benef_S = weight / (2.0 * r_f - 1.0)
+        idxD = benef_D.argmax(dim=-1)
+        idxS = benef_S.argmax(dim=-1)
+
+        for li in range(L):
+            w_row = weight[li]
+            cnt_row = logcnt[li]
+            d = int(idxD[li].item())
+            s = int(idxS[li].item())
+
+            # Predict outcomes
+            peakD, secondD, cntD = _predict_after(cnt_row, w_row, d)
+            peakS, secondS, cntS = _predict_after(cnt_row, w_row, s)
+
+            # Lexicographic choose: minimize (new_peak, new_second_peak, receiver_count)
+            choose = d
+            if (peakS < peakD - 1e-12) or (
+                abs(peakS - peakD) <= 1e-12 and (secondS < secondD - 1e-12 or
+                (abs(secondS - secondD) <= 1e-12 and cntS < cntD))
+            ):
+                choose = s
+
+            phy2log[li, col] = choose
+            rank[li, col] = logcnt[li, choose]
+            logcnt[li, choose] += 1
+        col += 1
+
+    # Peak-focused fix-up: up to two donor->receiver moves per row
+    if num_log > 1 and extra > 0:
+        def best_move_for_row(li: int) -> tuple[bool, int, int, float, float]:
+            """
+            Returns (improves, donor, receiver, new_peak, new_second_peak).
+            Considers donors from top-2 average and receivers from bottom-2.
+            """
+            cnt = logcnt[li].to(dtype_f)
+            avg = weight[li] / cnt
+            k = min(2, num_log)
+            top_vals, top_idx = torch.topk(avg, k=k, largest=True)
+            bot_vals, bot_idx = torch.topk(avg, k=k, largest=False)
+            cur_peak = float(top_vals[0].item())
+            # second peak under current averages
+            if k > 1:
+                current_second = float(top_vals[1].item())
+            else:
+                current_second = float(top_vals[0].item())
+            best = None
+
+            for di in range(k):
+                d = int(top_idx[di].item())
+                cd = int(logcnt[li, d].item())
+                if cd <= 1:
+                    continue
+                for rj in range(k):
+                    r = int(bot_idx[rj].item())
+                    if d == r:
+                        continue
+                    cr = int(logcnt[li, r].item())
+                    # simulate
+                    new_d = float(weight[li, d].item()) / float(cd - 1)
+                    new_r = float(weight[li, r].item()) / float(cr + 1)
+                    # others' max excluding d and r
+                    cnt_tmp = logcnt[li].clone()
+                    cnt_tmp[d] -= 1
+                    cnt_tmp[r] += 1
+                    avg_after = weight[li] / cnt_tmp.to(dtype_f)
+                    new_peak = float(avg_after.max().item())
+                    # second peak for tie-break
+                    top2_after = torch.topk(avg_after, k=min(2, num_log), largest=True).values
+                    if top2_after.numel() == 1:
+                        new_second = float(top2_after[0].item())
+                    else:
+                        new_second = float(top2_after[1].item())
+
+                    if new_peak + 1e-12 < cur_peak:
+                        if best is None or (new_peak < best[0] - 1e-12 or
+                                            (abs(new_peak - best[0]) <= 1e-12 and new_second < best[1] - 1e-12)):
+                            best = (new_peak, new_second, d, r)
+            if best is None:
+                return False, -1, -1, 0.0, 0.0
+            return True, int(best[2]), int(best[3]), float(best[0]), float(best[1])
+
+        for li in range(L):
+            # attempt up to two moves
+            attempts = 0
+            while attempts < 2:
+                ok, d, r, _, _ = best_move_for_row(li)
+                if not ok:
+                    break
+                # select donor physical column with highest rank (i.e., last replica)
+                donor_cols = torch.nonzero(phy2log[li] == d, as_tuple=False).squeeze(1)
+                if donor_cols.numel() == 0:
+                    break
+                maxr_pos = int(torch.argmax(rank[li, donor_cols]).item())
+                col_idx = int(donor_cols[maxr_pos].item())
+                # move to receiver, rank equals current receiver count
+                new_rank = int(logcnt[li, r].item())
+                phy2log[li, col_idx] = r
+                rank[li, col_idx] = new_rank
+                # update counts
+                logcnt[li, d] -= 1
+                logcnt[li, r] += 1
+                attempts += 1
+
+    return phy2log, rank, logcnt
+
+
+def rebalance_experts_hierarchical(
+    weight: torch.Tensor,
+    num_physical_experts: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+):
+    """
+    Parameters:
+        weight: [num_moe_layers, num_logical_experts]
+        num_physical_experts: number of physical experts after replication
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [num_layers, num_physical_experts]
+        logical_to_physical_map: [num_layers, num_logical_experts, X]
+        logical_count: [num_layers, num_logical_experts]
+    """
+    L, num_logical_experts = weight.shape
+    assert num_logical_experts % num_groups == 0
+    group_sz = num_logical_experts // num_groups
+    assert num_groups % num_nodes == 0
+    groups_per_node = num_groups // num_nodes
+    assert num_gpus % num_nodes == 0
+    assert num_physical_experts % num_gpus == 0
+    phy_per_gpu = num_physical_experts // num_gpus
+
+    # Step 1: pack expert groups to nodes
+    tokens_per_group = weight.unflatten(-1, (num_groups, group_sz)).sum(-1)  # [L, num_groups]
+    group_pack_idx, group_rank_in_pack = balanced_packing(tokens_per_group, num_nodes, refine_steps=1)
+
+    # Build logical -> meta-logical permutation (contiguous per-node layout)
+    log2mlog = (((group_pack_idx * groups_per_node + group_rank_in_pack) * group_sz).unsqueeze(-1) +
+                torch.arange(group_sz, dtype=torch.int64, device=weight.device)).flatten(-2)
+    mlog2log = PermOps.inverse(log2mlog)
+
+    # Step 2: replicate within nodes using node-local loads
+    tokens_per_mlog = weight.gather(-1, mlog2log).view(-1, num_logical_experts // num_nodes)
+    phy2mlog, phyrank, mlogcnt = replicate_experts(tokens_per_mlog, num_physical_experts // num_nodes)
+
+    # Step 3: pack physical experts to GPUs with diversity-aware tie-breaks
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)  # per-replica average
+    labels_per_phy = phy2mlog  # avoid co-locating same meta-logical ids on a GPU under ties
+    pack_idx, rank_in_pack = _balanced_packing_diverse(tokens_per_phy, labels_per_phy, num_gpus // num_nodes, refine_steps_default=2)
+    phy2pphy = pack_idx * phy_per_gpu + rank_in_pack
+    pphy2phy = PermOps.inverse(phy2pphy)
+
+    # Map back to global logical ids
+    pphy2mlog = phy2mlog.gather(-1, pphy2phy)
+    pphy2mlog = (pphy2mlog.view(L, num_nodes, -1) +
+                 torch.arange(0, num_logical_experts, num_logical_experts // num_nodes, device=weight.device).view(1, -1, 1)
+                 ).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(L, -1)
+    logcnt = mlogcnt.view(L, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer.
+
+    Parameters:
+        weight: [layers, num_logical_experts]
+        num_replicas: number of physical experts, must be a multiple of `num_gpus`
+        num_groups: number of expert groups
+        num_nodes: number of server nodes
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas]
+        logical_to_physical_map: [layers, num_logical_experts, X]
+        expert_count: [layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+    if num_groups % num_nodes == 0:
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, num_groups, num_nodes, num_gpus
+        )
+    else:
+        # global policy as a fallback
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, 1, 1, num_gpus
+        )
+
+    num_redundant = num_replicas - num_logical_experts
+    maxlogcnt = num_redundant + 1
+    log2phy: torch.Tensor = torch.full(
+        (num_layers, num_logical_experts, maxlogcnt),
+        -1,
+        dtype=torch.int64,
+        device=logcnt.device,
+    )
+    # Scatter physical ids into per-logical replica slots
+    log2phy.view(num_layers, -1).scatter_(
+        -1,
+        phy2log * maxlogcnt + phyrank,
+        torch.arange(num_replicas, dtype=torch.int64, device=log2phy.device).expand(num_layers, -1),
+    )
+    return phy2log, log2phy, logcnt
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_eplb(weight: torch.Tensor, num_replicas: int, num_groups: int,
+             num_nodes: int, num_gpus: int):
+    """Run the expert parallelism load balancer"""
+    phy2log, log2phy, logcnt = rebalance_experts(
+        weight, num_replicas, num_groups, num_nodes, num_gpus
+    )
+    return phy2log, log2phy, logcnt
+
+
+__all__ = ["rebalance_experts", "run_eplb"]

@@ -1,0 +1,115 @@
+<NAME>
+expected_penalty_and_micro_finish
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to enhance counter repair accuracy while preserving and improving confidence calibration:
+
+1) Expected-penalty lookahead for router side selection:
+   - Instead of choosing the router side to adjust purely by lower average confidence, we estimate the adjustment penalty on each side using a trust-weighted capacity: sum(conf_dir * rate). This favors adjusting the side with less trusted aggregate capacity, reducing the chance of moving well-trusted counters, and improves projection accuracy.
+
+2) Micro high-confidence finishing tier:
+   - After the main router projection, if a router’s residual remains noticeably above a fraction of its adaptive tolerance, apply a small, high-confidence-only finishing pass:
+     - conf ≥ 0.85 candidates, tiny per-interface clip ±3%, and mild damping 0.25.
+     - This tightens residual gaps that the conservative primary pass left behind, improving flow conservation and link symmetry without overfitting, and minimally impacts confidences due to small movements.
+
+I also add necessary hyperparameters for the micro pass. These changes are consistent with the Hodor principles (redundant signal hardening, dynamic checking against invariants) and the provided recommendations, and they are minimal, localized edits that should raise counter accuracy and keep confidence scores well-calibrated.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+=======
+    UNTOUCHED_BOOST = 0.02   # confidence boost for untouched, well-synced counters
+    # Micro finishing tier (high-confidence small-scope correction)
+    DAMP_ROUTER_MICRO = 0.25
+    PER_LINK_CLIP_MICRO = 0.03
+    MICRO_RESIDUAL_FACTOR = 0.60
+    MICRO_CONF_MIN = 0.85
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Choose side with lower aggregate confidence to adjust
+        avg_rx_conf = sum(conf_rx[i] for i in up_ifs) / len(up_ifs)
+        avg_tx_conf = sum(conf_tx[i] for i in up_ifs) / len(up_ifs)
+        adjust_side = 'rx' if avg_rx_conf < avg_tx_conf else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+=======
+        # Choose side to adjust via expected-penalty lookahead (lower trusted capacity)
+        pen_rx = sum(clamp01(conf_rx[i]) * max(hardened_rx[i], ZERO_THRESH) for i in up_ifs)
+        pen_tx = sum(clamp01(conf_tx[i]) * max(hardened_tx[i], ZERO_THRESH) for i in up_ifs)
+        adjust_side = 'rx' if pen_rx <= pen_tx else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER
+>>>>>>> REPLACE
+
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Stage 3: Confidence-gap-proportional re-sync with scaling guard and router attenuation
+=======
+    # Stage 2c: Micro high-confidence finishing pass to close small residuals
+    for r, ifs in router_ifaces.items():
+        up_ifs = [i for i in ifs if status.get(i) == 'up']
+        if len(up_ifs) < 2:
+            continue
+        sum_rx = sum(hardened_rx[i] for i in up_ifs)
+        sum_tx = sum(hardened_tx[i] for i in up_ifs)
+        denom = max(1.0, sum_rx, sum_tx)
+        imbalance = sum_rx - sum_tx
+        rel_gap = abs(imbalance) / denom
+        n_active = len(up_ifs)
+        tau_router = min(0.07, max(0.03, 0.05 * (2.0 / max(2, n_active)) ** 0.5))
+        if rel_gap <= MICRO_RESIDUAL_FACTOR * tau_router:
+            continue
+
+        # Choose side using expected-penalty lookahead on high-confidence set
+        pen_rx = sum(clamp01(conf_rx[i]) * max(hardened_rx[i], ZERO_THRESH) for i in up_ifs)
+        pen_tx = sum(clamp01(conf_tx[i]) * max(hardened_tx[i], ZERO_THRESH) for i in up_ifs)
+        adjust_side = 'rx' if pen_rx <= pen_tx else 'tx'
+        total_adjust = (-imbalance if adjust_side == 'rx' else imbalance) * DAMP_ROUTER_MICRO
+
+        # Candidate set: high-confidence only
+        if adjust_side == 'rx':
+            cand = [i for i in up_ifs if conf_rx.get(i, 0.7) >= MICRO_CONF_MIN]
+        else:
+            cand = [i for i in up_ifs if conf_tx.get(i, 0.7) >= MICRO_CONF_MIN]
+        if not cand:
+            continue
+
+        # Weights inversely proportional to confidence so the very highest confidence move the least
+        if adjust_side == 'rx':
+            vals = {i: hardened_rx[i] for i in cand}
+            weights = {i: (1.0 - clamp01(conf_rx[i]) + 0.05) * max(vals[i], ZERO_THRESH) for i in cand}
+        else:
+            vals = {i: hardened_tx[i] for i in cand}
+            weights = {i: (1.0 - clamp01(conf_tx[i]) + 0.05) * max(vals[i], ZERO_THRESH) for i in cand}
+        total_w = sum(weights.values()) or 1.0
+
+        for i in cand:
+            v_old = vals[i]
+            w_i = weights[i] / total_w
+            adj_i_raw = total_adjust * w_i
+            cap = PER_LINK_CLIP_MICRO * max(v_old, ZERO_THRESH)
+            adj_i = min(max(adj_i_raw, -cap), cap)
+            v_new = max(0.0, v_old + adj_i)
+            if adjust_side == 'rx':
+                if hardened_rx[i] > ZERO_EPS:
+                    scaled_rx_factor[i] *= (v_new / hardened_rx[i])
+                hardened_rx[i] = v_new
+                relc = abs(adj_i) / max(1.0, abs(v_old))
+                conf_rx[i] = clamp01(conf_rx[i] * (1.0 - 0.25 * relc))
+            else:
+                if hardened_tx[i] > ZERO_EPS:
+                    scaled_tx_factor[i] *= (v_new / hardened_tx[i])
+                hardened_tx[i] = v_new
+                relc = abs(adj_i) / max(1.0, abs(v_old))
+                conf_tx[i] = clamp01(conf_tx[i] * (1.0 - 0.25 * relc))
+
+    # Stage 3: Confidence-gap-proportional re-sync with scaling guard and router attenuation
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,225 @@
+<NAME>
+endgame_bnb_pruning
+</NAME>
+
+<DESCRIPTION>
+I’m adding an exact endgame branch-and-bound (BnB) completion for the final few transactions, integrated into both the constructive beam’s completion step and the LNS repair. This targets the highest-leverage part of the search: when only a small number of transactions remain, exhaustive enumeration with good pruning provides significantly better schedules than heuristic completion.
+
+Key elements:
+- Introduce parameters endgame_enum_K (size threshold) and endgame_node_cap (safety cap).
+- Implement endgame_optimal_completion(prefix_seq, rem_set) using DFS with:
+  - Partial-cost pruning via seq_cost on partial sequences.
+  - Expansion ordering by higher regret first (using best_two_insertion), then lower best insertion cost.
+  - A small transposition table keyed by (frozenset(remaining), suffix of the prefix) to prune repeated subproblems.
+- Use this exact completion in regret_insertion_build when a beam state has a small remainder, and in LNS both at the start (if removed set is small) and mid-repair when the remainder becomes small.
+
+Why this helps:
+- Minimizes approximation error at the endgame where greedy/regret-only choices can trap the schedule in suboptimal conflicts.
+- The pruning and ordering keep runtime bounded while sharply improving makespan.
+
+This change is localized, compatible with existing caches and best-two insertion, and improves quality without heavy rewrite.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Large Neighborhood Search (LNS)
+    lns_iters = max(2, min(6, 2 + num_seqs // 3))
+    destroy_frac_range = (0.08, 0.18)
+=======
+    # Large Neighborhood Search (LNS)
+    lns_iters = max(2, min(6, 2 + num_seqs // 3))
+    destroy_frac_range = (0.08, 0.18)
+
+    # Endgame exact completion (branch-and-bound) parameters
+    endgame_enum_K = max(6, min(9, 3 + num_seqs // 3))
+    endgame_node_cap = 3000
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def best_two_insertion(base_seq, t, use_all_pos=False, focus_idx=None, k_positions=None):
+        """
+        Deterministically sample positions and compute best and second-best insertion of t into base_seq.
+        Caches results per (tuple(base_seq), t, use_all_pos) to avoid recomputation across beam/LNS.
+        """
+        key = (tuple(base_seq), t, bool(use_all_pos))
+        if key in best_two_cache:
+            return best_two_cache[key]
+        L = len(base_seq)
+        if use_all_pos or L <= 12:
+            pos_list = list(range(L + 1))
+        else:
+            # Deterministic stratified sampling around anchors and (optionally) focus
+            rng = random.Random((hash((tuple(base_seq[-min(10, L):]), t, L)) & 0xffffffff))
+            pos_set = {0, L, L // 2, (L * 1) // 4, (L * 3) // 4}
+            if focus_idx is not None:
+                for d in (-3, -2, -1, 0, 1, 2, 3):
+                    p = focus_idx + d
+                    if 0 <= p <= L:
+                        pos_set.add(p)
+            cap = k_positions if k_positions is not None else k_pos_sample
+            for _ in range(min(cap, L + 1)):
+                pos_set.add(rng.randint(0, L))
+            pos_list = sorted(pos_set)
+        res = evaluate_best_two_positions(base_seq, t, pos_list)
+        best_two_cache[key] = res
+        return res
+
+    def regret_insertion_build(seed_t=None):
+=======
+    def best_two_insertion(base_seq, t, use_all_pos=False, focus_idx=None, k_positions=None):
+        """
+        Deterministically sample positions and compute best and second-best insertion of t into base_seq.
+        Caches results per (tuple(base_seq), t, use_all_pos) to avoid recomputation across beam/LNS.
+        """
+        key = (tuple(base_seq), t, bool(use_all_pos))
+        if key in best_two_cache:
+            return best_two_cache[key]
+        L = len(base_seq)
+        if use_all_pos or L <= 12:
+            pos_list = list(range(L + 1))
+        else:
+            # Deterministic stratified sampling around anchors and (optionally) focus
+            rng = random.Random((hash((tuple(base_seq[-min(10, L):]), t, L)) & 0xffffffff))
+            pos_set = {0, L, L // 2, (L * 1) // 4, (L * 3) // 4}
+            if focus_idx is not None:
+                for d in (-3, -2, -1, 0, 1, 2, 3):
+                    p = focus_idx + d
+                    if 0 <= p <= L:
+                        pos_set.add(p)
+            cap = k_positions if k_positions is not None else k_pos_sample
+            for _ in range(min(cap, L + 1)):
+                pos_set.add(rng.randint(0, L))
+            pos_list = sorted(pos_set)
+        res = evaluate_best_two_positions(base_seq, t, pos_list)
+        best_two_cache[key] = res
+        return res
+
+    # Endgame exact completion (branch-and-bound over a small remaining set)
+    def endgame_optimal_completion(prefix_seq, rem_set):
+        """
+        Given a prefix sequence and a small remaining set of txns (|rem_set| <= endgame_enum_K),
+        enumerate txn orders with best-position insertion to find the minimal-cost completion.
+        Uses branch-and-bound with the current best bound, a node cap, and a small transposition table.
+        Returns (best_cost, best_seq).
+        """
+        if not rem_set:
+            return seq_cost(prefix_seq), prefix_seq[:]
+
+        best_c = float('inf')
+        best_s = None
+        nodes = 0
+        # transposition table keyed by (frozenset(remaining), suffix of prefix)
+        TT = {}
+
+        def suffix_key(seq, k=3):
+            m = min(k, len(seq))
+            return tuple(seq[-m:]) if m > 0 else ()
+
+        def dfs(seq, rem):
+            nonlocal best_c, best_s, nodes
+            if nodes >= endgame_node_cap:
+                return
+            c_prefix = seq_cost(seq)
+            if c_prefix >= best_c:
+                return
+            key = (frozenset(rem), suffix_key(seq, 3))
+            prev = TT.get(key)
+            if prev is not None and prev <= c_prefix:
+                return
+            TT[key] = c_prefix
+            if not rem:
+                best_c = c_prefix
+                best_s = seq[:]
+                return
+            # Order candidates by high regret first, then by lower best insertion cost
+            order = []
+            for t in rem:
+                b, p, s2 = best_two_insertion(seq, t, use_all_pos=True)
+                regret = (s2 - b) if s2 < float('inf') else 0.0
+                order.append((-regret, b, t, p))
+            order.sort()
+            for _, bcost, t, p in order:
+                if nodes >= endgame_node_cap:
+                    break
+                if bcost >= best_c:
+                    continue
+                nodes += 1
+                new_seq = seq[:p] + [t] + seq[p:]
+                new_rem = rem.copy()
+                new_rem.remove(t)
+                dfs(new_seq, new_rem)
+
+        dfs(prefix_seq[:], set(rem_set))
+        if best_s is None:
+            seq_complete = prefix_seq[:] + sorted(list(rem_set))
+            best_c = seq_cost(seq_complete)
+            best_s = seq_complete
+        return best_c, best_s
+
+    def regret_insertion_build(seed_t=None):
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        for seq, rem, cost in beam:
+            if rem:
+                # Append remaining deterministically and evaluate
+                seq_complete = seq + sorted(list(rem))
+                c = seq_cost(seq_complete)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = seq_complete
+            else:
+                if cost < best_cost:
+                    best_cost = cost
+                    best_seq = seq
+        return best_seq
+=======
+        for seq, rem, cost in beam:
+            if rem:
+                if len(rem) <= endgame_enum_K:
+                    c, s = endgame_optimal_completion(seq, set(rem))
+                else:
+                    seq_complete = seq + sorted(list(rem))
+                    c, s = seq_cost(seq_complete), seq_complete
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = s
+            else:
+                if cost < best_cost:
+                    best_cost = cost
+                    best_seq = seq
+        return best_seq
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        removed = [cur[i] for i in remove_idxs]
+        remaining = [cur[i] for i in range(n) if i not in set(remove_idxs)]
+        # Repair using regret insertion
+        seq_rep = remaining[:]
+        rem_set = removed[:]
+        while rem_set:
+=======
+        removed = [cur[i] for i in remove_idxs]
+        remaining = [cur[i] for i in range(n) if i not in set(remove_idxs)]
+        # Exact endgame rebuild when small
+        if len(removed) <= endgame_enum_K:
+            c_end, s_end = endgame_optimal_completion(remaining, set(removed))
+            c_rep, s_rep = local_refine(s_end)
+            return c_rep, s_rep
+
+        # Repair using regret insertion, switch to exact endgame when small
+        seq_rep = remaining[:]
+        rem_set = removed[:]
+        while rem_set:
+            if len(rem_set) <= endgame_enum_K:
+                c_end, s_end = endgame_optimal_completion(seq_rep, set(rem_set))
+                c_rep, s_rep = local_refine(s_end)
+                return c_rep, s_rep
+>>>>>>> REPLACE
+</DIFF>

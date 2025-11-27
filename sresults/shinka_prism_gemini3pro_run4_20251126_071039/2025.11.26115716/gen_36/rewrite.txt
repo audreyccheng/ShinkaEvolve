@@ -1,0 +1,271 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+import math
+import heapq
+
+GPU_MEM_SIZE = 80.0
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+    
+    Method:
+    1. Binary Search on the target KVPR (K).
+    2. Feasibility check using Beam Search (Width=5):
+       - Sorts items by linearized cost (w + K*s).
+       - Maintains top W states.
+       - State representation: Sorted tuple of bin loads to break symmetry.
+       - Heuristic: Maximize sum of squared loads (Best Fit preference).
+    3. Post-verification Hill Climbing:
+       - If a solution is found for K, optimize it using move/swap operations to minimize actual KVPR.
+       - Use the optimized KVPR to tighten the binary search upper bound.
+    """
+
+    # 1. Preprocess items
+    # We store index to track original models
+    items = []
+    for i, m in enumerate(models):
+        w = m.req_rate / m.slo
+        s = m.model_size
+        items.append({'w': w, 's': s, 'model': m, 'id': i})
+
+    def get_max_kvpr(placement):
+        """Calculate the actual maximum KVPR of a placement."""
+        max_k = 0.0
+        for p in placement.values():
+            w_sum = sum(m.req_rate / m.slo for m in p)
+            s_sum = sum(m.model_size for m in p)
+            rem = GPU_MEM_SIZE - s_sum
+            if rem <= 1e-9:
+                if w_sum > 1e-9: return float('inf')
+                val = 0.0
+            else:
+                val = w_sum / rem
+            if val > max_k: max_k = val
+        return max_k
+
+    def hill_climb(placement):
+        """
+        Refine a valid placement to reduce max KVPR.
+        Uses greedy moves and swaps from the bottleneck GPU.
+        """
+        # Convert to mutable structure
+        # bins: list of {'w': float, 's': float, 'models': list}
+        bins = []
+        for i in range(gpu_num):
+            m_list = list(placement[i])
+            w = sum(m.req_rate / m.slo for m in m_list)
+            s = sum(m.model_size for m in m_list)
+            bins.append({'w': w, 's': s, 'models': m_list})
+            
+        def calc_k(w, s):
+            rem = GPU_MEM_SIZE - s
+            if rem <= 1e-9: return float('inf') if w > 1e-9 else 0.0
+            return w / rem
+
+        for _ in range(50): # Limit iterations for speed
+            # Find bottleneck
+            max_k = -1.0
+            src_idx = -1
+            
+            # Recompute Ks
+            for i in range(gpu_num):
+                k = calc_k(bins[i]['w'], bins[i]['s'])
+                if k > max_k:
+                    max_k = k
+                    src_idx = i
+            
+            if max_k <= 1e-9: break
+            
+            improved = False
+            src = bins[src_idx]
+            
+            # 1. Try Move (Source -> Dest)
+            for i, m in enumerate(src['models']):
+                mw = m.req_rate / m.slo
+                ms = m.model_size
+                
+                # Check src improvement
+                ns_w = src['w'] - mw
+                ns_s = src['s'] - ms
+                ns_k = calc_k(ns_w, ns_s)
+                
+                if ns_k >= max_k - 1e-9: continue
+                
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = bins[dst_idx]
+                    
+                    if dst['s'] + ms > GPU_MEM_SIZE: continue
+                    nd_w = dst['w'] + mw
+                    nd_s = dst['s'] + ms
+                    nd_k = calc_k(nd_w, nd_s)
+                    
+                    if nd_k < max_k - 1e-9:
+                        # Apply Move
+                        src['models'].pop(i)
+                        src['w'], src['s'] = ns_w, ns_s
+                        dst['models'].append(m)
+                        dst['w'], dst['s'] = nd_w, nd_s
+                        improved = True
+                        break
+                if improved: break
+            
+            if improved: continue
+            
+            # 2. Try Swap
+            for i, m1 in enumerate(src['models']):
+                m1w = m1.req_rate / m1.slo
+                m1s = m1.model_size
+                
+                for dst_idx in range(gpu_num):
+                    if dst_idx == src_idx: continue
+                    dst = bins[dst_idx]
+                    # Optimization: Skip if dst is also high pressure
+                    if calc_k(dst['w'], dst['s']) > max_k * 0.9: continue
+
+                    for j, m2 in enumerate(dst['models']):
+                        m2w = m2.req_rate / m2.slo
+                        m2s = m2.model_size
+                        
+                        # New Source
+                        ns_s = src['s'] - m1s + m2s
+                        if ns_s > GPU_MEM_SIZE: continue
+                        ns_w = src['w'] - m1w + m2w
+                        ns_k = calc_k(ns_w, ns_s)
+                        
+                        if ns_k >= max_k - 1e-9: continue
+                        
+                        # New Dest
+                        nd_s = dst['s'] - m2s + m1s
+                        if nd_s > GPU_MEM_SIZE: continue
+                        nd_w = dst['w'] - m2w + m1w
+                        nd_k = calc_k(nd_w, nd_s)
+                        
+                        if nd_k < max_k - 1e-9:
+                            # Apply Swap
+                            src['models'][i] = m2
+                            src['w'], src['s'] = ns_w, ns_s
+                            dst['models'][j] = m1
+                            dst['w'], dst['s'] = nd_w, nd_s
+                            improved = True
+                            break
+                    if improved: break
+                if improved: break
+                
+            if not improved: break
+            
+        return {i: bins[i]['models'] for i in range(gpu_num)}
+
+    def check_feasibility_beam(k_target, beam_width=5):
+        """
+        Check if models can be placed using Beam Search.
+        Objective: Minimize K implies Maximize utilization under constraint.
+        Constraint: w + k*s <= k*C
+        """
+        limit = k_target * GPU_MEM_SIZE
+        
+        # Prepare items: sort by linearized cost
+        # w + k*s
+        weighted_items = []
+        for it in items:
+            cost = it['w'] + k_target * it['s']
+            if cost > limit + 1e-5: return None # Impossible single item
+            weighted_items.append((cost, it))
+        
+        # BFD: Sort descending
+        weighted_items.sort(key=lambda x: x[0], reverse=True)
+        
+        # State: (score, loads_tuple, placement_list_of_lists)
+        # We use tuple for loads to be hashable if needed, but here just for structure
+        # Loads track 'linearized load'
+        
+        # Initial Beam
+        # (score, [load_0, ..., load_m], [ [item_indices], ... ])
+        # Score: Sum of squares of loads (encourages imbalance/filling bins)
+        init_loads = tuple([0.0] * gpu_num)
+        init_placements = tuple([[] for _ in range(gpu_num)])
+        
+        beam = [(0.0, init_loads, init_placements)]
+        
+        for cost, it in weighted_items:
+            next_beam = []
+            # Optimization: Use set of seen load configurations (sorted) to prune duplicates
+            seen_configs = set()
+            
+            for score, loads, placements in beam:
+                # Try putting item in each unique load bin
+                # Since GPUs are identical, we only need to try one bin for each unique load value
+                tried_load_vals = set()
+                
+                for i in range(gpu_num):
+                    curr_load = loads[i]
+                    if curr_load in tried_load_vals:
+                        continue
+                    
+                    if curr_load + cost <= limit + 1e-5:
+                        tried_load_vals.add(curr_load)
+                        
+                        # Construct new state
+                        new_loads_list = list(loads)
+                        new_loads_list[i] += cost
+                        
+                        # Create canonical configuration for checking duplicates
+                        # Sort loads to detect symmetry
+                        canon_loads = sorted(new_loads_list, reverse=True)
+                        canon_tuple = tuple(canon_loads)
+                        
+                        if canon_tuple not in seen_configs:
+                            seen_configs.add(canon_tuple)
+                            
+                            # Update placement
+                            new_placements_list = list(placements)
+                            new_placements_list[i] = placements[i] + [it['model']]
+                            
+                            # Heuristic score: Sum of squares of loads
+                            new_score = sum(l*l for l in new_loads_list)
+                            
+                            next_beam.append((new_score, tuple(new_loads_list), tuple(new_placements_list)))
+            
+            if not next_beam:
+                return None
+            
+            # Prune
+            next_beam.sort(key=lambda x: x[0], reverse=True)
+            beam = next_beam[:beam_width]
+            
+        # Return best
+        best = beam[0]
+        return {i: best[2][i] for i in range(gpu_num)}
+
+    # Binary Search
+    high = 1e9
+    
+    # Initial check
+    best_placement = check_feasibility_beam(high)
+    if not best_placement:
+        raise ValueError("Insufficient memory.")
+        
+    best_placement = hill_climb(best_placement)
+    high = get_max_kvpr(best_placement)
+    low = 0.0
+    
+    # Search
+    for _ in range(25):
+        if high - low < 1e-4: break
+        mid = (low + high) / 2
+        
+        res = check_feasibility_beam(mid)
+        if res:
+            # Optimize to find true max pressure
+            res = hill_climb(res)
+            max_k = get_max_kvpr(res)
+            best_placement = res
+            high = min(mid, max_k)
+        else:
+            low = mid
+            
+    return best_placement
+
+# EVOLVE-BLOCK-END

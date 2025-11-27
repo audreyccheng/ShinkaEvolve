@@ -1,0 +1,188 @@
+<NAME>
+tolerance_aware_partial_reconcile
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements that leverage redundancy and tolerances to reduce over-corrections and improve confidence calibration:
+
+1) Introduce a rate-aware tolerance function that blends relative tolerance with an absolute allowance for low rates. This replaces fixed 2% checks with adaptive thresholds, preventing false positives on small flows and making decisions more robust.
+
+2) Make the link-hardening pass use tolerance-aware checks and soft averaging rather than hard substitution when only one side violates. This reduces bias from snapping one counter to its peer and respects measurement timing differences.
+
+3) Replace the final pairwise reconciliation’s full equality snaps with tolerance-aware, partial moves (about 30% of the residual) and per-interface caps (≤20% of the current value). This preserves stability and avoids overfitting while still reducing inconsistencies.
+
+4) Calibrate confidence using a tolerance-aware residual mapping. Confidence remains high when residuals are within tolerance and decays gently beyond it, improving calibration without being overconfident on aggressive edits.
+
+These changes should improve counter repair accuracy and confidence calibration while keeping status handling unchanged and consistent with invariants.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    MIN_TOL = 0.02              # minimum relative tolerance
+    LOW_RATE_CONST = 5.0        # absolute tolerance cushion for low rates (Mbps)
+    EPS = 1e-9
+
+    # Helpers
+    def rel_diff(a: float, b: float) -> float:
+        a = float(a)
+        b = float(b)
+        denom = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / denom
+
+    def rate_aware_tol(a: float, b: float) -> float:
+        # Blend relative and absolute tolerance to protect low-rate links
+        mag = max(a, b, 1.0)
+        return max(MIN_TOL, LOW_RATE_CONST / mag)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            # Link hardening using redundant signals only if peer is present and up
+            if had_peer and peer_status == 'up':
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+
+                pair_rx_ok = rx_link_diff <= HARDENING_THRESHOLD
+                pair_tx_ok = tx_link_diff <= HARDENING_THRESHOLD
+
+                # Targeted substitution: fix only the violating side; if both violate, average
+                if pair_tx_ok and not pair_rx_ok:
+                    pre_rx = peer_tx
+                elif pair_rx_ok and not pair_tx_ok:
+                    pre_tx = peer_rx
+                elif not pair_rx_ok and not pair_tx_ok:
+                    pre_rx = 0.5 * (rx_orig + peer_tx)
+                    pre_tx = 0.5 * (tx_orig + peer_rx)
+                # else: both ok -> keep as is
+            else:
+                rx_link_diff = 0.0
+                tx_link_diff = 0.0
+=======
+            # Link hardening using redundant signals only if peer is present and up
+            if had_peer and peer_status == 'up':
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+                tol_rx = rate_aware_tol(rx_orig, peer_tx)
+                tol_tx = rate_aware_tol(tx_orig, peer_rx)
+
+                pair_rx_ok = rx_link_diff <= tol_rx
+                pair_tx_ok = tx_link_diff <= tol_tx
+
+                # Targeted soft correction: use averaging for violating sides; leave within-tolerance unchanged
+                if pair_tx_ok and not pair_rx_ok:
+                    pre_rx = 0.5 * (rx_orig + peer_tx)
+                elif pair_rx_ok and not pair_tx_ok:
+                    pre_tx = 0.5 * (tx_orig + peer_rx)
+                elif not pair_rx_ok and not pair_tx_ok:
+                    pre_rx = 0.5 * (rx_orig + peer_tx)
+                    pre_tx = 0.5 * (tx_orig + peer_rx)
+                # else: both ok -> keep as is
+            else:
+                rx_link_diff = 0.0
+                tx_link_diff = 0.0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Reconcile A.tx <-> B.rx if needed
+        if tx_pair_resid > HARDENING_THRESHOLD:
+            a_tx_s = susp(iface, 'tx')
+            b_rx_s = susp(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                # Adjust the more suspicious side to match its peer
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx if needed
+        if rx_pair_resid > HARDENING_THRESHOLD:
+            a_rx_s = susp(iface, 'rx')
+            b_tx_s = susp(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+=======
+        # Reconcile A.tx <-> B.rx if needed (tolerance-aware, partial move with caps)
+        tx_tol = rate_aware_tol(post[iface]['tx'], post[peer_id]['rx'])
+        if tx_pair_resid > tx_tol:
+            a_tx_s = susp(iface, 'tx')
+            b_rx_s = susp(peer_id, 'rx')
+            frac = 0.30
+            diff = post[iface]['tx'] - post[peer_id]['rx']
+            if a_tx_s >= b_rx_s:
+                # Move A.tx toward B.rx
+                cap = 0.2 * max(post[iface]['tx'], 1.0)
+                step = max(-cap, min(cap, frac * diff))
+                post[iface]['tx'] -= step
+                if post[iface]['tx'] < 0.0:
+                    post[iface]['tx'] = 0.0
+            else:
+                # Move B.rx toward A.tx
+                cap = 0.2 * max(post[peer_id]['rx'], 1.0)
+                step = max(-cap, min(cap, frac * (-diff)))  # toward A.tx
+                post[peer_id]['rx'] -= step
+                if post[peer_id]['rx'] < 0.0:
+                    post[peer_id]['rx'] = 0.0
+
+        # Reconcile A.rx <-> B.tx if needed (tolerance-aware, partial move with caps)
+        rx_tol = rate_aware_tol(post[iface]['rx'], post[peer_id]['tx'])
+        if rx_pair_resid > rx_tol:
+            a_rx_s = susp(iface, 'rx')
+            b_tx_s = susp(peer_id, 'tx')
+            frac = 0.30
+            diff = post[iface]['rx'] - post[peer_id]['tx']
+            if a_rx_s >= b_tx_s:
+                # Move A.rx toward B.tx
+                cap = 0.2 * max(post[iface]['rx'], 1.0)
+                step = max(-cap, min(cap, frac * diff))
+                post[iface]['rx'] -= step
+                if post[iface]['rx'] < 0.0:
+                    post[iface]['rx'] = 0.0
+            else:
+                # Move B.tx toward A.rx
+                cap = 0.2 * max(post[peer_id]['tx'], 1.0)
+                step = max(-cap, min(cap, frac * (-diff)))  # toward A.rx
+                post[peer_id]['tx'] -= step
+                if post[peer_id]['tx'] < 0.0:
+                    post[peer_id]['tx'] = 0.0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            rx_link_conf = max(0.0, 1.0 - rx_resid)
+            tx_link_conf = max(0.0, 1.0 - tx_resid)
+=======
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)
+            tol_rx = rate_aware_tol(rx_repaired, peer_tx_after)
+            tol_tx = rate_aware_tol(tx_repaired, peer_rx_after)
+
+            def conf_from_resid(resid: float, tol: float) -> float:
+                # High confidence within tolerance; gentle decay beyond it
+                x = resid / max(tol, EPS)
+                return max(0.0, 1.0 - min(1.0, x / 5.0))
+
+            rx_link_conf = conf_from_resid(rx_resid, tol_rx)
+            tx_link_conf = conf_from_resid(tx_resid, tol_tx)
+>>>>>>> REPLACE
+</DIFF>

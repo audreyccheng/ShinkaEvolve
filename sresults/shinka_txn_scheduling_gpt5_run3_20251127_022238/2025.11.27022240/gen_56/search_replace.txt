@@ -1,0 +1,414 @@
+<NAME>
+buddy_beam_seed_lns
+</NAME>
+
+<DESCRIPTION>
+I introduce a compact, conflict-aware beam seed stage that leverages precomputed buddy lists (top partners with minimal two-step marginal delta) and prefix-dominance pruning to explore high-quality prefixes, greedily probes top children to tighten the incumbent, and then finishes sequences using a focused greedy completion. This is integrated before the existing multi-start local search portfolio to provide a stronger starting incumbent.
+
+Key improvements:
+- Build buddies per transaction using true extension costs to reflect read/write conflicts.
+- Add lb_singleton lower bound to prune poor branches early.
+- Implement a lightweight beam search (beam 8–12, branch 8–12, lookahead 3) with memoized extension costs and prefix dominance over (remaining set, suffix) to avoid redundant states.
+- Greedy completion guided by buddies to quickly estimate full schedules and update the incumbent.
+- Feed the best beam sequence into the existing local search (adjacent swaps, ruin-and-recreate, 2-opt) pipeline for additional improvements.
+
+This approach better aligns search with makespan cost compared to pure heuristic merges, while staying within the time budget by using small candidate pools, memoization, and pruning.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ----------------------------------------
+    # 4) Multi-start portfolio
+    # ----------------------------------------
+    # Build several initial orders:
+    #  - by aggregated tournament score
+    #  - reverse (to diversify)
+    #  - singleton-cost sorted
+    #  - random
+    base_rank = sorted(all_txns, key=lambda t: (-agg_score.get(t, 0.0), t))
+    seeds_orders = []
+    if base_rank:
+        seeds_orders.append(base_rank)
+        seeds_orders.append(list(reversed(base_rank)))
+    seeds_orders.append(sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf'))))
+    # Add a couple of random orders
+    if N > 0:
+        rnd = all_txns[:]
+        random.shuffle(rnd)
+        seeds_orders.append(rnd)
+        rnd2 = all_txns[:]
+        random.shuffle(rnd2)
+        seeds_orders.append(rnd2)
+
+    # Limit restarts by num_seqs but ensure coverage
+    max_starts = max(3, min(len(seeds_orders), int(num_seqs) + 2))
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    for r in range(max_starts):
+        if not time_left():
+            break
+        order = seeds_orders[r % len(seeds_orders)]
+        # Merge-based construction
+        seq0 = build_by_merge(order)
+        c0 = eval_seq_cost(seq0)
+
+        # Quick adjacent swap polish
+        c1, s1 = adjacent_swap_pass(seq0, c0, max_passes=1)
+
+        # Ruin-and-recreate around worst edges
+        c2, s2 = ruin_and_recreate(s1, c1, rounds=2)
+
+        # Limited 2-opt
+        c3, s3 = limited_two_opt(s2, c2, trials=28)
+
+        # Final adjacent swap pass
+        c4, s4 = adjacent_swap_pass(s3, c3, max_passes=1)
+
+        if c4 < global_best_cost:
+            global_best_cost, global_best_seq = c4, s4
+
+    # Safety: ensure a valid permutation of all transactions
+    if global_best_seq is None:
+        global_best_seq = list(range(N))
+        random.shuffle(global_best_seq)
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    if len(global_best_seq) != N or len(set(global_best_seq)) != N:
+        seen = set()
+        repaired = []
+        for t in global_best_seq:
+            if 0 <= t < N and t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        global_best_seq = repaired[:N]
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+=======
+    # ----------------------------------------
+    # 4) Buddy-guided beam seed + Multi-start portfolio
+    # ----------------------------------------
+    # Build several initial orders:
+    #  - by aggregated tournament score
+    #  - reverse (to diversify)
+    #  - singleton-cost sorted
+    #  - random
+    base_rank = sorted(all_txns, key=lambda t: (-agg_score.get(t, 0.0), t))
+    seeds_orders = []
+    if base_rank:
+        seeds_orders.append(base_rank)
+        seeds_orders.append(list(reversed(base_rank)))
+    seeds_orders.append(sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf'))))
+    # Add a couple of random orders
+    if N > 0:
+        rnd = all_txns[:]
+        random.shuffle(rnd)
+        seeds_orders.append(rnd)
+        rnd2 = all_txns[:]
+        random.shuffle(rnd2)
+        seeds_orders.append(rnd2)
+
+    # Build small buddy lists B[t]: top partners minimizing delta cost cost([t,u]) - cost([t])
+    def build_buddies(max_buddies=8, sample_per_t=16):
+        buds = {t: [] for t in all_txns}
+        singles_sorted = sorted(all_txns, key=lambda x: singleton_cost.get(x, float('inf')))
+        for t in all_txns:
+            if not time_left():
+                break
+            base = singleton_cost[t]
+            # candidate pool: top by singleton + random sample
+            pool = [u for u in singles_sorted[:min(20, max(6, N // 6))] if u != t]
+            others = [u for u in all_txns if u != t and u not in pool]
+            if others:
+                pool.extend(random.sample(others, min(sample_per_t, len(others))))
+            seen = set()
+            scored = []
+            for u in pool:
+                if u in seen or u == t:
+                    continue
+                seen.add(u)
+                ec = pair_ext_cost(t, u)  # cost([t,u])
+                scored.append((ec - base, u))
+            scored.sort(key=lambda x: x[0])
+            buds[t] = [u for _d, u in scored[:max_buddies]]
+        return buds
+
+    buddies = build_buddies(max_buddies=8, sample_per_t=min(16, max(8, N // 10)))
+
+    # Lower bound using max remaining singleton cost
+    def lb_singleton(cur_cost, rem_set):
+        if not rem_set:
+            return cur_cost
+        m = 0.0
+        for t in rem_set:
+            c = singleton_cost.get(t)
+            if c is None:
+                c = eval_seq_cost([t])
+                singleton_cost[t] = c
+            if c > m:
+                m = c
+        return max(cur_cost, m)
+
+    # Greedy completion guided by buddies and extension cost
+    def greedy_finish(seq, rem_set, branch_k=10, incumbent=None):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0.0
+        while rem and time_left():
+            if incumbent is not None and lb_singleton(cur_cost, rem) >= incumbent:
+                break
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+            cand_pool = []
+            if last is not None and last in buddies:
+                for u in buddies[last]:
+                    if u in rem:
+                        cand_pool.append(u)
+            # fill with random to reach pool size
+            need = max(0, branch_k - len(cand_pool))
+            if need > 0:
+                others = [x for x in rem_list if x not in cand_pool]
+                if others:
+                    cand_pool.extend(random.sample(others, min(need, len(others))))
+            if not cand_pool:
+                cand_pool = rem_list if len(rem_list) <= branch_k else random.sample(rem_list, branch_k)
+            pt = tuple(seq_out)
+            best_t = None
+            best_ec = float('inf')
+            for t in cand_pool:
+                ec = eval_ext_cost(pt, t)
+                if ec < best_ec:
+                    best_ec = ec
+                    best_t = t
+            if best_t is None:
+                # Fallback if time exhausted
+                seq_out.extend(list(rem))
+                cur_cost = eval_seq_cost(seq_out)
+                break
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_ec
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+
+    # Lightweight beam search seeded by best singletons and guided by buddies
+    def beam_seed(incumbent=float('inf')):
+        beam_width = min(12, max(8, N // 8))
+        branch_factor = min(12, max(8, N // 10))
+        lookahead_top = 3
+        probe_k = 4
+
+        # Global/local prefix dominance: key = (frozenset(rem), suffix)
+        dom = {}
+        def sig_of(rem_set, seq, k=3):
+            tail = tuple(seq[-k:]) if len(seq) >= k else tuple(seq)
+            return (frozenset(rem_set), tail)
+
+        # Initialize beam with best singletons
+        seeds = sorted(all_txns, key=lambda t: singleton_cost.get(t, float('inf')))[:max(beam_width * 2, 8)]
+        beam = []
+        for t in seeds:
+            if not time_left():
+                break
+            seq = [t]
+            rem = set(all_txns)
+            rem.remove(t)
+            c = eval_seq_cost(seq)
+            beam.append((c, seq, rem))
+        if not beam:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            return eval_seq_cost(seq), seq
+
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_width]
+
+        best_full_cost = incumbent
+        best_full_seq = None
+
+        steps = N - 1
+        depth = 0
+        while depth < steps and time_left():
+            depth += 1
+            new_beam = []
+            # adaptive suffix length
+            if depth < int(0.4 * N):
+                k_suffix = 3
+            elif depth < int(0.75 * N):
+                k_suffix = 2
+            else:
+                k_suffix = 2
+
+            for cost_so_far, seq, rem in beam:
+                if not rem:
+                    if cost_so_far < best_full_cost:
+                        best_full_cost, best_full_seq = cost_so_far, seq[:]
+                    continue
+                if cost_so_far >= best_full_cost:
+                    continue
+                # dominance
+                s = sig_of(rem, seq, k=k_suffix)
+                prev = dom.get(s)
+                if prev is not None and cost_so_far >= prev:
+                    continue
+                dom[s] = cost_so_far
+
+                last = seq[-1]
+                rem_list = list(rem)
+                cand_pool = []
+                if last in buddies:
+                    for u in buddies[last]:
+                        if u in rem:
+                            cand_pool.append(u)
+                need = max(0, branch_factor * 2 - len(cand_pool))
+                if need > 0:
+                    others = [x for x in rem_list if x not in cand_pool]
+                    if others:
+                        cand_pool.extend(random.sample(others, min(need, len(others))))
+                if not cand_pool:
+                    cand_pool = rem_list if len(rem_list) <= branch_factor * 2 else random.sample(rem_list, branch_factor * 2)
+
+                pt = tuple(seq)
+                scored = []
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(pt, cand)
+                    if ec >= best_full_cost:
+                        continue
+                    # shallow lookahead
+                    la_best = ec
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    la_pool = []
+                    if cand in buddies:
+                        for v in buddies[cand]:
+                            if v in new_rem:
+                                la_pool.append(v)
+                    if not la_pool:
+                        la_pool = list(new_rem)
+                    if len(la_pool) > lookahead_top:
+                        la_pool = random.sample(la_pool, lookahead_top)
+                    new_pt = tuple(seq + [cand])
+                    for nxt in la_pool:
+                        c2 = eval_ext_cost(new_pt, nxt)
+                        if c2 < la_best:
+                            la_best = c2
+                    scored.append((ec, la_best, cand))
+                if not scored:
+                    continue
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+                # expand children and probe a few greedily
+                for idx, (ec, la, cand) in enumerate(top):
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+                    # greedy probe to tighten incumbent
+                    if idx < probe_k and time_left():
+                        g_cost, g_seq = greedy_finish(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        la = min(la, g_cost)
+                    new_beam.append((ec, new_seq, new_rem, la))
+            if not new_beam:
+                break
+            new_beam.sort(key=lambda x: x[3])
+            unique = []
+            seen = set()
+            for ec, s, r, la in new_beam:
+                key = tuple(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append((ec, s, r))
+                if len(unique) >= beam_width:
+                    break
+            beam = unique
+
+        # finalize remaining prefixes greedily
+        for ec, s, r in beam:
+            if not time_left():
+                break
+            c_fin, s_fin = greedy_finish(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost)
+            if len(s_fin) == N and c_fin < best_full_cost:
+                best_full_cost, best_full_seq = c_fin, s_fin
+
+        if best_full_seq is None:
+            seq = all_txns[:]
+            random.shuffle(seq)
+            best_full_seq = seq
+            best_full_cost = eval_seq_cost(seq)
+        return best_full_cost, best_full_seq
+
+    # Limit restarts by num_seqs but ensure coverage
+    max_starts = max(3, min(len(seeds_orders), int(num_seqs) + 2))
+
+    global_best_cost = float('inf')
+    global_best_seq = None
+
+    # Beam-seeded candidate first (to set a strong incumbent)
+    if time_left():
+        cb, sb = beam_seed(incumbent=global_best_cost)
+        # quick polish
+        cb1, sb1 = adjacent_swap_pass(sb, cb, max_passes=1) if time_left() else (cb, sb)
+        cb2, sb2 = ruin_and_recreate(sb1, cb1, rounds=1) if time_left() else (cb1, sb1)
+        cb3, sb3 = limited_two_opt(sb2, cb2, trials=20) if time_left() else (cb2, sb2)
+        if cb3 < global_best_cost:
+            global_best_cost, global_best_seq = cb3, sb3
+
+    # Multi-start portfolio with existing constructors and LNS
+    for r in range(max_starts):
+        if not time_left():
+            break
+        order = seeds_orders[r % len(seeds_orders)]
+        # Merge-based construction
+        seq0 = build_by_merge(order)
+        c0 = eval_seq_cost(seq0)
+
+        # Quick adjacent swap polish
+        c1, s1 = adjacent_swap_pass(seq0, c0, max_passes=1)
+
+        # Ruin-and-recreate around worst edges
+        c2, s2 = ruin_and_recreate(s1, c1, rounds=2)
+
+        # Limited 2-opt
+        c3, s3 = limited_two_opt(s2, c2, trials=28)
+
+        # Final adjacent swap pass
+        c4, s4 = adjacent_swap_pass(s3, c3, max_passes=1)
+
+        if c4 < global_best_cost:
+            global_best_cost, global_best_seq = c4, s4
+
+    # Safety: ensure a valid permutation of all transactions
+    if global_best_seq is None:
+        global_best_seq = list(range(N))
+        random.shuffle(global_best_seq)
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    if len(global_best_seq) != N or len(set(global_best_seq)) != N:
+        seen = set()
+        repaired = []
+        for t in global_best_seq:
+            if 0 <= t < N and t not in seen:
+                repaired.append(t)
+                seen.add(t)
+        for t in all_txns:
+            if t not in seen:
+                repaired.append(t)
+        global_best_seq = repaired[:N]
+        global_best_cost = eval_seq_cost(global_best_seq)
+
+    return global_best_cost, global_best_seq
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,357 @@
+<NAME>
+insertion_beam_endgame_dfs
+</NAME>
+
+<DESCRIPTION>
+I replace the current beam search to make every expansion use true best-position insertion instead of appending transactions to the end, and propagate this quality into the one-step lookahead as well. This better aligns beam scoring with the actual makespan impact, since insertion positions drastically affect conflicts. I also upgrade the completion step by using best-insertion for the remaining transactions, and introduce a bounded endgame DFS enumerator (with pruning and a tiny time budget) for the last few transactions (K≈8). This locks in optimal finishes more often while keeping runtime low. These targeted changes leverage the existing best-two memoization and cost cache without altering other components.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def beam_search():
+        bw = beam_width
+        diversity_quota = max(1, int(diversity_quota_ratio * bw))
+
+        # initialize with top singletons and one GRASP seed
+        starters = [(ctx.eval_cost([t]), [t]) for t in all_txns]
+        starters.sort(key=lambda x: x[0])
+        init_pool = starters[:min(len(starters), max(bw * 2, bw + 2))]
+        c0, s0 = construct_grasp_regret()
+        init_pool.append((c0, s0))
+
+        beam = []
+        used = set()
+        for c, seq in init_pool:
+            k = tuple(seq)
+            if k in used:
+                continue
+            used.add(k)
+            rem = frozenset(t for t in all_txns if t not in seq)
+            beam.append((c, seq, rem))
+            if len(beam) >= bw:
+                break
+
+        best_complete = (float('inf'), [])
+
+        for _depth in range(1, n + 1):
+            if not beam:
+                break
+            next_pool = []
+            suffix_seen = set()
+            # endgame detection
+            min_remaining = min((len(rem) for (_, _, rem) in beam), default=n)
+            endgame = min_remaining <= 2 * bw
+
+            for c_so_far, prefix, rem in beam:
+                if not rem:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    continue
+
+                rem_list = list(rem)
+                if len(rem_list) <= cand_per_state:
+                    expand_list = rem_list
+                else:
+                    expand_list = random.sample(rem_list, cand_per_state)
+
+                # compute immediate + dispersion via second-step
+                scored = []
+                spans = []
+                for t in expand_list:
+                    seq1 = prefix + [t]
+                    c1 = ctx.eval_cost(seq1)
+                    rem_after = [x for x in rem_list if x != t]
+                    best_c2 = c1
+                    second_costs = []
+                    if rem_after:
+                        k2 = len(rem_after) if (endgame and len(rem_after) <= 10) else min(lookahead_k, len(rem_after))
+                        candidates2 = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        for u in candidates2:
+                            cu = ctx.eval_cost(seq1 + [u])
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                    span = (max(second_costs) - min(second_costs)) if len(second_costs) >= 2 else 0.0
+                    spans.append(span)
+                    scored.append((c1, best_c2, span, seq1, frozenset(rem_after)))
+
+                if not scored:
+                    continue
+
+                spans_sorted = sorted(spans)
+                median_span = spans_sorted[len(spans_sorted) // 2] if spans_sorted else 0.0
+
+                local = []
+                for c1, best_c2, span, seq2, rem2 in scored:
+                    alpha = 0.5 if span > median_span else 0.8  # more lookahead under dispersion
+                    score = alpha * c1 + (1.0 - alpha) * best_c2
+                    second_best_gap = max(0.0, best_c2 - c1)
+                    local.append((score, second_best_gap, c1, seq2, rem2))
+
+                    if len(seq2) == n and c1 < best_complete[0]:
+                        best_complete = (c1, seq2)
+
+                local.sort(key=lambda x: x[0])
+                keep_k = min(len(local), (bw + endgame_widen_by) if endgame else 6)
+                top_cost = local[:keep_k]
+                top_regret = sorted(local, key=lambda x: (-x[1], x[0]))[:min(diversity_quota, len(local))]
+                cand = top_cost + top_regret
+
+                for score, rg, c1, seq2, rem2 in cand:
+                    sig = tuple(seq2[-3:]) if len(seq2) >= 3 else tuple(seq2)
+                    if sig in suffix_seen:
+                        continue
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, seq2, rem2))
+
+            if not next_pool:
+                break
+
+            next_pool.sort(key=lambda x: x[0])
+            pruned = []
+            seen_prefixes = set()
+            local_bw = bw
+            if next_pool:
+                min_rem = min(len(r) for _, _, r in next_pool)
+                if min_rem <= endgame_widen_by * bw:
+                    local_bw = min(len(next_pool), bw + endgame_widen_by)
+            for c1, seq, rem in next_pool:
+                key = tuple(seq)
+                if key in seen_prefixes:
+                    continue
+                seen_prefixes.add(key)
+                pruned.append((c1, seq, rem))
+                if len(pruned) >= local_bw:
+                    break
+            beam = pruned
+
+        # return best complete if any
+        for c, seq, rem in beam:
+            if not rem and c < best_complete[0]:
+                best_complete = (c, seq)
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # otherwise greedy complete from best partial
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_c = None, float('inf')
+                for t in rem_list:
+                    c2 = ctx.eval_cost(cur + [t])
+                    if c2 < best_c:
+                        best_c, best_t = c2, t
+                cur.append(best_t)
+                rem_list.remove(best_t)
+            return ctx.eval_cost(cur), cur
+
+        # fallback
+        ident = list(range(n))
+        return ctx.eval_cost(ident), ident
+=======
+    def beam_search():
+        bw = beam_width
+        diversity_quota = max(1, int(diversity_quota_ratio * bw))
+        ENDGAME_K = 8  # bounded enumeration when remaining <= K
+        TIME_BUDGET = 0.03
+
+        # initialize with top singletons and one GRASP seed
+        starters = [(ctx.eval_cost([t]), [t]) for t in all_txns]
+        starters.sort(key=lambda x: x[0])
+        init_pool = starters[:min(len(starters), max(bw * 2, bw + 2))]
+        c0, s0 = construct_grasp_regret()
+        init_pool.append((c0, s0))
+
+        beam = []
+        used = set()
+        for c, seq in init_pool:
+            k = tuple(seq)
+            if k in used:
+                continue
+            used.add(k)
+            rem = frozenset(t for t in all_txns if t not in seq)
+            beam.append((c, seq, rem))
+            if len(beam) >= bw:
+                break
+
+        best_complete = (float('inf'), [])
+
+        # helper: bounded finish via DFS using best-insertion at each step
+        def bounded_finish(prefix, rem_set):
+            start_t = time.time()
+
+            # greedy upper bound using best-insertion
+            def greedy_complete(prefix, rem_list):
+                cur = list(prefix)
+                rem = list(rem_list)
+                while rem:
+                    best_t, best_p, best_c = None, 0, float('inf')
+                    for t in rem:
+                        c_ins, p_ins, _ = ctx.best_two_insertions(cur, t, force_all=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                        if c_ins < best_c:
+                            best_c, best_t, best_p = c_ins, t, p_ins
+                    cur.insert(best_p, best_t)
+                    rem.remove(best_t)
+                return ctx.eval_cost(cur), cur
+
+            ub_cost, ub_seq = greedy_complete(prefix, list(rem_set))
+            best_cost_local = ub_cost
+            best_seq_local = ub_seq
+
+            cache = {}
+
+            def dfs(cur_seq, rem_fs):
+                nonlocal best_cost_local, best_seq_local
+                if time.time() - start_t > TIME_BUDGET:
+                    return
+                if not rem_fs:
+                    c = ctx.eval_cost(cur_seq)
+                    if c < best_cost_local:
+                        best_cost_local, best_seq_local = c, list(cur_seq)
+                    return
+                key = (tuple(cur_seq), rem_fs)
+                if cache.get(key, float('inf')) <= best_cost_local + 1e-12:
+                    return
+                cache[key] = best_cost_local
+
+                # order candidates by best-insertion cost
+                order = []
+                for t in rem_fs:
+                    c_ins, p_ins, _ = ctx.best_two_insertions(cur_seq, t, force_all=(len(cur_seq) <= EXHAUSTIVE_THRESHOLD))
+                    order.append((c_ins, p_ins, t))
+                order.sort(key=lambda x: x[0])
+
+                for c_ins, p_ins, t in order:
+                    if c_ins >= best_cost_local - 1e-12:
+                        continue
+                    nxt = cur_seq[:]
+                    nxt.insert(p_ins, t)
+                    dfs(nxt, frozenset(x for x in rem_fs if x != t))
+
+            dfs(list(prefix), frozenset(rem_set))
+            return best_cost_local, best_seq_local
+
+        for _depth in range(1, n + 1):
+            if not beam:
+                break
+            next_pool = []
+            suffix_seen = set()
+            # endgame detection
+            min_remaining = min((len(rem) for (_, _, rem) in beam), default=n)
+            endgame = min_remaining <= 2 * bw
+
+            for c_so_far, prefix, rem in beam:
+                if not rem:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    continue
+
+                rem_list = list(rem)
+                expand_list = rem_list if len(rem_list) <= cand_per_state else random.sample(rem_list, cand_per_state)
+
+                # compute immediate best-insertion + dispersion via second-step (also best-insertion)
+                prelim = []
+                spans = []
+                for t in expand_list:
+                    c1, p1, c1_second = ctx.best_two_insertions(prefix, t, force_all=(len(prefix) <= EXHAUSTIVE_THRESHOLD))
+                    seq1 = prefix[:]
+                    seq1.insert(p1, t)
+                    rem_after = [x for x in rem_list if x != t]
+
+                    best_c2 = c1
+                    second_costs = []
+                    if rem_after:
+                        k2 = len(rem_after) if (endgame and len(rem_after) <= 10) else min(lookahead_k, len(rem_after))
+                        candidates2 = rem_after if k2 == len(rem_after) else random.sample(rem_after, k2)
+                        best_c2 = float('inf')
+                        for u in candidates2:
+                            cu, pu, _ = ctx.best_two_insertions(seq1, u, force_all=False)
+                            second_costs.append(cu)
+                            if cu < best_c2:
+                                best_c2 = cu
+                    span = (max(second_costs) - min(second_costs)) if len(second_costs) >= 2 else 0.0
+                    spans.append(span)
+                    prelim.append((c1, c1_second, best_c2, span, seq1, frozenset(rem_after)))
+
+                if not prelim:
+                    continue
+
+                spans_sorted = sorted(spans)
+                median_span = spans_sorted[len(spans_sorted) // 2] if spans_sorted else 0.0
+
+                local = []
+                for c1, c1_second, best_c2, span, seq2, rem2 in prelim:
+                    alpha = 0.5 if span > median_span else 0.8  # more lookahead under dispersion
+                    score = alpha * c1 + (1.0 - alpha) * best_c2
+                    regret = 0.5 * max(0.0, c1_second - c1) + 0.5 * span
+                    local.append((score, regret, c1, seq2, rem2))
+                    if len(seq2) == n and c1 < best_complete[0]:
+                        best_complete = (c1, seq2)
+
+                local.sort(key=lambda x: x[0])
+                keep_k = min(len(local), (bw + endgame_widen_by) if endgame else 6)
+                top_cost = local[:keep_k]
+                top_regret = sorted(local, key=lambda x: (-x[1], x[0]))[:min(diversity_quota, len(local))]
+                cand = top_cost + top_regret
+
+                for score, rg, c1, seq2, rem2 in cand:
+                    sig = tuple(seq2[-3:]) if len(seq2) >= 3 else tuple(seq2)
+                    if sig in suffix_seen:
+                        continue
+                    suffix_seen.add(sig)
+                    next_pool.append((c1, seq2, rem2))
+
+            if not next_pool:
+                break
+
+            next_pool.sort(key=lambda x: x[0])
+            pruned = []
+            seen_prefixes = set()
+            local_bw = bw
+            if next_pool:
+                min_rem = min(len(r) for _, _, r in next_pool)
+                if min_rem <= endgame_widen_by * bw:
+                    local_bw = min(len(next_pool), bw + endgame_widen_by)
+            for c1, seq, rem in next_pool:
+                key = tuple(seq)
+                if key in seen_prefixes:
+                    continue
+                seen_prefixes.add(key)
+                pruned.append((c1, seq, rem))
+                if len(pruned) >= local_bw:
+                    break
+            beam = pruned
+
+        # return best complete if any
+        for c, seq, rem in beam:
+            if not rem and c < best_complete[0]:
+                best_complete = (c, seq)
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # otherwise complete from best partial: prefer endgame DFS, else greedy best-insertion
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            if len(rem) <= ENDGAME_K:
+                return bounded_finish(seq, rem)
+            # greedy completion by best-insertion
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_p, best_c = None, 0, float('inf')
+                for t in rem_list:
+                    c_ins, p_ins, _ = ctx.best_two_insertions(cur, t, force_all=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                    if c_ins < best_c:
+                        best_c, best_t, best_p = c_ins, t, p_ins
+                cur.insert(best_p, best_t)
+                rem_list.remove(best_t)
+            return ctx.eval_cost(cur), cur
+
+        # fallback
+        ident = list(range(n))
+        return ctx.eval_cost(ident), ident
+>>>>>>> REPLACE
+</DIFF>

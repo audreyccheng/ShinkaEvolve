@@ -1,0 +1,539 @@
+--- a/original.py
++++ b/original.py
+@@ -1,452 +1,482 @@
+ # EVOLVE-BLOCK-START
+ """
+ Expert parallelism load balancer (EPLB) for vLLM.
+ 
+ This module implements the core rearrangement algorithm using
+ Chunked Sorted Greedy packing and Binary Search based replication.
+ """
+ 
+ import torch
+ 
+ 
+ def _refine_packing(weights: torch.Tensor,
+                     pack_ids: torch.Tensor,
+                     ranks: torch.Tensor,
+                     num_packs: int,
+                     num_iters: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+     """
+-    Refines the packing by attempting to swap a single item between the heaviest
+-    and lightest packs in each layer.
++    Refines the packing by iteratively repacking the heaviest and lightest packs
++    using a localized LPT Greedy strategy (Destruct-Reconstruct).
+     """
+     batch_size, num_items = weights.shape
+     device = weights.device
++    capacity = num_items // num_packs
+     batch_indices = torch.arange(batch_size, device=device)
+-    inf = torch.tensor(float('inf'), device=device, dtype=weights.dtype)
+ 
+     # Track loads
+     pack_loads = torch.zeros(batch_size, num_packs, device=device, dtype=weights.dtype)
+     pack_loads.scatter_add_(1, pack_ids, weights)
+ 
+     for _ in range(num_iters):
+-        max_load, max_pack_idx = pack_loads.max(dim=1)
+-        min_load, min_pack_idx = pack_loads.min(dim=1)
+-        curr_diff = max_load - min_load
+-
+-        # Mask items in max/min packs
+-        in_max = (pack_ids == max_pack_idx.unsqueeze(1))
+-        in_min = (pack_ids == min_pack_idx.unsqueeze(1))
+-
+-        # w[b,i] - w[b,j]
+-        w_diff = weights.unsqueeze(2) - weights.unsqueeze(1)
+-
+-        # Metric: |curr_diff - 2*(wi - wj)|
+-        metric = torch.abs(curr_diff.view(-1, 1, 1) - 2 * w_diff)
+-
+-        # Valid mask
+-        valid = in_max.unsqueeze(2) & in_min.unsqueeze(1)
+-        metric = torch.where(valid, metric, inf)
+-
+-        # Best swap
+-        best_val, best_flat_idx = metric.view(batch_size, -1).min(dim=1)
+-
+-        improve = best_val < curr_diff
+-        if not improve.any():
++        # Identify heaviest and lightest packs
++        max_load, max_pack = pack_loads.max(dim=1)
++        min_load, min_pack = pack_loads.min(dim=1)
++
++        # Termination check
++        if (max_load - min_load).max() < 1e-4:
+             break
+ 
+-        active_b = batch_indices[improve]
+-        active_idx = best_flat_idx[improve]
+-
+-        i_idx = active_idx // num_items
+-        j_idx = active_idx % num_items
+-
+-        # Apply swap
+-        p_max = max_pack_idx[active_b]
+-        p_min = min_pack_idx[active_b]
+-
+-        # IDs
+-        pack_ids[active_b, i_idx] = p_min
+-        pack_ids[active_b, j_idx] = p_max
+-
+-        # Ranks
+-        r_i = ranks[active_b, i_idx]
+-        r_j = ranks[active_b, j_idx]
+-        ranks[active_b, i_idx] = r_j
+-        ranks[active_b, j_idx] = r_i
+-
+-        # Loads
+-        w_i = weights[active_b, i_idx]
+-        w_j = weights[active_b, j_idx]
+-        delta = w_i - w_j
+-        pack_loads[active_b, p_max] -= delta
+-        pack_loads[active_b, p_min] += delta
++        # Mask items in these two packs [B, N]
++        mask_max = (pack_ids == max_pack.unsqueeze(1))
++        mask_min = (pack_ids == min_pack.unsqueeze(1))
++        mask_active = mask_max | mask_min
++
++        # Weights of active items, others set to -1 for sorting
++        active_weights = torch.where(mask_active, weights, torch.tensor(-1.0, device=device, dtype=weights.dtype))
++
++        # Sort active items descending [B, N]
++        sorted_w, sorted_idx = active_weights.sort(dim=1, descending=True)
++
++        # Number of active items per batch
++        num_active = mask_active.sum(dim=1)
++        max_active_items = int(num_active.max().item())
++
++        # Temporary loads/counts for reconstruction
++        l_max = torch.zeros(batch_size, device=device, dtype=weights.dtype)
++        l_min = torch.zeros(batch_size, device=device, dtype=weights.dtype)
++        c_max = torch.zeros(batch_size, device=device, dtype=torch.int64)
++        c_min = torch.zeros(batch_size, device=device, dtype=torch.int64)
++
++        # Greedy allocation loop
++        for k in range(max_active_items):
++            w = sorted_w[:, k]
++
++            # Active batches for this column (k < num_active)
++            active_mask = k < num_active
++            if not active_mask.any():
++                break
++
++            # Decide placement: Try to balance loads
++            # Prefer Min if it has lower load and capacity
++            go_to_min = (l_min < l_max) & (c_min < capacity)
++            # If Max is full, forced to Min
++            go_to_min = go_to_min | (c_max >= capacity)
++
++            # Determine target
++            target_pack = torch.where(go_to_min, min_pack, max_pack)
++            target_rank = torch.where(go_to_min, c_min, c_max)
++
++            # Update global state for active batches
++            orig_item_idx = sorted_idx[:, k]
++
++            # We use scatter to update only the specific items
++            # Need [B, 1] index and src
++            idx_view = orig_item_idx.unsqueeze(1)
++
++            # Update IDs
++            # Implementation: gather old, merge, scatter back.
++
++            old_pid = pack_ids.gather(1, idx_view).squeeze(1)
++            old_rank = ranks.gather(1, idx_view).squeeze(1)
++
++            new_pid_val = torch.where(active_mask, target_pack, old_pid)
++            new_rank_val = torch.where(active_mask, target_rank, old_rank)
++
++            pack_ids.scatter_(1, idx_view, new_pid_val.unsqueeze(1))
++            ranks.scatter_(1, idx_view, new_rank_val.unsqueeze(1))
++
++            # Update local accumulators
++            # Mask weight: if not active, w is -1, we shouldn't add it.
++            w_masked = torch.where(active_mask, w, torch.tensor(0.0, device=device, dtype=weights.dtype))
++
++            l_min = torch.where(go_to_min, l_min + w_masked, l_min)
++            c_min = torch.where(go_to_min, c_min + 1, c_min)
++
++            l_max = torch.where(~go_to_min, l_max + w_masked, l_max)
++            c_max = torch.where(~go_to_min, c_max + 1, c_max)
++
++        # Update global pack loads
++        pack_loads.scatter_(1, min_pack.unsqueeze(1), l_min.unsqueeze(1))
++        pack_loads.scatter_(1, max_pack.unsqueeze(1), l_max.unsqueeze(1))
+ 
+     return pack_ids, ranks
+ 
+ 
+ def balanced_packing(weight: torch.Tensor,
+                      num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+     """
+     Pack n weighted objects to m packs using a Massive Parallel Ensemble strategy.
+ 
+     Includes:
+     - LPT (Sorted Descending)
+     - ZigZag (Interleaved Sorted)
+     - Random Shuffle (Random Order)
+     - Noisy LPT (Perturbed Weights)
+ 
+-    Followed by local search refinement on the best candidate.
++    Followed by Destruct-Reconstruct refinement on the best candidate.
+     """
+     num_layers, num_items = weight.shape
+     device = weight.device
+     num_candidates = 128
+     capacity = num_items // num_packs
+ 
+     # --- 1. Candidate Generation ---
+     # LPT Base
+     lpt_val, lpt_idx = weight.sort(dim=-1, descending=True)
+ 
+     # ZigZag Base
+     zigzag_perm = torch.empty(num_items, device=device, dtype=torch.long)
+     half = (num_items + 1) // 2
+     arange = torch.arange(num_items, device=device)
+     zigzag_perm[0::2] = arange[:half]
+     zigzag_perm[1::2] = arange[half:].flip(0)
+ 
+     c0_idx = lpt_idx.unsqueeze(1) # LPT
+ 
+     # ZigZag: permute lpt_idx
+     c1_idx = lpt_idx.gather(1, zigzag_perm.view(1, -1).expand(num_layers, -1)).unsqueeze(1)
+ 
+     # Random Shuffles (25% of candidates approx, say 32)
+     num_shuffle = 32
+     rand_keys = torch.randn(num_layers, num_shuffle, num_items, device=device)
+     _, c_shuffle_idx = rand_keys.sort(dim=-1)
+ 
+     # Noisy LPT (Rest)
++    # Tighter noise range [0.9, 1.1] to preserve LPT structure better
+     num_noisy = num_candidates - 2 - num_shuffle
+-    noise = torch.rand(num_layers, num_noisy, num_items, device=device) * 0.4 + 0.8
++    noise = torch.rand(num_layers, num_noisy, num_items, device=device) * 0.2 + 0.9
+     noisy_w = weight.unsqueeze(1) * noise
+     _, c_noisy_idx = noisy_w.sort(dim=-1, descending=True)
+ 
+     # Combine
+     all_indices = torch.cat([c0_idx, c1_idx, c_shuffle_idx, c_noisy_idx], dim=1)
+ 
+     # Gather actual weights
+     # [L, C, N]
+     expanded_weight = weight.unsqueeze(1).expand(-1, num_candidates, -1)
+     ordered_weights = expanded_weight.gather(2, all_indices)
+ 
+     # --- 2. Vectorized Greedy Packing ---
+     batch_size = num_layers * num_candidates
+     flat_weights = ordered_weights.view(batch_size, num_items)
+ 
+     pack_loads = torch.zeros(batch_size, num_packs, device=device, dtype=weight.dtype)
+     pack_counts = torch.zeros(batch_size, num_packs, device=device, dtype=torch.int64)
+     flat_assigned_packs = torch.empty(batch_size, num_items, device=device, dtype=torch.int64)
+     flat_assigned_ranks = torch.empty(batch_size, num_items, device=device, dtype=torch.int64)
+ 
+     batch_range = torch.arange(batch_size, device=device)
+     inf = torch.tensor(float('inf'), device=device, dtype=weight.dtype)
+ 
+     for i in range(num_items):
+         w = flat_weights[:, i]
+         valid_mask = pack_counts < capacity
+         temp_loads = torch.where(valid_mask, pack_loads, inf)
+         chosen_pack = temp_loads.argmin(dim=1)
+ 
+         flat_assigned_packs[:, i] = chosen_pack
+         flat_assigned_ranks[:, i] = pack_counts[batch_range, chosen_pack]
+ 
+         pack_loads[batch_range, chosen_pack] += w
+         pack_counts[batch_range, chosen_pack] += 1
+ 
+     # --- 3. Selection ---
+     loads = pack_loads.view(num_layers, num_candidates, num_packs)
+     imbalance = loads.max(dim=-1).values - loads.min(dim=-1).values
+     best_candidate_idx = imbalance.argmin(dim=1)
+ 
+     def gather_best(tensor_lcn, best_idx_l):
+         idx_expanded = best_idx_l.view(num_layers, 1, 1).expand(-1, 1, num_items)
+         return tensor_lcn.gather(1, idx_expanded).squeeze(1)
+ 
+     # Get the packing configuration of the best candidate
+     # These are in the *sorted/permuted* order of that candidate
+     final_ordered_indices = gather_best(all_indices, best_candidate_idx)
+     final_packs_ordered = gather_best(flat_assigned_packs.view(num_layers, num_candidates, num_items), best_candidate_idx)
+     final_ranks_ordered = gather_best(flat_assigned_ranks.view(num_layers, num_candidates, num_items), best_candidate_idx)
+ 
+     # Scatter back to original item order
+     # pack_index[l, original_idx] = pack_id
+     pack_index = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+     rank_in_pack = torch.empty(num_layers, num_items, device=device, dtype=torch.int64)
+ 
+     pack_index.scatter_(1, final_ordered_indices, final_packs_ordered)
+     rank_in_pack.scatter_(1, final_ordered_indices, final_ranks_ordered)
+ 
+     # --- 4. Refinement ---
+     # Apply refinement on the best selected packing
+     # We pass 'weight' which is in original order, matching pack_index
+     pack_index, rank_in_pack = _refine_packing(weight, pack_index, rank_in_pack, num_packs, num_iters=5)
+ 
+     return pack_index, rank_in_pack
+ 
+ 
+ def replicate_experts(
+         weight: torch.Tensor,
+         num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Replicate experts using Binary Search on Max Load followed by Greedy Refinement.
+ 
+     Finds a capacity threshold T such that sum(ceil(w/T)) is close to num_phy,
+     then adjusts counts to exactly num_phy minimizing the max load density.
+     """
+     num_layers, num_log = weight.shape
+     device = weight.device
+ 
+     # Trivial case
+     if num_phy == num_log:
+         phy2log = torch.arange(num_log, device=device).expand(num_layers, -1)
+         rank = torch.zeros(num_layers, num_phy, dtype=torch.int64, device=device)
+         logcnt = torch.ones(num_layers, num_log, dtype=torch.int64, device=device)
+         return phy2log, rank, logcnt
+ 
+     # Binary Search for optimal max load threshold
+     # Lower bound: average load per physical slot
+     low = weight.sum(dim=-1, keepdim=True) / num_phy
+     # Upper bound: max weight (since min replica count is 1)
+     high = weight.max(dim=-1, keepdim=True).values
+ 
+     # Ensure low > 0
+     low = torch.max(low, torch.tensor(1e-6, device=device))
+ 
+     # 15 iterations provide sufficient precision for integer allocation
+     for _ in range(15):
+         mid = (low + high) * 0.5
+         # Calculate required replicas for this threshold
+         counts = torch.ceil(weight / mid)
+         total = counts.sum(dim=-1, keepdim=True)
+ 
+         # If we fit within num_phy, try to lower the threshold (tighten)
+         mask = total <= num_phy
+         high = torch.where(mask, mid, high)
+         low = torch.where(mask, low, mid)
+ 
+     # Initial counts using the feasible threshold
+     logcnt = torch.ceil(weight / high).long().clamp(min=1)
+ 
+     # Correct sum to equal num_phy
+     current_sum = logcnt.sum(dim=-1)
+     diff = num_phy - current_sum
+ 
+     # Handle under-allocation (sum < num_phy): Add to experts with highest load density
+     max_diff = int(diff.max().item())
+     if max_diff > 0:
+         rows = torch.arange(num_layers, device=device)
+         for _ in range(max_diff):
+             active = current_sum < num_phy
+             if not active.any(): break
+ 
+             # Density = weight / count
+             density = weight / logcnt.float()
+ 
+             # Pick expert with max density
+             target_idx = density.argmax(dim=-1)
+ 
+             # Update active rows
+             mask_indices = rows[active]
+             mask_targets = target_idx[active]
+ 
+             logcnt.index_put_((mask_indices, mask_targets),
+                               torch.tensor(1, device=device, dtype=torch.int64),
+                               accumulate=True)
+             current_sum[active] += 1
+ 
+     # Handle over-allocation (sum > num_phy): Remove from experts with lowest cost
+     # Cost = New Load = weight / (count - 1). We want minimum new load.
+     min_diff = int(diff.min().item())
+     if min_diff < 0:
+         rows = torch.arange(num_layers, device=device)
+         for _ in range(abs(min_diff)):
+             active = current_sum > num_phy
+             if not active.any(): break
+ 
+             # Only consider experts with > 1 replica
+             valid = logcnt > 1
+             cost = weight / (logcnt - 1).float()
+             cost[~valid] = float('inf')
+ 
+             target_idx = cost.argmin(dim=-1)
+ 
+             mask_indices = rows[active]
+             mask_targets = target_idx[active]
+ 
+             logcnt.index_put_((mask_indices, mask_targets),
+                               torch.tensor(-1, device=device, dtype=torch.int64),
+                               accumulate=True)
+             current_sum[active] -= 1
+ 
+     # Construct physical to logical map
+     flat_log_ids = torch.arange(num_log, device=device).repeat(num_layers)
+     flat_counts = logcnt.flatten()
+ 
+     flat_phy2log = torch.repeat_interleave(flat_log_ids, flat_counts)
+ 
+     # Reshape
+     # If sizes mismatch due to weird edge cases, we safeguard, though logic implies exact match
+     target_size = num_layers * num_phy
+     if flat_phy2log.numel() != target_size:
+         if flat_phy2log.numel() < target_size:
+             flat_phy2log = torch.cat([flat_phy2log, torch.zeros(target_size - flat_phy2log.numel(), device=device, dtype=torch.long)])
+         else:
+             flat_phy2log = flat_phy2log[:target_size]
+ 
+     phy2log = flat_phy2log.view(num_layers, num_phy)
+ 
+     # Calculate ranks
+     # Rank is the 0-based index of a replica for a specific logical expert
+     offsets = torch.zeros_like(logcnt)
+     offsets[:, 1:] = logcnt[:, :-1].cumsum(dim=1)
+ 
+     mapped_offsets = offsets.gather(1, phy2log)
+     phy_indices = torch.arange(num_phy, device=device).expand(num_layers, -1)
+ 
+     rank = phy_indices - mapped_offsets
+ 
+     return phy2log, rank, logcnt
+ 
+ 
+ def rebalance_experts_hierarchical(
+     weight: torch.Tensor,
+     num_physical_experts: int,
+     num_groups: int,
+     num_nodes: int,
+     num_gpus: int,
+ ):
+     """
+     Hierarchical rebalancing using the optimized packing and replication strategies.
+     """
+     num_layers, num_logical_experts = weight.shape
+     group_size = num_logical_experts // num_groups
+     groups_per_node = num_groups // num_nodes
+     phy_experts_per_gpu = num_physical_experts // num_gpus
+ 
+     def inverse(perm: torch.Tensor) -> torch.Tensor:
+         inv = torch.empty_like(perm)
+         inv.scatter_(
+             1,
+             perm,
+             torch.arange(perm.size(1), dtype=torch.int64,
+                          device=perm.device).expand(perm.shape),
+         )
+         return inv
+ 
+     # Step 1: Pack groups to nodes
+     tokens_per_group = weight.unflatten(-1, (num_groups, group_size)).sum(-1)
+     group_pack_index, group_rank_in_pack = balanced_packing(
+         tokens_per_group, num_nodes)
+ 
+     log2mlog = (((group_pack_index * groups_per_node + group_rank_in_pack) *
+                  group_size).unsqueeze(-1) +
+                 torch.arange(group_size,
+                              dtype=torch.int64,
+                              device=group_pack_index.device)).flatten(-2)
+     mlog2log = inverse(log2mlog)
+ 
+     # Step 2: Replicate experts within nodes
+     tokens_per_mlog = weight.gather(-1, mlog2log).view(
+         -1, num_logical_experts // num_nodes)
+     phy2mlog, phyrank, mlogcnt = replicate_experts(
+         tokens_per_mlog, num_physical_experts // num_nodes)
+ 
+     # Step 3: Pack physical experts to GPUs
+     # Load per replica is approximated as total_weight / count
+     tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+     pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                 num_gpus // num_nodes)
+ 
+     phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+     pphy2phy = inverse(phy2pphy)
+ 
+     # Map back to original logical IDs
+     pphy2mlog = phy2mlog.gather(-1, pphy2phy)
+ 
+     node_offsets = torch.arange(
+         0,
+         num_logical_experts,
+         num_logical_experts // num_nodes,
+         device=weight.device,
+     ).view(1, -1, 1)
+ 
+     pphy2mlog_restored = (pphy2mlog.view(num_layers, num_nodes, -1) + node_offsets).flatten(-2)
+ 
+     pphy2log = mlog2log.gather(-1, pphy2mlog_restored)
+     pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+     logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+ 
+     return pphy2log, pphyrank, logcnt
+ 
+ 
+ def rebalance_experts(
+     weight: torch.Tensor,
+     num_replicas: int,
+     num_groups: int,
+     num_nodes: int,
+     num_gpus: int,
+ ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+     """
+     Entry point for expert-parallelism load balancer.
+     """
+     num_layers, num_logical_experts = weight.shape
+     # Ensure CPU computation for algorithmic stability and memory
+     weight = weight.float().cpu()
+ 
+     if num_groups % num_nodes == 0:
+         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+             weight, num_replicas, num_groups, num_nodes, num_gpus)
+     else:
+         # Fallback to global policy if groups not divisible by nodes
+         phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+             weight, num_replicas, 1, 1, num_gpus)
+ 
+     # Construct log2phy map [layers, logical_experts, max_replicas]
+     max_replicas = int(logcnt.max().item())
+ 
+     log2phy = torch.full(
+         (num_layers, num_logical_experts, max_replicas),
+         -1,
+         dtype=torch.int64,
+         device=logcnt.device,
+     )
+ 
+     # Optimized scatter for log2phy
+     # Flat indices calculation
+     flat_layer_idx = torch.arange(num_layers, device=logcnt.device).unsqueeze(-1).expand(-1, num_replicas).flatten()
+     flat_log_idx = phy2log.flatten()
+     flat_rank_idx = phyrank.flatten()
+     flat_phy_ids = torch.arange(num_replicas, dtype=torch.int64, device=logcnt.device).expand(num_layers, -1).flatten()
+ 
+     # Map to flat index of log2phy
+     # Index = layer * (num_logical * max_rep) + logical * max_rep + rank
+     flat_indices = (flat_layer_idx * num_logical_experts * max_replicas) + \
+                    (flat_log_idx * max_replicas) + \
+                    flat_rank_idx
+ 
+     # Scatter
+     log2phy.view(-1).scatter_(0, flat_indices, flat_phy_ids)
+ 
+     return phy2log, log2phy, logcnt
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_eplb(weight: torch.Tensor, num_replicas: int, num_groups: int,
+              num_nodes: int, num_gpus: int):
+     """Run the expert parallelism load balancer"""
+     phy2log, log2phy, logcnt = rebalance_experts(
+         weight, num_replicas, num_groups, num_nodes, num_gpus
+     )
+     return phy2log, log2phy, logcnt
+ 
+ 
+ __all__ = ["rebalance_experts", "run_eplb"]

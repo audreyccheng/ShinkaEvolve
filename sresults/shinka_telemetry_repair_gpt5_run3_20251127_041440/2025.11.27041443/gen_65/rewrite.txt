@@ -1,0 +1,488 @@
+# EVOLVE-BLOCK-START
+"""
+IRLS global projections: solve telemetry repair as a global weighted least-squares
+under hard invariants via alternating projections (POCS) with robust reweighting.
+
+Key ideas:
+- Variables: per-interface tx and rx
+- Hard constraints:
+  - Link symmetry (my_tx = their_rx, their_tx = my_rx)
+  - Router flow conservation (sum tx = sum rx at each router)
+  - Status and non-negativity (down => zeros; all rates >= 0)
+- Objective: stay close to observed counters (weighted L2), with robust IRLS weights
+  derived from redundancy residuals (link symmetry).
+- Solver: iterate weighted projections onto constraints until convergence.
+
+Confidence reflects:
+- Final link symmetry agreement
+- Change magnitude from original
+- Router imbalance after projection
+- Redundancy improvement (pre vs post residuals)
+"""
+from typing import Dict, Any, Tuple, List
+import math
+
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Numeric helpers
+    EPS = 1e-9
+    ZERO_THRESH = 0.1  # Mbps considered near-zero baseline
+    TAU_H = 0.02       # target symmetry tolerance for confidence use
+
+    def safe_rate(x: Any) -> float:
+        try:
+            v = float(x)
+            if not math.isfinite(v) or v < 0:
+                return 0.0
+            return v
+        except Exception:
+            return 0.0
+
+    def clamp01(x: float) -> float:
+        return 0.0 if x < 0.0 else 1.0 if x > 1.0 else x
+
+    def rel_diff(a: float, b: float) -> float:
+        m = max(abs(a), abs(b), 1.0)
+        return abs(a - b) / m
+
+    # Build peer mapping
+    peers: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        peer = data.get("connected_to")
+        if isinstance(peer, str) and peer in telemetry:
+            peers[if_id] = peer
+
+    # Build router->interfaces from topology; fallback to local_router to ensure completeness
+    router_ifaces: Dict[str, List[str]] = {}
+    for r, if_list in topology.items():
+        router_ifaces.setdefault(r, [])
+        for i in if_list:
+            if i in telemetry:
+                router_ifaces[r].append(i)
+    for if_id, data in telemetry.items():
+        r = data.get("local_router")
+        if not isinstance(r, str):
+            r = f"unknown_router::{if_id}"
+        router_ifaces.setdefault(r, [])
+        if if_id not in router_ifaces[r]:
+            router_ifaces[r].append(if_id)
+
+    # Reverse map interface -> router
+    router_of: Dict[str, str] = {}
+    for r, ifs in router_ifaces.items():
+        for i in ifs:
+            router_of[i] = r
+
+    # Prepare originals, status
+    orig_tx: Dict[str, float] = {}
+    orig_rx: Dict[str, float] = {}
+    status: Dict[str, str] = {}
+    for if_id, data in telemetry.items():
+        orig_tx[if_id] = safe_rate(data.get("tx_rate", 0.0))
+        orig_rx[if_id] = safe_rate(data.get("rx_rate", 0.0))
+        s = data.get("interface_status", "unknown")
+        status[if_id] = s if s in ("up", "down") else "unknown"
+
+    # Initialize working variables with observed values
+    tx: Dict[str, float] = {i: orig_tx[i] for i in telemetry}
+    rx: Dict[str, float] = {i: orig_rx[i] for i in telemetry}
+
+    # Enforce initial down constraints: down implies zero counters
+    for i in telemetry.keys():
+        if status.get(i) == "down":
+            tx[i] = 0.0
+            rx[i] = 0.0
+
+    # IRLS weights (trust of staying at current values during projections)
+    w_tx: Dict[str, float] = {i: 1.0 for i in telemetry}
+    w_rx: Dict[str, float] = {i: 1.0 for i in telemetry}
+
+    # Pre-fusion mismatches (for confidence improvement credit)
+    pre_mismatch_tx: Dict[str, float] = {}
+    pre_mismatch_rx: Dict[str, float] = {}
+    for i, data in telemetry.items():
+        p = peers.get(i)
+        if p:
+            pre_mismatch_tx[i] = rel_diff(orig_tx[i], orig_rx.get(p, 0.0))
+            pre_mismatch_rx[i] = rel_diff(orig_rx[i], orig_tx.get(p, 0.0))
+        else:
+            pre_mismatch_tx[i] = 0.4
+            pre_mismatch_rx[i] = 0.4
+
+    # Router-aware near-zero thresholds
+    def router_thresholds(cur_tx: Dict[str, float], cur_rx: Dict[str, float]) -> Dict[str, float]:
+        thr: Dict[str, float] = {}
+        for r, ifs in router_ifaces.items():
+            stx = sum(cur_tx.get(i, 0.0) for i in ifs)
+            srx = sum(cur_rx.get(i, 0.0) for i in ifs)
+            thr[r] = max(ZERO_THRESH, 0.002 * (stx + srx))
+        return thr
+
+    # Main IRLS + alternating projections loop
+    MAX_ITERS = 10
+    RELAX_ROUTER = 0.9  # use 90% of the exact Lagrange update to damp oscillations
+
+    for _ in range(MAX_ITERS):
+        # 1) Update robust weights from link residuals and status
+        # Huber-like: weight = 1 / (1 + (res/k)^2), k adapts with rate magnitude
+        for i in telemetry.keys():
+            s = status.get(i, "unknown")
+            p = peers.get(i)
+            # Base weights
+            wti = 1.0
+            wri = 1.0
+            if s == "down":
+                # Strongly anchor down interfaces at zero
+                wti = 5.0
+                wri = 5.0
+            else:
+                if p and p in telemetry:
+                    # Residuals for redundancy
+                    mis_tx = rel_diff(tx.get(i, 0.0), rx.get(p, 0.0))
+                    mis_rx = rel_diff(rx.get(i, 0.0), tx.get(p, 0.0))
+                    # Scale k with magnitude (stricter when high rate)
+                    mag_tx = max(tx.get(i, 0.0), rx.get(p, 0.0), 1.0)
+                    mag_rx = max(rx.get(i, 0.0), tx.get(p, 0.0), 1.0)
+                    k_tx = 0.05 if mag_tx > 100.0 else 0.08
+                    k_rx = 0.05 if mag_rx > 100.0 else 0.08
+                    wti = 1.0 / (1.0 + (mis_tx / max(k_tx, EPS)) ** 2)
+                    wri = 1.0 / (1.0 + (mis_rx / max(k_rx, EPS)) ** 2)
+                else:
+                    # No peer redundancy -> moderate trust, let router projection shape it
+                    wti, wri = 0.8, 0.8
+
+                # Very small magnitudes: reduce weight slightly to let router conservation adjust
+                if max(tx.get(i, 0.0), rx.get(i, 0.0)) < ZERO_THRESH:
+                    wti *= 0.8
+                    wri *= 0.8
+
+            # Clamp weights
+            w_tx[i] = max(0.2, min(5.0, wti))
+            w_rx[i] = max(0.2, min(5.0, wri))
+
+        # 2) Project onto link symmetry with weighted means
+        processed_pairs = set()
+        for a, data_a in telemetry.items():
+            b = data_a.get("connected_to")
+            if not isinstance(b, str) or b not in telemetry:
+                continue
+            key = tuple(sorted([a, b]))
+            if key in processed_pairs:
+                continue
+            processed_pairs.add(key)
+
+            # If both ends report down: they should already be zeros; skip
+            if status.get(a) == "down" and status.get(b) == "down":
+                tx[a] = 0.0; rx[a] = 0.0
+                tx[b] = 0.0; rx[b] = 0.0
+                continue
+
+            # Direction a->b: enforce tx[a] == rx[b]
+            wa = w_tx.get(a, 1.0)
+            wb = w_rx.get(b, 1.0)
+            denom = wa + wb + EPS
+            v_ab = (wa * tx.get(a, 0.0) + wb * rx.get(b, 0.0)) / denom
+            # Direction b->a: enforce tx[b] == rx[a]
+            wb2 = w_tx.get(b, 1.0)
+            wa2 = w_rx.get(a, 1.0)
+            denom2 = wb2 + wa2 + EPS
+            v_ba = (wb2 * tx.get(b, 0.0) + wa2 * rx.get(a, 0.0)) / denom2
+
+            tx[a] = max(0.0, v_ab)
+            rx[b] = max(0.0, v_ab)
+            tx[b] = max(0.0, v_ba)
+            rx[a] = max(0.0, v_ba)
+
+        # 3) Project onto router flow conservation using weighted Lagrange update
+        # For each router r: minimize sum w_tx*(x-a)^2 + sum w_rx*(y-b)^2 s.t. sum x = sum y
+        # Solution: x_i' = a_i - mu/(2 w_tx[i]), y_i' = b_i + mu/(2 w_rx[i])
+        # with mu = 2*(sum a - sum b) / (sum 1/w_tx + sum 1/w_rx)
+        for r, ifs in router_ifaces.items():
+            if not ifs:
+                continue
+            sum_a = sum(tx.get(i, 0.0) for i in ifs)
+            sum_b = sum(rx.get(i, 0.0) for i in ifs)
+            # If trivially small traffic, skip
+            if max(sum_a, sum_b) < EPS:
+                continue
+            denom = 0.0
+            for i in ifs:
+                denom += 1.0 / max(w_tx.get(i, 1.0), EPS)
+                denom += 1.0 / max(w_rx.get(i, 1.0), EPS)
+            if denom <= EPS:
+                continue
+            mu = 2.0 * (sum_a - sum_b) / denom
+            mu *= RELAX_ROUTER  # damping to reduce oscillations
+
+            for i in ifs:
+                tx_i = tx.get(i, 0.0)
+                rx_i = rx.get(i, 0.0)
+                wti = max(w_tx.get(i, 1.0), EPS)
+                wri = max(w_rx.get(i, 1.0), EPS)
+                # Do not move 'down' interfaces away from zero thanks to large weights; formula handles that
+                tx_new = tx_i - mu / (2.0 * wti)
+                rx_new = rx_i + mu / (2.0 * wri)
+                tx[i] = max(0.0, tx_new)
+                rx[i] = max(0.0, rx_new)
+
+        # 4) Re-apply down constraints and non-negativity
+        for i in telemetry.keys():
+            if status.get(i) == "down":
+                tx[i] = 0.0
+                rx[i] = 0.0
+            else:
+                if tx[i] < 0.0: tx[i] = 0.0
+                if rx[i] < 0.0: rx[i] = 0.0
+
+        # 5) Dynamic soft-zero snapping for tiny, balanced links
+        thr_by_router = router_thresholds(tx, rx)
+        seen = set()
+        for a, data_a in telemetry.items():
+            b = data_a.get("connected_to")
+            if not isinstance(b, str) or b not in telemetry:
+                continue
+            key = tuple(sorted([a, b]))
+            if key in seen:
+                continue
+            seen.add(key)
+            ra = router_of.get(a)
+            rb = router_of.get(b)
+            thr_pair = 1.5 * max(thr_by_router.get(ra, ZERO_THRESH), thr_by_router.get(rb, ZERO_THRESH))
+            if max(tx.get(a, 0.0), rx.get(a, 0.0), tx.get(b, 0.0), rx.get(b, 0.0)) < thr_pair:
+                # Snap to zero if both routers are already near-balanced after projection
+                def router_imbalance_local(rid: str) -> float:
+                    if rid not in router_ifaces:
+                        return 0.0
+                    ifs = router_ifaces[rid]
+                    stx = sum(tx.get(i, 0.0) for i in ifs)
+                    srx = sum(rx.get(i, 0.0) for i in ifs)
+                    return rel_diff(stx, srx)
+                if router_imbalance_local(ra) <= 0.05 and router_imbalance_local(rb) <= 0.05:
+                    tx[a] = rx[a] = 0.0
+                    tx[b] = rx[b] = 0.0
+                    # Increase trust next round for zeros
+                    w_tx[a] = max(w_tx[a], 1.2)
+                    w_rx[a] = max(w_rx[a], 1.2)
+                    w_tx[b] = max(w_tx[b], 1.2)
+                    w_rx[b] = max(w_rx[b], 1.2)
+
+    # Final router imbalance map (should be near zero)
+    router_imb_after: Dict[str, float] = {}
+    for r, ifs in router_ifaces.items():
+        if not ifs:
+            router_imb_after[r] = 0.0
+            continue
+        stx = sum(tx.get(i, 0.0) for i in ifs)
+        srx = sum(rx.get(i, 0.0) for i in ifs)
+        router_imb_after[r] = rel_diff(stx, srx)
+
+    # Post-projection per-direction symmetry residuals
+    post_mismatch_tx: Dict[str, float] = {}
+    post_mismatch_rx: Dict[str, float] = {}
+    for i in telemetry.keys():
+        p = peers.get(i)
+        if p:
+            post_mismatch_tx[i] = rel_diff(tx.get(i, 0.0), rx.get(p, 0.0))
+            post_mismatch_rx[i] = rel_diff(rx.get(i, 0.0), tx.get(p, 0.0))
+        else:
+            post_mismatch_tx[i] = 0.4
+            post_mismatch_rx[i] = 0.4
+
+    # Status repair (symmetry-aware)
+    repaired_status: Dict[str, str] = {}
+    status_conf: Dict[str, float] = {}
+    processed_s = set()
+    for i in telemetry.keys():
+        if i in processed_s:
+            continue
+        p = peers.get(i)
+        s_i = status.get(i, "unknown")
+        if not p:
+            # Isolated: infer up if any traffic, else keep
+            if max(tx.get(i, 0.0), rx.get(i, 0.0)) >= ZERO_THRESH:
+                repaired_status[i] = "up"
+                status_conf[i] = 0.8 if s_i != "up" else 0.95
+            else:
+                repaired_status[i] = s_i
+                status_conf[i] = 0.9
+            processed_s.add(i)
+            continue
+        s_p = status.get(p, "unknown")
+        # If any repaired traffic across link, set both up
+        link_has_traffic = (max(tx.get(i, 0.0), rx.get(i, 0.0), tx.get(p, 0.0), rx.get(p, 0.0)) >= ZERO_THRESH)
+        if s_i == "down" and s_p == "down" and not link_has_traffic:
+            repaired_status[i] = "down"
+            repaired_status[p] = "down"
+            status_conf[i] = 0.98
+            status_conf[p] = 0.98
+        elif link_has_traffic:
+            repaired_status[i] = "up"
+            repaired_status[p] = "up"
+            # Lower confidence if we flipped from any "down"
+            base_c = 0.7 if (s_i != "up" or s_p != "up") else 0.9
+            status_conf[i] = base_c
+            status_conf[p] = base_c
+        else:
+            # No traffic: keep original statuses but with moderate confidence
+            repaired_status[i] = s_i
+            repaired_status[p] = s_p
+            status_conf[i] = 0.8
+            status_conf[p] = 0.8
+        processed_s.add(i)
+        processed_s.add(p)
+
+    # Compose confidences and result
+    result: Dict[str, Dict[str, Tuple]] = {}
+    # Router mean confidence used for light smoothing
+    def router_mean_conf_dir(dir_map: Dict[str, float], direction: str) -> Dict[str, float]:
+        mean_c: Dict[str, float] = {}
+        for r, ifs in router_ifaces.items():
+            cs = [dir_map[i] for i in ifs if i in dir_map]
+            mean_c[r] = sum(cs) / len(cs) if cs else 0.85
+        return mean_c
+
+    # Compute raw confidences per direction
+    tx_conf_raw: Dict[str, float] = {}
+    rx_conf_raw: Dict[str, float] = {}
+    for i in telemetry.keys():
+        r_id = router_of.get(i)
+        # Components
+        pre_tx = pre_mismatch_tx.get(i, 0.4)
+        pre_rx = pre_mismatch_rx.get(i, 0.4)
+        post_tx = post_mismatch_tx.get(i, 0.4)
+        post_rx = post_mismatch_rx.get(i, 0.4)
+        ch_tx = rel_diff(orig_tx.get(i, 0.0), tx.get(i, 0.0))
+        ch_rx = rel_diff(orig_rx.get(i, 0.0), rx.get(i, 0.0))
+        router_ctx = router_imb_after.get(r_id, 0.0)
+
+        # Improvement credit
+        imp_tx = clamp01(pre_tx - post_tx)
+        imp_rx = clamp01(pre_rx - post_rx)
+
+        # Compose
+        conf_tx = clamp01(
+            0.25 * clamp01(1.0 - post_tx) +    # final symmetry
+            0.18 * clamp01(1.0 - ch_tx) +      # small change implies higher confidence
+            0.15 * clamp01(1.0 - min(0.5, router_ctx)) +  # router balanced
+            0.12 * clamp01(1.0 - pre_tx) +     # prior redundancy quality
+            0.10 * imp_tx +                    # improvement credit
+            0.20 * 0.9                         # prior baseline trust
+        )
+        conf_rx = clamp01(
+            0.25 * clamp01(1.0 - post_rx) +
+            0.18 * clamp01(1.0 - ch_rx) +
+            0.15 * clamp01(1.0 - min(0.5, router_ctx)) +
+            0.12 * clamp01(1.0 - pre_rx) +
+            0.10 * imp_rx +
+            0.20 * 0.9
+        )
+
+        # Status enforcement: down implies counters zero; calibrate confidence accordingly
+        if repaired_status.get(i, status.get(i, "unknown")) == "down":
+            if orig_tx[i] >= ZERO_THRESH or orig_rx[i] >= ZERO_THRESH:
+                conf_tx *= 0.8
+                conf_rx *= 0.8
+            else:
+                conf_tx = max(conf_tx, 0.9)
+                conf_rx = max(conf_rx, 0.9)
+
+        tx_conf_raw[i] = clamp01(conf_tx)
+        rx_conf_raw[i] = clamp01(conf_rx)
+
+    # Final residual-informed touch-up and peer smoothing (purely on confidences)
+    # 70/30 residual-informed, then 10% peer smoothing when both ends are up
+    for i, data in telemetry.items():
+        p = data.get("connected_to")
+        if not isinstance(p, str) or p not in telemetry:
+            continue
+        if repaired_status.get(i, "unknown") != "up" or repaired_status.get(p, "unknown") != "up":
+            continue
+        mis_tx = rel_diff(tx.get(i, 0.0), rx.get(p, 0.0))
+        mis_rx = rel_diff(rx.get(i, 0.0), tx.get(p, 0.0))
+        tx_conf_raw[i] = clamp01(0.70 * tx_conf_raw[i] + 0.30 * clamp01(1.0 - mis_tx))
+        rx_conf_raw[i] = clamp01(0.70 * rx_conf_raw[i] + 0.30 * clamp01(1.0 - mis_rx))
+
+    mean_tx_by_router = router_mean_conf_dir(tx_conf_raw, "tx")
+    mean_rx_by_router = router_mean_conf_dir(rx_conf_raw, "rx")
+
+    # Light router-aware smoothing for stable directions (small change from original)
+    for i in telemetry.keys():
+        r_id = router_of.get(i)
+        # Stable if relative change < 5%
+        if rel_diff(orig_tx.get(i, 0.0), tx.get(i, 0.0)) < 0.05:
+            tx_conf_raw[i] = clamp01(0.85 * tx_conf_raw[i] + 0.15 * clamp01(mean_tx_by_router.get(r_id, tx_conf_raw[i])))
+        if rel_diff(orig_rx.get(i, 0.0), rx.get(i, 0.0)) < 0.05:
+            rx_conf_raw[i] = clamp01(0.85 * rx_conf_raw[i] + 0.15 * clamp01(mean_rx_by_router.get(r_id, rx_conf_raw[i])))
+
+    # Build output with repaired counters and confidences
+    for i, data in telemetry.items():
+        out: Dict[str, Tuple] = {}
+
+        rep_status = repaired_status.get(i, status.get(i, "unknown"))
+        conf_status = status_conf.get(i, 0.9)
+
+        rep_tx = tx.get(i, 0.0)
+        rep_rx = rx.get(i, 0.0)
+
+        # Status enforcement: if down, ensure zeros
+        if rep_status == "down":
+            rep_tx = 0.0
+            rep_rx = 0.0
+
+        out["rx_rate"] = (orig_rx[i], rep_rx, clamp01(rx_conf_raw.get(i, 0.8)))
+        out["tx_rate"] = (orig_tx[i], rep_tx, clamp01(tx_conf_raw.get(i, 0.8)))
+        out["interface_status"] = (status[i], rep_status, conf_status)
+
+        # Copy metadata
+        out["connected_to"] = data.get("connected_to")
+        out["local_router"] = data.get("local_router")
+        out["remote_router"] = data.get("remote_router")
+
+        result[i] = out
+
+    return result
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Minimal sanity test
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,
+            'tx_rate': 100.0,
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+    res = run_repair(test_telemetry, test_topology)
+    for k, v in res.items():
+        print(k, v)
+# EVOLVE-BLOCK-END

@@ -1,0 +1,284 @@
+<NAME>
+broaden_refine_and_adaptive_tail
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements:
+
+1) In CapacityPacker._refine_single_layer, broaden the local refinement search to include donors from the two heaviest packs and receivers from the three lightest packs. For each donor/receiver pack pair, we use the same fast searchsorted partner selection and evaluate the predicted new global peak; we then apply the single strictly improving swap that minimizes that peak. This follows the recommended 1×1 best global swap strategy while keeping complexity small and deterministic. This should reduce the maximum pack load more effectively in the GPU placement stage without incurring significant runtime costs.
+
+2) In replicate_experts, make the Sainte-Laguë tail length adaptive based on dispersion (coefficient of variation) of per-row weights. We set tail = clamp(1, num_redundant, round(alpha * num_redundant * s)) where alpha=0.10 and s is the dispersion factor (CV clamped to [0.7, 1.3]). This modestly increases the tail for more uneven workloads and reduces it for uniform ones, improving load balance with negligible overhead.
+
+These changes aim to increase balancedness while preserving the current high speed score.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Targeted refinement by swapping one item between the heaviest pack and the
+        lightest or second-lightest packs per iteration (up to self.refine_steps).
+        Chooses the swap that minimizes the predicted new global peak and applies
+        it only if it strictly improves the current peak.
+        """
+        if self.refine_steps <= 0:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for _ in range(self.refine_steps):
+            # Identify heaviest pack
+            h = int(torch.argmax(pack_w).item())
+
+            # Candidate light packs: lightest and (if available) second-lightest excluding h
+            order = torch.argsort(pack_w, descending=False)
+            light_candidates = []
+            for pid in order.tolist():
+                if pid != h:
+                    light_candidates.append(pid)
+                if len(light_candidates) >= 2:
+                    break
+            if not light_candidates:
+                break
+
+            # Indices of items in heaviest pack
+            heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+            if heavy_idx.numel() == 0:
+                break
+
+            w = weights
+            hw = w[heavy_idx]
+            if hw.numel() == 0:
+                break
+
+            # Current global peak
+            cur_peak = float(pack_w.max().item())
+
+            # Track best candidate across light candidates
+            best_candidate = None  # (new_peak, hi, lj, l_sel, wi, wj, new_delta)
+
+            for l in light_candidates:
+                light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+                if light_idx.numel() == 0:
+                    continue
+                lw = w[light_idx]
+                if lw.numel() == 0:
+                    continue
+
+                # Current imbalance between h and this l
+                delta_hl = float(pack_w[h] - pack_w[l])
+                if delta_hl <= 1e-9:
+                    continue
+
+                # Sort light weights ascending and find nearest partners for each heavy item
+                lw_sorted, lw_perm = torch.sort(lw)  # ascending
+                target = hw - (delta_hl / 2.0)
+                pos = torch.searchsorted(lw_sorted, target)
+                pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+                cand_pos = torch.stack(
+                    [pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1
+                )  # [H, 2]
+                cand_lw = lw_sorted[cand_pos]  # [H, 2]
+                resid = (delta_hl - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+                best_flat = int(torch.argmin(resid).item())
+                best_h_index = best_flat // 2
+                best_option = best_flat % 2
+                j_sorted_idx = int(cand_pos[best_h_index, best_option].item())
+
+                wi = float(hw[best_h_index].item())
+                wj = float(lw_sorted[j_sorted_idx].item())
+                # Predicted new delta for (h, l) (for tie-break)
+                new_delta_hl = abs(delta_hl - 2.0 * (wi - wj))
+
+                # Predicted new global peak if we swap (hi <-> lj)
+                if num_packs > 2:
+                    mask = torch.ones(num_packs, dtype=torch.bool, device=pack_w.device)
+                    mask[h] = False
+                    mask[l] = False
+                    other_max = float(pack_w[mask].max().item()) if mask.any() else float('-inf')
+                else:
+                    other_max = float('-inf')
+                new_h = float(pack_w[h].item()) - wi + wj
+                new_l = float(pack_w[l].item()) - wj + wi
+                cand_peak = max(other_max, new_h, new_l)
+
+                # Keep the candidate with smallest new global peak; tie-break by new delta
+                if best_candidate is None or cand_peak < best_candidate[0] - 1e-12 or (
+                    abs(cand_peak - best_candidate[0]) <= 1e-12 and new_delta_hl < best_candidate[6]
+                ):
+                    hi = heavy_idx[best_h_index]
+                    lj = light_idx[lw_perm[j_sorted_idx]]
+                    best_candidate = (cand_peak, hi, lj, l, wi, wj, new_delta_hl)
+
+            if best_candidate is None:
+                break
+
+            # Apply only if it strictly improves the global peak
+            if best_candidate[0] + 1e-12 < cur_peak:
+                _, hi, lj, l_sel, wi, wj, _ = best_candidate
+                pack_idx[hi] = l_sel
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l_sel] = pack_w[l_sel] - wj + wi
+            else:
+                break
+
+        return pack_idx
+=======
+    def _refine_single_layer(
+        self,
+        weights: torch.Tensor,
+        pack_idx: torch.Tensor,
+        num_packs: int,
+        capacity: int,
+    ) -> torch.Tensor:
+        """
+        Broadened targeted refinement:
+        - Donor packs: top-2 heaviest packs by current load.
+        - Receiver packs: bottom-3 lightest packs (excluding the donor pack).
+        - For each donor/receiver pair, evaluate the best single item swap using
+          searchsorted-based nearest matching to minimize the predicted new global peak.
+        - Apply the single strictly improving swap per iteration (up to self.refine_steps).
+        This preserves speed while improving peak reduction versus a pure 1×1 heaviest-lightest scheme.
+        """
+        if self.refine_steps <= 0 or num_packs <= 1:
+            return pack_idx
+
+        # Compute pack loads
+        pack_w = self._pack_loads(weights, pack_idx, num_packs)
+
+        for _ in range(self.refine_steps):
+            # Determine donor and receiver packs
+            order_desc = torch.argsort(pack_w, descending=True).tolist()
+            order_asc = torch.argsort(pack_w, descending=False).tolist()
+            donors = []
+            for pid in order_desc:
+                donors.append(pid)
+                if len(donors) >= 2:
+                    break
+            receivers = []
+            for pid in order_asc:
+                receivers.append(pid)
+                if len(receivers) >= 3:
+                    break
+
+            # No refinement possible if all equal
+            if len(donors) == 0 or len(receivers) == 0:
+                break
+
+            # Current global peak
+            cur_peak = float(pack_w.max().item())
+
+            best_cand = None  # (new_peak, donor_pack, recv_pack, hi, lj, wi, wj, new_delta_pair)
+
+            # Evaluate all donor/receiver pairs (up to 2×3 = 6 small checks)
+            for h in donors:
+                heavy_idx = torch.nonzero(pack_idx == h, as_tuple=False).squeeze(1)
+                if heavy_idx.numel() == 0:
+                    continue
+                hw = weights[heavy_idx]
+                if hw.numel() == 0:
+                    continue
+
+                for l in receivers:
+                    if l == h:
+                        continue
+                    light_idx = torch.nonzero(pack_idx == l, as_tuple=False).squeeze(1)
+                    if light_idx.numel() == 0:
+                        continue
+                    lw = weights[light_idx]
+                    if lw.numel() == 0:
+                        continue
+
+                    delta_hl = float(pack_w[h] - pack_w[l])
+                    if delta_hl <= 1e-12:
+                        continue
+
+                    # Best pair selection via searchsorted target matching
+                    lw_sorted, lw_perm = torch.sort(lw)  # ascending
+                    target = hw - (delta_hl / 2.0)
+                    pos = torch.searchsorted(lw_sorted, target)
+                    pos = torch.clamp(pos, 0, lw_sorted.numel() - 1)
+                    cand_pos = torch.stack(
+                        [pos, torch.clamp(pos - 1, 0, lw_sorted.numel() - 1)], dim=1
+                    )  # [H, 2]
+                    cand_lw = lw_sorted[cand_pos]  # [H, 2]
+                    resid = (delta_hl - 2.0 * (hw.unsqueeze(1) - cand_lw)).abs()
+                    best_flat = int(torch.argmin(resid).item())
+                    best_h_index = best_flat // 2
+                    best_option = best_flat % 2
+                    j_sorted_idx = int(cand_pos[best_h_index, best_option].item())
+
+                    wi = float(hw[best_h_index].item())
+                    wj = float(lw_sorted[j_sorted_idx].item())
+                    new_h = float(pack_w[h].item()) - wi + wj
+                    new_l = float(pack_w[l].item()) - wj + wi
+
+                    # Max of the unaffected packs
+                    if num_packs > 2:
+                        mask = torch.ones(num_packs, dtype=torch.bool, device=pack_w.device)
+                        mask[h] = False
+                        mask[l] = False
+                        other_max = float(pack_w[mask].max().item()) if mask.any() else float('-inf')
+                    else:
+                        other_max = float('-inf')
+
+                    cand_peak = max(other_max, new_h, new_l)
+                    new_delta_pair = abs(delta_hl - 2.0 * (wi - wj))
+
+                    # Track globally best candidate; tie-break by smaller pair delta
+                    if best_cand is None or cand_peak < best_cand[0] - 1e-12 or (
+                        abs(cand_peak - best_cand[0]) <= 1e-12 and new_delta_pair < best_cand[7]
+                    ):
+                        hi = heavy_idx[best_h_index]
+                        lj = light_idx[lw_perm[j_sorted_idx]]
+                        best_cand = (cand_peak, h, l, hi, lj, wi, wj, new_delta_pair)
+
+            if best_cand is None:
+                break
+
+            # Apply only if strictly improves the global peak
+            if best_cand[0] + 1e-12 < cur_peak:
+                _, h, l, hi, lj, wi, wj, _ = best_cand
+                pack_idx[hi] = l
+                pack_idx[lj] = h
+                # Update loads incrementally
+                pack_w[h] = pack_w[h] - wi + wj
+                pack_w[l] = pack_w[l] - wj + wi
+            else:
+                break
+
+        return pack_idx
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Hybrid allocation: D'Hondt for bulk, Sainte-Laguë for the last ~10% (at least 1)
+    tail = max(1, (num_redundant + 9) // 10)
+    bulk = num_redundant - tail
+=======
+    # Hybrid allocation with adaptive tail:
+    # Choose tail length based on dispersion (coefficient of variation) of per-row weights.
+    # tail = clamp(1, num_redundant, round(alpha * num_redundant * s)), where s in [0.7, 1.3].
+    if num_redundant > 0:
+        mean_w = weight.mean(dim=-1).clamp_min(1e-12)
+        std_w = weight.std(dim=-1)
+        cv = (std_w / mean_w).mean().item()
+        s = float(min(1.3, max(0.7, cv)))
+        alpha = 0.10
+        tail = max(1, min(num_redundant, int(round(alpha * num_redundant * s))))
+    else:
+        tail = 0
+    bulk = num_redundant - tail
+>>>>>>> REPLACE
+
+</DIFF>

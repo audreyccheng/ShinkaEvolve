@@ -1,0 +1,406 @@
+<NAME>
+best_fit_descent_variance
+</NAME>
+
+<DESCRIPTION>
+Replacing the existing Local Search with a Best-Improvement Descent algorithm that uses variance-based tie-breaking.
+1.  **Best-Improvement Descent**: Evaluates all moves and swaps from the bottleneck GPU and selects the one that minimizes the resulting maximum pressure.
+2.  **Variance Tie-Breaking**: When moves result in the same maximum pressure (common in bin packing), it prefers the one with lower sum of squared pressures, smoothing the load distribution.
+3.  **Integrated Perturbation**: If no improving move is found (local optimum), it triggers a random shuffle perturbation on the bottleneck and a random partner to escape.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # --- 3. Iterated Local Search (Ruin & Recreate) ---
+    import random
+
+    current_placement = final_placement
+
+    # Helper to calculate state
+    def get_state(plc):
+        l = [0.0] * gpu_num
+        u = [0.0] * gpu_num
+        mx_p = 0.0
+        bn = -1
+        for g in range(gpu_num):
+            for m in plc[g]:
+                l[g] += m.req_rate / m.slo
+                u[g] += m.model_size
+            rem = GPU_MEM_SIZE - u[g]
+            p = l[g] / rem if rem > 1e-6 else (float('inf') if l[g] > 0 else 0.0)
+            if p > mx_p:
+                mx_p = p
+                bn = g
+        return l, u, mx_p, bn
+
+    loads, used, global_max_p, bottleneck = get_state(current_placement)
+    best_placement = {k: list(v) for k, v in current_placement.items()}
+    best_max_p = global_max_p
+
+    # ILS Loop
+    max_iters = 1000
+    for i in range(max_iters):
+        # --- Hill Climbing Step ---
+        # Identify bottleneck
+        max_p = -1.0
+        bottleneck = -1
+        for g in range(gpu_num):
+            rem = GPU_MEM_SIZE - used[g]
+            p = loads[g] / rem if rem > 1e-6 else float('inf')
+            if p > max_p:
+                max_p = p
+                bottleneck = g
+
+        # Update Global Best
+        if max_p < best_max_p - 1e-6:
+            best_max_p = max_p
+            best_placement = {k: list(v) for k, v in current_placement.items()}
+
+        improved = False
+        if bottleneck != -1:
+            bn_items = list(current_placement[bottleneck])
+            # Move
+            for m in bn_items:
+                w = m.req_rate / m.slo
+                s = m.model_size
+                src_l = loads[bottleneck] - w
+                src_u = used[bottleneck] - s
+
+                for dst in range(gpu_num):
+                    if dst == bottleneck: continue
+                    if used[dst] + s >= GPU_MEM_SIZE - 1e-6: continue
+                    dst_l = loads[dst] + w
+                    dst_u = used[dst] + s
+                    dst_p = dst_l / (GPU_MEM_SIZE - dst_u)
+
+                    if dst_p < max_p - 1e-6:
+                        current_placement[bottleneck].remove(m)
+                        current_placement[dst].append(m)
+                        loads[bottleneck] = src_l
+                        used[bottleneck] = src_u
+                        loads[dst] = dst_l
+                        used[dst] = dst_u
+                        improved = True
+                        break
+                if improved: break
+
+            # Swap
+            if not improved:
+                for dst in range(gpu_num):
+                    if dst == bottleneck: continue
+                    dst_items = list(current_placement[dst])
+                    for m_src in bn_items:
+                        ws = m_src.req_rate / m_src.slo
+                        ss = m_src.model_size
+                        for m_dst in dst_items:
+                            wd = m_dst.req_rate / m_dst.slo
+                            sd = m_dst.model_size
+
+                            n_src_u = used[bottleneck] - ss + sd
+                            if n_src_u >= GPU_MEM_SIZE - 1e-6: continue
+                            n_src_l = loads[bottleneck] - ws + wd
+                            n_src_p = n_src_l / (GPU_MEM_SIZE - n_src_u)
+
+                            n_dst_u = used[dst] - sd + ss
+                            if n_dst_u >= GPU_MEM_SIZE - 1e-6: continue
+                            n_dst_l = loads[dst] - wd + ws
+                            n_dst_p = n_dst_l / (GPU_MEM_SIZE - n_dst_u)
+
+                            if n_src_p < max_p - 1e-6 and n_dst_p < max_p - 1e-6:
+                                current_placement[bottleneck].remove(m_src)
+                                current_placement[bottleneck].append(m_dst)
+                                current_placement[dst].remove(m_dst)
+                                current_placement[dst].append(m_src)
+                                loads[bottleneck] = n_src_l
+                                used[bottleneck] = n_src_u
+                                loads[dst] = n_dst_l
+                                used[dst] = n_dst_u
+                                improved = True
+                                break
+                        if improved: break
+                    if improved: break
+
+        if improved: continue
+
+        # --- Ruin and Recreate (Perturbation) ---
+        # If no improvement locally, kick the solution
+        if bottleneck == -1: break
+
+        # Select victims: bottleneck + 2 random
+        victims = {bottleneck}
+        others = [g for g in range(gpu_num) if g != bottleneck]
+        if others:
+            victims.update(random.sample(others, min(2, len(others))))
+        victim_list = list(victims)
+
+        # Ruin
+        removed_models = []
+        for v in victim_list:
+            removed_models.extend(current_placement[v])
+            current_placement[v] = []
+            loads[v] = 0.0
+            used[v] = 0.0
+
+        # Recreate: Best-Fit Decreasing by Density
+        removed_models.sort(key=lambda x: (x.req_rate/x.slo)/x.model_size if x.model_size>0 else 0, reverse=True)
+
+        feasible_repack = True
+
+        for m in removed_models:
+            w = m.req_rate / m.slo
+            s = m.model_size
+            best_v = -1
+            min_p = float('inf')
+
+            for v in victim_list:
+                rem = GPU_MEM_SIZE - used[v] - s
+                if rem > 1e-6:
+                    p = (loads[v] + w) / rem
+                    if p < min_p:
+                        min_p = p
+                        best_v = v
+
+            if best_v != -1:
+                current_placement[best_v].append(m)
+                loads[best_v] += w
+                used[best_v] += s
+            else:
+                # Fallback: try to fit anywhere in victims (ignoring pressure min)
+                for v in victim_list:
+                    if used[v] + s <= GPU_MEM_SIZE - 1e-6:
+                        best_v = v
+                        current_placement[best_v].append(m)
+                        loads[best_v] += w
+                        used[best_v] += s
+                        break
+                if best_v == -1:
+                    feasible_repack = False
+                    break
+
+        if not feasible_repack:
+            # Revert to best known to recover from bad perturbation
+            current_placement = {k: list(v) for k, v in best_placement.items()}
+            loads, used, _, _ = get_state(current_placement)
+            # Stop if we are just failing to repack repeatedly
+            if i > max_iters * 0.8: break
+
+    return best_placement
+=======
+    # --- 3. Iterated Local Search (Descent with Variance Tie-Breaking) ---
+    import random
+
+    current_placement = final_placement
+
+    # Track state
+    loads = [0.0] * gpu_num
+    used = [0.0] * gpu_num
+    for g in range(gpu_num):
+        for m in current_placement[g]:
+            loads[g] += m.req_rate / m.slo
+            used[g] += m.model_size
+
+    best_placement = {k: list(v) for k, v in current_placement.items()}
+
+    def get_pressure(l, u):
+        rem = GPU_MEM_SIZE - u
+        if rem <= 1e-6: return float('inf') if l > 1e-6 else 0.0
+        return l / rem
+
+    # Initial best pressure
+    pressures = [get_pressure(loads[g], used[g]) for g in range(gpu_num)]
+    best_max_p = max(pressures)
+
+    # ILS Loop
+    max_iters = 200 # Sufficient given best-improvement is expensive
+
+    for iteration in range(max_iters):
+        # Current state metrics
+        current_max_p = max(pressures)
+        current_sum_sq = sum(p*p for p in pressures)
+
+        # Update global best
+        if current_max_p < best_max_p - 1e-7:
+            best_max_p = current_max_p
+            best_placement = {k: list(v) for k, v in current_placement.items()}
+
+        # Determine bottleneck(s)
+        bottleneck = -1
+        max_val = -1.0
+        for g in range(gpu_num):
+            if pressures[g] > max_val:
+                max_val = pressures[g]
+                bottleneck = g
+
+        if bottleneck == -1: break
+
+        # --- Best-Improvement Search ---
+        best_move = None
+        # Structure: (type, partner_idx, item_idx1, item_idx2, new_bn_l, new_bn_u, new_pt_l, new_pt_u, score_max, score_sq)
+
+        pair_excl_max_cache = {} # Cache max pressure of other GPUs
+
+        bn_items = current_placement[bottleneck]
+
+        for partner in range(gpu_num):
+            if partner == bottleneck: continue
+
+            # Calculate max pressure excluding bn and partner
+            if partner not in pair_excl_max_cache:
+                m_ex = 0.0
+                for g in range(gpu_num):
+                    if g != bottleneck and g != partner:
+                        if pressures[g] > m_ex: m_ex = pressures[g]
+                pair_excl_max_cache[partner] = m_ex
+
+            pair_excl_max = pair_excl_max_cache[partner]
+            pair_excl_sq = current_sum_sq - (pressures[bottleneck]**2 + pressures[partner]**2)
+
+            # 1. Try Moving item from Bottleneck -> Partner
+            for i, m in enumerate(bn_items):
+                w, s = m.req_rate / m.slo, m.model_size
+
+                if used[partner] + s >= GPU_MEM_SIZE - 1e-6: continue
+
+                n_bn_l = loads[bottleneck] - w
+                n_bn_u = used[bottleneck] - s
+                n_pt_l = loads[partner] + w
+                n_pt_u = used[partner] + s
+
+                p_bn = get_pressure(n_bn_l, n_bn_u)
+                p_pt = get_pressure(n_pt_l, n_pt_u)
+
+                new_max = max(pair_excl_max, p_bn, p_pt)
+
+                # Check feasibility and quality
+                if new_max > current_max_p + 1e-9: continue
+
+                new_sq = pair_excl_sq + p_bn**2 + p_pt**2
+
+                is_improvement = False
+                if new_max < current_max_p - 1e-9: is_improvement = True
+                elif new_max < current_max_p + 1e-9 and new_sq < current_sum_sq - 1e-9: is_improvement = True
+
+                if is_improvement:
+                    if best_move is None:
+                        best_move = ('move', partner, i, -1, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+                    else:
+                        bm_max, bm_sq = best_move[8], best_move[9]
+                        if new_max < bm_max - 1e-9:
+                            best_move = ('move', partner, i, -1, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+                        elif abs(new_max - bm_max) < 1e-9 and new_sq < bm_sq - 1e-9:
+                            best_move = ('move', partner, i, -1, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+
+            # 2. Try Swapping items
+            pt_items = current_placement[partner]
+            for i, m1 in enumerate(bn_items):
+                w1, s1 = m1.req_rate / m1.slo, m1.model_size
+                for j, m2 in enumerate(pt_items):
+                    w2, s2 = m2.req_rate / m2.slo, m2.model_size
+
+                    n_bn_u = used[bottleneck] - s1 + s2
+                    if n_bn_u >= GPU_MEM_SIZE - 1e-6: continue
+                    n_pt_u = used[partner] - s2 + s1
+                    if n_pt_u >= GPU_MEM_SIZE - 1e-6: continue
+
+                    n_bn_l = loads[bottleneck] - w1 + w2
+                    n_pt_l = loads[partner] - w2 + w1
+
+                    p_bn = get_pressure(n_bn_l, n_bn_u)
+                    p_pt = get_pressure(n_pt_l, n_pt_u)
+
+                    new_max = max(pair_excl_max, p_bn, p_pt)
+                    if new_max > current_max_p + 1e-9: continue
+
+                    new_sq = pair_excl_sq + p_bn**2 + p_pt**2
+
+                    is_improvement = False
+                    if new_max < current_max_p - 1e-9: is_improvement = True
+                    elif new_max < current_max_p + 1e-9 and new_sq < current_sum_sq - 1e-9: is_improvement = True
+
+                    if is_improvement:
+                        if best_move is None:
+                            best_move = ('swap', partner, i, j, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+                        else:
+                            bm_max, bm_sq = best_move[8], best_move[9]
+                            if new_max < bm_max - 1e-9:
+                                best_move = ('swap', partner, i, j, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+                            elif abs(new_max - bm_max) < 1e-9 and new_sq < bm_sq - 1e-9:
+                                best_move = ('swap', partner, i, j, n_bn_l, n_bn_u, n_pt_l, n_pt_u, new_max, new_sq)
+
+        # Apply Move
+        if best_move:
+            mtype, pt, i, j, nbl, nbu, npl, npu, _, _ = best_move
+            if mtype == 'move':
+                item = current_placement[bottleneck].pop(i)
+                current_placement[pt].append(item)
+            else:
+                item1 = current_placement[bottleneck][i]
+                item2 = current_placement[pt][j]
+                current_placement[bottleneck][i] = item2
+                current_placement[pt][j] = item1
+
+            loads[bottleneck] = nbl
+            used[bottleneck] = nbu
+            loads[pt] = npl
+            used[pt] = npu
+            pressures[bottleneck] = get_pressure(loads[bottleneck], used[bottleneck])
+            pressures[pt] = get_pressure(loads[pt], used[pt])
+
+        else:
+            # Perturbation if stuck
+            candidates = [g for g in range(gpu_num) if g != bottleneck]
+            if not candidates: break
+            partner = random.choice(candidates)
+            victims = [bottleneck, partner]
+
+            # Extract
+            repack_items = []
+            for v in victims:
+                repack_items.extend(current_placement[v])
+                current_placement[v] = []
+                loads[v] = 0.0
+                used[v] = 0.0
+                pressures[v] = 0.0
+
+            random.shuffle(repack_items)
+
+            # Greedy repack
+            success = True
+            for item in repack_items:
+                w, s = item.req_rate / item.slo, item.model_size
+                best_v = -1
+                min_p = float('inf')
+
+                for v in victims:
+                    rem = GPU_MEM_SIZE - used[v] - s
+                    if rem > 1e-6:
+                        p = (loads[v] + w) / rem
+                        if p < min_p:
+                            min_p = p
+                            best_v = v
+
+                if best_v != -1:
+                    current_placement[best_v].append(item)
+                    loads[best_v] += w
+                    used[best_v] += s
+                else:
+                    success = False
+                    break
+
+            if success:
+                for v in victims:
+                    pressures[v] = get_pressure(loads[v], used[v])
+            else:
+                # Revert to best known
+                current_placement = {k: list(v) for k, v in best_placement.items()}
+                loads = [0.0]*gpu_num
+                used = [0.0]*gpu_num
+                for g in range(gpu_num):
+                    for m in current_placement[g]:
+                        loads[g] += m.req_rate / m.slo
+                        used[g] += m.model_size
+                    pressures[g] = get_pressure(loads[g], used[g])
+
+    return best_placement
+>>>>>>> REPLACE
+</DIFF>

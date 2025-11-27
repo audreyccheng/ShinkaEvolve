@@ -1,0 +1,175 @@
+<NAME>
+pair_reconcile_and_conf_fix
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements guided by network validation principles and prior performance observations:
+
+1) Avoid zeroing traffic when only the peer reports down. Previously, zeroing if either side reported down degraded counter accuracy when the peer status was misreported. We now zero only when the local interface is down, aligning with interface-local truth and avoiding over-aggressive zeroing.
+
+2) Add a post-scaling, pairwise reconciliation pass. After router-level flow conservation scaling, we reconcile each link pair to enforce link symmetry (my_tx ≈ their_rx, my_rx ≈ their_tx). We adjust the more suspicious side (based on pre link residuals, scaling magnitude, and router imbalance) by directly matching its peer. This reduces residual inconsistencies introduced by router scaling and improves counter repair accuracy.
+
+3) Calibrate confidence using post-repair residuals instead of pre-link diffs. Confidence should reflect how well the final repaired values agree with redundant signals. We now compute link confidence from post-repair residuals against the peer, combined with router imbalance and change penalties, for better calibration.
+
+These changes preserve the structure, use topology, and focus on accuracy and robust confidence calibration. They should improve the combined score by increasing counter accuracy and aligning confidence with actual repair quality.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Status-aware zeroing: if either side is down, no traffic should flow
+        if local_status == 'down' or (had_peer and peer_status == 'down'):
+            pre_rx = 0.0
+            pre_tx = 0.0
+            rx_link_diff = 0.0
+            tx_link_diff = 0.0
+        else:
+            # Both sides up (or no peer) -> link hardening using redundant signals if peer present
+            if had_peer:
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+
+                # Apply direct substitution when violation exceeds tolerance (higher accuracy under single-sided faults)
+                if rx_link_diff > HARDENING_THRESHOLD:
+                    pre_rx = peer_tx
+                if tx_link_diff > HARDENING_THRESHOLD:
+                    pre_tx = peer_rx
+            else:
+                rx_link_diff = 0.0
+                tx_link_diff = 0.0
+=======
+        # Status-aware zeroing: zero only when the local interface is down
+        if local_status == 'down':
+            pre_rx = 0.0
+            pre_tx = 0.0
+            rx_link_diff = 0.0
+            tx_link_diff = 0.0
+        else:
+            # Link hardening using redundant signals only if peer is present and up
+            if had_peer and peer_status == 'up':
+                # My RX should match peer TX; My TX should match peer RX
+                rx_link_diff = rel_diff(rx_orig, peer_tx)
+                tx_link_diff = rel_diff(tx_orig, peer_rx)
+
+                # Apply direct substitution when violation exceeds tolerance (higher accuracy under single-sided faults)
+                if rx_link_diff > HARDENING_THRESHOLD:
+                    pre_rx = peer_tx
+                if tx_link_diff > HARDENING_THRESHOLD:
+                    pre_tx = peer_rx
+            else:
+                # No reliable peer signal available
+                rx_link_diff = 0.0
+                tx_link_diff = 0.0
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Assemble final results with calibrated confidence
+    result: Dict[str, Dict[str, Tuple]] = {}
+=======
+    # Third pass: pairwise link reconciliation to enforce link symmetry post router scaling
+    # Build post-scaled values
+    post: Dict[str, Dict[str, float]] = {}
+    for iface in telemetry:
+        post[iface] = {
+            'rx': pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0),
+            'tx': pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0),
+        }
+
+    visited_pairs = set()
+    for iface, data in telemetry.items():
+        peer_id = peers.get(iface)
+        if not (peer_id and peer_id in telemetry):
+            continue
+        pair_key = tuple(sorted([iface, peer_id]))
+        if pair_key in visited_pairs:
+            continue
+        visited_pairs.add(pair_key)
+
+        # Only reconcile when both interfaces are locally up (we trust counters more in this case)
+        if pre[iface]['local_status'] != 'up' or pre.get(peer_id, {}).get('local_status') != 'up':
+            continue
+
+        # Compute residuals after router scaling
+        tx_pair_resid = rel_diff(post[iface]['tx'], post[peer_id]['rx'])  # A.tx vs B.rx
+        rx_pair_resid = rel_diff(post[iface]['rx'], post[peer_id]['tx'])  # A.rx vs B.tx
+
+        # Suspicion metric combines pre link diffs, scale magnitude, and router imbalance
+        def suspicion(ifc: str, kind: str) -> float:
+            rid = telemetry.get(ifc, {}).get('local_router')
+            imb = router_imbalance.get(rid, 0.0)
+            if kind == 'tx':
+                return pre[ifc]['tx_link_diff'] + 0.5 * abs(scale_tx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+            else:
+                return pre[ifc]['rx_link_diff'] + 0.5 * abs(scale_rx.get(ifc, 1.0) - 1.0) + 0.3 * imb
+
+        # Reconcile A.tx <-> B.rx if residual exceeds tolerance
+        if tx_pair_resid > HARDENING_THRESHOLD:
+            a_tx_s = suspicion(iface, 'tx')
+            b_rx_s = suspicion(peer_id, 'rx')
+            if a_tx_s >= b_rx_s:
+                post[iface]['tx'] = post[peer_id]['rx']
+            else:
+                post[peer_id]['rx'] = post[iface]['tx']
+
+        # Reconcile A.rx <-> B.tx if residual exceeds tolerance
+        if rx_pair_resid > HARDENING_THRESHOLD:
+            a_rx_s = suspicion(iface, 'rx')
+            b_tx_s = suspicion(peer_id, 'tx')
+            if a_rx_s >= b_tx_s:
+                post[iface]['rx'] = post[peer_id]['tx']
+            else:
+                post[peer_id]['tx'] = post[iface]['rx']
+
+    # Assemble final results with calibrated confidence
+    result: Dict[str, Dict[str, Tuple]] = {}
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Apply router scaling
+        rx_repaired = pre[iface]['pre_rx'] * scale_rx.get(iface, 1.0)
+        tx_repaired = pre[iface]['pre_tx'] * scale_tx.get(iface, 1.0)
+
+        # Confidence components
+        rx_link_diff = pre[iface]['rx_link_diff']
+        tx_link_diff = pre[iface]['tx_link_diff']
+        # Link agreement confidence (higher when redundant signals agree)
+        if had_peer and local_status == 'up' and (peer_status == 'up' or peer_status == 'unknown'):
+            rx_link_conf = max(0.0, 1.0 - rx_link_diff)
+            tx_link_conf = max(0.0, 1.0 - tx_link_diff)
+        elif local_status == 'down' or (had_peer and peer_status == 'down'):
+            # When link is down and we zeroed, high confidence if zeroed
+            rx_link_conf = 0.85 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.85 if tx_repaired == 0.0 else 0.5
+        else:
+            # No peer information
+            rx_link_conf = 0.6
+            tx_link_conf = 0.6
+=======
+        # Apply post-reconciliation values
+        rx_repaired = post[iface]['rx']
+        tx_repaired = post[iface]['tx']
+
+        # Confidence components based on post-repair residuals
+        if had_peer and local_status == 'up' and (peer_status == 'up'):
+            peer_id = peers.get(iface)
+            # Peer repaired (post) rates
+            peer_tx_after = post[peer_id]['tx']
+            peer_rx_after = post[peer_id]['rx']
+            rx_resid = rel_diff(rx_repaired, peer_tx_after)  # A.rx vs B.tx
+            tx_resid = rel_diff(tx_repaired, peer_rx_after)  # A.tx vs B.rx
+            rx_link_conf = max(0.0, 1.0 - rx_resid)
+            tx_link_conf = max(0.0, 1.0 - tx_resid)
+        elif local_status == 'down':
+            # When locally down and we zeroed, high confidence if zeroed
+            rx_link_conf = 0.85 if rx_repaired == 0.0 else 0.5
+            tx_link_conf = 0.85 if tx_repaired == 0.0 else 0.5
+        else:
+            # No reliable peer information
+            rx_link_conf = 0.6
+            tx_link_conf = 0.6
+>>>>>>> REPLACE
+</DIFF>

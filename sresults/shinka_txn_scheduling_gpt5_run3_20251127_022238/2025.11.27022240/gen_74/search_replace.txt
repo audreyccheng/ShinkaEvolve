@@ -1,0 +1,629 @@
+<NAME>
+greedy_lookahead_prefixdom
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements that reduce makespan by tightening the incumbent earlier, improving greedy decisions, and pruning low-yield expansions:
+
+1) Shallow lookahead with prefix-dominance gating in greedy_complete:
+   - When completing a prefix, instead of picking only by immediate extension cost, we evaluate a small, depth-adaptive lookahead on the top immediate candidates. This better anticipates conflict cascades and leads to higher-quality completions.
+   - We gate candidates using the global prefix-dominance map: if a child state (remaining set + 3-suffix) has already been seen with a cost no worse than the current extension cost, we skip it. This avoids re-exploring dominated states and saves budget for better branches.
+
+2) Stronger incumbent seeding and diversified candidate pools in beam_seed:
+   - Immediately after seeding the beam with best singletons, we greedily complete the top-2 prefixes to establish a solid incumbent early, enabling more aggressive pruning throughout the beam search.
+   - While expanding nodes, we now also inject low-singleton candidates alongside buddies and randoms, improving coverage of promising candidates that are not in the buddy lists.
+
+These changes increase search focus and quality without substantially increasing runtime, as lookahead is restricted to a few candidates and reuses existing caches. The global prefix dominance is now meaningfully leveraged in both the beam and greedy phases, further reducing redundant exploration.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Conflict-aware greedy completion with anti-buddy filtering
+    def greedy_complete(seq, rem_set, branch_k=12, incumbent=None, depth_ctx=0):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0.0
+        steps = 0
+        while rem and time_left():
+            steps += 1
+            # incumbent-based lower bound prune
+            if incumbent is not None and lb_singleton(cur_cost, rem) >= incumbent:
+                break
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+
+            cand_pool = []
+            # buddies of last
+            if last is not None:
+                for u in buddies.get(last, []):
+                    if u in rem:
+                        cand_pool.append(u)
+            # low-singletons
+            low_single = sorted(rem_list, key=lambda t: singleton_cost.get(t, float('inf')))[:min(4, len(rem_list))]
+            for u in low_single:
+                if u not in cand_pool:
+                    cand_pool.append(u)
+            # fill random
+            need = max(0, branch_k - len(cand_pool))
+            others = [x for x in rem_list if x not in cand_pool]
+            if need > 0 and others:
+                cand_pool.extend(rng.sample(others, min(need, len(others))))
+            if not cand_pool:
+                cand_pool = rem_list
+
+            pt = tuple(seq_out)
+            best_t = None
+            best_c = float('inf')
+            # Evaluate immediate ext costs
+            scored = []
+            for t in cand_pool:
+                c = eval_ext_cost(pt, t)
+                scored.append((c, t))
+            scored.sort(key=lambda x: x[0])
+            # Anti-buddy filter: skip strongly disfavored unless within 1%
+            filtered = []
+            if last is not None:
+                if scored:
+                    thresh = scored[0][0] * 1.01
+                else:
+                    thresh = float('inf')
+                for c, t in scored:
+                    if is_antibuddy(last, t) and c > thresh:
+                        continue
+                    filtered.append((c, t))
+            else:
+                filtered = scored
+
+            if not filtered:
+                filtered = scored
+
+            best_c, best_t = filtered[0]
+            seq_out.append(best_t)
+            rem.remove(best_t)
+            cur_cost = best_c
+
+            # Occasionally hoist prefix dominance and try completion to update incumbent
+            if steps % 9 == 0:
+                s = dom_sig(rem, seq_out, k=3)
+                prev = prefix_dom.get(s)
+                if prev is None or cur_cost < prev:
+                    prefix_dom[s] = cur_cost
+
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+=======
+    # Conflict-aware greedy completion with shallow lookahead and prefix-dominance gating
+    def greedy_complete(seq, rem_set, branch_k=12, incumbent=None, depth_ctx=0):
+        seq_out = list(seq)
+        rem = set(rem_set)
+        cur_cost = eval_seq_cost(seq_out) if seq_out else 0.0
+        steps = 0
+        while rem and time_left():
+            steps += 1
+            # incumbent-based lower bound prune
+            if incumbent is not None and lb_singleton(cur_cost, rem) >= incumbent:
+                break
+
+            last = seq_out[-1] if seq_out else None
+            rem_list = list(rem)
+
+            # Depth-adaptive lookahead size and evaluation cap
+            progress = len(seq_out) / float(N) if N > 0 else 1.0
+            if progress < 0.4:
+                lookahead_top = 4
+            elif progress < 0.75:
+                lookahead_top = 3
+            else:
+                lookahead_top = 2
+            la_eval_k = max(3, min(6, branch_k // 2))
+
+            # Build candidate pool: buddies + low-singletons + random
+            cand_pool = []
+            if last is not None:
+                for u in buddies.get(last, []):
+                    if u in rem:
+                        cand_pool.append(u)
+            low_single = sorted(rem_list, key=lambda t: singleton_cost.get(t, float('inf')))[:min(4, len(rem_list))]
+            for u in low_single:
+                if u not in cand_pool:
+                    cand_pool.append(u)
+            need = max(0, branch_k - len(cand_pool))
+            others = [x for x in rem_list if x not in cand_pool]
+            if need > 0 and others:
+                cand_pool.extend(rng.sample(others, min(need, len(others))))
+            if not cand_pool:
+                cand_pool = rem_list
+
+            pt = tuple(seq_out)
+            # Immediate extension costs for all candidates
+            scored = []
+            best_immediate = float('inf')
+            for t in cand_pool:
+                c = eval_ext_cost(pt, t)
+                scored.append((c, t))
+                if c < best_immediate:
+                    best_immediate = c
+            scored.sort(key=lambda x: x[0])
+
+            # Anti-buddy filter: skip strongly disfavored unless close to best
+            filtered = []
+            if last is not None and scored:
+                thresh = scored[0][0] * 1.01  # 1% tolerance
+                for ec, t in scored:
+                    if is_antibuddy(last, t) and ec > thresh:
+                        continue
+                    filtered.append((ec, t))
+            else:
+                filtered = scored[:]
+
+            if not filtered:
+                filtered = scored[:]
+
+            # Compute shallow lookahead for top la_eval_k candidates,
+            # with prefix-dominance gating on the child state
+            considered = []
+            eval_count = 0
+            for idx, (ec, t) in enumerate(filtered):
+                if not time_left():
+                    break
+                # Prefix-dominance gate on child
+                new_rem = rem.copy()
+                new_rem.remove(t)
+                new_seq_tail = seq_out + [t]
+                sig = dom_sig(new_rem, new_seq_tail, k=3)
+                prev = prefix_dom.get(sig)
+                if prev is not None and prev <= ec:
+                    # Already have a child state with <= cost, skip
+                    continue
+
+                if idx < la_eval_k and new_rem:
+                    la_best = ec
+                    la_pool = [v for v in buddies.get(t, []) if v in new_rem]
+                    if not la_pool:
+                        la_pool = list(new_rem)
+                    if len(la_pool) > lookahead_top:
+                        la_pool = rng.sample(la_pool, lookahead_top)
+                    new_pt = tuple(new_seq_tail)
+                    for nxt in la_pool:
+                        c2 = eval_ext_cost(new_pt, nxt)
+                        la_best = c2 if c2 < la_best else la_best
+                        eval_count += 1
+                        if not time_left():
+                            break
+                    considered.append((la_best, ec, t))
+                else:
+                    considered.append((ec, ec, t))
+
+            if not considered:
+                # Fallback: take the immediate best candidate
+                best_c, best_t = filtered[0]
+                seq_out.append(best_t)
+                rem.remove(best_t)
+                cur_cost = best_c
+            else:
+                considered.sort(key=lambda x: (x[0], x[1]))
+                la_best, best_c, best_t = considered[0]
+                seq_out.append(best_t)
+                rem.remove(best_t)
+                cur_cost = best_c
+
+            # Occasionally hoist prefix dominance for the current state
+            if steps % 8 == 0:
+                s = dom_sig(rem, seq_out, k=3)
+                prev = prefix_dom.get(s)
+                if prev is None or cur_cost < prev:
+                    prefix_dom[s] = cur_cost
+
+        if rem:
+            seq_out.extend(list(rem))
+            cur_cost = eval_seq_cost(seq_out)
+        return cur_cost, seq_out
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Beam builder with prefix-dominance pruning and incumbent-aware greedy probes
+    def beam_seed(params, incumbent=float('inf')):
+        beam_width = params['beam']
+        branch_factor = params['branch']
+        k_suffix = params.get('k_suffix', 3)
+
+        # Depth-adaptive lookahead parameters
+        def depth_params(depth):
+            if depth < int(0.4 * N):
+                return params['lookahead_top'], params['next_k'], max(3, k_suffix)
+            elif depth < int(0.75 * N):
+                return max(2, params['lookahead_top'] - 1), max(3, params['next_k'] - 1), max(2, k_suffix - 1)
+            else:
+                return max(2, params['lookahead_top'] - 2), max(2, params['next_k'] - 1), max(2, k_suffix - 1)
+
+        # Initialize with best singletons and a few randoms
+        seed_pool = singles_sorted[:max(beam_width * 2, 8)]
+        extra = min(6, max(0, N - len(seed_pool)))
+        if extra > 0:
+            add = [x for x in all_txns if x not in seed_pool]
+            if add:
+                seed_pool.extend(rng.sample(add, min(extra, len(add))))
+
+        beam = []
+        for t in seed_pool:
+            if not time_left():
+                break
+            seq = [t]
+            rem = set(all_txns)
+            rem.remove(t)
+            c = eval_seq_cost(seq)
+            beam.append((c, seq, rem))
+        if not beam:
+            seq = all_txns[:]
+            rng.shuffle(seq)
+            return eval_seq_cost(seq), seq
+
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_width]
+
+        best_full_cost = incumbent
+        best_full_seq = None
+
+        steps = N - 1
+        depth = 0
+        while depth < steps and time_left():
+            lookahead_top, next_k, k_cur = depth_params(depth)
+            depth += 1
+            new_beam = []
+
+            for cost_so_far, seq, rem in beam:
+                if not rem:
+                    if cost_so_far < best_full_cost:
+                        best_full_cost, best_full_seq = cost_so_far, seq[:]
+                    continue
+
+                # incumbent pruning
+                if cost_so_far >= best_full_cost:
+                    continue
+
+                # prefix dominance
+                sig = dom_sig(rem, seq, k=k_cur)
+                prev = prefix_dom.get(sig)
+                if prev is not None and cost_so_far >= prev:
+                    continue
+                # update dom
+                prefix_dom[sig] = cost_so_far if prev is None else min(prev, cost_so_far)
+
+                last = seq[-1]
+                rem_list = list(rem)
+
+                # Candidate pool: buddies of last + random sample
+                cand_pool = []
+                for u in buddies.get(last, []):
+                    if u in rem:
+                        cand_pool.append(u)
+                need = max(0, branch_factor * 2 - len(cand_pool))
+                if need > 0:
+                    others = [x for x in rem_list if x not in cand_pool]
+                    if others:
+                        cand_pool.extend(rng.sample(others, min(need, len(others))))
+                if not cand_pool:
+                    cand_pool = rem_list if len(rem_list) <= branch_factor * 2 else rng.sample(rem_list, branch_factor * 2)
+
+                # Score immediate and shallow lookahead with anti-buddy filter
+                pt = tuple(seq)
+                scored = []
+                # First pass to get best immediate for anti-buddy tolerance
+                best_immediate = float('inf')
+                tmp = []
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(pt, cand)
+                    tmp.append((ec, cand))
+                    if ec < best_immediate:
+                        best_immediate = ec
+
+                # Apply anti-buddy gating
+                for ec, cand in tmp:
+                    if is_antibuddy(last, cand) and ec > best_immediate * 1.01:
+                        continue
+                    # Lookahead candidates from buddies of cand or random few
+                    la = ec
+                    if rem and time_left():
+                        new_rem = rem.copy()
+                        new_rem.remove(cand)
+                        la_pool = [v for v in buddies.get(cand, []) if v in new_rem]
+                        if not la_pool:
+                            la_pool = list(new_rem)
+                        if len(la_pool) > lookahead_top:
+                            la_pool = rng.sample(la_pool, lookahead_top)
+                        new_pt = tuple(seq + [cand])
+                        for nxt in la_pool:
+                            c2 = eval_ext_cost(new_pt, nxt)
+                            if c2 < la:
+                                la = c2
+                    scored.append((ec, la, cand))
+
+                if not scored:
+                    continue
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+
+                # Expand children; greedy probe top next_k
+                kept_any = False
+                for idx, (ec, la, cand) in enumerate(top):
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+
+                    # LB prune
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+
+                    # Greedy probe for first next_k children
+                    adj_la = la
+                    if idx < next_k and time_left():
+                        g_cost, g_seq = greedy_complete(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost, depth_ctx=depth)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        adj_la = min(adj_la, g_cost)
+
+                        # Prune child if probe is already worse than incumbent
+                        if g_cost >= best_full_cost:
+                            # still consider at least one candidate overall
+                            pass
+
+                    new_beam.append((ec, new_seq, new_rem, adj_la))
+                    kept_any = True
+
+                # Always ensure at least the single best child is kept
+                if not kept_any:
+                    ec, la, cand = min(scored, key=lambda x: (x[0], x[1]))
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    new_beam.append((ec, new_seq, new_rem, la))
+
+            if not new_beam:
+                break
+
+            # Select next beam by adjusted lookahead score
+            new_beam.sort(key=lambda x: x[3])
+            unique = []
+            seen = set()
+            for ec, s, r, la in new_beam:
+                key = tuple(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append((ec, s, r))
+                if len(unique) >= beam_width:
+                    break
+            beam = unique
+
+            # Periodically greedily complete top-2 prefixes to tighten incumbent
+            if beam and time_left():
+                for ec, s, r in beam[:min(2, len(beam))]:
+                    c_try, s_try = greedy_complete(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost, depth_ctx=depth)
+                    if len(s_try) == N and c_try < best_full_cost:
+                        best_full_cost, best_full_seq = c_try, s_try
+
+        # Finalize remaining prefixes greedily
+        for ec, s, r in beam:
+            if not time_left():
+                break
+            c_fin, s_fin = greedy_complete(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost)
+            if len(s_fin) == N and c_fin < best_full_cost:
+                best_full_cost, best_full_seq = c_fin, s_fin
+
+        if best_full_seq is None:
+            seq = all_txns[:]
+            rng.shuffle(seq)
+            best_full_seq = seq
+            best_full_cost = eval_seq_cost(seq)
+        return best_full_cost, best_full_seq
+=======
+    # Beam builder with prefix-dominance pruning and incumbent-aware greedy probes
+    def beam_seed(params, incumbent=float('inf')):
+        beam_width = params['beam']
+        branch_factor = params['branch']
+        k_suffix = params.get('k_suffix', 3)
+
+        # Depth-adaptive lookahead parameters
+        def depth_params(depth):
+            if depth < int(0.4 * N):
+                return params['lookahead_top'], params['next_k'], max(3, k_suffix)
+            elif depth < int(0.75 * N):
+                return max(2, params['lookahead_top'] - 1), max(3, params['next_k'] - 1), max(2, k_suffix - 1)
+            else:
+                return max(2, params['lookahead_top'] - 2), max(2, params['next_k'] - 1), max(2, k_suffix - 1)
+
+        # Initialize with best singletons and a few randoms
+        seed_pool = singles_sorted[:max(beam_width * 2, 8)]
+        extra = min(6, max(0, N - len(seed_pool)))
+        if extra > 0:
+            add = [x for x in all_txns if x not in seed_pool]
+            if add:
+                seed_pool.extend(rng.sample(add, min(extra, len(add))))
+
+        beam = []
+        for t in seed_pool:
+            if not time_left():
+                break
+            seq = [t]
+            rem = set(all_txns)
+            rem.remove(t)
+            c = eval_seq_cost(seq)
+            beam.append((c, seq, rem))
+        if not beam:
+            seq = all_txns[:]
+            rng.shuffle(seq)
+            return eval_seq_cost(seq), seq
+
+        beam.sort(key=lambda x: x[0])
+        beam = beam[:beam_width]
+
+        # Establish a strong incumbent early by greedily completing top seeds
+        best_full_cost = incumbent
+        best_full_seq = None
+        if time_left():
+            for cost_so_far, seq, rem in beam[:min(2, len(beam))]:
+                c_try, s_try = greedy_complete(seq, rem, branch_k=max(8, N // 10), incumbent=best_full_cost, depth_ctx=0)
+                if len(s_try) == N and c_try < best_full_cost:
+                    best_full_cost, best_full_seq = c_try, s_try
+
+        steps = N - 1
+        depth = 0
+        while depth < steps and time_left():
+            lookahead_top, next_k, k_cur = depth_params(depth)
+            depth += 1
+            new_beam = []
+
+            for cost_so_far, seq, rem in beam:
+                if not rem:
+                    if cost_so_far < best_full_cost:
+                        best_full_cost, best_full_seq = cost_so_far, seq[:]
+                    continue
+
+                # incumbent pruning
+                if cost_so_far >= best_full_cost:
+                    continue
+
+                # prefix dominance
+                sig = dom_sig(rem, seq, k=k_cur)
+                prev = prefix_dom.get(sig)
+                if prev is not None and cost_so_far >= prev:
+                    continue
+                # update dom
+                prefix_dom[sig] = cost_so_far if prev is None else min(prev, cost_so_far)
+
+                last = seq[-1]
+                rem_list = list(rem)
+
+                # Candidate pool: buddies of last + low-singletons + random sample
+                cand_pool = []
+                for u in buddies.get(last, []):
+                    if u in rem:
+                        cand_pool.append(u)
+                low_single = sorted(rem_list, key=lambda t: singleton_cost.get(t, float('inf')))[:min(4, len(rem_list))]
+                for u in low_single:
+                    if u not in cand_pool:
+                        cand_pool.append(u)
+                need = max(0, branch_factor * 2 - len(cand_pool))
+                if need > 0:
+                    others = [x for x in rem_list if x not in cand_pool]
+                    if others:
+                        cand_pool.extend(rng.sample(others, min(need, len(others))))
+                if not cand_pool:
+                    cand_pool = rem_list if len(rem_list) <= branch_factor * 2 else rng.sample(rem_list, branch_factor * 2)
+
+                # Score immediate and shallow lookahead with anti-buddy filter
+                pt = tuple(seq)
+                scored = []
+                # First pass to get best immediate for anti-buddy tolerance
+                best_immediate = float('inf')
+                tmp = []
+                for cand in cand_pool:
+                    if not time_left():
+                        break
+                    ec = eval_ext_cost(pt, cand)
+                    tmp.append((ec, cand))
+                    if ec < best_immediate:
+                        best_immediate = ec
+
+                # Apply anti-buddy gating
+                for ec, cand in tmp:
+                    if is_antibuddy(last, cand) and ec > best_immediate * 1.01:
+                        continue
+                    # Lookahead candidates from buddies of cand or random few
+                    la = ec
+                    if rem and time_left():
+                        new_rem = rem.copy()
+                        new_rem.remove(cand)
+                        la_pool = [v for v in buddies.get(cand, []) if v in new_rem]
+                        if not la_pool:
+                            la_pool = list(new_rem)
+                        if len(la_pool) > lookahead_top:
+                            la_pool = rng.sample(la_pool, lookahead_top)
+                        new_pt = tuple(seq + [cand])
+                        for nxt in la_pool:
+                            c2 = eval_ext_cost(new_pt, nxt)
+                            if c2 < la:
+                                la = c2
+                    scored.append((ec, la, cand))
+
+                if not scored:
+                    continue
+                scored.sort(key=lambda x: (x[0], x[1]))
+                top = scored[:min(branch_factor, len(scored))]
+
+                # Expand children; greedy probe top next_k
+                kept_any = False
+                for idx, (ec, la, cand) in enumerate(top):
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+
+                    # LB prune
+                    if lb_singleton(ec, new_rem) >= best_full_cost:
+                        continue
+
+                    # Greedy probe for first next_k children
+                    adj_la = la
+                    if idx < next_k and time_left():
+                        g_cost, g_seq = greedy_complete(new_seq, new_rem, branch_k=max(6, N // 12), incumbent=best_full_cost, depth_ctx=depth)
+                        if len(g_seq) == N and g_cost < best_full_cost:
+                            best_full_cost, best_full_seq = g_cost, g_seq
+                        adj_la = min(adj_la, g_cost)
+
+                    new_beam.append((ec, new_seq, new_rem, adj_la))
+                    kept_any = True
+
+                # Always ensure at least the single best child is kept
+                if not kept_any:
+                    ec, la, cand = min(scored, key=lambda x: (x[0], x[1]))
+                    new_seq = seq + [cand]
+                    new_rem = rem.copy()
+                    new_rem.remove(cand)
+                    new_beam.append((ec, new_seq, new_rem, la))
+
+            if not new_beam:
+                break
+
+            # Select next beam by adjusted lookahead score
+            new_beam.sort(key=lambda x: x[3])
+            unique = []
+            seen = set()
+            for ec, s, r, la in new_beam:
+                key = tuple(s)
+                if key in seen:
+                    continue
+                seen.add(key)
+                unique.append((ec, s, r))
+                if len(unique) >= beam_width:
+                    break
+            beam = unique
+
+            # Periodically greedily complete top-2 prefixes to tighten incumbent
+            if beam and time_left():
+                for ec, s, r in beam[:min(2, len(beam))]:
+                    c_try, s_try = greedy_complete(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost, depth_ctx=depth)
+                    if len(s_try) == N and c_try < best_full_cost:
+                        best_full_cost, best_full_seq = c_try, s_try
+
+        # Finalize remaining prefixes greedily
+        for ec, s, r in beam:
+            if not time_left():
+                break
+            c_fin, s_fin = greedy_complete(s, r, branch_k=max(8, N // 10), incumbent=best_full_cost)
+            if len(s_fin) == N and c_fin < best_full_cost:
+                best_full_cost, best_full_seq = c_fin, s_fin
+
+        if best_full_seq is None:
+            seq = all_txns[:]
+            rng.shuffle(seq)
+            best_full_seq = seq
+            best_full_cost = eval_seq_cost(seq)
+        return best_full_cost, best_full_seq
+>>>>>>> REPLACE
+</DIFF>

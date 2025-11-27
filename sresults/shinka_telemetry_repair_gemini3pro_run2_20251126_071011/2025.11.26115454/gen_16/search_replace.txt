@@ -1,0 +1,256 @@
+<NAME>
+improved_flow_repair_logic
+</NAME>
+
+<DESCRIPTION>
+Refine the telemetry repair logic with three key improvements:
+1.  **Dual-Ended Flow Conservation**: When repairing a link, check flow conservation at *both* the local and remote routers to select the best value. This minimizes global network imbalance rather than just local imbalance.
+2.  **Noise Floor Normalization**: Increase the normalization denominator floor to 10.0 to prevent trivial measurement noise on low-bandwidth links from triggering false repairs or lowering confidence.
+3.  **Steeper Confidence Decay**: Use a steeper decay function (`1.0 - 2.0 * rel_err`) for confidence scores to better reflect the probability of correctness when residual errors exist.
+Also ensures deterministic processing order.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Pass 2: Fix Rates using Symmetry & Flow Conservation
+    # We iterate over interfaces and check for symmetry violations
+    for if_id, s in state.items():
+        if s['status'] == 'down':
+            continue
+
+        peer_id = s['orig'].get('connected_to')
+        if not peer_id or peer_id not in state:
+            continue
+        peer = state[peer_id]
+
+        # --- Check RX (should match Peer TX) ---
+        diff_rx = abs(s['rx'] - peer['tx'])
+        denom_rx = max(s['rx'], peer['tx'], 1.0)
+
+        if diff_rx / denom_rx > HARDENING_THRESHOLD:
+            # Symmetry Violation. Try to use Flow Conservation to pick winner.
+            local_router = s['orig'].get('local_router')
+            use_peer = True # Default fallback
+
+            # Calculate target RX for this interface to balance local router
+            if local_router and local_router in topology:
+                sum_tx_all = 0.0
+                sum_rx_other = 0.0
+                valid_topology = True
+
+                for rid in topology[local_router]:
+                    if rid not in state:
+                        valid_topology = False; break
+                    sum_tx_all += state[rid]['tx']
+                    if rid != if_id:
+                        sum_rx_other += state[rid]['rx']
+
+                if valid_topology:
+                    target_rx = max(0.0, sum_tx_all - sum_rx_other)
+                    dist_local = abs(s['rx'] - target_rx)
+                    dist_peer = abs(peer['tx'] - target_rx)
+
+                    if dist_local < dist_peer:
+                        use_peer = False
+                        # We trust local, but it disagrees with peer.
+                        # Confidence low unless very close to target
+                        match_q = dist_local / max(target_rx, 1.0)
+                        s['rx_conf'] = max(0.5, 1.0 - match_q)
+                    else:
+                        use_peer = True
+                        # We trust peer because it balances flow
+                        match_q = dist_peer / max(target_rx, 1.0)
+                        # Boost confidence if flow conservation confirms it
+                        s['rx_conf'] = max(0.8, 1.0 - match_q)
+                else:
+                    # No topology validation possible, fallback to peer + diff penalty
+                    s['rx_conf'] = max(0.0, 1.0 - (diff_rx / denom_rx))
+            else:
+                 s['rx_conf'] = max(0.0, 1.0 - (diff_rx / denom_rx))
+
+            if use_peer:
+                s['rx'] = peer['tx']
+
+        # --- Check TX (should match Peer RX) ---
+        diff_tx = abs(s['tx'] - peer['rx'])
+        denom_tx = max(s['tx'], peer['rx'], 1.0)
+
+        if diff_tx / denom_tx > HARDENING_THRESHOLD:
+            local_router = s['orig'].get('local_router')
+            use_peer = True
+
+            # Target TX = Sum(RX_all) - Sum(TX_other)
+            if local_router and local_router in topology:
+                sum_rx_all = 0.0
+                sum_tx_other = 0.0
+                valid_topology = True
+
+                for rid in topology[local_router]:
+                    if rid not in state:
+                        valid_topology = False; break
+                    sum_rx_all += state[rid]['rx']
+                    if rid != if_id:
+                        sum_tx_other += state[rid]['tx']
+
+                if valid_topology:
+                    target_tx = max(0.0, sum_rx_all - sum_tx_other)
+                    dist_local = abs(s['tx'] - target_tx)
+                    dist_peer = abs(peer['rx'] - target_tx)
+
+                    if dist_local < dist_peer:
+                        use_peer = False
+                        match_q = dist_local / max(target_tx, 1.0)
+                        s['tx_conf'] = max(0.5, 1.0 - match_q)
+                    else:
+                        use_peer = True
+                        match_q = dist_peer / max(target_tx, 1.0)
+                        s['tx_conf'] = max(0.8, 1.0 - match_q)
+                else:
+                    s['tx_conf'] = max(0.0, 1.0 - (diff_tx / denom_tx))
+            else:
+                s['tx_conf'] = max(0.0, 1.0 - (diff_tx / denom_tx))
+
+            if use_peer:
+                s['tx'] = peer['rx']
+=======
+    # Pass 2: Fix Rates using Symmetry & Flow Conservation
+
+    # Helper to get router imbalance excluding a specific interface's flow component
+    def get_router_partial_imbalance(router_id, exclude_if_id, component_type):
+        # component_type 'rx' means we exclude the RX of exclude_if_id from In_sum
+        # component_type 'tx' means we exclude the TX of exclude_if_id from Out_sum
+        if not router_id or router_id not in topology:
+            return 0.0, False
+
+        in_sum = 0.0
+        out_sum = 0.0
+        for rid in topology[router_id]:
+            if rid not in state: return 0.0, False
+            if rid == exclude_if_id:
+                if component_type == 'tx': # Exclude TX, include RX
+                    in_sum += state[rid]['rx']
+                elif component_type == 'rx': # Exclude RX, include TX
+                    out_sum += state[rid]['tx']
+            else:
+                in_sum += state[rid]['rx']
+                out_sum += state[rid]['tx']
+
+        return in_sum - out_sum, True
+
+    # Sort for deterministic processing
+    sorted_ifs = sorted(state.keys())
+
+    for if_id in sorted_ifs:
+        s = state[if_id]
+        if s['status'] == 'down':
+            continue
+
+        peer_id = s['orig'].get('connected_to')
+        if not peer_id or peer_id not in state:
+            continue
+        peer = state[peer_id]
+
+        # --- Check RX (should match Peer TX) ---
+        diff_rx = abs(s['rx'] - peer['tx'])
+        denom_rx = max(s['rx'], peer['tx'], 10.0)
+
+        if diff_rx / denom_rx > HARDENING_THRESHOLD:
+            # Symmetry Violation.
+            # We want to pick value V that minimizes: |Imbalance_Local(V)| + |Imbalance_Remote(V)|
+
+            r_local = s['orig'].get('local_router')
+            r_remote = peer['orig'].get('local_router')
+
+            p_imb_local, valid_local = get_router_partial_imbalance(r_local, if_id, 'rx')
+            p_imb_remote, valid_remote = get_router_partial_imbalance(r_remote, peer_id, 'tx')
+
+            c1 = s['rx']        # Candidate 1: Trust Local
+            c2 = peer['tx']     # Candidate 2: Trust Peer
+
+            score_c1 = 0.0
+            score_c2 = 0.0
+
+            if valid_local:
+                score_c1 += abs(p_imb_local + c1)
+                score_c2 += abs(p_imb_local + c2)
+            if valid_remote:
+                score_c1 += abs(p_imb_remote - c1)
+                score_c2 += abs(p_imb_remote - c2)
+
+            use_peer = True
+            conf_score = 0.5
+
+            if valid_local or valid_remote:
+                if score_c1 < score_c2:
+                    use_peer = False
+                    winner_err = score_c1
+                    base = max(c1, 10.0)
+                    rel_err = winner_err / base
+                    conf_score = max(0.0, 1.0 - 2.0 * rel_err)
+                else:
+                    use_peer = True
+                    winner_err = score_c2
+                    base = max(c2, 10.0)
+                    rel_err = winner_err / base
+                    conf_score = max(0.0, 1.0 - 2.0 * rel_err)
+            else:
+                 conf_score = max(0.0, 1.0 - (diff_rx / denom_rx))
+
+            if use_peer:
+                s['rx'] = peer['tx']
+
+            s['rx_conf'] = conf_score
+        else:
+            s['rx_conf'] = 1.0
+
+        # --- Check TX (should match Peer RX) ---
+        diff_tx = abs(s['tx'] - peer['rx'])
+        denom_tx = max(s['tx'], peer['rx'], 10.0)
+
+        if diff_tx / denom_tx > HARDENING_THRESHOLD:
+            r_local = s['orig'].get('local_router')
+            r_remote = peer['orig'].get('local_router')
+
+            p_imb_local, valid_local = get_router_partial_imbalance(r_local, if_id, 'tx')
+            p_imb_remote, valid_remote = get_router_partial_imbalance(r_remote, peer_id, 'rx')
+
+            c1 = s['tx']      # Trust Local
+            c2 = peer['rx']   # Trust Peer
+
+            score_c1 = 0.0
+            score_c2 = 0.0
+
+            if valid_local:
+                score_c1 += abs(p_imb_local - c1)
+                score_c2 += abs(p_imb_local - c2)
+            if valid_remote:
+                score_c1 += abs(p_imb_remote + c1)
+                score_c2 += abs(p_imb_remote + c2)
+
+            use_peer = True
+            conf_score = 0.5
+
+            if valid_local or valid_remote:
+                if score_c1 < score_c2:
+                    use_peer = False
+                    winner_err = score_c1
+                    base = max(c1, 10.0)
+                    rel_err = winner_err / base
+                    conf_score = max(0.0, 1.0 - 2.0 * rel_err)
+                else:
+                    use_peer = True
+                    winner_err = score_c2
+                    base = max(c2, 10.0)
+                    rel_err = winner_err / base
+                    conf_score = max(0.0, 1.0 - 2.0 * rel_err)
+            else:
+                conf_score = max(0.0, 1.0 - (diff_tx / denom_tx))
+
+            if use_peer:
+                s['tx'] = peer['rx']
+
+            s['tx_conf'] = conf_score
+        else:
+            s['tx_conf'] = 1.0
+>>>>>>> REPLACE
+</DIFF>

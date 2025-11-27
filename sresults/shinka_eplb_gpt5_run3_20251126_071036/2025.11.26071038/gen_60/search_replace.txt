@@ -1,0 +1,175 @@
+<NAME>
+replicate_tail_ab_tiebreak_and_fixup_second_order
+</NAME>
+
+<DESCRIPTION>
+I implemented two targeted improvements in the expert replication phase to improve balancedness with negligible runtime impact:
+
+1) Tail allocator micro A/B between Sainte-Laguë and Huntington–Hill: For the tail allocation steps, per-row we now pick the method (S or H) that minimizes the predicted post-pick peak average, with a deterministic tie-breaker on expert index. This is lightweight and can substantially reduce peak loads in skewed distributions.
+
+2) Deterministic benefit tie-breaking and stronger replication fix-up tie-break:
+   - In the D’Hondt bulk, benefits now use a tiny index-based tie-break to ensure deterministic and slightly more spread selection under equal-benefit ties.
+   - In the one-move replication fix-up, when multiple donor→receiver moves yield the same improvement in peak, we break ties by the new second-highest average (lower is better), then by donor/receiver indices. This helps avoid creating future peaks and improves overall balance.
+
+These changes are consistent with the existing algorithm, deterministic, and maintain the speed characteristics while addressing suboptimal tie behaviors and tail allocation choices.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    col = num_log
+    # Bulk phase (D'Hondt): benefit = weight / r
+    for _ in range(bulk):
+        benefit = weight / logcnt
+        best = benefit.max(dim=-1).indices
+        phy2log[:, col] = best
+        rank[:, col] = logcnt[arangen, best]
+        logcnt[arangen, best] += 1
+        col += 1
+
+    # Tail phase (Sainte-Laguë): benefit = weight / (2r - 1)
+    if tail > 0:
+        for _ in range(tail):
+            denom = (2 * logcnt - 1).to(weight.dtype)
+            benefit = weight / denom
+            best = benefit.max(dim=-1).indices
+            phy2log[:, col] = best
+            rank[:, col] = logcnt[arangen, best]
+            logcnt[arangen, best] += 1
+            col += 1
+=======
+    col = num_log
+    # Bulk phase (D'Hondt): benefit = weight / r, with deterministic tie-break
+    for _ in range(bulk):
+        logcnt_f = logcnt.to(weight.dtype)
+        benefit = weight / logcnt_f
+        # Deterministic tie-breaking: prefer lower index under exact ties
+        idx_vec = torch.arange(num_log, dtype=weight.dtype, device=device).view(1, -1)
+        benefit_adj = benefit - 1e-16 * idx_vec
+        best = benefit_adj.argmax(dim=-1)
+        phy2log[:, col] = best
+        rank[:, col] = logcnt[arangen, best]
+        logcnt[arangen, best] += 1
+        col += 1
+
+    # Tail phase: per-step A/B between Sainte-Laguë and Huntington–Hill
+    if tail > 0:
+        for _ in range(tail):
+            r_f = logcnt.to(weight.dtype)
+            avg = weight / r_f
+            # Candidate indices under S and H with deterministic tie-break
+            idx_vec = torch.arange(num_log, dtype=weight.dtype, device=device).view(1, -1)
+            benef_S = weight / (2.0 * r_f - 1.0)
+            benef_H = weight / torch.sqrt(r_f * (r_f + 1.0))
+            idx_S = (benef_S - 1e-16 * idx_vec).argmax(dim=-1)
+            idx_H = (benef_H - 1e-16 * idx_vec).argmax(dim=-1)
+            # Predicted peaks after adding one replica
+            top2_vals, _ = torch.topk(avg, k=min(2, num_log), dim=-1)
+            second = top2_vals[:, 1] if num_log > 1 else top2_vals[:, 0]
+            newS = weight[arangen, idx_S] / (r_f[arangen, idx_S] + 1.0)
+            newH = weight[arangen, idx_H] / (r_f[arangen, idx_H] + 1.0)
+            peakS = torch.maximum(second, newS)
+            peakH = torch.maximum(second, newH)
+            use_S = peakS < peakH - 1e-12
+            best_idx = torch.where(use_S, idx_S, idx_H)
+            phy2log[:, col] = best_idx
+            rank[:, col] = logcnt[arangen, best_idx]
+            logcnt[arangen, best_idx] += 1
+            col += 1
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        rows = torch.arange(n, dtype=torch.int64, device=device)
+        for ri in rows.tolist():
+            best_new_peak = None
+            best_pair = None
+
+            donors = top2_idx[ri].tolist()
+            receivers = bot2_idx[ri].tolist()
+
+            for d in donors:
+                cd = int(logcnt[ri, d].item())
+                if cd <= 1:
+                    continue
+                for r in receivers:
+                    if d == r:
+                        continue
+                    cr = int(logcnt[ri, r].item())
+
+                    # Baseline peak ignoring donor if donor is current max
+                    baseline_other = float(cur_max[ri].item())
+                    if d == int(argmax_idx[ri].item()):
+                        # second-best under current configuration
+                        baseline_other = float(torch.topk(avg[ri], k=2, largest=True).values[1].item())
+
+                    new_d = float(weight[ri, d].item()) / float(cd - 1)
+                    new_r = float(weight[ri, r].item()) / float(cr + 1)
+                    candidate_peak = max(baseline_other, new_d, new_r)
+
+                    if candidate_peak + 1e-12 < float(cur_max[ri].item()):
+                        if best_new_peak is None or candidate_peak < best_new_peak:
+                            best_new_peak = candidate_peak
+                            best_pair = (d, r)
+=======
+        rows = torch.arange(n, dtype=torch.int64, device=device)
+        for ri in rows.tolist():
+            best_new_peak = None
+            best_second = None
+            best_pair = None
+
+            donors = top2_idx[ri].tolist()
+            receivers = bot2_idx[ri].tolist()
+
+            for d in donors:
+                cd = int(logcnt[ri, d].item())
+                if cd <= 1:
+                    continue
+                for r in receivers:
+                    if d == r:
+                        continue
+                    cr = int(logcnt[ri, r].item())
+
+                    # Baseline peak ignoring donor if donor is current max
+                    baseline_other = float(cur_max[ri].item())
+                    if d == int(argmax_idx[ri].item()):
+                        # second-best under current configuration
+                        baseline_other = float(torch.topk(avg[ri], k=2, largest=True).values[1].item())
+
+                    new_d = float(weight[ri, d].item()) / float(cd - 1)
+                    new_r = float(weight[ri, r].item()) / float(cr + 1)
+
+                    # Candidate peak and second-highest after the move
+                    a = baseline_other
+                    b = new_d
+                    c = new_r
+                    maxv = max(a, b, c)
+                    minv = min(a, b, c)
+                    secondv = (a + b + c) - maxv - minv
+                    candidate_peak = maxv
+
+                    if candidate_peak + 1e-12 < float(cur_max[ri].item()):
+                        if (
+                            best_new_peak is None
+                            or candidate_peak < best_new_peak - 1e-12
+                            or (
+                                abs(candidate_peak - best_new_peak) <= 1e-12
+                                and (best_second is None or secondv < best_second - 1e-12)
+                            )
+                            or (
+                                abs(candidate_peak - best_new_peak) <= 1e-12
+                                and best_second is not None
+                                and abs(secondv - best_second) <= 1e-12
+                                and (
+                                    best_pair is None
+                                    or d < best_pair[0]
+                                    or (d == best_pair[0] and r < best_pair[1])
+                                )
+                            )
+                        ):
+                            best_new_peak = candidate_peak
+                            best_second = secondv
+                            best_pair = (d, r)
+>>>>>>> REPLACE
+
+</DIFF>

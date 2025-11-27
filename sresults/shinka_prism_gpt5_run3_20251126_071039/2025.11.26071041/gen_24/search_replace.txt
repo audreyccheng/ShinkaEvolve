@@ -1,0 +1,177 @@
+<NAME>
+add_parametric_T_candidates
+</NAME>
+
+<DESCRIPTION>
+I add a lightweight parametric T-based packing candidate generator that explicitly minimizes the maximum KVPR via transformed bin packing. It computes strong lower bounds on T (per-item, global, pair, and short k-prefix), performs an exponential search to find a feasible T, refines T via binary search, and builds placements with two simple orderings. These candidates are added to the existing candidate set before local improvement. This approach aligns directly with the objective and has shown strong performance in prior implementations, while keeping the code simple and fast. Existing regret/memory-based methods remain as fallbacks for robustness.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build multiple initial candidates
+    candidates = []
+
+    # Candidate A: regret-based insertion (KVPR-aware)
+    plc_regret = regret_insertion()
+    if plc_regret is not None:
+        candidates.append(plc_regret)
+
+    # Candidate B: memory-balanced dual strategy
+    plc_dual = memory_pack(order="size_desc", strategy="dual")
+    if plc_dual is not None:
+        candidates.append(plc_dual)
+
+    # Fallbacks to ensure a feasible start
+    if not candidates:
+        for strat in ("bestfit", "maxfree", "firstfit"):
+            plc_try = memory_pack(order="size_desc", strategy=strat if strat != "firstfit" else "firstfit")
+            if plc_try is not None:
+                candidates.append(plc_try)
+                break
+
+    if not candidates:
+        raise ValueError("Unable to construct any feasible placement")
+=======
+    # Build multiple initial candidates
+
+    # Parametric T-based transformed packing to directly minimize max KVPR
+    def parametric_pack_candidates():
+        # Lower bounds on T
+        indiv_lb = max(safe_div(n, max(GPU_MEM_SIZE - ms, 1e-9)) for _, ms, n in items)
+        global_lb = safe_div(total_n, max(total_capacity - total_mem, 1e-9))
+
+        # Pair bound for heavy pairs that cannot co-reside
+        pair_lb = 0.0
+        if gpu_num >= 2 and len(items) >= 2:
+            L = min(len(items), 80)
+            heavy = sorted(items, key=lambda it: it[1], reverse=True)[:L]
+            for i in range(len(heavy)):
+                _, mi, ni = heavy[i]
+                for j in range(i + 1, len(heavy)):
+                    _, mj, nj = heavy[j]
+                    if mi + mj > GPU_MEM_SIZE + 1e-12:
+                        denom = 2.0 * GPU_MEM_SIZE - (mi + mj)
+                        pair_lb = max(pair_lb, safe_div(ni + nj, max(denom, 1e-9)))
+
+        # k-prefix bound (small k)
+        kprefix_lb = 0.0
+        if items:
+            by_m = sorted(items, key=lambda it: it[1], reverse=True)
+            max_k = min(gpu_num, 4)
+            for k in range(1, max_k + 1):
+                s_m = 0.0
+                s_n = 0.0
+                for (_, ms, n) in by_m:
+                    s_m += ms
+                    s_n += n
+                    if s_m > (k - 1) * GPU_MEM_SIZE + 1e-12:
+                        break
+                denom = k * GPU_MEM_SIZE - s_m
+                kprefix_lb = max(kprefix_lb, safe_div(s_n, max(denom, 1e-9)))
+
+        low_T = max(0.0, indiv_lb, global_lb, pair_lb, kprefix_lb)
+
+        def try_pack(T, ordering=0, return_placement=False):
+            cap = GPU_MEM_SIZE * T
+            eps = 1e-12
+            if ordering == 0:
+                ordered = sorted(items, key=lambda it: (it[2] + T * it[1], it[2], it[1]), reverse=True)
+            else:
+                ordered = sorted(items, key=lambda it: (safe_div(it[2], max(GPU_MEM_SIZE - it[1], 1e-9)), it[1]), reverse=True)
+
+            m_sum = [0.0] * gpu_num
+            n_sum = [0.0] * gpu_num
+            used_cap = [0.0] * gpu_num
+            plc = [[] for _ in range(gpu_num)]
+
+            for mdl, ms, n in ordered:
+                w = n + T * ms
+                best_g = None
+                best_resid = float('inf')
+                for g in range(gpu_num):
+                    if m_sum[g] + ms > GPU_MEM_SIZE + eps:
+                        continue
+                    resid = cap - (used_cap[g] + w)
+                    if resid >= -eps and resid < best_resid - 1e-15:
+                        best_resid = resid
+                        best_g = g
+                if best_g is None:
+                    return (False, None) if return_placement else False
+                plc[best_g].append(mdl)
+                m_sum[best_g] += ms
+                n_sum[best_g] += n
+                used_cap[best_g] += w
+
+            if return_placement:
+                return True, {g: plc[g] for g in range(gpu_num)}
+            return True
+
+        def try_any(T, need_plc=False):
+            if need_plc:
+                feas = []
+                ok0, p0 = try_pack(T, 0, True)
+                ok1, p1 = try_pack(T, 1, True)
+                if ok0: feas.append(p0)
+                if ok1: feas.append(p1)
+                return (len(feas) > 0), feas
+            else:
+                return try_pack(T, 0, False) or try_pack(T, 1, False)
+
+        # Exponential search for an initial feasible T
+        T = max(low_T, 1e-9)
+        found = False
+        for _ in range(50):
+            if try_any(T, need_plc=False):
+                found = True
+                break
+            T *= 2.0
+        if not found:
+            return []
+
+        # Binary search to tighten T
+        low, high = low_T, T
+        for _ in range(40):
+            mid = (low + high) / 2.0
+            if try_any(mid, need_plc=False):
+                high = mid
+            else:
+                low = mid
+
+        # Build placements at near-optimal T
+        ok, feas_plcs = try_any(high, need_plc=True)
+        if not ok:
+            return []
+        return feas_plcs
+
+    candidates = []
+
+    # Add parametric T-based candidates first
+    try:
+        candidates.extend(parametric_pack_candidates())
+    except Exception:
+        # If any numerical oddity occurs, fall back to other strategies
+        pass
+
+    # Candidate A: regret-based insertion (KVPR-aware)
+    plc_regret = regret_insertion()
+    if plc_regret is not None:
+        candidates.append(plc_regret)
+
+    # Candidate B: memory-balanced dual strategy
+    plc_dual = memory_pack(order="size_desc", strategy="dual")
+    if plc_dual is not None:
+        candidates.append(plc_dual)
+
+    # Fallbacks to ensure a feasible start
+    if not candidates:
+        for strat in ("bestfit", "maxfree", "firstfit"):
+            plc_try = memory_pack(order="size_desc", strategy=strat if strat != "firstfit" else "firstfit")
+            if plc_try is not None:
+                candidates.append(plc_try)
+                break
+
+    if not candidates:
+        raise ValueError("Unable to construct any feasible placement")
+>>>>>>> REPLACE
+
+</DIFF>

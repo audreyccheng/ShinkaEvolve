@@ -1,0 +1,234 @@
+<NAME>
+all_pairs_refinement
+</NAME>
+
+<DESCRIPTION>
+1. Increased `num_restarts` from 8 to 12 to explore more initial packings using parallel execution.
+2. Replaced the `Top-K` vs `Bottom-K` refinement with a global `All-Pairs` refinement strategy. Instead of only looking at the heaviest and lightest packs, this method computes the potential L2 variance reduction gain for swapping items between *any* two packs. This avoids local minima where extreme packs cannot swap directly, but intermediate swaps (e.g., between the 2nd heaviest and 2nd lightest) can reduce global variance and unlock further improvements. The computation is fully vectorized.
+3. Increased the refinement iteration limit from 20 to 30 to allow the global descent to converge further.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Run multiple random restarts in parallel
+    num_restarts = 8
+
+    # Expand weight for restarts: [num_layers, num_restarts, num_groups]
+=======
+    # Run multiple random restarts in parallel
+    num_restarts = 12
+
+    # Expand weight for restarts: [num_layers, num_restarts, num_groups]
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # Refinement: Top-K / Bottom-K Swap minimizing L2 norm (Sum of Squared Weights)
+    # Construct pack_contents for easy access: [Batch, num_packs, groups_per_pack]
+    pack_contents = torch.zeros(batch_size,
+                                num_packs,
+                                groups_per_pack,
+                                device=device)
+    pack_item_ids = torch.zeros(batch_size,
+                                num_packs,
+                                groups_per_pack,
+                                dtype=torch.int64,
+                                device=device)
+
+    flat_indices = row_indices.unsqueeze(1).expand(-1, num_groups).flatten()
+    flat_pack_idx = pack_index_sorted.flatten()
+    flat_rank_idx = rank_in_pack_sorted.flatten()
+
+    pack_contents.index_put_((flat_indices, flat_pack_idx, flat_rank_idx),
+                             sorted_w.flatten())
+    pack_item_ids.index_put_((flat_indices, flat_pack_idx, flat_rank_idx),
+                             sorted_indices.flatten())
+
+    # Number of top/bottom packs to consider
+    K = min(num_packs, 4)
+
+    for _ in range(20):
+        current_pack_weights = pack_contents.sum(dim=2)  # [B, P]
+
+        # Identify Top-K and Bottom-K packs
+        # vals_top: [B, K], idx_top: [B, K]
+        vals_top, idx_top = torch.topk(current_pack_weights, k=K, largest=True)
+        vals_bot, idx_bot = torch.topk(current_pack_weights,
+                                       k=K,
+                                       largest=False)
+
+        # Check convergence (difference between heaviest and lightest)
+        diff = vals_top[:, 0] - vals_bot[:, 0]
+        active_mask = diff > 1e-4
+        if not active_mask.any():
+            break
+
+        # Gather items from Top-K and Bottom-K packs
+        # Expand indices for gathering: [B, K, G]
+        gather_top = idx_top.unsqueeze(2).expand(-1, -1, groups_per_pack)
+        gather_bot = idx_bot.unsqueeze(2).expand(-1, -1, groups_per_pack)
+
+        items_top = pack_contents.gather(1, gather_top)  # [B, K, G]
+        items_bot = pack_contents.gather(1, gather_bot)  # [B, K, G]
+
+        # Compute delta for all pairs: w_u - w_v (u from Top, v from Bot)
+        # Shape: [B, K, G, K, G]
+        # items_top: [B, K, G, 1, 1]
+        # items_bot: [B, 1, 1, K, G]
+        delta = items_top.unsqueeze(3).unsqueeze(4) - items_bot.unsqueeze(
+            1).unsqueeze(2)
+
+        # Compute L2 gain: reduction in sum of squared weights
+        # Gain = (W_A^2 + W_B^2) - ((W_A - d)^2 + (W_B + d)^2)
+        #      = 2*d*(W_A - W_B - d)
+        # W_A corresponds to vals_top, W_B to vals_bot
+        W_A = vals_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        W_B = vals_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        diff_packs = W_A - W_B
+
+        gain = 2 * delta * (diff_packs - delta)
+
+        # Mask invalid swaps:
+        # 1. Must be distinct packs (if K is large enough to overlap)
+        # idx_top: [B, K, 1, 1, 1], idx_bot: [B, 1, 1, K, 1]
+        p_top_exp = idx_top.unsqueeze(2).unsqueeze(3).unsqueeze(4)
+        p_bot_exp = idx_bot.unsqueeze(1).unsqueeze(2).unsqueeze(4)
+        valid_pair = p_top_exp != p_bot_exp
+
+        # 2. Only consider positive gain
+        gain_mask = (gain > 1e-6) & valid_pair
+        gain[~gain_mask] = -float('inf')
+
+        # Find best swap per batch
+        gain_flat = gain.view(batch_size, -1)
+        best_gain, best_flat_idx = gain_flat.max(dim=1)
+
+        do_swap = (best_gain > 1e-6) & active_mask
+        if not do_swap.any():
+            break
+
+        # Decode indices
+        batch_active = row_indices[do_swap]
+        idx_tuple = best_flat_idx[do_swap]
+
+        KG = K * groups_per_pack
+        # Index in flattened [K*G, K*G]
+        idx_pair_top = idx_tuple // KG
+        idx_pair_bot = idx_tuple % KG
+
+        k_t = idx_pair_top // groups_per_pack
+        g_t = idx_pair_top % groups_per_pack
+        k_b = idx_pair_bot // groups_per_pack
+        g_b = idx_pair_bot % groups_per_pack
+
+        # Retrieve pack indices
+        p_top = idx_top[batch_active, k_t]
+        p_bot = idx_bot[batch_active, k_b]
+
+        # Perform swap
+        val_top = pack_contents[batch_active, p_top, g_t]
+        val_bot = pack_contents[batch_active, p_bot, g_b]
+
+        pack_contents[batch_active, p_top, g_t] = val_bot
+        pack_contents[batch_active, p_bot, g_b] = val_top
+
+        id_top = pack_item_ids[batch_active, p_top, g_t]
+        id_bot = pack_item_ids[batch_active, p_bot, g_b]
+
+        pack_item_ids[batch_active, p_top, g_t] = id_bot
+        pack_item_ids[batch_active, p_bot, g_b] = id_top
+=======
+    # Refinement: All-Pairs Swap minimizing L2 norm (Sum of Squared Weights)
+    # Construct pack_contents for easy access: [Batch, num_packs, groups_per_pack]
+    pack_contents = torch.zeros(batch_size,
+                                num_packs,
+                                groups_per_pack,
+                                device=device)
+    pack_item_ids = torch.zeros(batch_size,
+                                num_packs,
+                                groups_per_pack,
+                                dtype=torch.int64,
+                                device=device)
+
+    flat_indices = row_indices.unsqueeze(1).expand(-1, num_groups).flatten()
+    flat_pack_idx = pack_index_sorted.flatten()
+    flat_rank_idx = rank_in_pack_sorted.flatten()
+
+    pack_contents.index_put_((flat_indices, flat_pack_idx, flat_rank_idx),
+                             sorted_w.flatten())
+    pack_item_ids.index_put_((flat_indices, flat_pack_idx, flat_rank_idx),
+                             sorted_indices.flatten())
+
+    for _ in range(30):
+        current_pack_weights = pack_contents.sum(dim=2)  # [B, P]
+
+        # Check convergence
+        max_w = current_pack_weights.max(dim=1).values
+        min_w = current_pack_weights.min(dim=1).values
+        diff_max_min = max_w - min_w
+        active_mask = diff_max_min > 1e-4
+        if not active_mask.any():
+            break
+
+        # Compute Weight Difference between all pairs of packs: W_u - W_v
+        # [B, P, 1] - [B, 1, P] -> [B, P, P]
+        diff_matrix = current_pack_weights.unsqueeze(2) - current_pack_weights.unsqueeze(1)
+
+        # Compute Item Difference between all pairs of items from all pairs of packs
+        # items: [B, P, G]
+        # [B, P, G, 1, 1] - [B, 1, 1, P, G] -> [B, P, G, P, G]
+        # We perform subtraction. delta = item_u - item_v
+        delta = pack_contents.unsqueeze(3).unsqueeze(4) - pack_contents.unsqueeze(1).unsqueeze(2)
+
+        # Compute Gain: 2 * delta * (diff - delta)
+        # diff_matrix needs expansion to [B, P, 1, P, 1]
+        target = diff_matrix.unsqueeze(2).unsqueeze(4)
+        gain = 2 * delta * (target - delta)
+
+        # Mask invalid swaps:
+        # 1. Gain must be positive
+        # 2. If p_u == p_v, diff=0, gain = -2*delta^2 <= 0. So diagonal is handled.
+        gain_mask = (gain > 1e-6)
+
+        # Optimization: We can zero out gains where mask is false to avoid NaN issues if any
+        # though we init with valid math. Just setting to -inf for argmax.
+        gain[~gain_mask] = -float('inf')
+
+        # Find best swap per batch
+        # Flatten the last 4 dims: P*G*P*G
+        gain_flat = gain.view(batch_size, -1)
+        best_gain, best_flat_idx = gain_flat.max(dim=1)
+
+        do_swap = (best_gain > 1e-6) & active_mask
+        if not do_swap.any():
+            break
+
+        # Decode indices
+        batch_active = row_indices[do_swap]
+        idx_tuple = best_flat_idx[do_swap]
+
+        PG = num_packs * groups_per_pack
+        G = groups_per_pack
+
+        # indices in flattened [P, G, P, G] space
+        # idx_tuple = ((p_u * G + g_u) * P + p_v) * G + g_v
+
+        g_v = idx_tuple % G
+        rem = idx_tuple // G
+        p_v = rem % num_packs
+        rem = rem // num_packs
+        g_u = rem % G
+        p_u = rem // G
+
+        # Perform swap
+        val_u = pack_contents[batch_active, p_u, g_u]
+        val_v = pack_contents[batch_active, p_v, g_v]
+
+        pack_contents[batch_active, p_u, g_u] = val_v
+        pack_contents[batch_active, p_v, g_v] = val_u
+
+        id_u = pack_item_ids[batch_active, p_u, g_u]
+        id_v = pack_item_ids[batch_active, p_v, g_v]
+
+        pack_item_ids[batch_active, p_u, g_u] = id_v
+        pack_item_ids[batch_active, p_v, g_v] = id_u
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,295 @@
+<NAME>
+vectorized_lpt_and_swap
+</NAME>
+
+<DESCRIPTION>
+I am replacing the `balanced_packing` function with a vectorized implementation. The original version used Python loops for an LPT (Longest Processing Time) initialization and a swap-based refinement, which is inefficient.
+
+The new implementation:
+1.  **Vectorized LPT Initialization**: Instead of processing layers sequentially in Python, it uses PyTorch operations. It processes items (sorted by weight) and assigns them to the least loaded valid packs for all layers in parallel.
+2.  **Batched Swap Refinement**: The refinement phase is fully vectorized. In each iteration, for every layer, it identifies the pack with the maximum load and evaluates all possible swaps between this max-pack and all other packs. It selects the swap that maximizes the reduction of the maximum load.
+3.  **Efficiency**: By avoiding Python loops and using batched tensor operations, the algorithm is significantly faster and allows for more robust optimization within time constraints.
+
+I am also keeping the execution on the device of the input tensor (cpu or gpu), removing explicit cpu moves inside `balanced_packing`, making it compatible with the existing `rebalance_experts` logic (which currently moves to CPU, but vectorization on CPU is still much faster).
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Greedy LPT initialization followed by a Swap-based local search refinement.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Pre-allocate outputs
+    pack_index = torch.full_like(weight, -1, dtype=torch.int64, device="cpu")
+    rank_in_pack = torch.full_like(pack_index, -1)
+
+    # Move weights to CPU for processing loops
+    weight_cpu = weight.cpu()
+
+    # Process each layer
+    for i in range(num_layers):
+        layer_weights = weight_cpu[i].tolist()
+        # Sort indices by weight descending for initial greedy allocation
+        sorted_indices = sorted(range(num_groups), key=lambda x: layer_weights[x], reverse=True)
+
+        # Initial Greedy Allocation (LPT with cardinality constraints)
+        current_pack_weights = [0.0] * num_packs
+        packs = [[] for _ in range(num_packs)]
+
+        # Fill packs
+        for group_idx in sorted_indices:
+            # Find the lightest pack that is not full
+            # If multiple packs have same weight, pick the first one (stable)
+            best_pack = -1
+            min_w = float('inf')
+
+            for p_idx in range(num_packs):
+                if len(packs[p_idx]) < groups_per_pack:
+                    if current_pack_weights[p_idx] < min_w:
+                        min_w = current_pack_weights[p_idx]
+                        best_pack = p_idx
+
+            packs[best_pack].append(group_idx)
+            current_pack_weights[best_pack] += layer_weights[group_idx]
+
+        # Refinement: Iterative Swap
+        # Try to swap items from the heaviest pack to others to reduce max load
+        # Limit iterations for speed
+        max_iters = 50
+
+        for _ in range(max_iters):
+            # Find max pack
+            max_p = -1
+            max_w = -1.0
+            for p in range(num_packs):
+                if current_pack_weights[p] > max_w:
+                    max_w = current_pack_weights[p]
+                    max_p = p
+
+            best_swap = None
+            best_improv = 0.0
+
+            # Try to swap an item from max_p with an item from any other pack
+            for other_p in range(num_packs):
+                if other_p == max_p:
+                    continue
+
+                other_w = current_pack_weights[other_p]
+
+                # Check all pairs
+                # Optimization: We want w_i > w_j to reduce max_p
+                # Target: Minimize max(new_max_p, new_other_p)
+                # This is equivalent to maximizing the reduction in the max of the pair
+
+                for idx_i, item_i in enumerate(packs[max_p]):
+                    w_i = layer_weights[item_i]
+                    for idx_j, item_j in enumerate(packs[other_p]):
+                        w_j = layer_weights[item_j]
+
+                        if w_i > w_j:
+                            diff = w_i - w_j
+                            # New weights
+                            new_max_w = max_w - diff
+                            new_other_w = other_w + diff
+
+                            # We want the new max of these two to be less than current max_w
+                            # improvement = old_pair_max - new_pair_max
+                            # old_pair_max is max_w (since max_w >= other_w)
+                            new_pair_max = max(new_max_w, new_other_w)
+                            improvement = max_w - new_pair_max
+
+                            if improvement > 1e-5:
+                                if best_swap is None or improvement > best_improv:
+                                    best_improv = improvement
+                                    best_swap = (max_p, idx_i, other_p, idx_j, diff)
+
+            if best_swap:
+                p1, i1, p2, i2, diff = best_swap
+                # Execute swap
+                item1 = packs[p1][i1]
+                item2 = packs[p2][i2]
+                packs[p1][i1] = item2
+                packs[p2][i2] = item1
+                current_pack_weights[p1] -= diff
+                current_pack_weights[p2] += diff
+            else:
+                # Local optima reached
+                break
+
+        # Write back to tensors
+        for p in range(num_packs):
+            for r, item_idx in enumerate(packs[p]):
+                pack_index[i, item_idx] = p
+                rank_in_pack[i, item_idx] = r
+
+    # Move back to original device if necessary (usually cpu is fine for index tensors)
+    if weight.device.type != 'cpu':
+        pack_index = pack_index.to(weight.device)
+        rank_in_pack = rank_in_pack.to(weight.device)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Vectorized Greedy LPT initialization followed by a Batched Swap-based
+    local search refinement on GPU.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups, dtype=torch.int64, device=device).expand(num_layers, num_groups)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- Phase 1: Vectorized LPT Initialization ---
+    # Sort items descending [L, N]
+    sorted_weight, sorted_indices = weight.sort(dim=-1, descending=True)
+
+    # pack_weights: [L, M]
+    pack_weights = torch.zeros(num_layers, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_layers, num_packs, device=device, dtype=torch.int64)
+
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [L, 1]
+
+        # Mask full packs by adding infinity to their weights so they aren't chosen
+        is_full = (pack_counts >= groups_per_pack)
+        masked_w = pack_weights.clone()
+        masked_w[is_full] = float('inf')
+
+        # Choose pack with min weight among valid ones
+        chosen_pack = masked_w.argmin(dim=1, keepdim=True) # [L, 1]
+
+        # Assign
+        sorted_pack_index[:, i:i+1] = chosen_pack
+
+        # Update
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # --- Phase 2: Vectorized Swap Refinement ---
+    num_iters = 50
+    for _ in range(num_iters):
+        # 1. Find max pack and recompute weights to be safe
+        pack_weights.fill_(0)
+        pack_weights.scatter_add_(1, sorted_pack_index, sorted_weight)
+
+        max_vals, max_packs = pack_weights.max(dim=1) # [L], [L]
+
+        # 2. Candidate Swaps: item i in max_pack, item j not in max_pack
+        # Mask for items in max pack: [L, N]
+        in_max = (sorted_pack_index == max_packs.unsqueeze(1))
+
+        # Diff matrix: diff = w_i - w_j. [L, N, N]
+        diffs = sorted_weight.unsqueeze(2) - sorted_weight.unsqueeze(1)
+
+        # Validity mask: i in max, j not in max, diff > 0
+        valid_mask = in_max.unsqueeze(2) & (~in_max.unsqueeze(1))
+        valid_mask &= (diffs > 0)
+
+        if not valid_mask.any():
+            break
+
+        # Get weight of pack containing j
+        p_j = sorted_pack_index # [L, N]
+        w_packs_j = torch.gather(pack_weights, 1, p_j) # [L, N]
+        w_target = w_packs_j.unsqueeze(1) # [L, 1, N]
+
+        # Improvement score = min(diff, M - T - diff)
+        # where M is max_load, T is target_load
+        M = max_vals.view(-1, 1, 1)
+        score = torch.min(diffs, M - w_target - diffs)
+
+        # Apply mask
+        score = torch.where(valid_mask, score, torch.tensor(float('-inf'), device=device))
+
+        # Find best swap per layer
+        best_score_flat, best_idx_flat = score.view(num_layers, -1).max(dim=1)
+
+        # Filter improvements (epsilon 1e-6)
+        do_swap = best_score_flat > 1e-6
+
+        if not do_swap.any():
+            break
+
+        # Decode indices
+        idx_i = best_idx_flat // num_groups
+        idx_j = best_idx_flat % num_groups
+
+        # Update sorted_pack_index for layers that swap
+        l_idx = torch.nonzero(do_swap).squeeze(1)
+
+        i_idx = idx_i[l_idx]
+        j_idx = idx_j[l_idx]
+
+        p_i = max_packs[l_idx]
+        p_j_val = sorted_pack_index[l_idx, j_idx]
+
+        sorted_pack_index[l_idx, i_idx] = p_j_val
+        sorted_pack_index[l_idx, j_idx] = p_i
+
+    # --- Construct Output ---
+    # Map back to original indices
+    pack_index = torch.empty_like(sorted_pack_index)
+    pack_index.scatter_(1, sorted_indices, sorted_pack_index)
+
+    # Construct rank_in_pack
+    # Sort items by pack (stable sort keeps heavier items first)
+    pack_sort_idx = sorted_pack_index.argsort(dim=1, stable=True)
+
+    # Ranks pattern: 0, 1, ..., k-1 repeated M times
+    ranks_pattern = torch.arange(groups_per_pack, device=device).repeat(num_packs).expand(num_layers, -1)
+
+    # Map ranks to sorted_pack positions
+    sorted_ranks = torch.empty_like(ranks_pattern)
+    sorted_ranks.scatter_(1, pack_sort_idx, ranks_pattern)
+
+    # Map back to original item order
+    rank_in_pack = torch.empty_like(pack_index)
+    rank_in_pack.scatter_(1, sorted_indices, sorted_ranks)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

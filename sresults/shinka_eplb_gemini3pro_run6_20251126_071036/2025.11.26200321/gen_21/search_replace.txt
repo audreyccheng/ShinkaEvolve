@@ -1,0 +1,315 @@
+<NAME>
+parallel_candidates_and_gpu_fix
+</NAME>
+
+<DESCRIPTION>
+1. Update `balanced_packing` to use a Massive Parallel Candidate strategy (64 candidates) with a noise spectrum (randomized LPT) to better explore the solution space. This leverages vectorized operations to solve many variations of the problem simultaneously and select the best result, improving balancedness without sacrificing speed (GPU).
+2. Update `rebalance_experts` to remove the forced `.cpu()` transfer. This ensures that the heavy lifting in `balanced_packing` can run on the GPU if the input tensors are on GPU, as intended.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Vectorized Greedy LPT initialization followed by a Batched Swap-based
+    local search refinement on GPU.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups, dtype=torch.int64, device=device).expand(num_layers, num_groups)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- Phase 1: Vectorized LPT Initialization ---
+    # Sort items descending [L, N]
+    sorted_weight, sorted_indices = weight.sort(dim=-1, descending=True)
+
+    # pack_weights: [L, M]
+    pack_weights = torch.zeros(num_layers, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_layers, num_packs, device=device, dtype=torch.int64)
+
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [L, 1]
+
+        # Mask full packs by adding infinity to their weights so they aren't chosen
+        is_full = (pack_counts >= groups_per_pack)
+        masked_w = pack_weights.clone()
+        masked_w[is_full] = float('inf')
+
+        # Choose pack with min weight among valid ones
+        chosen_pack = masked_w.argmin(dim=1, keepdim=True) # [L, 1]
+
+        # Assign
+        sorted_pack_index[:, i:i+1] = chosen_pack
+
+        # Update
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # --- Phase 2: Vectorized Swap Refinement ---
+    num_iters = 50
+    for _ in range(num_iters):
+        # 1. Find max pack and recompute weights to be safe
+        pack_weights.fill_(0)
+        pack_weights.scatter_add_(1, sorted_pack_index, sorted_weight)
+
+        max_vals, max_packs = pack_weights.max(dim=1) # [L], [L]
+
+        # 2. Candidate Swaps: item i in max_pack, item j not in max_pack
+        # Mask for items in max pack: [L, N]
+        in_max = (sorted_pack_index == max_packs.unsqueeze(1))
+
+        # Diff matrix: diff = w_i - w_j. [L, N, N]
+        diffs = sorted_weight.unsqueeze(2) - sorted_weight.unsqueeze(1)
+
+        # Validity mask: i in max, j not in max, diff > 0
+        valid_mask = in_max.unsqueeze(2) & (~in_max.unsqueeze(1))
+        valid_mask &= (diffs > 0)
+
+        if not valid_mask.any():
+            break
+
+        # Get weight of pack containing j
+        p_j = sorted_pack_index # [L, N]
+        w_packs_j = torch.gather(pack_weights, 1, p_j) # [L, N]
+        w_target = w_packs_j.unsqueeze(1) # [L, 1, N]
+
+        # Improvement score = min(diff, M - T - diff)
+        # where M is max_load, T is target_load
+        M = max_vals.view(-1, 1, 1)
+        score = torch.min(diffs, M - w_target - diffs)
+
+        # Apply mask
+        score = torch.where(valid_mask, score, torch.tensor(float('-inf'), device=device))
+
+        # Find best swap per layer
+        best_score_flat, best_idx_flat = score.view(num_layers, -1).max(dim=1)
+
+        # Filter improvements (epsilon 1e-6)
+        do_swap = best_score_flat > 1e-6
+
+        if not do_swap.any():
+            break
+
+        # Decode indices
+        idx_i = best_idx_flat // num_groups
+        idx_j = best_idx_flat % num_groups
+
+        # Update sorted_pack_index for layers that swap
+        l_idx = torch.nonzero(do_swap).squeeze(1)
+
+        i_idx = idx_i[l_idx]
+        j_idx = idx_j[l_idx]
+
+        p_i = max_packs[l_idx]
+        p_j_val = sorted_pack_index[l_idx, j_idx]
+
+        sorted_pack_index[l_idx, i_idx] = p_j_val
+        sorted_pack_index[l_idx, j_idx] = p_i
+
+    # --- Construct Output ---
+    # Map back to original indices
+    pack_index = torch.empty_like(sorted_pack_index)
+    pack_index.scatter_(1, sorted_indices, sorted_pack_index)
+
+    # Construct rank_in_pack
+    # Sort items by pack (stable sort keeps heavier items first)
+    pack_sort_idx = sorted_pack_index.argsort(dim=1, stable=True)
+
+    # Ranks pattern: 0, 1, ..., k-1 repeated M times
+    ranks_pattern = torch.arange(groups_per_pack, device=device).repeat(num_packs).expand(num_layers, -1)
+
+    # Map ranks to sorted_pack positions
+    sorted_ranks = torch.empty_like(ranks_pattern)
+    sorted_ranks.scatter_(1, pack_sort_idx, ranks_pattern)
+
+    # Map back to original item order
+    rank_in_pack = torch.empty_like(pack_index)
+    rank_in_pack.scatter_(1, sorted_indices, sorted_ranks)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Parallel Randomized Greedy LPT initialization followed by a
+    Vectorized Swap-based local search refinement on GPU.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups, dtype=torch.int64, device=device).expand(num_layers, num_groups)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- Parallel Candidate Expansion ---
+    num_candidates = 64
+    num_problems = num_layers * num_candidates
+
+    # [L*C, N]
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Noise Spectrum: 0.0 to 0.5
+    scales = torch.linspace(0, 0.5, num_candidates, device=device)
+    # [L*C, 1]
+    scales_expanded = scales.repeat(num_layers).view(-1, 1)
+
+    # Apply noise
+    noise = torch.rand_like(w_expanded) * w_expanded * scales_expanded
+    sort_keys = w_expanded + noise
+
+    # Sort descending [L*C, N]
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+
+    # --- Phase 1: Vectorized Greedy LPT ---
+    pack_weights = torch.zeros(num_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_problems, num_packs, device=device, dtype=torch.int64)
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [L*C, 1]
+
+        # Mask full packs
+        is_full = (pack_counts >= groups_per_pack)
+        masked_w = pack_weights.clone()
+        masked_w[is_full] = float('inf')
+
+        # Choose pack with min weight
+        chosen_pack = masked_w.argmin(dim=1, keepdim=True)
+
+        sorted_pack_index[:, i:i+1] = chosen_pack
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, torch.ones_like(chosen_pack))
+
+    # --- Phase 2: Vectorized Swap Refinement ---
+    num_iters = 20
+    for _ in range(num_iters):
+        # 1. Identify max packs
+        pack_weights.fill_(0)
+        pack_weights.scatter_add_(1, sorted_pack_index, sorted_weight)
+        max_vals, max_packs = pack_weights.max(dim=1) # [L*C]
+
+        # 2. Compute potential swaps
+        # Mask for items in max pack: [L*C, N]
+        in_max = (sorted_pack_index == max_packs.unsqueeze(1))
+
+        # Diff matrix: diff = w_i - w_j. [L*C, N, N]
+        diffs = sorted_weight.unsqueeze(2) - sorted_weight.unsqueeze(1)
+
+        # Validity mask: i in max, j not in max, diff > 0
+        valid_mask = in_max.unsqueeze(2) & (~in_max.unsqueeze(1))
+        valid_mask &= (diffs > 0)
+
+        if not valid_mask.any():
+            break
+
+        # Calculate improvement
+        p_j = sorted_pack_index
+        w_packs_j = torch.gather(pack_weights, 1, p_j)
+        w_target = w_packs_j.unsqueeze(1)
+
+        M = max_vals.view(-1, 1, 1)
+        score = torch.min(diffs, M - w_target - diffs)
+
+        score = torch.where(valid_mask, score, torch.tensor(float('-inf'), device=device))
+
+        best_score_flat, best_idx_flat = score.view(num_problems, -1).max(dim=1)
+        do_swap = best_score_flat > 1e-6
+
+        if not do_swap.any():
+            break
+
+        # Decode and Apply
+        l_idx = torch.nonzero(do_swap).squeeze(1)
+
+        # indices in flattened N*N
+        flat_indices = best_idx_flat[l_idx]
+        i_idx = flat_indices // num_groups
+        j_idx = flat_indices % num_groups
+
+        p_i = max_packs[l_idx]
+        p_j_val = sorted_pack_index[l_idx, j_idx]
+
+        sorted_pack_index[l_idx, i_idx] = p_j_val
+        sorted_pack_index[l_idx, j_idx] = p_i
+
+    # --- Phase 3: Selection ---
+    # Recompute final max loads
+    pack_weights.fill_(0)
+    pack_weights.scatter_add_(1, sorted_pack_index, sorted_weight)
+    final_max_loads = pack_weights.max(dim=1).values # [L*C]
+
+    # Reshape to [L, C]
+    final_max_loads = final_max_loads.view(num_layers, num_candidates)
+    best_cand_idx = final_max_loads.argmin(dim=1) # [L]
+
+    # Select best results
+    # Index into the expanded batch
+    best_indices = torch.arange(num_layers, device=device) * num_candidates + best_cand_idx
+
+    best_sorted_pack_index = sorted_pack_index[best_indices] # [L, N]
+    best_sorted_indices = sorted_indices[best_indices] # [L, N]
+
+    # Construct Output
+    pack_index = torch.empty_like(best_sorted_pack_index)
+    pack_index.scatter_(1, best_sorted_indices, best_sorted_pack_index)
+
+    # Rank in pack
+    pack_sort_idx = best_sorted_pack_index.argsort(dim=1, stable=True)
+    ranks_pattern = torch.arange(groups_per_pack, device=device).repeat(num_packs).expand(num_layers, -1)
+
+    sorted_ranks = torch.empty_like(ranks_pattern)
+    sorted_ranks.scatter_(1, pack_sort_idx, ranks_pattern)
+
+    rank_in_pack = torch.empty_like(pack_index)
+    rank_in_pack.scatter_(1, best_sorted_indices, sorted_ranks)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+
+    if num_groups % num_nodes == 0:
+=======
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float()
+
+    if num_groups % num_nodes == 0:
+>>>>>>> REPLACE
+</DIFF>

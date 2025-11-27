@@ -1,0 +1,208 @@
+<NAME>
+exhaustive_insertion_and_final_polish
+</NAME>
+
+<DESCRIPTION>
+I introduce two targeted improvements to reduce makespan while keeping runtime practical:
+
+1) Exhaustive-aware best-two insertion with correct caching: In both GRASP construction and LNS repair, when the sequence is short or we're in the endgame, we now evaluate all insertion positions for candidate transactions (rather than a sampled subset). To prevent cache pollution between stratified vs exhaustive evaluations, the cache key includes the mode. I also slightly raise POS_SAMPLE_CAP to improve insertion accuracy in medium/large cases.
+
+Why it helps: For near-complete prefixes, the exact insertion position has a large effect on makespan. Exhaustive evaluation in these phases yields more accurate choices, which improves both construction and LNS performance.
+
+2) Final exhaustive 1-block reinsertion polish: After the main search stabilizes, we run one pass that tries removing each single transaction and reinserting it at the globally best position (evaluating all positions). This is a strong but bounded local move not fully covered by stratified Or-opt(1) and can shave off residual conflicts.
+
+These changes integrate seamlessly with the existing hybrid algorithm and should lower the makespan across workloads without significant runtime penalties.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Position sampling
+    POS_SAMPLE_CAP = None if small else 18
+    STRATIFIED_R = 8 if large else (10 if med else 12)
+=======
+    # Position sampling
+    POS_SAMPLE_CAP = None if small else 24
+    STRATIFIED_R = 12 if large else (12 if med else 14)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+        def best_two_insertions(self, seq, txn):
+            key = (tuple(seq), txn)
+            hit = self.best_two_cache.get(key)
+            if hit is not None:
+                return hit
+            positions = self.stratified_positions(len(seq))
+            best_cost = float('inf')
+            best_pos = 0
+            second_best = float('inf')
+            for pos in positions:
+                cand = seq[:]
+                cand.insert(pos, txn)
+                c = self.eval_cost(cand)
+                if c < best_cost:
+                    second_best = best_cost
+                    best_cost = c
+                    best_pos = pos
+                elif c < second_best:
+                    second_best = c
+            if second_best == float('inf'):
+                second_best = best_cost
+            self.best_two_cache[key] = (best_cost, best_pos, second_best)
+            return self.best_two_cache[key]
+=======
+        def best_two_insertions(self, seq, txn, exhaustive=False):
+            # Cache must distinguish exhaustive vs stratified evaluations
+            mode = 'all' if exhaustive else 'strat'
+            key = (mode, tuple(seq), txn)
+            hit = self.best_two_cache.get(key)
+            if hit is not None:
+                return hit
+            if exhaustive:
+                positions = list(range(len(seq) + 1))
+            else:
+                positions = self.stratified_positions(len(seq))
+            best_cost = float('inf')
+            best_pos = 0
+            second_best = float('inf')
+            for pos in positions:
+                cand = seq[:]
+                cand.insert(pos, txn)
+                c = self.eval_cost(cand)
+                if c < best_cost:
+                    second_best = best_cost
+                    best_cost = c
+                    best_pos = pos
+                elif c < second_best:
+                    second_best = c
+            if second_best == float('inf'):
+                second_best = best_cost
+            self.best_two_cache[key] = (best_cost, best_pos, second_best)
+            return self.best_two_cache[key]
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+            scored = []
+            for t in cand_txns:
+                best_c, pos, second_c = ctx.best_two_insertions(seq, t)
+                regret = max(0.0, second_c - best_c)
+                scored.append((best_c, regret, t, pos))
+            scored.sort(key=lambda x: x[0])  # by best cost
+
+            rcl_size = min(max(3, RCL_K), len(scored))
+            rcl = scored[:rcl_size]
+            # Prefer high regret among good candidates with 60% probability
+            if random.random() < 0.6:
+                chosen = max(rcl, key=lambda x: (x[1], -x[0]))
+            else:
+                chosen = random.choice(rcl)
+            c_step, _, t_step, pos_step = chosen
+            seq.insert(pos_step, t_step)
+            remaining.remove(t_step)
+=======
+            scored = []
+            # Use exhaustive insertion early or in endgame for higher accuracy
+            exhaustive_ins = (len(seq) <= 20) or (len(remaining) <= 2 * beam_width)
+            for t in cand_txns:
+                best_c, pos, second_c = ctx.best_two_insertions(seq, t, exhaustive=exhaustive_ins)
+                regret = max(0.0, second_c - best_c)
+                scored.append((best_c, regret, t, pos))
+            scored.sort(key=lambda x: x[0])  # by best cost
+
+            rcl_size = min(max(3, RCL_K), len(scored))
+            rcl = scored[:rcl_size]
+            # Prefer high regret among good candidates with 60% probability
+            if random.random() < 0.6:
+                chosen = max(rcl, key=lambda x: (x[1], -x[0]))
+            else:
+                chosen = random.choice(rcl)
+            c_step, _, t_step, pos_step = chosen
+            seq.insert(pos_step, t_step)
+            remaining.remove(t_step)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    # ------------------------ LNS: Sensitivity-guided destroy/repair ------------------------
+    def lns_ruin_and_repair(seq, start_cost, rounds=LNS_ROUNDS):
+=======
+    # ------------------------ Exhaustive 1-block reinsertion polish ------------------------
+    def full_or_opt1_polish(seq, start_cost, passes=1):
+        best_seq = list(seq)
+        best_cost = start_cost
+        L = len(best_seq)
+        if L <= 2:
+            return best_seq, best_cost
+        for _ in range(max(1, passes)):
+            improved = False
+            move_best_cost = best_cost
+            move_apply = None  # (i, pos, cand_seq)
+            for i in range(L):
+                t = best_seq[i]
+                base = best_seq[:i] + best_seq[i + 1:]
+                m = len(base) + 1
+                for pos in range(m):
+                    if pos == i:
+                        continue
+                    cand = base[:]
+                    cand.insert(pos, t)
+                    c = ctx.eval_cost(cand)
+                    if c < move_best_cost:
+                        move_best_cost = c
+                        move_apply = (i, pos, cand)
+            if move_apply is not None and move_best_cost + 1e-12 < best_cost:
+                _, _, new_seq = move_apply
+                best_seq = new_seq
+                best_cost = move_best_cost
+                L = len(best_seq)
+                improved = True
+            if not improved:
+                break
+        return best_seq, best_cost
+
+    # ------------------------ LNS: Sensitivity-guided destroy/repair ------------------------
+    def lns_ruin_and_repair(seq, start_cost, rounds=LNS_ROUNDS):
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+                scored = []
+                for t in cand_txns:
+                    best_c, pos, second_c = ctx.best_two_insertions(rebuilt, t)
+                    scored.append((best_c, second_c, t, pos))
+                scored.sort(key=lambda x: x[0])
+                # Regret-aware pick: adaptive weighting
+                if scored:
+                    # compute regret
+                    by_regret = sorted(scored[:min(3, len(scored))], key=lambda x: (-(x[1] - x[0]), x[0]))
+                    chosen = by_regret[0]
+                    c1, c2, t, p = chosen
+                    rebuilt.insert(p, t)
+                    rem.remove(t)
+                else:
+                    t = rem.pop()
+                    rebuilt.append(t)
+=======
+                scored = []
+                exhaustive_ins = (len(rebuilt) <= 20) or (len(rem) <= 2 * beam_width)
+                for t in cand_txns:
+                    best_c, pos, second_c = ctx.best_two_insertions(rebuilt, t, exhaustive=exhaustive_ins)
+                    scored.append((best_c, second_c, t, pos))
+                scored.sort(key=lambda x: x[0])
+                # Regret-aware pick: adaptive weighting
+                if scored:
+                    by_regret = sorted(scored[:min(3, len(scored))], key=lambda x: (-(x[1] - x[0]), x[0]))
+                    c1, c2, t, p = by_regret[0]
+                    rebuilt.insert(p, t)
+                    rem.remove(t)
+                else:
+                    t = rem.pop()
+                    rebuilt.append(t)
+>>>>>>> REPLACE
+
+<<<<<<< SEARCH
+    best_cost, best_seq = incumbent_cost, incumbent_seq
+=======
+    best_cost, best_seq = incumbent_cost, incumbent_seq
+    # Final exhaustive 1-block reinsertion polish
+    best_seq, best_cost = full_or_opt1_polish(best_seq, best_cost, passes=1)
+>>>>>>> REPLACE
+
+</DIFF>

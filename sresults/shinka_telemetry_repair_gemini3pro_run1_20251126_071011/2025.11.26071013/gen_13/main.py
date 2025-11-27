@@ -1,0 +1,236 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair algorithm using Reliability-Weighted Flow Consensus.
+Uses a two-pass approach:
+1. Estimate rates using strong symmetry signals to establish a clean baseline.
+2. Calculate router reliability and flow hints using these clean estimates.
+3. Repair inconsistencies by weighting candidates by their router's reliability.
+"""
+from typing import Dict, Any, Tuple, List
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]], 
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    
+    HARDENING_THRESHOLD = 0.02
+    TRAFFIC_THRESHOLD = 1.0
+    
+    # --- Phase 1: Pre-processing & Status Repair ---
+    # Create a clean dataset with fixed statuses and normalized rates
+    prepared = {}
+    
+    for iface_id, data in telemetry.items():
+        raw_rx = data.get('rx_rate', 0.0)
+        raw_tx = data.get('tx_rate', 0.0)
+        raw_status = data.get('interface_status', 'unknown')
+        peer_id = data.get('connected_to')
+        peer_data = telemetry.get(peer_id) if (peer_id and peer_id in telemetry) else None
+        
+        # Traffic Evidence
+        evidence = [raw_rx, raw_tx]
+        if peer_data:
+            evidence.extend([peer_data.get('rx_rate', 0.0), peer_data.get('tx_rate', 0.0)])
+        max_traffic = max(evidence) if evidence else 0.0
+        
+        # Status Logic
+        status = raw_status
+        status_conf = 1.0
+        
+        if max_traffic > TRAFFIC_THRESHOLD:
+            if raw_status != 'up':
+                status = 'up'
+                status_conf = 0.95
+        elif raw_status == 'up' and peer_data and peer_data.get('interface_status') == 'down':
+             status = 'down'
+             status_conf = 0.8
+             
+        # Normalize
+        if status == 'down':
+            cur_rx, cur_tx = 0.0, 0.0
+        else:
+            cur_rx, cur_tx = raw_rx, raw_tx
+            
+        prepared[iface_id] = {
+            'rx': cur_rx, 'tx': cur_tx,
+            'status': status, 'status_conf': status_conf,
+            'peer_id': peer_id,
+            'orig_rx': raw_rx, 'orig_tx': raw_tx, 'orig_status': raw_status
+        }
+        
+    # --- Phase 2: Symmetric Estimation ---
+    # Generate "Best Guess" rates to use for router flow sums.
+    # Prioritize averaging symmetric links to remove noise.
+    estimates = {}
+    
+    for iface_id, data in prepared.items():
+        if data['status'] == 'down':
+            estimates[iface_id] = {'rx': 0.0, 'tx': 0.0}
+            continue
+            
+        peer_id = data['peer_id']
+        rx, tx = data['rx'], data['tx']
+        
+        if peer_id and peer_id in prepared:
+            p_rx = prepared[peer_id]['rx']
+            p_tx = prepared[peer_id]['tx']
+            
+            # If symmetric, average. Else trust local (as a placeholder).
+            diff_rx = abs(rx - p_tx) / max(rx, p_tx, 1.0)
+            est_rx = (rx + p_tx)/2.0 if diff_rx <= HARDENING_THRESHOLD else rx
+            
+            diff_tx = abs(tx - p_rx) / max(tx, p_rx, 1.0)
+            est_tx = (tx + p_rx)/2.0 if diff_tx <= HARDENING_THRESHOLD else tx
+        else:
+            est_rx, est_tx = rx, tx
+            
+        estimates[iface_id] = {'rx': est_rx, 'tx': est_tx}
+        
+    # --- Phase 3: Router Reliability Analysis ---
+    router_stats = {}
+    
+    for r_id, ifaces in topology.items():
+        valid_ifaces = [i for i in ifaces if i in estimates]
+        sum_in = sum(estimates[i]['rx'] for i in valid_ifaces)
+        sum_out = sum(estimates[i]['tx'] for i in valid_ifaces)
+        
+        # Reliability based on how well the "Best Guesses" balance
+        # 0% imbalance -> 1.0 reliability
+        imbalance = abs(sum_in - sum_out) / max(sum_in, sum_out, 1.0)
+        reliability = max(0.0, 1.0 - (imbalance - HARDENING_THRESHOLD) * 2)
+        
+        router_stats[r_id] = {'rel': reliability, 'in': sum_in, 'out': sum_out}
+        
+    # --- Phase 4: Final Resolution ---
+    result = {}
+    
+    for iface_id, data in prepared.items():
+        # Handle Down Interfaces
+        if data['status'] == 'down':
+            # Inherit confidence from status decision if we suppressed real traffic
+            c = data['status_conf'] if (data['orig_rx'] > TRAFFIC_THRESHOLD or data['orig_tx'] > TRAFFIC_THRESHOLD) else 1.0
+            result[iface_id] = {
+                'rx_rate': (data['orig_rx'], 0.0, c),
+                'tx_rate': (data['orig_tx'], 0.0, c),
+                'interface_status': (data['orig_status'], 'down', data['status_conf']),
+                'connected_to': data['peer_id'],
+                'local_router': telemetry[iface_id].get('local_router'),
+                'remote_router': telemetry[iface_id].get('remote_router')
+            }
+            continue
+            
+        # Handle Up Interfaces
+        def get_best(local_val, peer_val, l_rid, r_rid, is_rx):
+            # 1. Check Symmetry (Strongest Signal)
+            diff = abs(local_val - peer_val) / max(local_val, peer_val, 1.0)
+            if diff <= HARDENING_THRESHOLD:
+                return (local_val + peer_val)/2.0, 1.0
+                
+            # 2. Symmetry Broken: Use Reliability-Weighted Hints
+            l_stats = router_stats.get(l_rid)
+            r_stats = router_stats.get(r_rid)
+            
+            # Score Local Candidate against Local Hint
+            # Hint: What should I be to balance my router?
+            score_l = 0.0
+            if l_stats:
+                my_est = estimates[iface_id]['rx'] if is_rx else estimates[iface_id]['tx']
+                # RX Target = Total_Out - (Total_In - My_In)
+                # TX Target = Total_In - (Total_Out - My_Out)
+                if is_rx:
+                    hint_l = max(0.0, l_stats['out'] - (l_stats['in'] - my_est))
+                else:
+                    hint_l = max(0.0, l_stats['in'] - (l_stats['out'] - my_est))
+                
+                err = abs(local_val - hint_l) / max(local_val, hint_l, 1.0)
+                score_l = l_stats['rel'] * max(0.0, 1.0 - err)
+
+            # Score Peer Candidate against Peer Hint
+            # Peer Candidate is physically consistent if it matches its own router balance
+            score_p = 0.0
+            if r_stats and data['peer_id'] and data['peer_id'] in estimates:
+                # Get the estimate for the peer interface
+                p_est = estimates[data['peer_id']]['tx'] if is_rx else estimates[data['peer_id']]['rx']
+                
+                if is_rx: # Peer is sending (TX)
+                    hint_p = max(0.0, r_stats['in'] - (r_stats['out'] - p_est))
+                else: # Peer is receiving (RX)
+                    hint_p = max(0.0, r_stats['out'] - (r_stats['in'] - p_est))
+                    
+                err = abs(peer_val - hint_p) / max(peer_val, hint_p, 1.0)
+                score_p = r_stats['rel'] * max(0.0, 1.0 - err)
+                
+            # Decision
+            if score_l >= score_p:
+                # Trust Local. Confidence is the score (Reliability * Match Quality)
+                # We floor confidence at 0.5 to represent "Best Guess" rather than "Total Failure"
+                return local_val, max(0.5, score_l)
+            else:
+                return peer_val, max(0.5, score_p)
+
+        peer_tx = prepared[data['peer_id']]['tx'] if data['peer_id'] and data['peer_id'] in prepared else 0.0
+        rep_rx, conf_rx = get_best(data['rx'], peer_tx, telemetry[iface_id].get('local_router'), telemetry[iface_id].get('remote_router'), True)
+
+        peer_rx = prepared[data['peer_id']]['rx'] if data['peer_id'] and data['peer_id'] in prepared else 0.0
+        rep_tx, conf_tx = get_best(data['tx'], peer_rx, telemetry[iface_id].get('local_router'), telemetry[iface_id].get('remote_router'), False)
+        
+        result[iface_id] = {
+            'rx_rate': (data['orig_rx'], rep_rx, conf_rx),
+            'tx_rate': (data['orig_tx'], rep_tx, conf_tx),
+            'interface_status': (data['orig_status'], 'up', data['status_conf']),
+            'connected_to': data['peer_id'],
+            'local_router': telemetry[iface_id].get('local_router'),
+            'remote_router': telemetry[iface_id].get('remote_router')
+        }
+        
+    return result
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point that will be called by the evaluator.
+    
+    Args:
+        telemetry: Network interface telemetry data
+        topology: Dictionary where key is router_id and value contains a list of interface_ids
+    
+    Returns:
+        Dictionary containing repaired results with confidence scores
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple test case
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,  # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+    
+    test_topology = {
+        'router1': ['if1_to_if2'],
+        'router2': ['if2_to_if1']
+    }
+    
+    result = run_repair(test_telemetry, test_topology)
+    
+    print("Repair results:")
+    for if_id, data in result.items():
+        print(f"\n{if_id}:")
+        print(f"  RX: {data['rx_rate']}")
+        print(f"  TX: {data['tx_rate']}")
+        print(f"  Status: {data['interface_status']}")
+

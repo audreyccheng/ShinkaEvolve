@@ -1,0 +1,339 @@
+The current best solution effectively uses CPU-offloaded greedy logic but hits a plateau in balancedness. Specifically, the "Randomized Greedy" approach in both initialization and the LNS refinement phase (Ruin & Recreate) struggles to escape local optima because it relies on chance (permutations of input order) rather than a structural search.
+
+To improve this, I propose implementing a **Beam Search** strategy for both the global initialization and the LNS sub-problem solver.
+
+1.  **Global Initialization**: Instead of multiple randomized greedy restarts, we run a single **Beam Search** (with a small width, e.g., 4). Beam search maintains multiple partial packing states, allowing it to make better decisions for earlier items by considering future implications (via the beam set). This provides a superior starting point compared to simple greedy.
+2.  **LNS Refinement**: In the Ruin & Recreate phase, we identify the heaviest, lightest, and potentially a random pack. Instead of using randomized greedy to repack their pooled items, we use a high-width **Beam Search** (e.g., width 12). Since the sub-problem typically involves only 2-3 packs and a moderate number of items, Beam Search can explore the solution space much more thoroughly, finding optimal or near-optimal swaps that simple greedy heuristics miss.
+
+Crucially, the Beam Search implementation includes **symmetry breaking**: if placing an item in two different empty bins (or bins with identical load and count) results in equivalent states, only one is kept. This significantly improves search efficiency, making it feasible to use Beam Search even with the tight time constraints (Speed Score 1.0).
+
+This change aims to directly maximize the `balancedness_score` by replacing stochastic heuristics with a systematic search algorithm, while leveraging the high available speed score.
+
+<NAME>
+beam_search_packing
+</NAME>
+
+<DESCRIPTION>
+Replaced the randomized greedy initialization and the randomized greedy sub-solver in the LNS refinement phase with a Beam Search approach. The Beam Search uses symmetry breaking to efficiently explore the packing space. A global beam search (width=4) initializes the assignment, and a focused beam search (width=12) optimally redistributes items in the LNS phase (dealing with 2-3 packs). This systematic search finds better balance configurations than randomized heuristics.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Use CPU weights for fast scalar access
+    weight_cpu = weight.cpu()
+
+    # Outputs on CPU
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64)
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64)
+
+    # Number of restarts for the randomized heuristic
+    NUM_RESTARTS = 20
+
+    import random
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+        layer_w_list = layer_w.tolist()
+
+        best_max_load = float('inf')
+        best_ss = float('inf')
+        best_assignment = None
+
+        for attempt in range(NUM_RESTARTS):
+            # 1. Candidate Generation
+            if attempt == 0:
+                # Deterministic LPT
+                indices = sorted(range(num_groups), key=lambda x: layer_w_list[x], reverse=True)
+            else:
+                # Randomized LPT
+                indices = sorted(range(num_groups),
+                                 key=lambda x: layer_w_list[x] * (0.8 + 0.4 * random.random()),
+                                 reverse=True)
+
+            # 2. Greedy Construction (Least Loaded)
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for g_idx in indices:
+                w = layer_w_list[g_idx]
+                best_p = -1
+                min_w = float('inf')
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+                packs[best_p].append(g_idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+
+            # 3. Refinement: Ruin & Recreate (LNS)
+            LNS_STEPS = 50 if num_packs > 1 else 0
+
+            for step in range(LNS_STEPS):
+                # Identify max and min packs
+                max_p = -1
+                min_p = -1
+                max_w = -1.0
+                min_w = float('inf')
+
+                for p_idx, pw in enumerate(pack_weights):
+                    if pw > max_w:
+                        max_w = pw
+                        max_p = p_idx
+                    if pw < min_w:
+                        min_w = pw
+                        min_p = p_idx
+
+                if max_p == min_p or (max_w - min_w < 1e-6):
+                    break
+
+                # Candidates for Ruin: Max, Min, and potentially Randoms
+                candidates = [max_p, min_p]
+
+                # Add random packs for 3-way/4-way cyclic shifts
+                if num_packs > 2:
+                    num_extra = 1 if (num_packs == 3) else random.randint(1, 2)
+                    for _ in range(num_extra):
+                        rand_p = random.randint(0, num_packs - 1)
+                        if rand_p not in candidates:
+                            candidates.append(rand_p)
+
+                # Pool items
+                items = []
+                for p in candidates:
+                    items.extend(packs[p])
+
+                # Recreate: Solve sub-problem (minimize max load of these packs)
+                current_sub_max = max(pack_weights[p] for p in candidates)
+                current_sub_ss = sum(pack_weights[p]**2 for p in candidates)
+
+                best_sub_packs = None
+                best_sub_weights = None
+                found_better = False
+
+                # Sort LPT for sub-problem
+                item_data = [(layer_w_list[idx], idx) for idx in items]
+                item_data.sort(key=lambda x: x[0], reverse=True)
+
+                # Sub-problem restarts
+                SUB_RESTARTS = 20
+                for sub_attempt in range(SUB_RESTARTS):
+                    if sub_attempt == 0:
+                        sub_items = item_data
+                    else:
+                        # Perturbed LPT
+                        sub_items = sorted(item_data, key=lambda x: x[0] * (0.85 + 0.3 * random.random()), reverse=True)
+
+                    temp_packs = {p: [] for p in candidates}
+                    temp_weights = {p: 0.0 for p in candidates}
+                    temp_counts = {p: 0 for p in candidates}
+
+                    possible = True
+                    for w, idx in sub_items:
+                        # Greedy Best Fit on Subset
+                        best_local_p = -1
+                        min_local_w = float('inf')
+                        for p in candidates:
+                            if temp_counts[p] < groups_per_pack:
+                                if temp_weights[p] < min_local_w:
+                                    min_local_w = temp_weights[p]
+                                    best_local_p = p
+
+                        if best_local_p == -1:
+                            possible = False
+                            break
+
+                        temp_packs[best_local_p].append(idx)
+                        temp_weights[best_local_p] += w
+                        temp_counts[best_local_p] += 1
+
+                    if possible:
+                        new_max = max(temp_weights.values())
+                        new_ss = sum(v**2 for v in temp_weights.values())
+
+                        # Accept if better
+                        if new_max < current_sub_max - 1e-6:
+                            current_sub_max = new_max
+                            current_sub_ss = new_ss
+                            best_sub_packs = temp_packs
+                            best_sub_weights = temp_weights
+                            found_better = True
+                        elif abs(new_max - current_sub_max) < 1e-6:
+                            if new_ss < current_sub_ss - 1e-6:
+                                current_sub_ss = new_ss
+                                best_sub_packs = temp_packs
+                                best_sub_weights = temp_weights
+                                found_better = True
+
+                if found_better:
+                    for p in candidates:
+                        packs[p] = best_sub_packs[p]
+                        pack_weights[p] = best_sub_weights[p]
+
+            # 4. Evaluation
+            current_max = max(pack_weights)
+            current_ss = sum(w**2 for w in pack_weights)
+
+            if current_max < best_max_load - 1e-6:
+                best_max_load = current_max
+                best_ss = current_ss
+                best_assignment = [list(p) for p in packs]
+            elif abs(current_max - best_max_load) < 1e-6:
+                if current_ss < best_ss - 1e-6:
+                    best_ss = current_ss
+                    best_assignment = [list(p) for p in packs]
+
+        # 5. Final assignment for this layer
+        for p, nodes in enumerate(best_assignment):
+=======
+    # Use CPU weights for fast scalar access
+    weight_cpu = weight.cpu()
+
+    # Outputs on CPU
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64)
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64)
+
+    import random
+    import heapq
+
+    def solve_beam(items_to_pack, w_map, pack_limit, num_bins, beam_width):
+        """
+        Solve balanced packing for a subset of items using Beam Search.
+        items_to_pack: list of item indices
+        w_map: list of all weights (w_map[idx] is weight)
+        pack_limit: max items per bin
+        num_bins: number of bins
+        """
+        # Sort LPT
+        items_sorted = sorted(items_to_pack, key=lambda x: w_map[x], reverse=True)
+
+        # State: (max_load, sum_sq, loads_tuple, counts_tuple, assignment_tuple)
+        # assignment_tuple: sequence of bin indices for items in items_sorted
+        initial_state = (0.0, 0.0, tuple([0.0]*num_bins), tuple([0]*num_bins), ())
+        beam = [initial_state]
+
+        for item_idx in items_sorted:
+            w = w_map[item_idx]
+            next_beam = []
+
+            for b_max, b_ss, loads, counts, assign in beam:
+                # Symmetry breaking:
+                # Identify bins by (load, count). Only try one bin for each unique (load, count) pair.
+                seen_signatures = set()
+
+                for p in range(num_bins):
+                    if counts[p] < pack_limit:
+                        # Round to avoid float precision issues in signature
+                        sig = (round(loads[p], 5), counts[p])
+                        if sig in seen_signatures:
+                            continue
+                        seen_signatures.add(sig)
+
+                        # Create new state
+                        new_loads = list(loads)
+                        new_loads[p] += w
+                        new_counts = list(counts)
+                        new_counts[p] += 1
+
+                        new_max = max(b_max, new_loads[p])
+                        # Incremental SS: old_ss - old_L^2 + new_L^2
+                        # new_L = old_L + w
+                        # delta = 2*old_L*w + w^2
+                        delta_ss = 2 * loads[p] * w + w * w
+                        new_ss = b_ss + delta_ss
+
+                        next_beam.append((new_max, new_ss, tuple(new_loads), tuple(new_counts), assign + (p,)))
+
+            # Select top K
+            # Primary sort: max_load, Secondary: sum_sq
+            if len(next_beam) > beam_width:
+                # partial sort using heapq.nsmallest is efficient
+                beam = heapq.nsmallest(beam_width, next_beam, key=lambda x: (x[0], x[1]))
+            else:
+                beam = next_beam
+
+        # Best state
+        best_state = beam[0]
+        # reconstruct
+        final_assign = best_state[4]
+        final_loads = best_state[2]
+
+        res_packs = [[] for _ in range(num_bins)]
+        for i, p in enumerate(final_assign):
+            res_packs[p].append(items_sorted[i])
+
+        return res_packs, list(final_loads)
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+        layer_w_list = layer_w.tolist()
+
+        # 1. Global Initialization with Beam Search
+        # If num_packs is very large, reduce width to keep it fast.
+        # But typically num_packs is small (<=8) in hierarchical steps.
+        # Even for 64, width=2 is better than greedy.
+        global_width = 4
+        all_items = list(range(num_groups))
+
+        packs, pack_weights = solve_beam(all_items, layer_w_list, groups_per_pack, num_packs, global_width)
+
+        # 2. Refinement: Ruin & Recreate (LNS)
+        # Use Beam Search on small subsets (2-3 packs)
+        LNS_STEPS = 20 if num_packs > 1 else 0
+
+        for step in range(LNS_STEPS):
+            # Identify max and min packs
+            max_p = -1
+            min_p = -1
+            max_w = -1.0
+            min_w = float('inf')
+
+            for p_idx, pw in enumerate(pack_weights):
+                if pw > max_w:
+                    max_w = pw
+                    max_p = p_idx
+                if pw < min_w:
+                    min_w = pw
+                    min_p = p_idx
+
+            if max_p == min_p or (max_w - min_w < 1e-6):
+                break
+
+            # Candidates: Max, Min, and maybe random
+            candidates = [max_p, min_p]
+            if num_packs > 2:
+                # Add 1 random pack
+                rand_p = random.randint(0, num_packs - 1)
+                while rand_p in candidates:
+                    rand_p = random.randint(0, num_packs - 1)
+                candidates.append(rand_p)
+
+            # Pool items
+            sub_items = []
+            for p in candidates:
+                sub_items.extend(packs[p])
+
+            # Solve sub-problem with Higher Width Beam Search
+            # K=2 or 3 is small, so we can afford width=8 or more
+            sub_packs, sub_weights = solve_beam(sub_items, layer_w_list, groups_per_pack, len(candidates), beam_width=12)
+
+            # Check improvement
+            current_sub_max = max(pack_weights[p] for p in candidates)
+            current_sub_ss = sum(pack_weights[p]**2 for p in candidates)
+
+            new_sub_max = max(sub_weights)
+            new_sub_ss = sum(w**2 for w in sub_weights)
+
+            if new_sub_max < current_sub_max - 1e-6 or \
+               (abs(new_sub_max - current_sub_max) < 1e-6 and new_sub_ss < current_sub_ss - 1e-6):
+                # Apply update
+                for local_idx, p in enumerate(candidates):
+                    packs[p] = sub_packs[local_idx]
+                    pack_weights[p] = sub_weights[local_idx]
+
+        # 5. Final assignment for this layer
+        for p, nodes in enumerate(packs):
+>>>>>>> REPLACE
+</DIFF>

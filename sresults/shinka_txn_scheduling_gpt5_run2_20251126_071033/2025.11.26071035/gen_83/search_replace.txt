@@ -1,0 +1,157 @@
+<NAME>
+endgame_bnb_completion
+</NAME>
+
+<DESCRIPTION>
+I add a bounded branch-and-bound exact finisher for the last K transactions during beam-search completion. Specifically:
+- Introduce ENDGAME_BNB_K and BNB_NODE_LIMIT parameters.
+- Define exact_finish_bnb(prefix, rem_set) that explores permutations of the remaining transactions, inserting each at its current best position using the existing best-two insertion evaluator. It uses a greedy upper bound, best-first child ordering, a monotone lower-bound prune on partial cost, and a small transposition memo keyed by (remaining set, last-2 suffix) with a strict node budget to keep runtime predictable.
+- Modify the beam-search completion to call this exact-finisher when the best partial has <= K remaining items; otherwise, fall back to the existing greedy best-insertion completion.
+
+This improves endgame optimality of schedules, reducing makespan without heavy overhead, and is fully compatible with the current caches and helpers.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Iterated improvements
+    ILS_ITERS = max(2, min(4, num_seqs))
+
+    # Seed RNG lightly for diversity per call
+    random.seed((n * 1103 + num_seqs * 911 + 7) % (2**32 - 1))
+=======
+    # Iterated improvements
+    ILS_ITERS = max(2, min(4, num_seqs))
+
+    # Endgame branch-and-bound exact finish parameters
+    ENDGAME_BNB_K = 9
+    BNB_NODE_LIMIT = 3000
+
+    # Seed RNG lightly for diversity per call
+    random.seed((n * 1103 + num_seqs * 911 + 7) % (2**32 - 1))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # -------- Insertion-based beam search with lookahead and suffix diversity --------
+    def beam_search():
+=======
+    # -------- Insertion-based beam search with lookahead and suffix diversity --------
+    # Endgame exact-finisher: explore orders of remaining txns, inserting each at its current best position.
+    # Uses monotone lower-bound prune (partial cost) and a small memo keyed by (remaining set, last-2 suffix).
+    def exact_finish_bnb(prefix, rem_set, node_limit=BNB_NODE_LIMIT):
+        best_seq = None
+        best_cost = float('inf')
+        nodes = 0
+
+        # Initial greedy upper bound (best-insertion completion)
+        cur = list(prefix)
+        remg = list(rem_set)
+        while remg:
+            best_t, best_pos, best_c = None, 0, float('inf')
+            for t in remg:
+                c2, p2, _ = ctx.best_two_insertions(cur, t, exhaustive=(len(cur) <= 20 or len(remg) <= 4))
+                if c2 < best_c:
+                    best_c, best_t, best_pos = c2, t, p2
+            cur.insert(best_pos, best_t)
+            remg.remove(best_t)
+        best_cost = eval_cost(cur)
+        best_seq = cur
+
+        memo = {}
+        def last2_sig(s):
+            return tuple(s[-2:]) if len(s) >= 2 else tuple(s)
+
+        def dfs(cur_seq, rem_list):
+            nonlocal nodes, best_cost, best_seq
+            if nodes >= node_limit:
+                return
+            nodes += 1
+            c_cur = eval_cost(cur_seq)
+            # Monotone LB prune: partial cost cannot exceed best complete cost found
+            if c_cur >= best_cost - 1e-12:
+                return
+            if not rem_list:
+                if c_cur < best_cost:
+                    best_cost = c_cur
+                    best_seq = list(cur_seq)
+                return
+            key = (frozenset(rem_list), last2_sig(cur_seq))
+            prev = memo.get(key)
+            if prev is not None and c_cur >= prev - 1e-12:
+                return
+            memo[key] = c_cur
+
+            # Order children by immediate best-insertion cost (best-first)
+            order = []
+            exhaustive = (len(cur_seq) <= 20 or len(rem_list) <= 4)
+            for t in rem_list:
+                c_child, p_child, _ = ctx.best_two_insertions(cur_seq, t, exhaustive=exhaustive)
+                order.append((c_child, t, p_child))
+            order.sort(key=lambda x: x[0])
+
+            for _, t, p in order:
+                nxt = cur_seq[:]
+                nxt.insert(p, t)
+                nxt_rem = [x for x in rem_list if x != t]
+                dfs(nxt, nxt_rem)
+
+        dfs(list(prefix), list(rem_set))
+        return best_cost, best_seq
+
+    def beam_search():
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # Greedy completion from best partial by best-insertion
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_pos, best_c = None, 0, float('inf')
+                for t in rem_list:
+                    c2, p2, _ = ctx.best_two_insertions(cur, t, exhaustive=False)
+                    if c2 < best_c:
+                        best_c, best_t, best_pos = c2, t, p2
+                cur.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur), cur
+
+        # Fallback: identity
+        ident = list(range(n))
+        return eval_cost(ident), ident
+=======
+        if best_complete[1] and len(best_complete[1]) == n:
+            return best_complete
+
+        # Completion from best partial: try exact endgame (BnB) when remaining is small, else greedy best-insertion
+        if beam:
+            # Prefer partials with fewer remaining, then by current cost
+            c, seq, rem = min(beam, key=lambda x: (len(x[2]), x[0]))
+            if len(rem) <= ENDGAME_BNB_K:
+                c_opt, s_opt = exact_finish_bnb(seq, rem, node_limit=BNB_NODE_LIMIT)
+                return c_opt, s_opt
+            else:
+                cur = list(seq)
+                rem_list = list(rem)
+                while rem_list:
+                    best_t, best_pos, best_c = None, 0, float('inf')
+                    for t in rem_list:
+                        c2, p2, _ = ctx.best_two_insertions(cur, t, exhaustive=False)
+                        if c2 < best_c:
+                            best_c, best_t, best_pos = c2, t, p2
+                    cur.insert(best_pos, best_t)
+                    rem_list.remove(best_t)
+                return eval_cost(cur), cur
+
+        # Fallback: identity
+        ident = list(range(n))
+        return eval_cost(ident), ident
+>>>>>>> REPLACE
+</DIFF>

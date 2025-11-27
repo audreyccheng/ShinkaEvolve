@@ -1,0 +1,174 @@
+<NAME>
+magnitude_aware_and_router_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements inspired by the Hodor validation approach that should improve counter accuracy and confidence calibration without disrupting status accuracy:
+
+1) Magnitude-aware link symmetry with absolute guard:
+   - Keep the 2% hardening threshold but relax to 5% for small flows (<10 Mbps) and require an absolute difference > 0.5 Mbps before repairing. This avoids overcorrecting tiny flows and reduces noisy changes.
+   - When within tolerance, increase confidence floors to 0.98–0.99, sharpening calibration on strong agreement.
+
+2) Router-level, direction-aware confidence attenuation:
+   - After repairs, compute router flow residuals (|Σtx − Σrx| / max(1, Σtx, Σrx)).
+   - Downscale per-direction confidences using local and remote residuals: TX is penalized more by local residual; RX more by remote. This aligns with flow conservation and improves calibration where conservation is violated.
+
+Additionally, I enforce interface consistency: if either side of a link is down, set both effectively down with zero rates, with calibrated confidence. These changes use topology to build router-to-interface mappings for residual calculation.
+
+Together, these changes aim to slightly raise counter accuracy while materially improving confidence calibration, thus improving the combined score.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    # Magnitude-aware tolerance and absolute guard to avoid over-correcting tiny flows
+    LOW_RATE_CUTOFF = 10.0  # Mbps
+    ABS_GUARD = 0.5         # Mbps; require this absolute delta to trigger a repair
+
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        return max(lo, min(hi, x))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Check for issues and attempt repair
+        if interface_id in link_symmetry_violations:
+            violations = link_symmetry_violations[interface_id]
+
+            # Repair RX rate if link symmetry is violated
+            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's TX as more reliable signal
+                repaired_rx = violations['peer_tx']
+                # Confidence decreases with magnitude of violation
+                rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+
+            # Repair TX rate if link symmetry is violated
+            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+                # Use peer's RX as more reliable signal
+                repaired_tx = violations['peer_rx']
+                # Confidence decreases with magnitude of violation
+                tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+
+        # Check status consistency
+        if connected_to and connected_to in telemetry:
+            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+            # If statuses don't match, lower confidence
+            if interface_status != peer_status:
+                status_confidence = 0.5
+                # If interface is down but has non-zero rates, that's suspicious
+                if interface_status == 'down' and (rx_rate > 0 or tx_rate > 0):
+                    repaired_rx = 0.0
+                    repaired_tx = 0.0
+                    rx_confidence = 0.3
+                    tx_confidence = 0.3
+=======
+        # Check for issues and attempt repair (magnitude-aware + absolute guard)
+        peer_status = None
+        peer_rx = None
+        peer_tx = None
+        if connected_to and connected_to in telemetry:
+            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+            peer_rx = float(telemetry[connected_to].get('rx_rate', 0.0))
+            peer_tx = float(telemetry[connected_to].get('tx_rate', 0.0))
+
+            # Enforce interface consistency: if either side is down, effectively down with zero rates
+            if interface_status == 'down' or peer_status == 'down':
+                both_down = (interface_status == 'down' and peer_status == 'down')
+                repaired_status = 'down'
+                repaired_rx = 0.0
+                repaired_tx = 0.0
+                status_confidence = 0.95 if both_down else 0.7
+                rx_confidence = status_confidence
+                tx_confidence = status_confidence
+            else:
+                # RX should match peer's TX
+                abs_diff_rx = abs(float(rx_rate) - float(peer_tx))
+                max_pair_rx = max(1.0, float(rx_rate), float(peer_tx))
+                rel_diff_rx = abs_diff_rx / max_pair_rx
+                tol_rx = 0.05 if max(float(rx_rate), float(peer_tx)) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+                if rel_diff_rx > tol_rx and abs_diff_rx > ABS_GUARD:
+                    repaired_rx = float(peer_tx)
+                    rx_confidence = max(0.0, 1.0 - rel_diff_rx)
+                else:
+                    # Within tolerance: strong agreement floor
+                    if max(float(rx_rate), float(peer_tx)) >= 10.0 and rel_diff_rx <= 0.005:
+                        rx_confidence = max(rx_confidence, 0.99)
+                    else:
+                        rx_confidence = max(rx_confidence, 0.98)
+
+                # TX should match peer's RX
+                abs_diff_tx = abs(float(tx_rate) - float(peer_rx))
+                max_pair_tx = max(1.0, float(tx_rate), float(peer_rx))
+                rel_diff_tx = abs_diff_tx / max_pair_tx
+                tol_tx = 0.05 if max(float(tx_rate), float(peer_rx)) < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+                if rel_diff_tx > tol_tx and abs_diff_tx > ABS_GUARD:
+                    repaired_tx = float(peer_rx)
+                    tx_confidence = max(0.0, 1.0 - rel_diff_tx)
+                else:
+                    if max(float(tx_rate), float(peer_rx)) >= 10.0 and rel_diff_tx <= 0.005:
+                        tx_confidence = max(tx_confidence, 0.99)
+                    else:
+                        tx_confidence = max(tx_confidence, 0.98)
+
+                # If statuses differ (but neither side is down), reduce status confidence modestly
+                if interface_status != peer_status:
+                    status_confidence = min(status_confidence, 0.6)
+        else:
+            # No redundancy: keep values but slightly lower confidence
+            rx_confidence = min(rx_confidence, 0.95)
+            tx_confidence = min(tx_confidence, 0.95)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    return result
+=======
+    # Router-level flow conservation: direction-aware confidence attenuation
+    # Build router->interfaces mapping (prefer topology, augment with telemetry hints)
+    router_ifaces: Dict[str, List[str]] = {r: list(if_list) for r, if_list in topology.items()}
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        if lr:
+            router_ifaces.setdefault(lr, [])
+            if if_id not in router_ifaces[lr]:
+                router_ifaces[lr].append(if_id)
+        rr = d.get('remote_router')
+        if rr and rr not in router_ifaces:
+            router_ifaces[rr] = []
+
+    # Compute per-router residual mismatch from repaired values
+    router_resid: Dict[str, float] = {}
+    for r, if_list in router_ifaces.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in result:
+                sum_tx += float(result[if_id]['tx_rate'][1])
+                sum_rx += float(result[if_id]['rx_rate'][1])
+        denom = max(1.0, sum_tx, sum_rx)
+        router_resid[r] = abs(sum_tx - sum_rx) / denom
+
+    # Apply direction-aware penalties with gentle floor to avoid over-penalizing noisy sites
+    for if_id, d in telemetry.items():
+        lr = d.get('local_router')
+        rr = d.get('remote_router')
+        resid_local = router_resid.get(lr, 0.0)
+        resid_remote = router_resid.get(rr, 0.0)
+        # TX leaves local, RX arrives from remote
+        penalty_tx = clamp(1.0 - (0.6 * resid_local + 0.4 * resid_remote), 0.7, 1.0)
+        penalty_rx = clamp(1.0 - (0.6 * resid_remote + 0.4 * resid_local), 0.7, 1.0)
+        orx, rrx, rc = result[if_id]['rx_rate']
+        otx, rtx, tc = result[if_id]['tx_rate']
+        result[if_id]['rx_rate'] = (orx, rrx, clamp(rc * penalty_rx))
+        result[if_id]['tx_rate'] = (otx, rtx, clamp(tc * penalty_tx))
+
+    return result
+>>>>>>> REPLACE
+</DIFF>

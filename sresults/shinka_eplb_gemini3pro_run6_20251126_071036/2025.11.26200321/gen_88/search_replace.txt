@@ -1,0 +1,538 @@
+<NAME>
+zoom_in_evolutionary_packing
+</NAME>
+
+<DESCRIPTION>
+Implements a Two-Stage "Zoom-In" Evolutionary Strategy to improve load balancing.
+1. **Exploration**: Initializes 256 diverse candidates (LPT with varying noise, Interleaved, Random) and runs a vectorized Greedy packing.
+2. **Zoom-In**: Evaluates the candidates, selects the single best candidate per layer, and replicates it 256 times to form a new population.
+3. **Mutation**: Applies random swap mutations to the replicas (preserving the elite original) to explore the local neighborhood of the best solution.
+4. **Refinement**: Runs Top-4 Destruct-Reconstruct (ZigZag pattern) followed by Max-Any Swap on the mutated population to fine-tune the solution.
+This approach focuses computational resources on refining the most promising solution found during the exploration phase.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Massive Parallel Strategy with Diverse Initialization (LPT, Random, Interleaved)
+    and Noisy Greedy Construction, followed by Vectorized Max-Any (1-item) and
+    Max-Min (2-item) Local Search.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_packs, dtype=torch.int64, device=device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- 1. Massive Parallel Initialization ---
+    # We use 128 candidates to cover a wide search space
+    num_candidates = 128
+    num_total_problems = num_layers * num_candidates
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Strategies for Sorting/Permutation:
+    # 0-63: Noisy LPT (0 is pure LPT, others have noise)
+    # 64-95: Random Shuffle
+    # 96-127: Interleaved Heavy-Light (Deterministic LPT reordered)
+
+    # A. Generate Base Keys for LPT & Random
+    # LPT base keys are the weights themselves.
+    # Add noise for 0-63.
+    scales = torch.zeros(num_candidates, device=device)
+    scales[1:64] = torch.linspace(0.001, 0.4, 63, device=device) # Skip 0 (Pure LPT)
+
+    # 64-95: Random keys (high noise domination or just random)
+    noise_scales = scales.repeat(num_layers).view(-1, 1)
+    noise = torch.rand_like(w_expanded) * w_expanded * noise_scales
+    sort_keys = w_expanded + noise
+
+    # For Random (64-95), replace keys with pure random
+    mask_random = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+    mask_random[64:96] = True
+    mask_random = mask_random.repeat(num_layers)
+    sort_keys[mask_random] = torch.rand_like(sort_keys[mask_random])
+
+    # Sort to get initial permutations
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+
+    # B. Apply Interleaved Pattern for 96-127
+    # Pattern: [0, N-1, 1, N-2...]
+    pattern = torch.empty(num_groups, dtype=torch.long, device=device)
+    half = (num_groups + 1) // 2
+    pattern[0::2] = torch.arange(half, device=device)
+    pattern[1::2] = torch.arange(num_groups - 1, half - 1, -1, device=device)
+
+    mask_interleaved = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+    mask_interleaved[96:] = True
+    mask_interleaved = mask_interleaved.repeat(num_layers)
+
+    sorted_indices[mask_interleaved] = sorted_indices[mask_interleaved][:, pattern]
+
+    # Gather weights in processing order
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+
+    # --- 2. Vectorized Noisy-Greedy Construction ---
+    pack_weights = torch.zeros(num_total_problems, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_total_problems, num_packs, device=device, dtype=torch.int64)
+    sorted_pack_index = torch.zeros_like(sorted_indices)
+
+    # Mask for Noisy Greedy (Candidates 64-127)
+    mask_noisy_greedy = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+    mask_noisy_greedy[64:] = True
+    mask_noisy_greedy = mask_noisy_greedy.repeat(num_layers)
+
+    ones = torch.ones(num_total_problems, 1, device=device, dtype=torch.int64)
+    inf_tensor = torch.tensor(float('inf'), device=device)
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1] # [LC, 1]
+
+        # Current pack loads
+        candidates = pack_weights.clone()
+
+        # Add selection noise for subset of candidates
+        if mask_noisy_greedy.any():
+            selection_noise = torch.rand_like(candidates) * w_item * 0.5
+            selection_noise[~mask_noisy_greedy] = 0
+            candidates += selection_noise
+
+        # Mask full packs
+        is_full = (pack_counts >= groups_per_pack)
+        candidates[is_full] = inf_tensor
+
+        # Choose pack
+        chosen_pack = candidates.argmin(dim=1, keepdim=True)
+
+        sorted_pack_index[:, i:i+1] = chosen_pack
+        pack_weights.scatter_add_(1, chosen_pack, w_item)
+        pack_counts.scatter_add_(1, chosen_pack, ones)
+
+    # --- 3. Vectorized Local Search ---
+    # Prepare pack contents: [LC, M, K]
+    _, pack_content_sort_idx = sorted_pack_index.sort(dim=1, stable=True)
+    pack_contents = pack_content_sort_idx.view(num_total_problems, num_packs, groups_per_pack)
+    K = groups_per_pack
+
+    # Phase A: Max-Any Swap (1-Item)
+    num_iters_1 = 20
+    for _ in range(num_iters_1):
+        flat_contents = pack_contents.view(num_total_problems, -1)
+        curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+        pack_sums = curr_w.sum(dim=2)
+
+        val_max, idx_max = pack_sums.max(dim=1)
+
+        gather_max = idx_max.view(-1, 1, 1).expand(-1, 1, K)
+        w_max_items = torch.gather(curr_w, 1, gather_max).squeeze(1) # [LC, K]
+
+        diffs = w_max_items.view(num_total_problems, 1, K, 1) - curr_w.view(num_total_problems, num_packs, 1, K)
+
+        val_max_exp = val_max.view(num_total_problems, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_total_problems, num_packs, 1, 1)
+
+        new_max_pair = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_max_pair
+
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == idx_max.view(-1, 1)).view(num_total_problems, num_packs, 1, 1)
+
+        valid = (diffs > 0) & (improvement > 1e-5) & (~mask_self)
+
+        scores = torch.where(valid, improvement, torch.tensor(float('-inf'), device=device))
+        best_imp, flat_idx = scores.view(num_total_problems, -1).max(dim=1)
+
+        if not (best_imp > float('-inf')).any():
+            break
+
+        active = torch.nonzero(best_imp > float('-inf')).squeeze(1)
+        if len(active) == 0: break
+
+        f_idx = flat_idx[active]
+        K2 = K * K
+        p_target = f_idx // K2
+        rem = f_idx % K2
+        k_max = rem // K
+        k_target = rem % K
+
+        p_max = idx_max[active]
+
+        # Swap
+        v_max = pack_contents[active, p_max, k_max].clone()
+        v_tgt = pack_contents[active, p_target, k_target].clone()
+        pack_contents[active, p_max, k_max] = v_tgt
+        pack_contents[active, p_target, k_target] = v_max
+
+    # Phase B: Top-K Destruct-Reconstruct (4-Pack ZigZag)
+    # Pools items from Top-2 Heaviest and Top-2 Lightest packs and redistributes them.
+    if num_packs >= 4:
+        num_iters_2 = 10
+        num_t = 4
+        num_pooled = num_t * K
+
+        # Precompute ZigZag Map for 4 Packs: 0, 1, 2, 3, 3, 2, 1, 0 ...
+        base_pat = torch.cat([torch.arange(num_t, device='cpu'), torch.arange(num_t - 1, -1, -1, device='cpu')])
+        reps = (num_pooled + len(base_pat) - 1) // len(base_pat)
+        zigzag_indices = base_pat.repeat(reps)[:num_pooled]
+
+        source_map_cpu = torch.empty(num_t, K, dtype=torch.long)
+        c = torch.zeros(num_t, dtype=torch.long)
+        for i, p in enumerate(zigzag_indices):
+            idx = p.item()
+            if c[idx] < K:
+                source_map_cpu[idx, c[idx]] = i
+                c[idx] += 1
+        gather_map_base = source_map_cpu.view(-1).unsqueeze(0).to(device) # Flattened for gather [1, 4*K]
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total_problems, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            # Select Top-2 Max and Top-2 Min using argsort (noisy to break ties)
+            noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-4
+            _, sorted_pack_idx = noisy_sums.sort(dim=1)
+
+            # Indices: [Min1, Min2, ..., Max2, Max1]
+            # Select 0, 1 (Lightest) and -2, -1 (Heaviest)
+            target_packs = torch.stack([
+                sorted_pack_idx[:, 0],
+                sorted_pack_idx[:, 1],
+                sorted_pack_idx[:, -2],
+                sorted_pack_idx[:, -1]
+            ], dim=1) # [Batch, 4]
+
+            gather_idx = target_packs.unsqueeze(2).expand(-1, -1, K)
+
+            pooled_contents = torch.gather(pack_contents, 1, gather_idx) # [Batch, 4, K]
+            pooled_flat = pooled_contents.view(num_total_problems, -1) # [Batch, 4*K]
+            pooled_weights = torch.gather(sorted_weight, 1, pooled_flat)
+
+            # Sort items descending
+            _, sort_order = pooled_weights.sort(dim=1, descending=True)
+            sorted_pooled_contents = torch.gather(pooled_flat, 1, sort_order)
+
+            # Redistribute using precomputed map
+            g_map = gather_map_base.expand(num_total_problems, -1)
+            new_contents_flat = torch.gather(sorted_pooled_contents, 1, g_map)
+            new_contents_grouped = new_contents_flat.view(num_total_problems, 4, K)
+
+            # Write back
+            pack_contents.scatter_(1, gather_idx, new_contents_grouped)
+
+    elif num_packs >= 2:
+        # Fallback to 2-Pack ABBA
+        num_iters_2 = 10
+        num_t = 2
+        num_pooled = num_t * K
+        base_pat = torch.tensor([0, 1, 1, 0], device='cpu')
+        reps = (num_pooled + 3) // 4
+        zigzag_indices = base_pat.repeat(reps)[:num_pooled]
+
+        source_map_cpu = torch.empty(num_t, K, dtype=torch.long)
+        c = torch.zeros(num_t, dtype=torch.long)
+        for i, p in enumerate(zigzag_indices):
+            idx = p.item()
+            if c[idx] < K:
+                source_map_cpu[idx, c[idx]] = i
+                c[idx] += 1
+        gather_map_base = source_map_cpu.view(-1).unsqueeze(0).to(device)
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total_problems, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-4
+            _, sorted_pack_idx = noisy_sums.sort(dim=1)
+
+            target_packs = torch.stack([sorted_pack_idx[:, 0], sorted_pack_idx[:, -1]], dim=1)
+
+            gather_idx = target_packs.unsqueeze(2).expand(-1, -1, K)
+            pooled_contents = torch.gather(pack_contents, 1, gather_idx)
+            pooled_flat = pooled_contents.view(num_total_problems, -1)
+            pooled_weights = torch.gather(sorted_weight, 1, pooled_flat)
+
+            _, sort_order = pooled_weights.sort(dim=1, descending=True)
+            sorted_pooled_contents = torch.gather(pooled_flat, 1, sort_order)
+
+            g_map = gather_map_base.expand(num_total_problems, -1)
+            new_contents_flat = torch.gather(sorted_pooled_contents, 1, g_map)
+            new_contents_grouped = new_contents_flat.view(num_total_problems, 2, K)
+
+            pack_contents.scatter_(1, gather_idx, new_contents_grouped)
+
+    # --- Selection ---
+    flat_contents = pack_contents.view(num_total_problems, -1)
+    final_weights = torch.gather(sorted_weight, 1, flat_contents).view(num_total_problems, num_packs, K)
+    final_max_loads = final_weights.sum(dim=2).max(dim=1).values
+
+    # Reshape: [L, C] -> min over candidates
+    reshaped_max_loads = final_max_loads.view(num_layers, num_candidates)
+    best_candidate_idx = reshaped_max_loads.argmin(dim=1) # [L]
+
+    # Gather best result
+    best_indices = torch.arange(num_layers, device=device) * num_candidates + best_candidate_idx
+
+    best_contents = pack_contents[best_indices]
+    best_sorted_indices = sorted_indices[best_indices]
+
+    # Map back
+    flat_best_contents = best_contents.view(num_layers, -1)
+    original_item_indices = torch.gather(best_sorted_indices, 1, flat_best_contents)
+
+    pack_ids = torch.arange(num_packs, device=device).view(1, num_packs, 1).expand(num_layers, -1, groups_per_pack).reshape(num_layers, -1)
+    rank_ids = torch.arange(groups_per_pack, device=device).view(1, 1, groups_per_pack).expand(num_layers, num_packs, -1).reshape(num_layers, -1)
+
+    pack_index = torch.empty_like(pack_ids)
+    rank_in_pack = torch.empty_like(rank_ids)
+
+    pack_index.scatter_(1, original_item_indices, pack_ids)
+    rank_in_pack.scatter_(1, original_item_indices, rank_ids)
+
+    return pack_index, rank_in_pack
+=======
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Uses a Two-Stage "Zoom-In" Evolutionary Strategy:
+    1. Exploration: 256 diverse candidates (LPT+Noise, Random, Interleaved).
+    2. Zoom-In: Select best, replicate, mutate (random swaps), and refine.
+
+    Parameters:
+        weight: [layers, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [layers, n], the pack index of each item
+        rank_in_pack: [layers, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    # Trivial case
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_packs, dtype=torch.int64, device=device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(pack_index)
+        return pack_index, rank_in_pack
+
+    # --- 1. Exploration Phase ---
+    num_candidates = 256
+    num_total = num_layers * num_candidates
+    w_expanded = weight.repeat_interleave(num_candidates, dim=0)
+
+    # Strategies:
+    # 0-127: LPT + Noise (0 is pure LPT)
+    # 128-191: Random
+    # 192-255: Interleaved
+
+    scales = torch.linspace(0, 0.4, 128, device=device)
+    scales[0] = 0 # Pure LPT
+    noise = torch.rand_like(w_expanded) * w_expanded * scales.repeat(num_layers).view(-1, 1)
+
+    # Random candidates (128-191)
+    mask_random = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+    mask_random[128:192] = True
+    mask_r = mask_random.repeat(num_layers)
+    noise[mask_r] = torch.rand_like(noise[mask_r]) * w_expanded[mask_r].max() # High noise domination
+
+    sort_keys = w_expanded + noise
+    _, sorted_indices = sort_keys.sort(dim=-1, descending=True)
+
+    # Interleaved (192-255)
+    mask_interleaved = torch.zeros(num_candidates, dtype=torch.bool, device=device)
+    mask_interleaved[192:] = True
+    if mask_interleaved.any():
+        pattern = torch.empty(num_groups, dtype=torch.long, device=device)
+        half = (num_groups + 1) // 2
+        pattern[0::2] = torch.arange(half, device=device)
+        pattern[1::2] = torch.arange(num_groups - 1, half - 1, -1, device=device)
+
+        mask_i = mask_interleaved.repeat(num_layers)
+        sorted_indices[mask_i] = sorted_indices[mask_i][:, pattern]
+
+    sorted_weight = torch.gather(w_expanded, 1, sorted_indices)
+
+    # Vectorized Greedy
+    pack_weights = torch.zeros(num_total, num_packs, device=device, dtype=weight.dtype)
+    pack_counts = torch.zeros(num_total, num_packs, device=device, dtype=torch.int64)
+    assignments = torch.zeros(num_total, num_groups, dtype=torch.int64, device=device)
+    inf_val = float('inf')
+
+    for i in range(num_groups):
+        w_item = sorted_weight[:, i:i+1]
+        is_full = (pack_counts >= groups_per_pack)
+        costs = pack_weights.clone()
+        costs[is_full] = inf_val
+        chosen = costs.argmin(dim=1, keepdim=True)
+        assignments[:, i:i+1] = chosen
+        pack_weights.scatter_add_(1, chosen, w_item)
+        pack_counts.scatter_add_(1, chosen, torch.ones_like(chosen))
+
+    # --- 2. Zoom-In Phase ---
+    # Evaluate Candidates
+    max_loads = pack_weights.max(dim=1).values.view(num_layers, num_candidates)
+    best_cand_idx = max_loads.argmin(dim=1) # [L]
+
+    # Gather Best Configs
+    global_best_idx = torch.arange(num_layers, device=device) * num_candidates + best_cand_idx
+
+    # We need pack contents for the best candidates
+    # assignments has pack indices for items in sorted order
+    # We need to convert this to [L, M, K] containing indices into sorted_indices
+    _, sort_p = assignments[global_best_idx].sort(dim=1, stable=True)
+    best_pack_contents = sort_p.view(num_layers, num_packs, groups_per_pack)
+    best_sorted_indices = sorted_indices[global_best_idx]
+    best_sorted_weight = sorted_weight[global_best_idx]
+
+    # Replicate Best Configs
+    # New population size: 256
+    pack_contents = best_pack_contents.repeat_interleave(num_candidates, dim=0) # [L*C, M, K]
+    sorted_weight = best_sorted_weight.repeat_interleave(num_candidates, dim=0) # [L*C, N]
+    sorted_indices = best_sorted_indices.repeat_interleave(num_candidates, dim=0) # [L*C, N]
+
+    # --- 3. Mutation (Random Swaps) ---
+    # Apply mutations to all except the first replica (keep elite)
+    # Number of mutations: random 1 to 5 swaps
+    K = groups_per_pack
+    num_mutations = 5
+
+    # Create mask for mutation (skip 0-th candidate for each layer)
+    mask_mutate = torch.ones(num_layers, num_candidates, dtype=torch.bool, device=device)
+    mask_mutate[:, 0] = False
+    flat_mask_mutate = mask_mutate.view(-1)
+    idx_mutate = torch.nonzero(flat_mask_mutate).squeeze()
+
+    if len(idx_mutate) > 0:
+        for _ in range(num_mutations):
+            # Select random packs and random items
+            p1 = torch.randint(0, num_packs, (len(idx_mutate),), device=device)
+            p2 = torch.randint(0, num_packs, (len(idx_mutate),), device=device)
+            k1 = torch.randint(0, K, (len(idx_mutate),), device=device)
+            k2 = torch.randint(0, K, (len(idx_mutate),), device=device)
+
+            # Swap
+            v1 = pack_contents[idx_mutate, p1, k1].clone()
+            v2 = pack_contents[idx_mutate, p2, k2].clone()
+            pack_contents[idx_mutate, p1, k1] = v2
+            pack_contents[idx_mutate, p2, k2] = v1
+
+    # --- 4. Refinement (Local Search) ---
+
+    # 4.1 Max-Any Swap (20 iters)
+    # Vectorized swap of max item with any other
+    for _ in range(20):
+        flat_c = pack_contents.view(num_total, -1)
+        curr_w = torch.gather(sorted_weight, 1, flat_c).view(num_total, num_packs, K)
+        pack_sums = curr_w.sum(dim=2)
+
+        val_max, p_max = pack_sums.max(dim=1)
+
+        # Max Items [L*C, 1, K]
+        gather_max = p_max.view(-1, 1, 1).expand(-1, 1, K)
+        w_max = torch.gather(curr_w, 1, gather_max)
+
+        # Diffs [L*C, M, K, K] implicit
+        diffs = w_max.unsqueeze(3) - curr_w.unsqueeze(2) # [B, 1, K, 1] - [B, M, 1, K]
+
+        # New Loads
+        val_max_exp = val_max.view(num_total, 1, 1, 1)
+        pack_sums_exp = pack_sums.view(num_total, num_packs, 1, 1)
+
+        new_pair_max = torch.max(val_max_exp - diffs, pack_sums_exp + diffs)
+        improvement = val_max_exp - new_pair_max
+
+        mask_self = (torch.arange(num_packs, device=device).view(1, -1) == p_max.view(-1, 1)).view(num_total, num_packs, 1, 1)
+        valid = (diffs > 0) & (improvement > 1e-6) & (~mask_self)
+
+        scores = torch.where(valid, improvement, torch.tensor(float('-inf'), device=device))
+        best_imp, best_idx = scores.view(num_total, -1).max(dim=1)
+
+        if not (best_imp > 0).any(): break
+
+        active = torch.nonzero(best_imp > 0).squeeze(1)
+        f_idx = best_idx[active]
+        K2 = K * K
+        p_target = f_idx // K2
+        rem = f_idx % K2
+        k_max = rem // K
+        k_target = rem % K
+
+        p_max_active = p_max[active]
+
+        v_max = pack_contents[active, p_max_active, k_max].clone()
+        v_tgt = pack_contents[active, p_target, k_target].clone()
+        pack_contents[active, p_max_active, k_max] = v_tgt
+        pack_contents[active, p_target, k_target] = v_max
+
+    # 4.2 Top-4 ZigZag (Top-2 Max, Top-2 Min)
+    if num_packs >= 4:
+        num_iters_2 = 15
+        num_t = 4
+        num_pooled = num_t * K
+
+        # ZigZag Pattern for 4 packs
+        base_pat = torch.cat([torch.arange(num_t, device='cpu'), torch.arange(num_t - 1, -1, -1, device='cpu')])
+        reps = (num_pooled + len(base_pat) - 1) // len(base_pat)
+        zigzag_indices = base_pat.repeat(reps)[:num_pooled]
+
+        source_map_cpu = torch.empty(num_t, K, dtype=torch.long)
+        c = torch.zeros(num_t, dtype=torch.long)
+        for i, p in enumerate(zigzag_indices):
+            idx = p.item()
+            if c[idx] < K:
+                source_map_cpu[idx, c[idx]] = i
+                c[idx] += 1
+        gather_map_base = source_map_cpu.view(-1).unsqueeze(0).to(device)
+
+        for _ in range(num_iters_2):
+            flat_contents = pack_contents.view(num_total, -1)
+            curr_w = torch.gather(sorted_weight, 1, flat_contents).view(num_total, num_packs, K)
+            pack_sums = curr_w.sum(dim=2)
+
+            # Select Top-2 Max and Top-2 Min
+            noisy_sums = pack_sums + torch.rand_like(pack_sums) * 1e-4
+            _, sorted_pack_idx = noisy_sums.sort(dim=1)
+
+            target_packs = torch.stack([
+                sorted_pack_idx[:, 0], sorted_pack_idx[:, 1],
+                sorted_pack_idx[:, -2], sorted_pack_idx[:, -1]
+            ], dim=1)
+
+            gather_idx = target_packs.unsqueeze(2).expand(-1, -1, K)
+            pooled_contents = torch.gather(pack_contents, 1, gather_idx)
+            pooled_flat = pooled_contents.view(num_total, -1)
+            pooled_weights = torch.gather(sorted_weight, 1, pooled_flat)
+
+            _, sort_order = pooled_weights.sort(dim=1, descending=True)
+            sorted_pooled_contents = torch.gather(pooled_flat, 1, sort_order)
+
+            g_map = gather_map_base.expand(num_total, -1)
+            new_contents_flat = torch.gather(sorted_pooled_contents, 1, g_map)
+            new_contents_grouped = new_contents_flat.view(num_total, 4, K)
+
+            pack_contents.scatter_(1, gather_idx, new_contents_grouped)
+
+    # --- 5. Selection ---
+    flat_contents = pack

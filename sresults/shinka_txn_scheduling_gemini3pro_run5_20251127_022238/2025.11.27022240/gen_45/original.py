@@ -1,0 +1,347 @@
+# EVOLVE-BLOCK-START
+"""Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+
+import time
+import random
+import math
+import sys
+import os
+
+# Add the openevolve_examples directory to the path to import txn_simulator and workloads
+# Find the repository root by looking for the openevolve_examples directory
+def find_repo_root(start_path):
+    """Find the repository root by looking for openevolve_examples directory."""
+    current = os.path.abspath(start_path)
+    # Search up the directory tree
+    while current != os.path.dirname(current):  # Stop at filesystem root
+        candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return current
+        current = os.path.dirname(current)
+
+    # If not found by searching up, try common locations relative to known paths
+    # This handles when the program is copied to a results directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    possible_roots = [
+        script_dir,  # Current directory
+        os.path.dirname(script_dir),  # Parent
+        os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+        '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+        '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+    ]
+    for root in possible_roots:
+        candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+        if os.path.exists(candidate):
+            return root
+
+    raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+
+repo_root = find_repo_root(os.path.dirname(__file__))
+sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+
+from txn_simulator import Workload
+from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+
+
+def get_best_schedule(workload, num_seqs):
+    """
+    Hybrid Scheduling Algorithm: Adaptive Beam Search + Multi-Segment ILS with VND.
+
+    1. Constructive Phase (Adaptive Beam Search):
+       - Uses 'Work-Density' metric with decaying Gamma (1.5 -> 1.0) to transition
+         from packing heavy work to filling gaps.
+       - 'Zero-Cost Bonus': Prioritizes candidates that add work without increasing makespan (parallelism).
+       - Selects candidates using LPT heuristic and random diversity.
+
+    2. Refinement Phase (ILS + VND):
+       - Multi-Segment Ruin: Removes two disjoint blocks of transactions to escape local optima.
+       - Recreate: Greedy Best-Fit insertion.
+       - Variable Neighborhood Descent (VND): Structured local search cycling through
+         Shift, Swap, and Reverse neighborhoods.
+
+    Args:
+        workload: Workload object
+        num_seqs: Hint for computational budget
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+
+    # --- 0. Precomputation ---
+    num_txns = workload.num_txns
+
+    # Extract transaction lengths
+    txn_lengths = {}
+    for i in range(num_txns):
+        try:
+            txn_lengths[i] = workload.txns[i][0][3]
+        except (IndexError, TypeError, AttributeError):
+            txn_lengths[i] = 1.0
+
+    # LPT sort for heuristics
+    lpt_indices = sorted(txn_lengths.keys(), key=lambda k: txn_lengths[k], reverse=True)
+
+    # --- 1. Constructive Phase: Adaptive Beam Search ---
+
+    # Beam parameters
+    BEAM_WIDTH = max(16, int(num_seqs * 2.5))
+
+    # Seed beam with top LPT and some randoms
+    seeds = set(lpt_indices[:BEAM_WIDTH])
+    if len(seeds) < BEAM_WIDTH:
+        rem = list(set(range(num_txns)) - seeds)
+        seeds.update(random.sample(rem, min(len(rem), BEAM_WIDTH - len(seeds))))
+
+    beam = []
+    initial_gamma = 1.5
+
+    for t in seeds:
+        seq = [t]
+        cost = workload.get_opt_seq_cost(seq)
+        work = txn_lengths[t]
+        score = cost - (initial_gamma * work)
+        beam.append({
+            'seq': seq,
+            'cost': cost,
+            'work': work,
+            'score': score,
+            'rem': set(range(num_txns)) - {t}
+        })
+
+    beam.sort(key=lambda x: x['score'])
+    beam = beam[:BEAM_WIDTH]
+
+    # Construction Loop
+    for step in range(num_txns - 1):
+        # Adaptive Gamma Decay: 1.5 -> 1.0
+        # Slowly reduce bias for heavy items, increase importance of fit
+        progress = (step + 1) / num_txns
+        current_gamma = 1.5 - (0.5 * progress)
+
+        candidates = []
+        for parent in beam:
+            rem = list(parent['rem'])
+            if not rem: continue
+
+            # Smart Candidate Selection
+            to_eval = set()
+
+            # 1. Top LPT candidates
+            added_lpt = 0
+            for t in lpt_indices:
+                if t in parent['rem']:
+                    to_eval.add(t)
+                    added_lpt += 1
+                    if added_lpt >= 5: break
+
+            # 2. Random candidates for diversity
+            if len(rem) > len(to_eval):
+                pool = [x for x in rem if x not in to_eval]
+                count = min(len(pool), 5)
+                to_eval.update(random.sample(pool, count))
+
+            base_cost = parent['cost']
+
+            for t in to_eval:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_work = parent['work'] + txn_lengths[t]
+
+                # Base Score: Cost - Gamma * Work
+                new_score = new_cost - (current_gamma * new_work)
+
+                # Zero-Cost Bonus (Gap Filling/Parallelism)
+                # If adding the txn doesn't increase cost (or increases very little),
+                # reward it heavily to prioritize this perfect fit.
+                if new_cost <= base_cost + 0.0001:
+                    new_score -= (txn_lengths[t] * 2.5)
+
+                new_rem = parent['rem'].copy()
+                new_rem.remove(t)
+
+                candidates.append({
+                    'seq': new_seq,
+                    'cost': new_cost,
+                    'work': new_work,
+                    'score': new_score,
+                    'rem': new_rem
+                })
+
+        if not candidates: break
+
+        # Diversity-Preserving Selection
+        candidates.sort(key=lambda x: x['score'])
+        beam = candidates[:BEAM_WIDTH]
+
+    # Select best from construction
+    beam.sort(key=lambda x: x['cost'])
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+
+    # --- 2. Refinement Phase: ILS + VND ---
+
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+
+    # Determine refinement budget
+    ILS_CYCLES = 5 if num_txns >= 20 else 3
+    if num_txns < 10: ILS_CYCLES = 2
+
+    # Neighborhoods for VND
+    neighborhoods = ['shift', 'swap', 'reverse']
+
+    for cycle in range(ILS_CYCLES):
+
+        # A. Multi-Segment Ruin
+        work_seq = list(current_schedule)
+        removed_txns = []
+
+        # Remove 1 or 2 disjoint blocks depending on size
+        num_blocks = 2 if num_txns > 25 else 1
+
+        for _ in range(num_blocks):
+            if len(work_seq) < 3: break
+            # Block size: 5% to 15%
+            bs = max(1, int(len(best_schedule) * random.uniform(0.05, 0.15)))
+            if len(work_seq) > bs:
+                start = random.randint(0, len(work_seq) - bs)
+                removed_txns.extend(work_seq[start : start + bs])
+                del work_seq[start : start + bs]
+
+        # Shuffle removed transactions for random re-insertion order
+        random.shuffle(removed_txns)
+
+        # B. Greedy Recreate (Best-Fit)
+        for txn in removed_txns:
+            best_pos = -1
+            best_incr = float('inf')
+
+            # Scan all positions
+            for pos in range(len(work_seq) + 1):
+                work_seq.insert(pos, txn)
+                c = workload.get_opt_seq_cost(work_seq)
+                if c < best_incr:
+                    best_incr = c
+                    best_pos = pos
+                del work_seq[pos]
+
+            work_seq.insert(best_pos, txn)
+
+        current_schedule = work_seq
+        current_cost = best_incr
+
+        if current_cost < best_cost:
+            best_cost = current_cost
+            best_schedule = list(current_schedule)
+        else:
+            # Restart strategy: occasionally revert to global best to intensify search
+            if random.random() > 0.3:
+                current_schedule = list(best_schedule)
+                current_cost = best_cost
+
+        # C. Variable Neighborhood Descent (VND)
+        # Cycle through neighborhoods. If improvement found, restart cycle.
+        # This replaces generic SA with structured moves.
+
+        improved = True
+        vnd_evals = 0
+        MAX_VND_EVALS = 400 # Budget per ILS cycle
+
+        while improved and vnd_evals < MAX_VND_EVALS:
+            improved = False
+
+            for nh in neighborhoods:
+                # Try a batch of random moves in this neighborhood
+                # This approximates exploring the neighborhood
+                batch_size = 30
+
+                best_neighbor = None
+                best_neighbor_cost = current_cost
+                found_better_in_batch = False
+
+                for _ in range(batch_size):
+                    cand = list(current_schedule)
+
+                    if nh == 'shift':
+                        i = random.randint(0, len(cand)-1)
+                        val = cand.pop(i)
+                        j = random.randint(0, len(cand))
+                        cand.insert(j, val)
+                    elif nh == 'swap':
+                        i, j = random.sample(range(len(cand)), 2)
+                        cand[i], cand[j] = cand[j], cand[i]
+                    elif nh == 'reverse':
+                        if len(cand) < 4: continue
+                        bs = random.randint(3, 8)
+                        si = random.randint(0, len(cand) - bs)
+                        cand[si:si+bs] = reversed(cand[si:si+bs])
+
+                    c = workload.get_opt_seq_cost(cand)
+                    vnd_evals += 1
+
+                    if c < best_neighbor_cost:
+                        best_neighbor_cost = c
+                        best_neighbor = cand
+                        found_better_in_batch = True
+
+                # If the batch produced a better solution than current, accept it
+                if found_better_in_batch:
+                    current_schedule = best_neighbor
+                    current_cost = best_neighbor_cost
+                    if current_cost < best_cost:
+                        best_cost = current_cost
+                        best_schedule = list(current_schedule)
+                    improved = True
+                    # Restart neighborhood cycle on improvement (VND logic)
+                    break
+
+                if vnd_evals >= MAX_VND_EVALS: break
+
+    return best_cost, best_schedule
+
+
+def get_random_costs():
+    """
+    Evaluate scheduling algorithm on three different workloads.
+
+    Returns:
+        Tuple of (total_makespan, list_of_schedules, execution_time)
+    """
+    start_time = time.time()
+
+    # Workload 1: Complex mixed read/write transactions
+    workload1 = Workload(WORKLOAD_1)
+    makespan1, schedule1 = get_best_schedule(workload1, 10)
+    cost1 = workload1.get_opt_seq_cost(schedule1)
+
+    # Workload 2: Simple read-then-write pattern
+    workload2 = Workload(WORKLOAD_2)
+    makespan2, schedule2 = get_best_schedule(workload2, 10)
+    cost2 = workload2.get_opt_seq_cost(schedule2)
+
+    # Workload 3: Minimal read/write operations
+    workload3 = Workload(WORKLOAD_3)
+    makespan3, schedule3 = get_best_schedule(workload3, 10)
+    cost3 = workload3.get_opt_seq_cost(schedule3)
+
+    total_makespan = cost1 + cost2 + cost3
+    schedules = [schedule1, schedule2, schedule3]
+    execution_time = time.time() - start_time
+
+    return total_makespan, schedules, execution_time
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_scheduling():
+    """Run the transaction scheduling algorithm for all workloads"""
+    total_makespan, schedules, execution_time = get_random_costs()
+    return total_makespan, schedules, execution_time
+
+
+if __name__ == "__main__":
+    total_makespan, schedules, execution_time = run_scheduling()
+    print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+    print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

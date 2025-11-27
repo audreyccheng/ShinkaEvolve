@@ -1,0 +1,316 @@
+<NAME>
+vectorized_topk_swap_lns_v2
+</NAME>
+
+<DESCRIPTION>
+1. Improved the vectorized swap heuristic: Instead of only attempting to balance the single heaviest pack against others, the new "Top-K vs All" strategy selects the K heaviest packs (e.g., K=4) and searches for optimal 1-swaps against all other packs. This uses tensor broadcasting to efficiently evaluate thousands of potential swaps in parallel, maximizing the reduction in the Sum of Squared Loads (variance). This broader search helps the system escape local optima where the max pack is stuck but variance can still be reduced.
+2. Enhanced the LNS (Ruin & Recreate) phase: Increased the number of packs involved in the local search from 2-3 to up to 4, allowing for more complex cyclic exchanges (3-way/4-way). Increased the number of randomized restarts within the LNS subroutine to better explore the sub-problem space.
+3. Increased global refinement iterations to utilize the available speed budget for better quality.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # --- 2. Refinement Loop ---
+        # Alternating between Vectorized 1-Swap and K-Way LNS
+        MAX_GLOBAL_ITERS = 5
+
+        for _ in range(MAX_GLOBAL_ITERS):
+            improved_any = False
+
+            # Phase 1: Vectorized Local Search (Swap)
+            # Uses broadcasting to evaluate swaps between the heaviest pack and all others simultaneously
+            # This replaces the slow O(G^2 * M) python loop with optimized PyTorch ops on CPU
+            for _ in range(15):
+                max_pack = torch.argmax(pack_weights).item()
+                max_w = pack_weights[max_pack].item()
+
+                # Items in max pack: [G]
+                u_indices = pack_assignment[max_pack]
+                w_u = layer_weights_t[u_indices].view(1, groups_per_pack, 1)
+
+                # Items in all packs: [M, G]
+                w_v = layer_weights_t[pack_assignment].view(num_packs, 1, groups_per_pack)
+
+                # Deltas: w_u - w_v. Shape [M, G, G]
+                deltas = w_u - w_v
+
+                # We want to swap u (from max_pack) with v (from other pack) such that:
+                # 1. max_load decreases: max_w - delta < max_w  => delta > 0
+                # 2. other pack doesn't exceed old max_load: w_v_pack + delta < max_w
+                #    => delta < max_w - w_v_pack
+
+                diffs = (max_w - pack_weights).view(num_packs, 1, 1)
+                mask = (deltas > 1e-6) & (deltas < diffs)
+
+                if not mask.any():
+                    break
+
+                # Gain metric: prefer swaps that balance the two packs (delta close to diff/2)
+                gains = deltas * (diffs - deltas)
+                gains = torch.where(mask, gains, -1.0)
+
+                best_val, best_flat_idx = gains.view(-1).max(0)
+
+                if best_val < 0:
+                    break
+
+                best_flat = best_flat_idx.item()
+                p_target = best_flat // (groups_per_pack * groups_per_pack)
+                rem = best_flat % (groups_per_pack * groups_per_pack)
+                u_pos = rem // groups_per_pack
+                v_pos = rem % groups_per_pack
+
+                # Apply Swap
+                item_u = pack_assignment[max_pack, u_pos].item()
+                item_v = pack_assignment[p_target, v_pos].item()
+                delta_val = deltas.view(-1)[best_flat].item()
+
+                pack_assignment[max_pack, u_pos] = item_v
+                pack_assignment[p_target, v_pos] = item_u
+                pack_weights[max_pack] -= delta_val
+                pack_weights[p_target] += delta_val
+                improved_any = True
+
+            # Phase 2: K-Way LNS (Ruin & Recreate)
+            # Pick max, min, and a random pack to reshuffle together
+            if num_packs >= 2:
+                for _ in range(5):
+                    max_p = torch.argmax(pack_weights).item()
+                    min_p = torch.argmin(pack_weights).item()
+
+                    if pack_weights[max_p] - pack_weights[min_p] < 1e-6:
+                        break # Perfectly balanced
+
+                    lns_packs = [max_p, min_p]
+                    if num_packs > 2:
+                        p3 = random.randint(0, num_packs - 1)
+                        while p3 in lns_packs:
+                            p3 = random.randint(0, num_packs - 1)
+                        lns_packs.append(p3)
+
+                    # Collect items
+                    items_flat = []
+                    for p in lns_packs:
+                        items_flat.extend(pack_assignment[p].tolist())
+
+                    # Solve sub-problem
+                    curr_sub_max = max(pack_weights[p].item() for p in lns_packs)
+                    curr_sub_ss = sum(pack_weights[p].item()**2 for p in lns_packs)
+
+                    best_sub_assign = None
+                    best_sub_weights = None
+                    found_lns_improvement = False
+
+                    # Strategies: Deterministic LPT + Random Noise
+                    strategies = []
+                    strategies.append(sorted(items_flat, key=lambda x: layer_weights[x], reverse=True))
+                    for _ in range(3):
+                         # Perturb weights
+                         strategies.append(sorted(items_flat, key=lambda x: layer_weights[x] * random.uniform(0.9, 1.1), reverse=True))
+
+                    for item_order in strategies:
+                        temp_bins = [[] for _ in lns_packs]
+                        temp_ws = [0.0] * len(lns_packs)
+                        temp_cts = [0] * len(lns_packs)
+
+                        possible = True
+                        for idx in item_order:
+                            w_val = layer_weights[idx]
+                            best_b = -1
+                            min_local_w = float('inf')
+                            for b in range(len(lns_packs)):
+                                if temp_cts[b] < groups_per_pack:
+                                    if temp_ws[b] < min_local_w:
+                                        min_local_w = temp_ws[b]
+                                        best_b = b
+                            if best_b == -1:
+                                possible = False
+                                break
+                            temp_bins[best_b].append(idx)
+                            temp_ws[best_b] += w_val
+                            temp_cts[best_b] += 1
+
+                        if possible:
+                            new_max = max(temp_ws)
+                            new_ss = sum(x*x for x in temp_ws)
+
+                            if new_max < curr_sub_max - 1e-6:
+                                curr_sub_max = new_max
+                                curr_sub_ss = new_ss
+                                best_sub_assign = temp_bins
+                                best_sub_weights = temp_ws
+                                found_lns_improvement = True
+                            elif abs(new_max - curr_sub_max) < 1e-6 and new_ss < curr_sub_ss - 1e-6:
+                                curr_sub_ss = new_ss
+                                best_sub_assign = temp_bins
+                                best_sub_weights = temp_ws
+                                found_lns_improvement = True
+
+                    if found_lns_improvement:
+                        for i_idx, p_idx in enumerate(lns_packs):
+                            pack_assignment[p_idx] = torch.tensor(best_sub_assign[i_idx], dtype=torch.int64)
+                            pack_weights[p_idx] = best_sub_weights[i_idx]
+                        improved_any = True
+
+            if not improved_any:
+                break
+=======
+        # --- 2. Refinement Loop ---
+        # Alternating between Vectorized 1-Swap and K-Way LNS
+        MAX_GLOBAL_ITERS = 8
+
+        for _ in range(MAX_GLOBAL_ITERS):
+            improved_any = False
+
+            # Phase 1: Vectorized Local Search (Swap)
+            # Check swaps for top-K heaviest packs to reduce max load or variance.
+            # Sorting helps to focus on the most critical packs first.
+            sorted_indices = torch.argsort(pack_weights, descending=True)
+            top_k = min(num_packs, 4)
+
+            for k in range(top_k):
+                source_pack = sorted_indices[k].item()
+
+                # Multiple passes for each heavy pack to clear easy swaps
+                for _ in range(5):
+                    w_source = pack_weights[source_pack].item()
+
+                    # Items in source pack: [G]
+                    u_indices = pack_assignment[source_pack]
+                    w_u = layer_weights_t[u_indices].view(1, groups_per_pack, 1)
+
+                    # Items in all packs: [M, G]
+                    w_v = layer_weights_t[pack_assignment].view(num_packs, 1, groups_per_pack)
+
+                    # Deltas: w_u - w_v. Shape [M, G, G]
+                    # delta > 0 implies item u is heavier than item v
+                    deltas = w_u - w_v
+
+                    # We want to swap u (heavy) with v (light) such that:
+                    # w_source decreases and w_target doesn't exceed original w_source
+                    # To minimize variance: d < w_s - w_t
+
+                    diffs = (w_source - pack_weights).view(num_packs, 1, 1)
+                    mask = (deltas > 1e-5) & (deltas < diffs)
+
+                    if not mask.any():
+                        break
+
+                    # Gain metric: maximize delta * (diff - delta)
+                    # This prefers large delta that fits in the gap
+                    gains = deltas * (diffs - deltas)
+                    gains = torch.where(mask, gains, -1.0)
+
+                    best_val, best_flat_idx = gains.view(-1).max(0)
+
+                    if best_val < 0:
+                        break
+
+                    best_flat = best_flat_idx.item()
+                    p_target = best_flat // (groups_per_pack * groups_per_pack)
+
+                    # Safety check: if target became heavier than source due to other swaps
+                    if pack_weights[p_target] >= w_source:
+                        break
+
+                    rem = best_flat % (groups_per_pack * groups_per_pack)
+                    u_pos = rem // groups_per_pack
+                    v_pos = rem % groups_per_pack
+
+                    # Apply Swap
+                    item_u = pack_assignment[source_pack, u_pos].item()
+                    item_v = pack_assignment[p_target, v_pos].item()
+                    delta_val = deltas.view(-1)[best_flat].item()
+
+                    pack_assignment[source_pack, u_pos] = item_v
+                    pack_assignment[p_target, v_pos] = item_u
+                    pack_weights[source_pack] -= delta_val
+                    pack_weights[p_target] += delta_val
+                    improved_any = True
+
+            # Phase 2: K-Way LNS (Ruin & Recreate)
+            if num_packs >= 2:
+                # Increased LNS iterations
+                for _ in range(10):
+                    max_p = torch.argmax(pack_weights).item()
+                    min_p = torch.argmin(pack_weights).item()
+
+                    if pack_weights[max_p] - pack_weights[min_p] < 1e-6:
+                        break
+
+                    # Select packs: Max, Min, and up to 2 random others
+                    lns_packs = {max_p, min_p}
+                    while len(lns_packs) < min(num_packs, 4):
+                         lns_packs.add(random.randint(0, num_packs - 1))
+
+                    lns_indices = list(lns_packs)
+
+                    # Collect items
+                    items_flat = []
+                    for p in lns_indices:
+                        items_flat.extend(pack_assignment[p].tolist())
+
+                    # Solve sub-problem
+                    curr_sub_max = max(pack_weights[p].item() for p in lns_indices)
+                    curr_sub_ss = sum(pack_weights[p].item()**2 for p in lns_indices)
+
+                    best_sub_assign = None
+                    best_sub_weights = None
+                    found_lns_improvement = False
+
+                    # Strategies: Deterministic LPT + Random Noise
+                    strategies = []
+                    strategies.append(sorted(items_flat, key=lambda x: layer_weights[x], reverse=True))
+                    # More random perturbations
+                    for _ in range(5):
+                         strategies.append(sorted(items_flat, key=lambda x: layer_weights[x] * random.uniform(0.85, 1.15), reverse=True))
+
+                    for item_order in strategies:
+                        temp_bins = [[] for _ in lns_indices]
+                        temp_ws = [0.0] * len(lns_indices)
+                        temp_cts = [0] * len(lns_indices)
+
+                        possible = True
+                        for idx in item_order:
+                            w_val = layer_weights[idx]
+                            # Greedy Best Fit on Subset
+                            best_b = -1
+                            min_local_w = float('inf')
+                            for b in range(len(lns_indices)):
+                                if temp_cts[b] < groups_per_pack:
+                                    if temp_ws[b] < min_local_w:
+                                        min_local_w = temp_ws[b]
+                                        best_b = b
+                            if best_b == -1:
+                                possible = False
+                                break
+                            temp_bins[best_b].append(idx)
+                            temp_ws[best_b] += w_val
+                            temp_cts[best_b] += 1
+
+                        if possible:
+                            new_max = max(temp_ws)
+                            new_ss = sum(x*x for x in temp_ws)
+
+                            if new_max < curr_sub_max - 1e-6:
+                                curr_sub_max = new_max
+                                curr_sub_ss = new_ss
+                                best_sub_assign = temp_bins
+                                best_sub_weights = temp_ws
+                                found_lns_improvement = True
+                            elif abs(new_max - curr_sub_max) < 1e-6 and new_ss < curr_sub_ss - 1e-6:
+                                curr_sub_ss = new_ss
+                                best_sub_assign = temp_bins
+                                best_sub_weights = temp_ws
+                                found_lns_improvement = True
+
+                    if found_lns_improvement:
+                        for i_idx, p_idx in enumerate(lns_indices):
+                            pack_assignment[p_idx] = torch.tensor(best_sub_assign[i_idx], dtype=torch.int64)
+                            pack_weights[p_idx] = best_sub_weights[i_idx]
+                        improved_any = True
+
+            if not improved_any:
+                break
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,281 @@
+<NAME>
+improved_local_search_objective
+</NAME>
+
+<DESCRIPTION>
+Replaces the standard Min-Max local search with a Lexicographical Local Search that optimizes two objectives:
+1. Primary: Reduce the Global Maximum KVPR.
+2. Secondary: Reduce the Sum of Squared KVPRs (L2 norm proxy).
+This allows the algorithm to make beneficial moves that balance the load even when the global maximum cannot be immediately reduced (e.g., when there are multiple bottlenecks or the move only improves a non-bottleneck GPU). This helps escape plateaus in the search space.
+The edit also simplifies the neighborhood search by removing Swap(2-1) to allow for more iterations of Move and Swap(1-1) which are faster and often sufficient with the improved objective function.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def evaluate(stats):
+        max_k = -1.0
+        bottlenecks = []
+        for g in range(gpu_num):
+            k = get_kvpr(stats[g]['l'], stats[g]['s'])
+            if k > max_k:
+                max_k = k
+                bottlenecks = [g]
+            elif abs(k - max_k) < 1e-9:
+                bottlenecks.append(g)
+        return max_k, bottlenecks
+
+    # Run ILS
+    while time.time() - start_time < 0.9:
+
+        # Steepest Descent Local Search
+        while True:
+            cur_max, bottlenecks = evaluate(gpu_stats)
+            if cur_max < 1e-9: break
+
+            best_move = None
+            best_imp = 0.0
+
+            # Check bottlenecks (prioritize worst)
+            candidates = bottlenecks[:2]
+
+            targets = []
+            for t in range(gpu_num):
+                if t not in bottlenecks:
+                    targets.append(t)
+
+            if not targets:
+                # If all GPUs are bottlenecks (perfect balance), break
+                break
+
+            for b_idx in candidates:
+                b_l = gpu_stats[b_idx]['l']
+                b_s = gpu_stats[b_idx]['s']
+                src_items = plc[b_idx]
+
+                # Pre-filter targets that can actually accept items without becoming new worst bottleneck
+                valid_targets = [t for t in targets if get_kvpr(gpu_stats[t]['l'], gpu_stats[t]['s']) < cur_max]
+
+                # 1. Move
+                for i, item in enumerate(src_items):
+                    for t in valid_targets:
+                        if gpu_stats[t]['s'] + item['s'] >= GPU_MEM_SIZE: continue
+
+                        nk_src = get_kvpr(b_l - item['l'], b_s - item['s'])
+                        nk_tgt = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+
+                        new_global = max(nk_src, nk_tgt)
+                        if new_global < cur_max - 1e-7:
+                            imp = cur_max - new_global
+                            if imp > best_imp:
+                                best_imp = imp
+                                best_move = ('move', b_idx, i, t)
+
+                # 2. Swap 1-1
+                for i, s_item in enumerate(src_items):
+                    for t in valid_targets:
+                        tgt_items = plc[t]
+                        for j, t_item in enumerate(tgt_items):
+                            # Capacity check
+                            if b_s - s_item['s'] + t_item['s'] >= GPU_MEM_SIZE: continue
+                            if gpu_stats[t]['s'] - t_item['s'] + s_item['s'] >= GPU_MEM_SIZE: continue
+
+                            nk_src = get_kvpr(b_l - s_item['l'] + t_item['l'], b_s - s_item['s'] + t_item['s'])
+                            nk_tgt = get_kvpr(gpu_stats[t]['l'] - t_item['l'] + s_item['l'], gpu_stats[t]['s'] - t_item['s'] + s_item['s'])
+
+                            new_global = max(nk_src, nk_tgt)
+                            if new_global < cur_max - 1e-7:
+                                imp = cur_max - new_global
+                                if imp > best_imp:
+                                    best_imp = imp
+                                    best_move = ('swap11', b_idx, i, t, j)
+
+                # 3. Swap 2-1 (2 from bottleneck)
+                if len(src_items) >= 2:
+                    # Heuristic limits to avoid O(N^2 * M)
+                    limit_checks = 100
+                    checks = 0
+                    for i1 in range(len(src_items)):
+                        if checks > limit_checks: break
+                        for i2 in range(i1 + 1, len(src_items)):
+                            m1 = src_items[i1]
+                            m2 = src_items[i2]
+                            pair_l = m1['l'] + m2['l']
+                            pair_s = m1['s'] + m2['s']
+
+                            for t in valid_targets:
+                                tgt_items = plc[t]
+                                for j, m3 in enumerate(tgt_items):
+                                    if b_s - pair_s + m3['s'] >= GPU_MEM_SIZE: continue
+                                    if gpu_stats[t]['s'] - m3['s'] + pair_s >= GPU_MEM_SIZE: continue
+
+                                    nk_src = get_kvpr(b_l - pair_l + m3['l'], b_s - pair_s + m3['s'])
+                                    nk_tgt = get_kvpr(gpu_stats[t]['l'] - m3['l'] + pair_l, gpu_stats[t]['s'] - m3['s'] + pair_s)
+
+                                    new_global = max(nk_src, nk_tgt)
+                                    if new_global < cur_max - 1e-7:
+                                        imp = cur_max - new_global
+                                        if imp > best_imp:
+                                            best_imp = imp
+                                            best_move = ('swap21', b_idx, i1, i2, t, j)
+                                    checks += 1
+
+            # Apply Best Move
+            if best_move:
+                mtype = best_move[0]
+                if mtype == 'move':
+                    _, b, i, t = best_move
+                    item = plc[b].pop(i)
+                    plc[t].append(item)
+                    gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+                    gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+                elif mtype == 'swap11':
+                    _, b, i, t, j = best_move
+                    it1 = plc[b][i]
+                    it2 = plc[t][j]
+                    plc[b][i] = it2
+                    plc[t][j] = it1
+                    dl = it2['l'] - it1['l']; ds = it2['s'] - it1['s']
+                    gpu_stats[b]['l'] += dl; gpu_stats[b]['s'] += ds
+                    gpu_stats[t]['l'] -= dl; gpu_stats[t]['s'] -= ds
+                elif mtype == 'swap21':
+                    _, b, i1, i2, t, j = best_move
+                    it2 = plc[b].pop(i2)
+                    it1 = plc[b].pop(i1)
+                    it3 = plc[t].pop(j)
+                    plc[b].append(it3)
+                    plc[t].extend([it1, it2])
+                    pl = it1['l'] + it2['l']; ps = it1['s'] + it2['s']
+                    gpu_stats[b]['l'] += it3['l'] - pl; gpu_stats[b]['s'] += it3['s'] - ps
+                    gpu_stats[t]['l'] += pl - it3['l']; gpu_stats[t]['s'] += ps - it3['s']
+            else:
+                break # Local Optima Reached
+
+        # Update Global Best
+        cur_max, bottlenecks = evaluate(gpu_stats)
+        if cur_max < best_global_score:
+            best_global_score = cur_max
+            best_global_plc = [list(p) for p in plc]
+=======
+    # Helper to calculate stats
+    def get_state_metrics(stats):
+        kvprs = []
+        max_k = -1.0
+        sum_sq = 0.0
+        for g in range(gpu_num):
+            k = get_kvpr(stats[g]['l'], stats[g]['s'])
+            kvprs.append(k)
+            if k > max_k: max_k = k
+            sum_sq += k**2
+        return max_k, sum_sq, kvprs
+
+    # Run ILS
+    while time.time() - start_time < 0.9:
+
+        # Steepest Descent Local Search
+        # Objective: Lexicographical (minimize max_k, then minimize sum_sq)
+        while True:
+            cur_max, cur_sum_sq, cur_kvprs = get_state_metrics(gpu_stats)
+            if cur_max < 1e-9: break
+
+            best_move = None
+            best_imp_max = 0.0
+            best_imp_sum = 0.0
+
+            # Candidates: GPUs with > 90% of max pressure
+            candidates = [g for g in range(gpu_num) if cur_kvprs[g] > cur_max * 0.9]
+            # Prioritize higher pressure
+            candidates.sort(key=lambda g: cur_kvprs[g], reverse=True)
+            candidates = candidates[:3]
+
+            # Count how many are at exactly max (for global reduction check)
+            num_at_max = sum(1 for k in cur_kvprs if abs(k - cur_max) < 1e-9)
+
+            for b_idx in candidates:
+                b_l = gpu_stats[b_idx]['l']
+                b_s = gpu_stats[b_idx]['s']
+                src_items = plc[b_idx]
+
+                # Targets: lower pressure
+                targets = [t for t in range(gpu_num) if cur_kvprs[t] < cur_max]
+
+                # 1. Move
+                for i, item in enumerate(src_items):
+                    for t in targets:
+                        if gpu_stats[t]['s'] + item['s'] >= GPU_MEM_SIZE: continue
+
+                        nk_src = get_kvpr(b_l - item['l'], b_s - item['s'])
+                        nk_tgt = get_kvpr(gpu_stats[t]['l'] + item['l'], gpu_stats[t]['s'] + item['s'])
+
+                        if max(nk_src, nk_tgt) > cur_max + 1e-9: continue
+
+                        old_sq = cur_kvprs[b_idx]**2 + cur_kvprs[t]**2
+                        new_sq = nk_src**2 + nk_tgt**2
+                        imp_sum = old_sq - new_sq
+
+                        imp_max = 0.0
+                        if abs(cur_kvprs[b_idx] - cur_max) < 1e-9 and num_at_max == 1:
+                            local_max_new = max(nk_src, nk_tgt)
+                            if local_max_new < cur_max - 1e-7:
+                                imp_max = cur_max - local_max_new
+
+                        if imp_max > best_imp_max + 1e-9:
+                            best_imp_max = imp_max; best_imp_sum = imp_sum
+                            best_move = ('move', b_idx, i, t)
+                        elif abs(imp_max - best_imp_max) < 1e-9 and imp_sum > best_imp_sum + 1e-9:
+                            best_imp_sum = imp_sum; best_move = ('move', b_idx, i, t)
+
+                # 2. Swap 1-1
+                for i, s_item in enumerate(src_items):
+                    for t in targets:
+                        tgt_items = plc[t]
+                        for j, t_item in enumerate(tgt_items):
+                            if b_s - s_item['s'] + t_item['s'] >= GPU_MEM_SIZE: continue
+                            if gpu_stats[t]['s'] - t_item['s'] + s_item['s'] >= GPU_MEM_SIZE: continue
+
+                            nk_src = get_kvpr(b_l - s_item['l'] + t_item['l'], b_s - s_item['s'] + t_item['s'])
+                            nk_tgt = get_kvpr(gpu_stats[t]['l'] - t_item['l'] + s_item['l'], gpu_stats[t]['s'] - t_item['s'] + s_item['s'])
+
+                            if max(nk_src, nk_tgt) > cur_max + 1e-9: continue
+
+                            old_sq = cur_kvprs[b_idx]**2 + cur_kvprs[t]**2
+                            new_sq = nk_src**2 + nk_tgt**2
+                            imp_sum = old_sq - new_sq
+
+                            imp_max = 0.0
+                            if abs(cur_kvprs[b_idx] - cur_max) < 1e-9 and num_at_max == 1:
+                                if max(nk_src, nk_tgt) < cur_max - 1e-7:
+                                    imp_max = cur_max - max(nk_src, nk_tgt)
+
+                            if imp_max > best_imp_max + 1e-9:
+                                best_imp_max = imp_max; best_imp_sum = imp_sum
+                                best_move = ('swap11', b_idx, i, t, j)
+                            elif abs(imp_max - best_imp_max) < 1e-9 and imp_sum > best_imp_sum + 1e-9:
+                                best_imp_sum = imp_sum; best_move = ('swap11', b_idx, i, t, j)
+
+            if best_move:
+                mtype = best_move[0]
+                if mtype == 'move':
+                    _, b, i, t = best_move
+                    item = plc[b].pop(i)
+                    plc[t].append(item)
+                    gpu_stats[b]['l'] -= item['l']; gpu_stats[b]['s'] -= item['s']
+                    gpu_stats[t]['l'] += item['l']; gpu_stats[t]['s'] += item['s']
+                elif mtype == 'swap11':
+                    _, b, i, t, j = best_move
+                    it1 = plc[b][i]; it2 = plc[t][j]
+                    plc[b][i] = it2; plc[t][j] = it1
+                    dl = it2['l'] - it1['l']; ds = it2['s'] - it1['s']
+                    gpu_stats[b]['l'] += dl; gpu_stats[b]['s'] += ds
+                    gpu_stats[t]['l'] -= dl; gpu_stats[t]['s'] -= ds
+            else:
+                break
+
+        # Update Global Best & Recalc Bottlenecks for Perturbation
+        cur_max, _, cur_kvprs = get_state_metrics(gpu_stats)
+        bottlenecks = [g for g in range(gpu_num) if abs(cur_kvprs[g] - cur_max) < 1e-9]
+
+        if cur_max < best_global_score:
+            best_global_score = cur_max
+            best_global_plc = [list(p) for p in plc]
+>>>>>>> REPLACE
+</DIFF>

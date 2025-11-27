@@ -1,0 +1,467 @@
+# EVOLVE-BLOCK-START
+"""
+Network telemetry repair via robust IRLS consensus over link- and router-factors.
+
+This algorithm:
+- Hardens statuses using redundancy and traffic evidence
+- Builds a factor graph with link symmetry and router flow constraints
+- Runs an iterative reweighted least-squares consensus procedure
+- Applies small, robust, per-iteration updates with adjustability tied to trust
+- Calibrates confidences from residuals, magnitude of edits, and improvement
+
+Maintains the same function signature and IO schema.
+"""
+from typing import Dict, Any, Tuple, List
+from math import isfinite
+
+def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                             topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    # Global tolerances and constants
+    HARDENING_THRESHOLD = 0.02         # ~2% timing skew tolerance
+    TRAFFIC_EVIDENCE_MIN = 0.5         # Mbps evidence for link being up
+    TOL_ROUTER_REL = HARDENING_THRESHOLD * 2.0
+    TOL_PAIR_BASE_REL = HARDENING_THRESHOLD * 1.5
+
+    # IRLS/consensus parameters
+    MAX_ITERS = 8
+    STEP_PAIR_0 = 0.55       # initial pair constraint step
+    STEP_ROUTER_0 = 0.60     # initial router constraint step
+    STEP_DECAY = 0.82        # per-iteration decay
+    PER_ITER_REL_CAP = 0.18  # max per-iter relative move per direction
+    PER_ITER_ABS_MIN = 0.20  # Mbps absolute cap for tiny links
+    TINY_LINK_MBPS = 1.0     # tiny-link protection
+    EPS = 1e-9
+
+    # Confidence weights
+    W_PAIR, W_ROUTER, W_STATUS = 0.62, 0.28, 0.10
+
+    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+        if not isfinite(x):
+            return lo
+        return max(lo, min(hi, x))
+
+    def rel_diff(a: float, b: float) -> float:
+        denom = max(abs(a), abs(b), 1e-9)
+        return abs(a - b) / denom
+
+    def conf_from_residual(residual: float, tol: float) -> float:
+        # Two-slope residual-to-confidence: high near 0, decays to 0 around 5*tol
+        tol = max(tol, 1e-9)
+        x = residual / tol
+        conf = 1.0 - min(1.0, x / 5.0)
+        if x > 3.0:
+            conf -= 0.1 * (x - 3.0) / 2.0
+        return clamp(conf)
+
+    def huber_weight_rel(res_rel: float, tol_rel: float) -> float:
+        # Relative residual Huber weight: 1 inside tol; tol/|res| outside
+        res_rel = abs(res_rel)
+        tol_rel = max(tol_rel, 1e-9)
+        return 1.0 if res_rel <= tol_rel else tol_rel / res_rel
+
+    # Build connected pairs
+    visited = set()
+    pairs: List[Tuple[str, str]] = []
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            k = tuple(sorted([if_id, peer]))
+            if k not in visited:
+                visited.add(k)
+                pairs.append((k[0], k[1]))
+
+    peer_of: Dict[str, str] = {}
+    paired_ids = set()
+    for a_id, b_id in pairs:
+        peer_of[a_id] = b_id
+        peer_of[b_id] = a_id
+        paired_ids.add(a_id)
+        paired_ids.add(b_id)
+
+    # Init interim state
+    interim: Dict[str, Dict[str, Any]] = {}
+    for if_id, data in telemetry.items():
+        rx0 = float(data.get('rx_rate', 0.0))
+        tx0 = float(data.get('tx_rate', 0.0))
+        interim[if_id] = {
+            'rx': rx0, 'tx': tx0,
+            'orig_rx': rx0, 'orig_tx': tx0,
+            'status': data.get('interface_status', 'unknown'),
+            'orig_status': data.get('interface_status', 'unknown'),
+            'status_conf': 1.0,
+            'connected_to': data.get('connected_to'),
+            'local_router': data.get('local_router'),
+            'remote_router': data.get('remote_router'),
+            # trust and adjustability
+            'trust_rx': 0.7, 'trust_tx': 0.7,
+            'adj_rx': 0.3, 'adj_tx': 0.3,
+            # edit tracking
+            'edit_rx_abs': 0.0, 'edit_tx_abs': 0.0,
+            'edit_rx_rel': 0.0, 'edit_tx_rel': 0.0,
+            'touched': False,
+        }
+
+    # Resolve statuses using redundancy and traffic evidence, harden down=>zero
+    for a_id, b_id in pairs:
+        a = telemetry[a_id]; b = telemetry[b_id]
+        a_stat = a.get('interface_status', 'unknown')
+        b_stat = b.get('interface_status', 'unknown')
+        a_rx, a_tx = float(a.get('rx_rate', 0.0)), float(a.get('tx_rate', 0.0))
+        b_rx, b_tx = float(b.get('rx_rate', 0.0)), float(b.get('tx_rate', 0.0))
+        max_tr = max(a_rx, a_tx, b_rx, b_tx)
+
+        if a_stat == b_stat:
+            resolved = a_stat
+            sconf = 0.95 if resolved in ('up', 'down') else 0.7
+        else:
+            if max_tr > TRAFFIC_EVIDENCE_MIN:
+                resolved = 'up'; sconf = 0.85
+            else:
+                resolved = 'down'; sconf = 0.75
+
+        interim[a_id]['status'] = resolved
+        interim[b_id]['status'] = resolved
+        interim[a_id]['status_conf'] = min(interim[a_id]['status_conf'], sconf) if interim[a_id]['status_conf'] else sconf
+        interim[b_id]['status_conf'] = min(interim[b_id]['status_conf'], sconf) if interim[b_id]['status_conf'] else sconf
+
+        if resolved == 'down':
+            for ifid, rxv, txv in [(a_id, a_rx, a_tx), (b_id, b_rx, b_tx)]:
+                interim[ifid]['rx'] = 0.0; interim[ifid]['tx'] = 0.0
+                # Confidence on counters reflects whether they were already near zero
+                # (final confidence adjustment applied later)
+    # Unpaired down interfaces
+    for if_id, r in interim.items():
+        if if_id not in paired_ids and r.get('status') == 'down':
+            r['rx'] = 0.0; r['tx'] = 0.0
+
+    # Build router map
+    router_ifaces: Dict[str, List[str]] = {}
+    if topology:
+        router_ifaces = {r: [i for i in lst if i in interim] for r, lst in topology.items()}
+    else:
+        # Topology helps; derive using local_router metadata if not provided.
+        for if_id, data in telemetry.items():
+            r = data.get('local_router')
+            if r is not None and if_id in interim:
+                router_ifaces.setdefault(r, []).append(if_id)
+
+    # Compute direction-specific trust from original pair mismatch (higher mismatch -> lower trust)
+    for if_id, r in interim.items():
+        peer = peer_of.get(if_id)
+        if peer and interim[if_id]['status'] == 'up' and interim[peer]['status'] == 'up':
+            my_tx = r['orig_tx']; my_rx = r['orig_rx']
+            prx = interim[peer]['orig_rx']; ptx = interim[peer]['orig_tx']
+            # Traffic-aware relative tolerances
+            tol_tx_rel = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / max(max(my_tx, prx), 1.0)))
+            tol_rx_rel = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / max(max(my_rx, ptx), 1.0)))
+            res_tx_rel = rel_diff(my_tx, prx)
+            res_rx_rel = rel_diff(my_rx, ptx)
+            conf_tx = conf_from_residual(res_tx_rel, tol_tx_rel)
+            conf_rx = conf_from_residual(res_rx_rel, tol_rx_rel)
+            # Trust in direction is the pair-based confidence; adjustability is 1 - trust
+            r['trust_tx'] = conf_tx
+            r['trust_rx'] = conf_rx
+            r['adj_tx'] = max(0.05, 1.0 - conf_tx)
+            r['adj_rx'] = max(0.05, 1.0 - conf_rx)
+        else:
+            # No peer or down: moderate trust; allow some adjustments via router factors
+            r['trust_tx'] = 0.7; r['trust_rx'] = 0.7
+            r['adj_tx'] = 0.3; r['adj_rx'] = 0.3
+
+    # IRLS consensus iterations
+    step_pair = STEP_PAIR_0
+    step_router = STEP_ROUTER_0
+
+    for it in range(MAX_ITERS):
+        # Pair factors: enforce tx_i ≈ rx_j and rx_i ≈ tx_j
+        for a_id, b_id in pairs:
+            if interim[a_id]['status'] != 'up' or interim[b_id]['status'] != 'up':
+                continue
+            a = interim[a_id]; b = interim[b_id]
+
+            # Direction 1: a.tx vs b.rx
+            ta = a['tx']; rb = b['rx']
+            res_rel = rel_diff(ta, rb)
+            traffic = max(ta, rb, 1.0)
+            tol_rel = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / traffic))
+            w = huber_weight_rel(res_rel, tol_rel)
+            if w > 0:
+                d = ta - rb  # Mbps difference
+                # Split correction proportional to adjustability
+                ga = max(EPS, a['adj_tx']); gb = max(EPS, b['adj_rx'])
+                gsum = ga + gb
+                # Proposed moves
+                delta_a = -step_pair * w * (ga / gsum) * d
+                delta_b = +step_pair * w * (gb / gsum) * d
+                # Per-iter caps with tiny-link protection
+                cap_a = max(PER_ITER_REL_CAP * max(ta, 1.0), PER_ITER_ABS_MIN if ta < TINY_LINK_MBPS else 0.0)
+                cap_b = max(PER_ITER_REL_CAP * max(rb, 1.0), PER_ITER_ABS_MIN if rb < TINY_LINK_MBPS else 0.0)
+                delta_a = max(-cap_a, min(cap_a, delta_a))
+                delta_b = max(-cap_b, min(cap_b, delta_b))
+                # Apply
+                new_ta = max(0.0, ta + delta_a)
+                new_rb = max(0.0, rb + delta_b)
+                if new_ta != ta:
+                    a['tx'] = new_ta
+                    a['touched'] = True
+                    dr = rel_diff(ta, new_ta)
+                    a['edit_tx_abs'] += abs(new_ta - ta)
+                    a['edit_tx_rel'] = max(a['edit_tx_rel'], dr)
+                if new_rb != rb:
+                    b['rx'] = new_rb
+                    b['touched'] = True
+                    dr = rel_diff(rb, new_rb)
+                    b['edit_rx_abs'] += abs(new_rb - rb)
+                    b['edit_rx_rel'] = max(b['edit_rx_rel'], dr)
+
+            # Direction 2: a.rx vs b.tx
+            ra = a['rx']; tb = b['tx']
+            res_rel2 = rel_diff(ra, tb)
+            traffic2 = max(ra, tb, 1.0)
+            tol_rel2 = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / traffic2))
+            w2 = huber_weight_rel(res_rel2, tol_rel2)
+            if w2 > 0:
+                d2 = ra - tb
+                ga2 = max(EPS, a['adj_rx']); gb2 = max(EPS, b['adj_tx'])
+                gsum2 = ga2 + gb2
+                delta_a2 = -step_pair * w2 * (ga2 / gsum2) * d2
+                delta_b2 = +step_pair * w2 * (gb2 / gsum2) * d2
+                cap_a2 = max(PER_ITER_REL_CAP * max(ra, 1.0), PER_ITER_ABS_MIN if ra < TINY_LINK_MBPS else 0.0)
+                cap_b2 = max(PER_ITER_REL_CAP * max(tb, 1.0), PER_ITER_ABS_MIN if tb < TINY_LINK_MBPS else 0.0)
+                delta_a2 = max(-cap_a2, min(cap_a2, delta_a2))
+                delta_b2 = max(-cap_b2, min(cap_b2, delta_b2))
+                new_ra = max(0.0, ra + delta_a2)
+                new_tb = max(0.0, tb + delta_b2)
+                if new_ra != ra:
+                    a['rx'] = new_ra
+                    a['touched'] = True
+                    dr = rel_diff(ra, new_ra)
+                    a['edit_rx_abs'] += abs(new_ra - ra)
+                    a['edit_rx_rel'] = max(a['edit_rx_rel'], dr)
+                if new_tb != tb:
+                    b['tx'] = new_tb
+                    b['touched'] = True
+                    dr = rel_diff(tb, new_tb)
+                    b['edit_tx_abs'] += abs(new_tb - tb)
+                    b['edit_tx_rel'] = max(b['edit_tx_rel'], dr)
+
+        # Router factors: enforce Σ(tx) ≈ Σ(rx)
+        for router, if_list in router_ifaces.items():
+            up_ifaces = [i for i in if_list if interim[i]['status'] == 'up']
+            if not up_ifaces:
+                continue
+            sum_tx = sum(max(0.0, interim[i]['tx']) for i in up_ifaces)
+            sum_rx = sum(max(0.0, interim[i]['rx']) for i in up_ifaces)
+            denom = max(sum_tx, sum_rx, 1.0)
+            delta = sum_tx - sum_rx  # Mbps residual
+            delta_rel = abs(delta) / denom
+            w_r = huber_weight_rel(delta_rel, TOL_ROUTER_REL)
+            if w_r <= 0.0 or abs(delta) <= EPS:
+                continue
+            # Distribute correction across interfaces by adjustability weights
+            # We pull tx down and rx up if delta>0; invert if delta<0
+            w_t: Dict[str, float] = {}
+            w_rdir: Dict[str, float] = {}
+            for i in up_ifaces:
+                vtx = max(0.0, interim[i]['tx'])
+                vrx = max(0.0, interim[i]['rx'])
+                # Lower trust => higher adjustability
+                w_t[i] = max(0.05, interim[i]['adj_tx']) * (0.5 + 0.5 * (vtx / max(denom, 1.0)))  # slight size term
+                w_rdir[i] = max(0.05, interim[i]['adj_rx']) * (0.5 + 0.5 * (vrx / max(denom, 1.0)))
+                # tiny-link protection
+                if vtx < TINY_LINK_MBPS: w_t[i] *= 0.6
+                if vrx < TINY_LINK_MBPS: w_rdir[i] *= 0.6
+            sum_wt = sum(w_t.values()) + EPS
+            sum_wr = sum(w_rdir.values()) + EPS
+            # Proposed total adjustments
+            # We aim to reduce delta by allocating opposite signed changes
+            for i in up_ifaces:
+                vtx = interim[i]['tx']; vrx = interim[i]['rx']
+                # Per-iter caps
+                cap_tx = max(PER_ITER_REL_CAP * max(vtx, 1.0), PER_ITER_ABS_MIN if vtx < TINY_LINK_MBPS else 0.0)
+                cap_rx = max(PER_ITER_REL_CAP * max(vrx, 1.0), PER_ITER_ABS_MIN if vrx < TINY_LINK_MBPS else 0.0)
+                # Move tx and rx symmetrically scaled
+                d_tx = -step_router * w_r * (w_t[i] / sum_wt) * delta
+                d_rx = +step_router * w_r * (w_rdir[i] / sum_wr) * delta
+                d_tx = max(-cap_tx, min(cap_tx, d_tx))
+                d_rx = max(-cap_rx, min(cap_rx, d_rx))
+                new_tx = max(0.0, vtx + d_tx)
+                new_rx = max(0.0, vrx + d_rx)
+                if new_tx != vtx:
+                    interim[i]['tx'] = new_tx
+                    interim[i]['touched'] = True
+                    dr = rel_diff(vtx, new_tx)
+                    interim[i]['edit_tx_abs'] += abs(new_tx - vtx)
+                    interim[i]['edit_tx_rel'] = max(interim[i]['edit_tx_rel'], dr)
+                if new_rx != vrx:
+                    interim[i]['rx'] = new_rx
+                    interim[i]['touched'] = True
+                    dr = rel_diff(vrx, new_rx)
+                    interim[i]['edit_rx_abs'] += abs(new_rx - vrx)
+                    interim[i]['edit_rx_rel'] = max(interim[i]['edit_rx_rel'], dr)
+
+        # Decay steps
+        step_pair *= STEP_DECAY
+        step_router *= STEP_DECAY
+
+    # Final gentle symmetry projection within tolerance to polish mismatches
+    for a_id, b_id in pairs:
+        if interim[a_id]['status'] != 'up' or interim[b_id]['status'] != 'up':
+            continue
+        a = interim[a_id]; b = interim[b_id]
+        # a.tx vs b.rx
+        ta, rb = a['tx'], b['rx']
+        res_rel = rel_diff(ta, rb)
+        traffic = max(ta, rb, 1.0)
+        tol_rel = min(0.10, max(TOL_PAIR_BASE_REL, 4.0 / traffic))
+        if res_rel > tol_rel:
+            mid = 0.5 * (ta + rb)
+            # small half-step toward mid, bounded
+            move = 0.20 * (mid - ta)
+            cap = 0.15 * max(ta, 1.0)
+            move = max(-cap, min(cap, move))
+            a['tx'] = max(0.0, ta + move)
+            b['rx'] = max(0.0, rb - move)
+        # a.rx vs b.tx
+        ra, tb = a['rx'], b['tx']
+        res_rel2 = rel_diff(ra, tb)
+        traffic2 = max(ra, tb, 1.0)
+        tol_rel2 = min(0.10, max(TOL_PAIR_BASE_REL, 4.0 / traffic2))
+        if res_rel2 > tol_rel2:
+            mid2 = 0.5 * (ra + tb)
+            move2 = 0.20 * (mid2 - ra)
+            cap2 = 0.15 * max(ra, 1.0)
+            move2 = max(-cap2, min(cap2, move2))
+            a['rx'] = max(0.0, ra + move2)
+            b['tx'] = max(0.0, tb - move2)
+
+    # Confidence calibration
+    # Compute final per-router imbalance residuals
+    router_final_imbalance: Dict[str, float] = {}
+    for router, if_list in router_ifaces.items():
+        up_ifaces = [i for i in if_list if interim.get(i, {}).get('status') == 'up']
+        if not up_ifaces:
+            router_final_imbalance[router] = 0.0
+            continue
+        sum_tx = sum(max(0.0, interim[i]['tx']) for i in up_ifaces)
+        sum_rx = sum(max(0.0, interim[i]['rx']) for i in up_ifaces)
+        router_final_imbalance[router] = rel_diff(sum_tx, sum_rx)
+
+    result: Dict[str, Dict[str, Tuple]] = {}
+
+    for if_id, r in interim.items():
+        peer = peer_of.get(if_id)
+        resolved_status = r.get('status', 'unknown')
+        status_comp = clamp(r.get('status_conf', 0.8))
+
+        # Pair components
+        if peer and interim.get(peer, {}).get('status') == resolved_status:
+            res_fwd = rel_diff(r['tx'], interim[peer]['rx'])
+            res_rev = rel_diff(r['rx'], interim[peer]['tx'])
+            traffic_tx = max(r['tx'], interim[peer]['rx'], 1.0)
+            traffic_rx = max(r['rx'], interim[peer]['tx'], 1.0)
+            tol_pair_tx = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / traffic_tx))
+            tol_pair_rx = min(0.12, max(TOL_PAIR_BASE_REL, 5.0 / traffic_rx))
+            pair_conf_tx = conf_from_residual(res_fwd, tol_pair_tx)
+            pair_conf_rx = conf_from_residual(res_rev, tol_pair_rx)
+        else:
+            pair_conf_tx = 0.58
+            pair_conf_rx = 0.58
+
+        # Router component
+        router = r.get('local_router')
+        router_resid = router_final_imbalance.get(router, 0.0)
+        router_conf = conf_from_residual(router_resid, TOL_ROUTER_REL)
+
+        base_tx_conf = W_PAIR * pair_conf_tx + W_ROUTER * router_conf + W_STATUS * status_comp
+        base_rx_conf = W_PAIR * pair_conf_rx + W_ROUTER * router_conf + W_STATUS * status_comp
+
+        # Edit-size penalties (tapered), and improvement bonus
+        edit_tx_rel = r.get('edit_tx_rel', rel_diff(r['orig_tx'], r['tx']))
+        edit_rx_rel = r.get('edit_rx_rel', rel_diff(r['orig_rx'], r['rx']))
+        pen_w_tx = 0.40 if edit_tx_rel < 0.15 else 0.55
+        pen_w_rx = 0.40 if edit_rx_rel < 0.15 else 0.55
+        final_tx_conf = clamp(base_tx_conf * (1.0 - pen_w_tx * max(0.0, edit_tx_rel - HARDENING_THRESHOLD)))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - pen_w_rx * max(0.0, edit_rx_rel - HARDENING_THRESHOLD)))
+
+        # Improvement bonus if both pair residuals and router residual improved significantly
+        if peer:
+            res_fwd0 = rel_diff(r['orig_tx'], interim[peer]['orig_rx'])
+            res_rev0 = rel_diff(r['orig_rx'], interim[peer]['orig_tx'])
+            res_fwd1 = rel_diff(r['tx'], interim[peer]['rx'])
+            res_rev1 = rel_diff(r['rx'], interim[peer]['tx'])
+            improved_pair = ((res_fwd0 > 0 and res_fwd1 <= 0.5 * res_fwd0) and
+                             (res_rev0 > 0 and res_rev1 <= 0.5 * res_rev0))
+        else:
+            improved_pair = False
+        # Router improvement: compare original totals if router known
+        improved_router = (router_conf > 0.85)  # small proxy when final imbalance near 0
+        if improved_pair and improved_router:
+            final_tx_conf = clamp(final_tx_conf + 0.05)
+            final_rx_conf = clamp(final_rx_conf + 0.05)
+
+        # No-edit bonus for stability
+        if rel_diff(r['orig_tx'], r['tx']) <= 1e-3:
+            final_tx_conf = clamp(final_tx_conf + 0.05)
+        if rel_diff(r['orig_rx'], r['rx']) <= 1e-3:
+            final_rx_conf = clamp(final_rx_conf + 0.05)
+
+        # Down links: counters confidence reflect near-zero consistency
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        # Subtle status calibration for idle ups
+        if resolved_status == 'up':
+            if r['rx'] <= TRAFFIC_EVIDENCE_MIN and r['tx'] <= TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(r['status_conf'] * 0.9)
+        elif resolved_status == 'down':
+            if r['rx'] > TRAFFIC_EVIDENCE_MIN or r['tx'] > TRAFFIC_EVIDENCE_MIN:
+                r['status_conf'] = clamp(min(r['status_conf'], 0.3))
+
+        # Assemble output
+        repaired: Dict[str, Tuple] = {}
+        repaired['rx_rate'] = (r['orig_rx'], r['rx'], clamp(final_rx_conf))
+        repaired['tx_rate'] = (r['orig_tx'], r['tx'], clamp(final_tx_conf))
+        repaired['interface_status'] = (r['orig_status'], resolved_status, clamp(r['status_conf']))
+        repaired['connected_to'] = r['connected_to']
+        repaired['local_router'] = r['local_router']
+        repaired['remote_router'] = r['remote_router']
+        result[if_id] = repaired
+
+    return result
+
+# EVOLVE-BLOCK-END
+
+
+def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+    """
+    Main entry point for the evaluator.
+    """
+    return repair_network_telemetry(telemetry, topology)
+
+
+if __name__ == "__main__":
+    # Simple sanity test
+    test_telemetry = {
+        'if1_to_if2': {
+            'interface_status': 'up',
+            'rx_rate': 100.0,
+            'tx_rate': 95.0,
+            'connected_to': 'if2_to_if1',
+            'local_router': 'router1',
+            'remote_router': 'router2'
+        },
+        'if2_to_if1': {
+            'interface_status': 'up',
+            'rx_rate': 95.0,   # Should match if1's TX
+            'tx_rate': 100.0,  # Should match if1's RX
+            'connected_to': 'if1_to_if2',
+            'local_router': 'router2',
+            'remote_router': 'router1'
+        }
+    }
+    test_topology = {'router1': ['if1_to_if2'], 'router2': ['if2_to_if1']}
+    out = run_repair(test_telemetry, test_topology)
+    for if_id, d in out.items():
+        print(if_id, d['rx_rate'], d['tx_rate'], d['interface_status'])

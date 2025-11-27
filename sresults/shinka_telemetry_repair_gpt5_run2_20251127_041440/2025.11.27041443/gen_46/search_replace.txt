@@ -1,0 +1,177 @@
+<NAME>
+residual_tilted_consensus_and_share_aware_confidence
+</NAME>
+
+<DESCRIPTION>
+I propose two complementary improvements grounded in Hodor’s principles to boost counter accuracy and confidence calibration without overfitting:
+
+1) Residual-tilted, asymmetric consensus for pair repair:
+   - Before pairwise hardening, compute per-router flow imbalance (delta) and residual on the original telemetry (treat down interfaces as zero).
+   - When a link-direction violates symmetry beyond τh, replace the simple average with a weighted consensus that slightly shrinks the local router’s influence if its imbalance aligns with the direction of disagreement. This biases the consensus toward the side that reduces the local router’s imbalance, with a bounded tilt (γ ≤ 0.08) proportional to the router’s residual.
+   - This change improves counter repair accuracy by leveraging flow conservation context while preserving stability with small, bounded nudges.
+
+2) Interface-share–aware, direction-coupled confidence:
+   - After repairs, compute per-router totals and use them to derive each interface’s traffic share for tx and rx on its local router.
+   - Compose direction-specific penalties using a weighted mix of local/remote residuals modulated by the interface’s share, then scale tx/rx confidences separately. This aligns confidence penalties with each interface’s directional influence on conservation, improving calibration.
+
+These changes keep the existing design intact, add minimal complexity, and should raise combined score by nudging counters toward globally consistent states while improving confidence alignment.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Build link pairs (unique, undirected)
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+=======
+    # Precompute router-level balances on original telemetry (before pairwise fusion)
+    pre_router_residual: Dict[str, float] = {}
+    pre_router_delta: Dict[str, float] = {}
+    for router, if_list in topology.items():
+        sum_tx0 = 0.0
+        sum_rx0 = 0.0
+        for if_id in if_list:
+            d = telemetry.get(if_id)
+            if not d:
+                continue
+            status0 = d.get('interface_status', 'unknown')
+            tx0 = float(d.get('tx_rate', 0.0) or 0.0)
+            rx0 = float(d.get('rx_rate', 0.0) or 0.0)
+            # Treat down interfaces as zero traffic to respect invariant expectations
+            if status0 == 'down':
+                tx0 = 0.0
+                rx0 = 0.0
+            sum_tx0 += tx0
+            sum_rx0 += rx0
+        pre_router_delta[router] = sum_tx0 - sum_rx0
+        pre_router_residual[router] = abs(sum_tx0 - sum_rx0) / max(sum_tx0, sum_rx0, 1.0)
+
+    # Build link pairs (unique, undirected)
+    pairs = {}  # key: tuple(sorted(if1, if2)) -> (if1_id, if2_id)
+    for if_id, data in telemetry.items():
+        peer = data.get('connected_to')
+        if peer and peer in telemetry:
+            key = tuple(sorted([if_id, peer]))
+            if key not in pairs:
+                pairs[key] = (if_id, peer)
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+                rep_a_tx = avg_ab
+                rep_b_rx = avg_ab
+=======
+            if diff_ab > HARDENING_THRESHOLD:
+                # Residual-tilted consensus: bias toward value that reduces local router imbalance
+                a_local = a.get('local_router')
+                delta_loc = pre_router_delta.get(a_local, 0.0)
+                resid_loc = pre_router_residual.get(a_local, 0.0)
+                w_a = 0.5
+                if (a_tx - b_rx) * delta_loc > 0.0:
+                    gamma = min(0.08, 0.1 * resid_loc)
+                    w_a = max(0.1, min(0.9, w_a - gamma))
+                consensus = w_a * a_tx + (1.0 - w_a) * b_rx
+                rep_a_tx = consensus
+                rep_b_rx = consensus
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+                rep_b_tx = avg_ba
+                rep_a_rx = avg_ba
+=======
+            if diff_ba > HARDENING_THRESHOLD:
+                # Residual-tilted consensus for reverse direction
+                b_local = b.get('local_router')
+                delta_loc_b = pre_router_delta.get(b_local, 0.0)
+                resid_loc_b = pre_router_residual.get(b_local, 0.0)
+                w_b = 0.5
+                if (b_tx - a_rx) * delta_loc_b > 0.0:
+                    gamma_b = min(0.08, 0.1 * resid_loc_b)
+                    w_b = max(0.1, min(0.9, w_b - gamma_b))
+                consensus_ba = w_b * b_tx + (1.0 - w_b) * a_rx
+                rep_b_tx = consensus_ba
+                rep_a_rx = consensus_ba
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+    router_residual: Dict[str, float] = {}
+    for router, if_list in topology.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in per_if_repair:
+                rep = per_if_repair[if_id]
+                # Include all interfaces; down interfaces contribute 0 traffic (already enforced)
+                sum_tx += float(rep['repaired_tx'])
+                sum_rx += float(rep['repaired_rx'])
+        resid = abs(sum_tx - sum_rx) / max(sum_tx, sum_rx, 1.0)
+        router_residual[router] = resid
+=======
+    # Second pass: compute router-level flow conservation residuals using repaired rates
+    router_residual: Dict[str, float] = {}
+    router_totals: Dict[str, Tuple[float, float]] = {}
+    for router, if_list in topology.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for if_id in if_list:
+            if if_id in per_if_repair:
+                rep = per_if_repair[if_id]
+                # Include all interfaces; down interfaces contribute 0 traffic (already enforced)
+                sum_tx += float(rep['repaired_tx'])
+                sum_rx += float(rep['repaired_rx'])
+        router_totals[router] = (sum_tx, sum_rx)
+        resid = abs(sum_tx - sum_rx) / max(sum_tx, sum_rx, 1.0)
+        router_residual[router] = resid
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        resid_local = router_residual.get(local_router, 0.0)
+        resid_remote = router_residual.get(remote_router, 0.0)
+
+        penalty = 1.0 - 0.5 * (resid_local + resid_remote)
+        penalty = max(0.0, min(1.0, penalty))
+
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty))
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty))
+        # Status confidence is less sensitive to flow residuals; apply mild scaling
+        status_conf = max(0.0, min(1.0, status_conf * (0.75 + 0.25 * penalty)))
+=======
+        resid_local = router_residual.get(local_router, 0.0)
+        resid_remote = router_residual.get(remote_router, 0.0)
+
+        # Interface-share–aware, direction-coupled penalties (tx/rx separately)
+        sum_tx_local, sum_rx_local = router_totals.get(local_router, (0.0, 0.0))
+        iface_tx_share = 0.0 if sum_tx_local <= 0.0 else repaired_tx / max(1.0, sum_tx_local)
+        iface_rx_share = 0.0 if sum_rx_local <= 0.0 else repaired_rx / max(1.0, sum_rx_local)
+
+        pen_tx = 1.0 - ((0.6 + 0.2 * iface_tx_share) * resid_local + (0.4 - 0.2 * iface_tx_share) * resid_remote)
+        pen_rx = 1.0 - ((0.6 + 0.2 * iface_rx_share) * resid_local + (0.4 - 0.2 * iface_rx_share) * resid_remote)
+        pen_tx = max(0.0, min(1.0, pen_tx))
+        pen_rx = max(0.0, min(1.0, pen_rx))
+
+        tx_conf = max(0.0, min(1.0, tx_conf * pen_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * pen_rx))
+
+        # Status confidence: mild scaling using symmetric penalty
+        penalty_status = 1.0 - 0.5 * (resid_local + resid_remote)
+        penalty_status = max(0.0, min(1.0, penalty_status))
+        status_conf = max(0.0, min(1.0, status_conf * (0.75 + 0.25 * penalty_status)))
+>>>>>>> REPLACE
+
+</DIFF>

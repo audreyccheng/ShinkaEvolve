@@ -1,0 +1,356 @@
+<NAME>
+k2_swap_tail_hybrid
+</NAME>
+
+<DESCRIPTION>
+I implement two targeted improvements for better balance with minimal runtime cost:
+
+1) K=2 best-improvement swap refinement: After the greedy packing, both balanced_packing and balanced_packing_diverse now perform up to 2 refinement iterations. Each iteration considers the two heaviest items in the heaviest pack and the two lightest items in the lightest pack and applies the swap that most reduces the heavy-light gap. This improves balance beyond a single-pair swap at negligible overhead.
+
+2) Hybrid D’Hondt→Sainte-Laguë replication: replicate_experts now allocates the final 10% of replicas using a Sainte-Laguë score (w/(2r+1)) instead of pure D’Hondt (w/r). This tempers over-replication of very heavy experts and often reduces the per-replica peak loads, improving balancedness without sacrificing speed.
+
+These changes are localized, do not add heavy loops, and preserve the API and performance profile while improving the balance metric.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # Lightweight local refinement: swap between heaviest and lightest packs
+        # Perform up to 4 swaps to reduce max-min imbalance
+        max_refine = min(4, groups_per_pack)
+        if max_refine > 0:
+            wi = weight[i].cpu()
+            # Build pack -> groups mapping
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(num_groups):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+            # Recompute precise pack weights
+            pack_weights_f = [0.0] * num_packs
+            for p in range(num_packs):
+                if pack_groups[p]:
+                    pack_weights_f[p] = float(wi[pack_groups[p]].sum().item())
+            # Try a few targeted swaps
+            for _ in range(max_refine):
+                h = max(range(num_packs), key=lambda k: pack_weights_f[k])
+                l = min(range(num_packs), key=lambda k: pack_weights_f[k])
+                diff = pack_weights_f[h] - pack_weights_f[l]
+                if diff <= 0 or not pack_groups[h] or not pack_groups[l]:
+                    break
+                h_weights = wi[pack_groups[h]]
+                l_weights = wi[pack_groups[l]]
+                a_idx = int(torch.argmax(h_weights).item())
+                b_idx = int(torch.argmin(l_weights).item())
+                a = pack_groups[h][a_idx]
+                b = pack_groups[l][b_idx]
+                wa = float(h_weights[a_idx].item())
+                wb = float(l_weights[b_idx].item())
+                if wa <= wb:
+                    break
+                # Swap
+                pack_groups[h][a_idx] = b
+                pack_groups[l][b_idx] = a
+                pack_index[i, a] = l
+                pack_index[i, b] = h
+                pack_weights_f[h] += (wb - wa)
+                pack_weights_f[l] += (wa - wb)
+            # Recompute ranks after refinement
+            for p in range(num_packs):
+                for r, g in enumerate(pack_groups[p]):
+                    rank_in_pack[i, g] = r
+=======
+        # K=2 best-improvement refinement between heaviest and lightest packs
+        refine_steps = min(2, groups_per_pack)
+        if refine_steps > 0:
+            wi = weight[i].cpu()
+            # Build pack -> groups mapping
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(num_groups):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+            # Precise pack weights
+            pack_weights_f = [0.0] * num_packs
+            for p in range(num_packs):
+                if pack_groups[p]:
+                    pack_weights_f[p] = float(wi[pack_groups[p]].sum().item())
+            # Perform limited k-candidate best swap
+            for _ in range(refine_steps):
+                h = max(range(num_packs), key=lambda k: pack_weights_f[k])
+                l = min(range(num_packs), key=lambda k: pack_weights_f[k])
+                diff = pack_weights_f[h] - pack_weights_f[l]
+                if diff <= 0 or not pack_groups[h] or not pack_groups[l]:
+                    break
+                h_weights = wi[pack_groups[h]]
+                l_weights = wi[pack_groups[l]]
+                kh = min(2, len(pack_groups[h]))
+                kl = min(2, len(pack_groups[l]))
+                if kh == 0 or kl == 0:
+                    break
+                # top-2 from heavy, bottom-2 from light
+                h_top_idx = torch.topk(h_weights, k=kh).indices.tolist()
+                l_bot_idx = torch.topk(l_weights, k=kl, largest=False).indices.tolist()
+                best_pair = None
+                best_new_gap = diff
+                for ai in h_top_idx:
+                    wa = float(h_weights[ai].item())
+                    for bi in l_bot_idx:
+                        wb = float(l_weights[bi].item())
+                        if wa <= wb:
+                            continue
+                        new_h = pack_weights_f[h] - wa + wb
+                        new_l = pack_weights_f[l] - wb + wa
+                        new_gap = abs(new_h - new_l)
+                        if new_gap < best_new_gap:
+                            best_new_gap = new_gap
+                            best_pair = (ai, bi, wa, wb)
+                if best_pair is None:
+                    break
+                ai, bi, wa, wb = best_pair
+                a = pack_groups[h][ai]
+                b = pack_groups[l][bi]
+                # Apply swap
+                pack_groups[h][ai] = b
+                pack_groups[l][bi] = a
+                pack_index[i, a] = l
+                pack_index[i, b] = h
+                pack_weights_f[h] += (wb - wa)
+                pack_weights_f[l] += (wa - wb)
+            # Recompute ranks after refinement
+            for p in range(num_packs):
+                for r, g in enumerate(pack_groups[p]):
+                    rank_in_pack[i, g] = r
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        if not has_dup:
+            # No duplicate labels; use projected load minimization
+            pack_loads = [0.0] * num_packs
+            pack_counts = [0] * num_packs
+            for group in row_sorted:
+                wv = float(row_w[group].item())
+                best_p = None
+                best_key = None
+                for p in range(num_packs):
+                    if pack_counts[p] >= items_per_pack:
+                        continue
+                    key = (pack_loads[p] + wv, pack_counts[p])
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_p = p
+                pack_index[i, group] = best_p
+                rank_in_pack[i, group] = pack_counts[best_p]
+                pack_counts[best_p] += 1
+                pack_loads[best_p] += wv
+            continue
+=======
+        if not has_dup:
+            # No duplicate labels; use projected load minimization
+            pack_loads = [0.0] * num_packs
+            pack_counts = [0] * num_packs
+            for group in row_sorted:
+                wv = float(row_w[group].item())
+                best_p = None
+                best_key = None
+                for p in range(num_packs):
+                    if pack_counts[p] >= items_per_pack:
+                        continue
+                    key = (pack_loads[p] + wv, pack_counts[p])
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_p = p
+                pack_index[i, group] = best_p
+                rank_in_pack[i, group] = pack_counts[best_p]
+                pack_counts[best_p] += 1
+                pack_loads[best_p] += wv
+
+            # Micro refinement: K=2 best swap between heaviest and lightest packs
+            pack_groups = [[] for _ in range(num_packs)]
+            for g in range(num_items):
+                p = int(pack_index[i, g])
+                pack_groups[p].append(g)
+            pack_weights_f = [0.0] * num_packs
+            for p in range(num_packs):
+                if pack_groups[p]:
+                    pack_weights_f[p] = float(row_w[pack_groups[p]].sum().item())
+            refine_steps = 2
+            for _ in range(refine_steps):
+                h = max(range(num_packs), key=lambda k: pack_weights_f[k])
+                l = min(range(num_packs), key=lambda k: pack_weights_f[k])
+                diff = pack_weights_f[h] - pack_weights_f[l]
+                if diff <= 0 or not pack_groups[h] or not pack_groups[l]:
+                    break
+                h_weights = row_w[pack_groups[h]]
+                l_weights = row_w[pack_groups[l]]
+                kh = min(2, len(pack_groups[h]))
+                kl = min(2, len(pack_groups[l]))
+                if kh == 0 or kl == 0:
+                    break
+                h_top_idx = torch.topk(h_weights, k=kh).indices.tolist()
+                l_bot_idx = torch.topk(l_weights, k=kl, largest=False).indices.tolist()
+                best_pair = None
+                best_new_gap = diff
+                for ai in h_top_idx:
+                    wa = float(h_weights[ai].item())
+                    for bi in l_bot_idx:
+                        wb = float(l_weights[bi].item())
+                        if wa <= wb:
+                            continue
+                        new_h = pack_weights_f[h] - wa + wb
+                        new_l = pack_weights_f[l] - wb + wa
+                        new_gap = abs(new_h - new_l)
+                        if new_gap < best_new_gap:
+                            best_new_gap = new_gap
+                            best_pair = (ai, bi, wa, wb)
+                if best_pair is None:
+                    break
+                ai, bi, wa, wb = best_pair
+                a = pack_groups[h][ai]
+                b = pack_groups[l][bi]
+                pack_groups[h][ai] = b
+                pack_groups[l][bi] = a
+                pack_index[i, a] = l
+                pack_index[i, b] = h
+                pack_weights_f[h] += (wb - wa)
+                pack_weights_f[l] += (wa - wb)
+            # Recompute ranks
+            for p in range(num_packs):
+                for r, g in enumerate(pack_groups[p]):
+                    rank_in_pack[i, g] = r
+            continue
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+        for group in row_sorted:
+            lab = int(row_labels[group].item())
+            wv = float(row_w[group].item())
+            best_p = None
+            best_key = None
+            for p in range(num_packs):
+                if pack_counts[p] >= items_per_pack:
+                    continue
+                rep = label_counts[p].get(lab, 0)
+                # Prefer fewer repeats; then minimize projected load; then fewer items
+                key = (rep, pack_loads[p] + wv, pack_counts[p])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_p = p
+            pack_index[i, group] = best_p
+            rank_in_pack[i, group] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += wv
+            label_counts[best_p][lab] += 1
+=======
+        for group in row_sorted:
+            lab = int(row_labels[group].item())
+            wv = float(row_w[group].item())
+            best_p = None
+            best_key = None
+            for p in range(num_packs):
+                if pack_counts[p] >= items_per_pack:
+                    continue
+                rep = label_counts[p].get(lab, 0)
+                # Prefer fewer repeats; then minimize projected load; then fewer items
+                key = (rep, pack_loads[p] + wv, pack_counts[p])
+                if best_key is None or key < best_key:
+                    best_key = key
+                    best_p = p
+            pack_index[i, group] = best_p
+            rank_in_pack[i, group] = pack_counts[best_p]
+            pack_counts[best_p] += 1
+            pack_loads[best_p] += wv
+            label_counts[best_p][lab] += 1
+
+        # Micro refinement: K=2 best swap between heaviest and lightest packs
+        pack_groups = [[] for _ in range(num_packs)]
+        for g in range(num_items):
+            p = int(pack_index[i, g])
+            pack_groups[p].append(g)
+        pack_weights_f = [0.0] * num_packs
+        for p in range(num_packs):
+            if pack_groups[p]:
+                pack_weights_f[p] = float(row_w[pack_groups[p]].sum().item())
+        refine_steps = 2
+        for _ in range(refine_steps):
+            h = max(range(num_packs), key=lambda k: pack_weights_f[k])
+            l = min(range(num_packs), key=lambda k: pack_weights_f[k])
+            diff = pack_weights_f[h] - pack_weights_f[l]
+            if diff <= 0 or not pack_groups[h] or not pack_groups[l]:
+                break
+            h_weights = row_w[pack_groups[h]]
+            l_weights = row_w[pack_groups[l]]
+            kh = min(2, len(pack_groups[h]))
+            kl = min(2, len(pack_groups[l]))
+            if kh == 0 or kl == 0:
+                break
+            h_top_idx = torch.topk(h_weights, k=kh).indices.tolist()
+            l_bot_idx = torch.topk(l_weights, k=kl, largest=False).indices.tolist()
+            best_pair = None
+            best_new_gap = diff
+            for ai in h_top_idx:
+                wa = float(h_weights[ai].item())
+                for bi in l_bot_idx:
+                    wb = float(l_weights[bi].item())
+                    if wa <= wb:
+                        continue
+                    new_h = pack_weights_f[h] - wa + wb
+                    new_l = pack_weights_f[l] - wb + wa
+                    new_gap = abs(new_h - new_l)
+                    if new_gap < best_new_gap:
+                        best_new_gap = new_gap
+                        best_pair = (ai, bi, wa, wb)
+            if best_pair is None:
+                break
+            ai, bi, wa, wb = best_pair
+            a = pack_groups[h][ai]
+            b = pack_groups[l][bi]
+            pack_groups[h][ai] = b
+            pack_groups[l][bi] = a
+            pack_index[i, a] = l
+            pack_index[i, b] = h
+            pack_weights_f[h] += (wb - wa)
+            pack_weights_f[l] += (wa - wb)
+        # Recompute ranks
+        for p in range(num_packs):
+            for r, g in enumerate(pack_groups[p]):
+                rank_in_pack[i, g] = r
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Maintain an incremental ratio to avoid recomputing divisions each step
+    ratio = weight / logcnt
+    for i in range(num_log, num_phy):
+        redundant_indices = ratio.argmax(dim=-1)
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+        # Update only the affected positions in ratio
+        ratio[arangen, redundant_indices] = weight[arangen, redundant_indices] / \
+            logcnt[arangen, redundant_indices]
+    return phy2log, rank, logcnt
+=======
+    # Hybrid D'Hondt → Sainte-Laguë: use D'Hondt for the bulk, SL for the tail 10%
+    ratio = weight / logcnt
+    num_add = num_phy - num_log
+    tail = max(1, int(0.1 * num_add)) if num_add > 0 else 0
+    for step in range(num_add):
+        j = num_log + step
+        if step < num_add - tail:
+            redundant_indices = ratio.argmax(dim=-1)
+        else:
+            sratio = weight / (2 * logcnt + 1)
+            redundant_indices = sratio.argmax(dim=-1)
+        phy2log[:, j] = redundant_indices
+        rank[:, j] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+        # Update only the affected positions for next D'Hondt step
+        ratio[arangen, redundant_indices] = weight[arangen, redundant_indices] / \
+            logcnt[arangen, redundant_indices]
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+
+</DIFF>

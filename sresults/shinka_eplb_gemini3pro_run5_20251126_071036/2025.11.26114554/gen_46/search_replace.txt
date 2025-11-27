@@ -1,0 +1,206 @@
+<NAME>
+hybrid_refinement
+</NAME>
+
+<DESCRIPTION>
+Replaces the L2-only refinement with a hybrid strategy that prioritizes reducing the maximum load directly. It first checks for any swaps involving the heaviest pack that result in a strictly lower global maximum load. If found, it executes the best such swap. If not, it falls back to the original L2 variance minimization to improve overall balance and potentially unlock future max-load reductions. This targets the "balancedness_score" (Min-Max Load) directly while maintaining the smoothness properties of the original algorithm.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 20) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items between any pair of packs
+    to minimize the sum of squared pack weights (variance).
+
+    Args:
+        weights: [num_groups] weights of items
+        pack_indices: [num_packs, groups_per_pack] indices of items in each pack
+        pack_weights: [num_packs] total weight of each pack
+
+    Returns:
+        pack_indices: Refined item assignments
+    """
+    device = weights.device
+
+    # Pre-compute pack index masks to mask out self-swaps
+    # [P, 1, P, 1]
+    idx_p = torch.arange(num_packs, device=device)
+    mask_same_pack = (idx_p.view(-1, 1) == idx_p.view(1, -1)).view(num_packs, 1, num_packs, 1)
+
+    for _ in range(max_iters):
+        # Current item weights: [P, G]
+        item_weights = weights[pack_indices]
+
+        # w_{p1, g1}: [P, G, 1, 1]
+        w1 = item_weights.view(num_packs, groups_per_pack, 1, 1)
+        # w_{p2, g2}: [1, 1, P, G]
+        w2 = item_weights.view(1, 1, num_packs, groups_per_pack)
+
+        # delta = w2 - w1 (amount added to p1, subtracted from p2)
+        delta = w2 - w1
+
+        # diff_W = W1 - W2
+        # [P, 1, P, 1]
+        diff_W = pack_weights.view(num_packs, 1, 1, 1) - pack_weights.view(1, 1, num_packs, 1)
+
+        # Change in variance (Sum of Squares):
+        # (W1+d)^2 + (W2-d)^2 - W1^2 - W2^2 = 2d^2 + 2d(W1 - W2)
+        # minimize: delta * (delta + diff_W)
+        change = delta * (delta + diff_W)
+
+        # Mask invalid swaps (same pack)
+        change = torch.where(mask_same_pack, torch.tensor(float('inf'), device=device), change)
+
+        # Find best swap
+        min_val, flat_idx = torch.min(change.flatten(), dim=0)
+
+        if min_val >= -1e-6:
+            break
+
+        # Decode indices
+        idx = flat_idx.item()
+        G = groups_per_pack
+        P = num_packs
+
+        p1 = idx // (G * P * G)
+        rem = idx % (G * P * G)
+        g1 = rem // (P * G)
+        rem = rem % (P * G)
+        p2 = rem // G
+        g2 = rem % G
+
+        # Execute swap
+        item_idx_1 = pack_indices[p1, g1].item()
+        item_idx_2 = pack_indices[p2, g2].item()
+
+        pack_indices[p1, g1] = item_idx_2
+        pack_indices[p2, g2] = item_idx_1
+
+        # Update pack weights
+        w_val_1 = weights[item_idx_1]
+        w_val_2 = weights[item_idx_2]
+        d = w_val_2 - w_val_1
+
+        pack_weights[p1] += d
+        pack_weights[p2] -= d
+
+    return pack_indices
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 50) -> torch.Tensor:
+    """
+    Iteratively refines the packing by swapping items.
+    Combines strict Max-Load reduction with L2 variance reduction.
+
+    Args:
+        weights: [num_groups] weights of items
+        pack_indices: [num_packs, groups_per_pack] indices of items in each pack
+        pack_weights: [num_packs] total weight of each pack
+
+    Returns:
+        pack_indices: Refined item assignments
+    """
+    device = weights.device
+
+    # Pre-compute pack index masks to mask out self-swaps
+    idx_p = torch.arange(num_packs, device=device)
+    mask_same_pack = (idx_p.view(-1, 1) == idx_p.view(1, -1)).view(num_packs, 1, num_packs, 1)
+
+    for _ in range(max_iters):
+        # 1. Try to reduce the Max Load directly
+        max_load, max_pid = torch.max(pack_weights, dim=0)
+        item_weights = weights[pack_indices]  # [P, G]
+
+        # Deltas for moving item i from MaxPack to Pack k (item j)
+        # delta = w_{max, i} - w_{k, j}
+        # w_max: [1, G, 1]
+        w_max_items = item_weights[max_pid].view(1, groups_per_pack, 1)
+        # w_other: [P, 1, G]
+        w_other_items = item_weights.view(num_packs, 1, groups_per_pack)
+
+        # Positive delta means weight flows OUT of MaxPack
+        deltas_max = w_max_items - w_other_items  # [P, G_max, G_other]
+
+        # We accept swap if:
+        # 1. delta > 0 (MaxPack reduces)
+        # 2. New load of 'other' pack < current max_load (strictly better balance)
+        p_weights_expanded = pack_weights.view(num_packs, 1, 1)
+        valid_mask = (deltas_max > 1e-6) & ((p_weights_expanded + deltas_max) < (max_load - 1e-6))
+        valid_mask[max_pid] = False
+
+        if valid_mask.any():
+            # Pick swap that maximizes delta (reduces max pack the most)
+            masked_deltas = deltas_max.clone()
+            masked_deltas[~valid_mask] = -float('inf')
+
+            best_val, flat_idx = torch.max(masked_deltas.flatten(), dim=0)
+
+            # Decode
+            best_p = flat_idx // (groups_per_pack * groups_per_pack)
+            rem = flat_idx % (groups_per_pack * groups_per_pack)
+            best_g_max = rem // groups_per_pack
+            best_g_other = rem % groups_per_pack
+
+            # Execute Max-Load Swap
+            idx_max = pack_indices[max_pid, best_g_max].item()
+            idx_other = pack_indices[best_p, best_g_other].item()
+
+            pack_indices[max_pid, best_g_max] = idx_other
+            pack_indices[best_p, best_g_other] = idx_max
+
+            pack_weights[max_pid] -= best_val
+            pack_weights[best_p] += best_val
+            continue
+
+        # 2. Fallback: L2 Variance Reduction
+        # If no direct max-load reduction is possible, optimize general balance
+        w1 = item_weights.view(num_packs, groups_per_pack, 1, 1)
+        w2 = item_weights.view(1, 1, num_packs, groups_per_pack)
+        delta = w2 - w1 # amount added to p1, subtracted from p2
+
+        diff_W = pack_weights.view(num_packs, 1, 1, 1) - pack_weights.view(1, 1, num_packs, 1)
+
+        # Change in variance: minimize delta * (delta + diff_W)
+        change = delta * (delta + diff_W)
+        change.masked_fill_(mask_same_pack, float('inf'))
+
+        min_val, flat_idx = torch.min(change.flatten(), dim=0)
+
+        if min_val >= -1e-6:
+            break
+
+        # Decode L2 Swap
+        idx = flat_idx.item()
+        G = groups_per_pack
+        P = num_packs
+
+        p1 = idx // (G * P * G)
+        rem = idx % (G * P * G)
+        g1 = rem // (P * G)
+        rem = rem % (P * G)
+        p2 = rem // G
+        g2 = rem % G
+
+        item_idx_1 = pack_indices[p1, g1].item()
+        item_idx_2 = pack_indices[p2, g2].item()
+
+        pack_indices[p1, g1] = item_idx_2
+        pack_indices[p2, g2] = item_idx_1
+
+        d = weights[item_idx_2] - weights[item_idx_1]
+        pack_weights[p1] += d
+        pack_weights[p2] -= d
+
+    return pack_indices
+>>>>>>> REPLACE
+</DIFF>

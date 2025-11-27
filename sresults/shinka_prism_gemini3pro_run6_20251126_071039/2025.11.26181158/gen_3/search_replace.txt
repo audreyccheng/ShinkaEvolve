@@ -1,0 +1,283 @@
+<NAME>
+randomized_multi_start_local_search
+</NAME>
+
+<DESCRIPTION>
+Improved the model placement algorithm by implementing a Randomized Multi-Start Local Search strategy.
+1. Replaced the single-pass greedy+local search with a function `solve_greedy_and_local_search` that can be called on different model orderings.
+2. Incorporated random restarts (shuffling models) in addition to the deterministic sorting strategies (Size, Load, Density) to explore a broader search space.
+3. Enhanced the local search to consider moving/swapping models from the top 3 bottleneck GPUs instead of just the single worst GPU, allowing for lexicographical improvements in the KVPR vector.
+4. Local search runs on every restart candidate, increasing the likelihood of finding the global minimum.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Strategies for sorting models: Size Desc, Load Desc, Density Desc
+    sort_keys = [
+        lambda m: m.model_size,
+        lambda m: m.req_rate / m.slo,
+        lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 0 else float('inf')
+    ]
+
+    best_gpus = None
+    best_vector = None
+
+    # 1. Multi-start Greedy Construction
+    for key in sort_keys:
+        # Sort models based on current strategy
+        sorted_models = sorted(models, key=key, reverse=True)
+        gpus = [GPUState(i) for i in range(gpu_num)]
+        valid_strategy = True
+
+        for model in sorted_models:
+            best_idx = -1
+            best_val = float('inf')
+
+            # Place on GPU that minimizes its resulting KVPR
+            # This is a 'Best Fit' heuristic for the objective function
+            for i in range(gpu_num):
+                g = gpus[i]
+                if g.can_fit(model):
+                    # Calculate hypothetical KVPR if we add this model
+                    new_load = g.load + model.req_rate / model.slo
+                    new_mem = g.used_mem + model.model_size
+                    rem = GPU_MEM_SIZE - new_mem
+                    val = float('inf')
+                    if rem > 1e-7:
+                        val = new_load / rem
+
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+
+            if best_idx == -1:
+                valid_strategy = False
+                break
+            gpus[best_idx].add(model)
+
+        if valid_strategy:
+            # Evaluate using lexicographical comparison of KVPR vectors
+            # This prioritizes minimizing the max, then the second max, etc.
+            current_vector = sorted([g.kvpr() for g in gpus], reverse=True)
+            if best_vector is None or current_vector < best_vector:
+                best_vector = current_vector
+                best_gpus = gpus
+
+    if best_gpus is None:
+        raise ValueError("Unable to place models on GPUs with available memory.")
+
+    # 2. Local Search Refinement
+    gpus = best_gpus
+    current_vector = best_vector
+
+    def get_vector(current_gpus):
+        return sorted([g.kvpr() for g in current_gpus], reverse=True)
+
+    max_iter = 100
+    for _ in range(max_iter):
+        improved = False
+
+        # Identify bottleneck GPUs (highest KVPR)
+        sorted_gpus = sorted(gpus, key=lambda g: g.kvpr(), reverse=True)
+        source = sorted_gpus[0]
+
+        # Try Moving a model from source to any other GPU
+        for i, model in enumerate(source.models):
+            for dest in gpus:
+                if dest.id == source.id: continue
+                if dest.can_fit(model):
+                    # Apply Move
+                    source.remove(i)
+                    dest.add(model)
+
+                    new_vec = get_vector(gpus)
+                    if new_vec < current_vector:
+                        current_vector = new_vec
+                        improved = True
+                        break
+                    else:
+                        # Revert Move
+                        dest.remove(len(dest.models)-1)
+                        source.restore_model(i, model)
+            if improved: break
+
+        if improved: continue
+
+        # Try Swapping a model from source with a model from another GPU
+        for i, m_a in enumerate(source.models):
+            for dest in gpus:
+                if dest.id == source.id: continue
+                for j, m_b in enumerate(dest.models):
+                    # Check capacity for swap
+                    s_rem = GPU_MEM_SIZE - (source.used_mem - m_a.model_size + m_b.model_size)
+                    d_rem = GPU_MEM_SIZE - (dest.used_mem - m_b.model_size + m_a.model_size)
+
+                    if s_rem >= 0 and d_rem >= 0:
+                        # Apply Swap
+                        source.remove(i)
+                        dest.remove(j)
+                        source.add(m_b)
+                        dest.add(m_a)
+
+                        new_vec = get_vector(gpus)
+                        if new_vec < current_vector:
+                            current_vector = new_vec
+                            improved = True
+                            break
+                        else:
+                            # Revert Swap
+                            dest.remove(len(dest.models)-1)
+                            source.remove(len(source.models)-1)
+                            dest.restore_model(j, m_b)
+                            source.restore_model(i, m_a)
+                if improved: break
+            if improved: break
+
+        if not improved:
+            break
+
+    return {g.id: g.models for g in gpus}
+=======
+    # Import random for stochastic operations
+    import random
+
+    best_overall_gpus = None
+    best_overall_vector = None
+
+    def solve_greedy_and_local_search(sorted_models_input):
+        # 1. Greedy Construction
+        current_gpus = [GPUState(i) for i in range(gpu_num)]
+        valid_strategy = True
+
+        for model in sorted_models_input:
+            best_idx = -1
+            best_val = float('inf')
+
+            # Place on GPU that minimizes its resulting KVPR
+            for i in range(gpu_num):
+                g = current_gpus[i]
+                if g.can_fit(model):
+                    new_load = g.load + model.req_rate / model.slo
+                    new_mem = g.used_mem + model.model_size
+                    rem = GPU_MEM_SIZE - new_mem
+                    val = float('inf')
+                    if rem > 1e-7:
+                        val = new_load / rem
+
+                    if val < best_val:
+                        best_val = val
+                        best_idx = i
+
+            if best_idx == -1:
+                valid_strategy = False
+                break
+            current_gpus[best_idx].add(model)
+
+        if not valid_strategy:
+            return None, None
+
+        def get_vector(gs):
+            return sorted([g.kvpr() for g in gs], reverse=True)
+
+        current_vector = get_vector(current_gpus)
+
+        # 2. Local Search Refinement
+        max_iter = 100
+        for _ in range(max_iter):
+            improved = False
+
+            # Identify bottleneck GPUs (sort by KVPR desc)
+            sorted_gpus_by_kvpr = sorted(current_gpus, key=lambda g: g.kvpr(), reverse=True)
+
+            # Optimization: Focus on moving load away from the most loaded GPUs
+            # We check the top few GPUs, not just the first one, as lexicographical optimization benefits from fixing 2nd max too.
+            sources_to_check = sorted_gpus_by_kvpr[:3] # Check top 3 bottleneck GPUs
+
+            for source in sources_to_check:
+                # Try Moving a model from source to any other GPU
+                for i, model in enumerate(source.models):
+                    for dest in current_gpus:
+                        if dest.id == source.id: continue
+                        if dest.can_fit(model):
+                            source.remove(i)
+                            dest.add(model)
+
+                            new_vec = get_vector(current_gpus)
+                            if new_vec < current_vector:
+                                current_vector = new_vec
+                                improved = True
+                                break
+                            else:
+                                dest.remove(len(dest.models)-1)
+                                source.restore_model(i, model)
+                    if improved: break
+                if improved: break
+
+            if improved: continue
+
+            # Try Swapping models between bottleneck GPUs and others
+            for source in sources_to_check:
+                for i, m_a in enumerate(source.models):
+                    for dest in current_gpus:
+                        if dest.id == source.id: continue
+                        for j, m_b in enumerate(dest.models):
+                            # Check capacity
+                            s_rem = GPU_MEM_SIZE - (source.used_mem - m_a.model_size + m_b.model_size)
+                            d_rem = GPU_MEM_SIZE - (dest.used_mem - m_b.model_size + m_a.model_size)
+
+                            if s_rem >= 0 and d_rem >= 0:
+                                source.remove(i)
+                                dest.remove(j)
+                                source.add(m_b)
+                                dest.add(m_a)
+
+                                new_vec = get_vector(current_gpus)
+                                if new_vec < current_vector:
+                                    current_vector = new_vec
+                                    improved = True
+                                    break
+                                else:
+                                    # Revert
+                                    dest.remove(len(dest.models)-1)
+                                    source.remove(len(source.models)-1)
+                                    dest.restore_model(j, m_b)
+                                    source.restore_model(i, m_a)
+                        if improved: break
+                    if improved: break
+                if improved: break
+
+            if not improved:
+                break
+
+        return current_gpus, current_vector
+
+    # Define various sorting strategies for initialization
+    strategies = [
+        lambda m: m.model_size, # Size Desc
+        lambda m: m.req_rate / m.slo, # Load Desc
+        lambda m: (m.req_rate / m.slo) / m.model_size if m.model_size > 0 else float('inf') # Density Desc
+    ]
+
+    # Run deterministic strategies
+    for key in strategies:
+        sorted_models = sorted(models, key=key, reverse=True)
+        res_gpus, res_vec = solve_greedy_and_local_search(sorted_models)
+        if res_gpus and (best_overall_vector is None or res_vec < best_overall_vector):
+            best_overall_vector = res_vec
+            best_overall_gpus = res_gpus
+
+    # Run random shuffle strategies
+    for _ in range(15):
+        shuffled_models = list(models)
+        random.shuffle(shuffled_models)
+        res_gpus, res_vec = solve_greedy_and_local_search(shuffled_models)
+        if res_gpus and (best_overall_vector is None or res_vec < best_overall_vector):
+            best_overall_vector = res_vec
+            best_overall_gpus = res_gpus
+
+    if best_overall_gpus is None:
+        raise ValueError("Unable to place models on GPUs with available memory.")
+
+    return {g.id: g.models for g in best_overall_gpus}
+>>>>>>> REPLACE
+</DIFF>

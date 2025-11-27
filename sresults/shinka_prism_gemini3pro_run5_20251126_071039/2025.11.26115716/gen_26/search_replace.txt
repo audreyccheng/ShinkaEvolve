@@ -1,0 +1,169 @@
+<NAME>
+lns_refinement
+</NAME>
+
+<DESCRIPTION>
+Replacing the Simulated Annealing refinement with a Large Neighborhood Search (LNS) using a "Ruin and Recreate" strategy. The new algorithm targets the bottleneck GPU and a random partner, pools their models, and attempts to optimally re-partition them using multiple randomized greedy packing attempts. This allows the algorithm to escape local optima by performing complex multi-item moves that single-item moves/swaps (as used in SA) often miss.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # 3. Simulated Annealing Refinement
+    final_placement = _simulated_annealing(gpu_num, placement_map)
+
+    return final_placement
+=======
+    # 3. Refinement using Large Neighborhood Search (Ruin and Recreate)
+    final_placement = _large_neighborhood_search(gpu_num, placement_map)
+
+    return final_placement
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+def _simulated_annealing(gpu_num, placement):
+    """
+    Refines placement using Simulated Annealing with variance-based tie-breaking.
+    Uses shallow copies for performance.
+    """
+    # Initialize state caches
+    gpu_s = [sum(m.model_size for m in placement[i]) for i in range(gpu_num)]
+    gpu_w = [sum(m.req_rate/m.slo for m in placement[i]) for i in range(gpu_num)]
+
+    def get_kvpr(i):
+        rem = GPU_MEM_SIZE - gpu_s[i]
+        if rem <= 1e-7: return 1e9
+        return gpu_w[i] / rem
+
+    # Pre-calculate initial metrics
+    current_kvprs = [get_kvpr(i) for i in range(gpu_num)]
+    max_k = max(current_kvprs)
+    sum_sq_k = sum(k*k for k in current_kvprs)
+
+    # Keep track of best solution
+    best_max_k = max_k
+    # Use shallow copy of lists, models are immutable refs
+    best_placement = {i: list(placement[i]) for i in range(gpu_num)}
+
+    # SA Parameters
+    T = max_k * 0.05  # Start temperature at 5% of max pressure
+    T_min = 1e-4
+    alpha = 0.95      # Cooling rate
+    steps = 600       # Iterations
+
+    for step in range(steps):
+        if T < T_min: break
+
+        # 1. Select Source GPU
+        # 70% chance to pick bottleneck, 30% random
+        if random.random() < 0.7:
+            src = max(range(gpu_num), key=lambda i: current_kvprs[i])
+        else:
+            src = random.randint(0, gpu_num - 1)
+
+        if not placement[src]:
+            T *= alpha
+            continue
+
+        # 2. Select Move Type: 60% Move, 40% Swap
+        move_type = 'move' if random.random() < 0.6 else 'swap'
+        accepted = False
+
+        if move_type == 'move':
+            # Select model from source
+            m_idx = random.randint(0, len(placement[src])-1)
+            m = placement[src][m_idx]
+            m_s = m.model_size
+            m_w = m.req_rate / m.slo
+
+            # Select destination
+            dst = random.randint(0, gpu_num - 1)
+            if src == dst: continue
+
+            # Check physical constraints
+            if gpu_s[dst] + m_s <= GPU_MEM_SIZE:
+                # Calculate new states
+                rem_src = GPU_MEM_SIZE - (gpu_s[src] - m_s)
+                new_k_src = (gpu_w[src] - m_w) / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - (gpu_s[dst] + m_s)
+                new_k_dst = (gpu_w[dst] + m_w) / rem_dst if rem_dst > 1e-7 else 1e9
+
+                # Delta evaluation
+                old_k_src = current_kvprs[src]
+                old_k_dst = current_kvprs[dst]
+
+                # Update temp list to find new global max
+                current_kvprs[src] = new_k_src
+                current_kvprs[dst] = new_k_dst
+                new_max_k = max(current_kvprs)
+                new_sum_sq_k = sum_sq_k - old_k_src**2 - old_k_dst**2 + new_k_src**2 + new_k_dst**2
+
+                delta_max = new_max_k - max_k
+
+                # Acceptance Logic
+                if delta_max < -1e-6:
+                    accepted = True
+                elif delta_max < 1e-6:
+                    # Tie-breaking: prefer lower variance
+                    if new_sum_sq_k < sum_sq_k:
+                        accepted = True
+                    else:
+                        prob = math.exp(-(new_sum_sq_k - sum_sq_k) / (T * max_k * 10))
+                        if random.random() < prob: accepted = True
+                else:
+                    # Metropolis for worsening
+                    prob = math.exp(-delta_max / T)
+                    if random.random() < prob: accepted = True
+
+                if accepted:
+                    placement[dst].append(m)
+                    placement[src].pop(m_idx)
+                    gpu_s[src] -= m_s; gpu_w[src] -= m_w
+                    gpu_s[dst] += m_s; gpu_w[dst] += m_w
+                    max_k = new_max_k
+                    sum_sq_k = new_sum_sq_k
+                else:
+                    # Revert temp list
+                    current_kvprs[src] = old_k_src
+                    current_kvprs[dst] = old_k_dst
+
+        elif move_type == 'swap':
+            # Select models
+            m1_idx = random.randint(0, len(placement[src])-1)
+            m1 = placement[src][m1_idx]
+
+            dst = random.randint(0, gpu_num - 1)
+            if src == dst or not placement[dst]: continue
+
+            m2_idx = random.randint(0, len(placement[dst])-1)
+            m2 = placement[dst][m2_idx]
+
+            # Check capacity
+            new_s_src = gpu_s[src] - m1.model_size + m2.model_size
+            new_s_dst = gpu_s[dst] - m2.model_size + m1.model_size
+
+            if new_s_src <= GPU_MEM_SIZE and new_s_dst <= GPU_MEM_SIZE:
+                rem_src = GPU_MEM_SIZE - new_s_src
+                new_w_src = gpu_w[src] - (m1.req_rate/m1.slo) + (m2.req_rate/m2.slo)
+                new_k_src = new_w_src / rem_src if rem_src > 1e-7 else 1e9
+
+                rem_dst = GPU_MEM_SIZE - new_s_dst
+                new_w_dst = gpu_w[dst] - (m2.req_rate/m2.slo) + (m1.req_rate/m1.slo)
+                new_k_dst = new_w_dst / rem_dst if rem_dst > 1e-7 else 1e9
+
+                old_k_src = current_kvprs[src]
+                old_k_dst = current_kvprs[dst]
+
+                current_kvprs[src] = new_k_src
+                current_kvprs[dst] = new_k_dst
+                new_max_k = max(current_kvprs)
+                new_sum_sq_k = sum_sq_k - old_k_src**2 - old_k_dst**2 + new_k_src**2 + new_k_dst**2
+
+                delta_max = new_max_k - max_k
+
+                if delta_max < -1e-6:
+                    accepted = True
+                elif delta_max < 1e-6:
+                     if new_sum_sq_k < sum_sq_k:
+                        accepted = True
+                     else:
+                        prob = math.exp(-(new_sum_sq_k - sum_sq_k) / (T * max_k * 1

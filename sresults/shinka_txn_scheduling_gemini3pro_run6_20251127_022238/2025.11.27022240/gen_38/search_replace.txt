@@ -1,0 +1,498 @@
+<ls_scheduling_optimization>
+<NAME>
+reintroduce_lookahead_and_ils
+</NAME>
+
+<DESCRIPTION>
+The previous highest scoring solution (Gen 24) utilized a 1-Step Lookahead during Beam Search and a more robust Iterated Local Search (ILS) with perturbation and repair. The current solution (Gen 25) dropped these in favor of a simpler, faster loop, resulting in a performance degradation (3.77 -> 3.57).
+
+This change re-integrates those advanced features:
+1.  **Stochastic One-Step Lookahead**: Instead of ranking candidates solely on their current 'work density' score, we calculate a lookahead score for the top candidates by tentatively adding the next largest available transaction (LPT). This helps the algorithm foresee if a move blocks a critical heavy transaction.
+2.  **Iterated Local Search (ILS)**: Replaces the simple windowed swap loop with a full ILS cycle: `Descent -> Perturbation (Random Kick) -> Repair (Descent)`. This helps escape local optima that Beam Search might settle into.
+3.  **Hybrid Sampling**: Retains the effective Top-LPT + Weighted Random sampling strategy.
+
+This combines the structural efficiency of the current code (state deduplication) with the deeper search logic of the best performing prior version.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Diverse Deduplicated Beam Search.
+
+    Combines state deduplication (efficiency) with parent diversity constraints (exploration)
+    and hybrid sampling (heuristics + randomness).
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Used to scale the beam width
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # --- Parameters ---
+    # Beam Width: Scale with effort, ensure minimum size for stability
+    BEAM_WIDTH = int(max(10, num_seqs * 2.0))
+
+    # Samples per node: Candidates to evaluate from each parent
+    SAMPLES_PER_NODE = 20
+
+    # Diversity: Max children to accept from a single parent in the next beam
+    # This prevents one "lucky" parent from flooding the beam with minor variations
+    MAX_CHILDREN = 3
+
+    num_txns = workload.num_txns
+
+    # --- Precompute Heuristics ---
+    # Duration: Proxy for transaction complexity/conflict potential.
+    txn_durations = {t: workload.get_opt_seq_cost([t]) for t in range(num_txns)}
+
+    # Sorted list for easy LPT (Longest Processing Time) access
+    sorted_by_duration = sorted(range(num_txns), key=lambda t: txn_durations[t], reverse=True)
+
+    # --- Initialization ---
+    # Seed beam with:
+    # 1. Top LPT transactions (often best anchors)
+    # 2. Random transactions (for diversity)
+    start_candidates = set()
+    start_candidates.update(sorted_by_duration[:BEAM_WIDTH])
+
+    # Fill remaining slots with random starts
+    while len(start_candidates) < BEAM_WIDTH * 2:
+        start_candidates.add(random.randint(0, num_txns - 1))
+
+    beam = []
+    for t in start_candidates:
+        rem = set(range(num_txns))
+        rem.remove(t)
+        beam.append({
+            'cost': txn_durations[t],
+            'total_dur': txn_durations[t],
+            'seq': [t],
+            'rem': rem
+        })
+
+    # Initial prune: Sort by cost, tie-break by total duration
+    beam.sort(key=lambda x: (x['cost'], -x['total_dur']))
+    beam = beam[:BEAM_WIDTH]
+
+    # --- Beam Search Loop ---
+    for _ in range(num_txns - 1):
+        candidates = []
+
+        for p_idx, parent in enumerate(beam):
+            rem_list = list(parent['rem'])
+
+            # --- Hybrid Sampling ---
+            samples = set()
+
+            # 1. Deterministic LPT: Always consider the longest remaining transactions
+            # This ensures we don't delay "heavy" items that cause bottlenecks
+            lpt_count = 0
+            for t in sorted_by_duration:
+                if t in parent['rem']:
+                    samples.add(t)
+                    lpt_count += 1
+                    if lpt_count >= 2: # Top 2
+                        break
+
+            # 2. Weighted Random Sampling: Favor longer transactions
+            needed = SAMPLES_PER_NODE - len(samples)
+            if needed > 0:
+                pool = [x for x in rem_list if x not in samples]
+                if len(pool) <= needed:
+                    samples.update(pool)
+                else:
+                    # Weighted sampling without replacement (approximation)
+                    # We pop to ensure uniqueness
+                    pool_copy = pool[:]
+                    weights = [txn_durations[x] for x in pool_copy]
+
+                    while len(samples) < SAMPLES_PER_NODE and pool_copy:
+                        try:
+                            pick = random.choices(pool_copy, weights=weights, k=1)[0]
+                            samples.add(pick)
+                            idx = pool_copy.index(pick)
+                            pool_copy.pop(idx)
+                            weights.pop(idx)
+                        except (ValueError, IndexError):
+                            break
+
+            # --- Evaluation ---
+            for t in samples:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_total_dur = parent['total_dur'] + txn_durations[t]
+
+                # Priority:
+                # Score = Makespan - TotalDuration. Lower is better (implies high parallelism).
+                # Tie-breaker: Maximize TotalDuration (prefer efficiently scheduling heavy items).
+                score = new_cost - new_total_dur
+                priority = (score, -new_total_dur)
+
+                candidates.append({
+                    'priority': priority,
+                    'cost': new_cost,
+                    'total_dur': new_total_dur,
+                    'seq': new_seq,
+                    'rem': parent['rem'], # Ref only
+                    'added': t,
+                    'p_idx': p_idx
+                })
+
+        # Sort candidates by priority (Best first)
+        candidates.sort(key=lambda x: x['priority'])
+
+        # --- Selection with Deduplication & Diversity ---
+        new_beam = []
+        seen_states = set()
+        parent_usage = {i: 0 for i in range(len(beam))}
+        reserve = []
+
+        # Identify unique state candidates first
+        # Because candidates are sorted by priority, the first time we see a state,
+        # it is via the optimal path found so far.
+        unique_candidates = []
+        for cand in candidates:
+            # Construct new state key
+            new_rem = cand['rem'].copy()
+            new_rem.remove(cand['added'])
+            # frozenset is O(N) hashing, faster than sorted tuple O(N log N)
+            state_key = frozenset(new_rem)
+
+            if state_key not in seen_states:
+                seen_states.add(state_key)
+                cand['state_rem'] = new_rem # Store for next iteration
+                unique_candidates.append(cand)
+
+        # Fill beam from unique candidates
+        for cand in unique_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            p_idx = cand['p_idx']
+            # Diversity Check
+            if parent_usage[p_idx] < MAX_CHILDREN:
+                new_beam.append({
+                    'cost': cand['cost'],
+                    'total_dur': cand['total_dur'],
+                    'seq': cand['seq'],
+                    'rem': cand['state_rem']
+                })
+                parent_usage[p_idx] += 1
+            else:
+                reserve.append(cand)
+
+        # Fill from reserve (relax diversity if beam not full)
+        if len(new_beam) < BEAM_WIDTH:
+            for cand in reserve:
+                if len(new_beam) >= BEAM_WIDTH:
+                    break
+                new_beam.append({
+                    'cost': cand['cost'],
+                    'total_dur': cand['total_dur'],
+                    'seq': cand['seq'],
+                    'rem': cand['state_rem']
+                })
+
+        if not new_beam:
+            break
+        beam = new_beam
+
+    # --- Best Result ---
+    best_result = min(beam, key=lambda x: x['cost'])
+    best_cost = best_result['cost']
+    best_seq = best_result['seq']
+
+    # --- Local Search Refinement ---
+    # Windowed swaps to fix local ordering inefficiencies
+    # A small window is sufficient to catch most greedy errors
+    WINDOW = 4
+    for _ in range(3): # Max passes
+        improved = False
+        for i in range(num_txns - 1):
+            # Try swapping with neighbors up to WINDOW distance
+            for offset in range(1, WINDOW + 1):
+                j = i + offset
+                if j >= num_txns:
+                    break
+
+                # Swap
+                best_seq[i], best_seq[j] = best_seq[j], best_seq[i]
+                new_c = workload.get_opt_seq_cost(best_seq)
+
+                if new_c < best_cost:
+                    best_cost = new_c
+                    improved = True
+                    # Keep swap and continue
+                else:
+                    # Revert
+                    best_seq[i], best_seq[j] = best_seq[j], best_seq[i]
+
+        if not improved:
+            break
+
+    return best_cost, best_seq
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Lookahead Beam Search with Iterated Local Search.
+
+    Combines:
+    1. Beam Search with 1-Step Lookahead (avoids myopic greedy choices).
+    2. Hybrid Sampling (LPT + Weighted Random) for robust exploration.
+    3. Iterated Local Search (Descent + Perturbation + Repair) to refine results.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Used to scale the beam width
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # --- Parameters ---
+    BEAM_WIDTH = int(max(10, num_seqs * 2.5))
+    SAMPLES_PER_NODE = 20
+    MAX_CHILDREN = 3
+    # Lookahead: Evaluate lookahead score for top N candidates
+    # N = Beam Width * Factor. Higher = more accurate but slower.
+    LOOKAHEAD_FACTOR = 2.0
+
+    num_txns = workload.num_txns
+
+    # --- Precompute Heuristics ---
+    txn_durations = {t: workload.get_opt_seq_cost([t]) for t in range(num_txns)}
+    sorted_lpt = sorted(range(num_txns), key=lambda t: txn_durations[t], reverse=True)
+
+    # --- Initialization ---
+    start_candidates = set()
+    start_candidates.update(sorted_lpt[:BEAM_WIDTH])
+    # Fill remaining with random starts
+    while len(start_candidates) < BEAM_WIDTH * 2 and len(start_candidates) < num_txns:
+        start_candidates.add(random.randint(0, num_txns - 1))
+
+    beam = []
+    for t in start_candidates:
+        rem = set(range(num_txns))
+        rem.remove(t)
+        cost = txn_durations[t]
+        beam.append({
+            'cost': cost,
+            'total_dur': cost,
+            'seq': [t],
+            'rem': rem,
+            'score': 0 # cost - total_dur, 0 for single item
+        })
+
+    # Initial Prune
+    beam.sort(key=lambda x: (x['score'], -x['total_dur']))
+    beam = beam[:BEAM_WIDTH]
+
+    # --- Beam Search Loop ---
+    for _ in range(num_txns - 1):
+        candidates = []
+
+        for p_idx, parent in enumerate(beam):
+            rem_list = list(parent['rem'])
+
+            # --- Hybrid Sampling ---
+            samples = set()
+
+            # 1. Deterministic LPT (Top 3)
+            lpt_count = 0
+            for t in sorted_lpt:
+                if t in parent['rem']:
+                    samples.add(t)
+                    lpt_count += 1
+                    if lpt_count >= 3: break
+
+            # 2. Weighted Random Sampling
+            needed = SAMPLES_PER_NODE - len(samples)
+            if needed > 0:
+                pool = [x for x in rem_list if x not in samples]
+                if pool:
+                    if len(pool) <= needed:
+                        samples.update(pool)
+                    else:
+                        weights = [txn_durations[x] for x in pool]
+                        # Efficient approximate sampling
+                        # Oversample slightly to account for collisions
+                        picks = random.choices(pool, weights=weights, k=needed * 2)
+                        samples.update(picks)
+
+                        # Fallback if choices didn't yield enough unique items
+                        if len(samples) < SAMPLES_PER_NODE:
+                            remaining = [x for x in pool if x not in samples]
+                            if remaining:
+                                k = min(len(remaining), SAMPLES_PER_NODE - len(samples))
+                                samples.update(random.sample(remaining, k))
+
+            # --- Base Evaluation ---
+            for t in samples:
+                new_seq = parent['seq'] + [t]
+                new_cost = workload.get_opt_seq_cost(new_seq)
+                new_total_dur = parent['total_dur'] + txn_durations[t]
+
+                # Base Score: Work Density (Makespan - TotalDuration)
+                base_score = new_cost - new_total_dur
+
+                candidates.append({
+                    'cost': new_cost,
+                    'total_dur': new_total_dur,
+                    'seq': new_seq,
+                    'rem': parent['rem'], # Ref only
+                    'added': t,
+                    'p_idx': p_idx,
+                    'base_score': base_score
+                })
+
+        # --- Lookahead Phase ---
+        # 1. Pre-filter by base score to limit lookahead cost
+        candidates.sort(key=lambda x: (x['base_score'], -x['total_dur']))
+
+        # 2. Select deduplicated pool for lookahead
+        lookahead_pool = []
+        seen_states = set()
+        target_pool_size = int(BEAM_WIDTH * LOOKAHEAD_FACTOR)
+
+        for cand in candidates:
+            # Deduplicate state
+            new_rem = cand['rem'].copy()
+            new_rem.remove(cand['added'])
+            state_key = frozenset(new_rem)
+
+            if state_key not in seen_states:
+                seen_states.add(state_key)
+                cand['new_rem'] = new_rem
+                lookahead_pool.append(cand)
+                if len(lookahead_pool) >= target_pool_size:
+                    break
+
+        # 3. Compute Lookahead Score
+        for cand in lookahead_pool:
+            rem = cand['new_rem']
+            if not rem:
+                cand['final_score'] = cand['base_score']
+                continue
+
+            # Find next LPT item in remaining set
+            next_t = None
+            for t in sorted_lpt:
+                if t in rem:
+                    next_t = t
+                    break
+
+            if next_t is not None:
+                # Tentative addition
+                la_seq = cand['seq'] + [next_t]
+                la_cost = workload.get_opt_seq_cost(la_seq)
+                la_total_dur = cand['total_dur'] + txn_durations[next_t]
+                cand['final_score'] = la_cost - la_total_dur
+            else:
+                cand['final_score'] = cand['base_score']
+
+        # 4. Final Selection (Sort by Lookahead Score)
+        lookahead_pool.sort(key=lambda x: (x['final_score'], -x['total_dur']))
+
+        new_beam = []
+        p_counts = {i: 0 for i in range(len(beam))}
+        reserve = []
+
+        for cand in lookahead_pool:
+            p_idx = cand['p_idx']
+            node = {
+                'cost': cand['cost'],
+                'total_dur': cand['total_dur'],
+                'seq': cand['seq'],
+                'rem': cand['new_rem'],
+                'score': cand['final_score']
+            }
+
+            if p_counts[p_idx] < MAX_CHILDREN:
+                if len(new_beam) < BEAM_WIDTH:
+                    new_beam.append(node)
+                    p_counts[p_idx] += 1
+                else:
+                    pass
+            else:
+                reserve.append(node)
+
+            if len(new_beam) >= BEAM_WIDTH and len(reserve) > BEAM_WIDTH:
+                break
+
+        # Fill from reserve
+        if len(new_beam) < BEAM_WIDTH:
+            for node in reserve:
+                if len(new_beam) >= BEAM_WIDTH: break
+                new_beam.append(node)
+
+        if not new_beam:
+            break
+        beam = new_beam
+
+    # Select best
+    best_result = min(beam, key=lambda x: x['cost'])
+    best_cost = best_result['cost']
+    best_seq = best_result['seq']
+
+    # --- Iterated Local Search (ILS) ---
+    def refine(seq, cost):
+        """Improve sequence using swaps and insertions"""
+        # Swaps
+        w_swap = 5
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(seq) - 1):
+                for offset in range(1, w_swap + 1):
+                    j = i + offset
+                    if j >= len(seq): break
+
+                    seq[i], seq[j] = seq[j], seq[i]
+                    c = workload.get_opt_seq_cost(seq)
+                    if c < cost:
+                        cost = c
+                        improved = True
+                    else:
+                        seq[i], seq[j] = seq[j], seq[i]
+            if improved: break # Limit iterations for speed
+
+        # Insertions
+        w_ins = 8
+        for i in range(len(seq)):
+            curr = seq[i]
+            temp = seq[:i] + seq[i+1:]
+            start = max(0, i - w_ins)
+            end = min(len(seq), i + w_ins)
+
+            for k in range(start, end):
+                cand = temp[:k] + [curr] + temp[k:]
+                c = workload.get_opt_seq_cost(cand)
+                if c < cost:
+                    cost = c
+                    seq = cand
+                    break # Greedy first improvement
+        return seq, cost
+
+    # 1. Initial Descent
+    best_seq, best_cost = refine(best_seq, best_cost)
+
+    # 2. Perturbation Loop
+    for _ in range(2):
+        p_seq = best_seq[:]
+        if len(p_seq) > 5:
+            # Kick: Swap 2 random items
+            i1, i2 = random.sample(range(len(p_seq)), 2)
+            p_seq[i1], p_seq[i2] = p_seq[i2], p_seq[i1]
+
+            # Repair
+            p_seq, p_cost = refine(p_seq, workload.get_opt_seq_cost(p_seq))
+
+            if p_cost < best_cost:
+                best_cost = p_cost
+                best_seq = p_seq
+
+    return best_cost, best_seq
+>>>>>>> REPLACE
+</DIFF>
+</ls_scheduling_optimization>

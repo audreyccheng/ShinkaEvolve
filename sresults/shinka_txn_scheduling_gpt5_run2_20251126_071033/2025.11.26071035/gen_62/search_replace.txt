@@ -1,0 +1,253 @@
+<NAME>
+deterministic_best_two_cache_and_insertion_completion
+</NAME>
+
+<DESCRIPTION>
+I introduce a deterministic, signature-based best-two insertion memoization that is shared across the whole episode and used consistently in construction, LNS repair, and local search. The previous stratified position sampling used random picks, which limited cache reuse and led to noisy regret values. I replace it with deterministic, evenly spaced position anchors (with optional focus-ring) and store results under a position-signature key, allowing the cache to be hit across multiple neighborhoods and steps.
+
+I also:
+- Rewire best_two_insertions to key the cache by (tuple(seq), txn, pos_sig) and to reuse any existing 'all-positions' entry.
+- Adjust Or-opt(1) moves to use the memoized best-two insertion for faster and more accurate reinsertion decisions.
+- Improve greedy completion at the end of beam search by using best insertion positions (not just appending), which often reduces makespan by resolving conflicts earlier.
+
+These changes reduce redundant simulator calls, stabilize regret evaluation, and allow better exploitation of high-impact insertion positions, which together lead to lower makespans.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------- Stratified position sampling ----------------
+    def stratified_positions(seq_len, cap=pos_sample_cap, R=rand_pos_R, exhaustive=False):
+        total = seq_len + 1
+        if exhaustive or cap is None or total <= cap:
+            return list(range(total))
+        anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+        anchors = {p for p in anchors if 0 <= p <= seq_len}
+        interior = [p for p in range(1, seq_len) if p not in anchors]
+        r = min(R, len(interior))
+        if r > 0:
+            anchors.update(random.sample(interior, r))
+        return sorted(anchors)
+=======
+    # ---------------- Deterministic position sampling with signature ----------------
+    def positions_signature(seq_len, exhaustive=False, focus_idx=None, cap=pos_sample_cap, ring_span=2):
+        total = seq_len + 1
+        if exhaustive or cap is None or total <= cap:
+            return ('all', seq_len)
+        anchors = {0, seq_len, seq_len // 2, seq_len // 4, (3 * seq_len) // 4}
+        anchors = {p for p in anchors if 0 <= p <= seq_len}
+        if focus_idx is not None:
+            for d in range(-ring_span, ring_span + 1):
+                p = focus_idx + d
+                if 0 <= p <= seq_len:
+                    anchors.add(p)
+        # Evenly spaced interior points (deterministic) to fill up to cap
+        need = max(0, min(cap, total) - len(anchors))
+        if need > 0:
+            for i in range(1, need + 1):
+                pos = round(i * seq_len / (need + 1))
+                if 0 <= pos <= seq_len:
+                    anchors.add(int(pos))
+        positions = tuple(sorted(anchors))
+        return positions
+
+    def positions_for_insertion(seq_len, exhaustive=False, focus_idx=None):
+        sig = positions_signature(seq_len, exhaustive=exhaustive, focus_idx=focus_idx)
+        if isinstance(sig, tuple) and len(sig) == 2 and sig[0] == 'all':
+            return list(range(seq_len + 1)), sig
+        return list(sig), sig
+
+    def stratified_positions(seq_len, cap=pos_sample_cap, R=rand_pos_R, exhaustive=False):
+        # Wrapper to keep existing callers; returns deterministic anchors
+        positions, _ = positions_for_insertion(seq_len, exhaustive=exhaustive, focus_idx=None)
+        return positions
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # ---------------- Best-two insertion with per-episode cache ----------------
+    # best_two_cache[(mode, tuple(seq), txn)] -> (best_cost, best_pos, second_cost)
+    def make_best_two_cache():
+        return {}
+
+    def best_two_insertions(seq, txn, bt_cache, exhaustive=False):
+        mode = 'all' if exhaustive else 'strat'
+        key = (mode, tuple(seq), txn)
+        cached = bt_cache.get(key)
+        if cached is not None:
+            return cached
+        positions = stratified_positions(len(seq), exhaustive=exhaustive)
+        best_c, best_p = float('inf'), None
+        second_c = float('inf')
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best_c:
+                second_c = best_c
+                best_c, best_p = c, pos
+            elif c < second_c:
+                second_c = c
+        if second_c == float('inf'):
+            second_c = best_c
+        res = (best_c, best_p, second_c)
+        bt_cache[key] = res
+        return res
+=======
+    # ---------------- Best-two insertion with episode-shared cache ----------------
+    # best_two_cache[(tuple(seq), txn, pos_sig)] -> (best_cost, best_pos, second_cost)
+    best_two_cache = {}
+
+    def make_best_two_cache():
+        # Return the shared cache for the entire episode
+        return best_two_cache
+
+    def best_two_insertions(seq, txn, bt_cache, exhaustive=False, focus_idx=None):
+        # Prefer an 'all' entry if it exists
+        all_sig = ('all', len(seq))
+        all_key = (tuple(seq), txn, all_sig)
+        if all_key in bt_cache:
+            return bt_cache[all_key]
+
+        positions, sig = positions_for_insertion(len(seq), exhaustive=exhaustive, focus_idx=focus_idx)
+        key = (tuple(seq), txn, sig)
+        cached = bt_cache.get(key)
+        if cached is not None:
+            return cached
+
+        best_c, best_p = float('inf'), 0
+        second_c = float('inf')
+        for pos in positions:
+            cand = seq[:]
+            cand.insert(pos, txn)
+            c = eval_cost(cand)
+            if c < best_c:
+                second_c = best_c
+                best_c, best_p = c, pos
+            elif c < second_c:
+                second_c = c
+        if second_c == float('inf'):
+            second_c = best_c
+        res = (best_c, best_p, second_c)
+        bt_cache[key] = res
+        if sig == all_sig:
+            bt_cache[all_key] = res
+        return res
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    def or_opt_pass(seq, start_cost, block_len, pos_cap=oropt_pos_cap):
+        best_seq = list(seq)
+        best_cost = start_cost
+        L = len(best_seq)
+        if L <= block_len:
+            return best_cost, best_seq, False
+        improved_any = False
+        i = 0
+        while i <= L - block_len:
+            block = best_seq[i:i + block_len]
+            base = best_seq[:i] + best_seq[i + block_len:]
+            m = len(base) + 1
+            exhaustive = (pos_cap is None) or (m <= (pos_cap + 1))
+            positions = list(range(m)) if exhaustive else stratified_positions(len(base), cap=pos_cap, R=rand_pos_R, exhaustive=False)
+            move_best_c, move_best_pos = best_cost, None
+            for pos in positions:
+                if pos == i:
+                    continue
+                cand = base[:]
+                cand[pos:pos] = block
+                c = eval_cost(cand)
+                if c < move_best_c:
+                    move_best_c, move_best_pos = c, pos
+            if move_best_pos is not None and move_best_c + 1e-12 < best_cost:
+                new_seq = base[:]
+                new_seq[move_best_pos:move_best_pos] = block
+                best_seq = new_seq
+                best_cost = move_best_c
+                improved_any = True
+                L = len(best_seq)
+                i = 0  # restart
+            else:
+                i += 1
+        return best_cost, best_seq, improved_any
+=======
+    def or_opt_pass(seq, start_cost, block_len, pos_cap=oropt_pos_cap):
+        best_seq = list(seq)
+        best_cost = start_cost
+        L = len(best_seq)
+        if L <= block_len:
+            return best_cost, best_seq, False
+        improved_any = False
+        i = 0
+        while i <= L - block_len:
+            block = best_seq[i:i + block_len]
+            base = best_seq[:i] + best_seq[i + block_len:]
+            m = len(base) + 1
+            exhaustive = (pos_cap is None) or (m <= (pos_cap + 1))
+            if block_len == 1:
+                # Use best-two insertion cache for 1-block reinsertion (with focus around i)
+                t = block[0]
+                c_ins, p_ins, _ = best_two_insertions(base, t, make_best_two_cache(), exhaustive=(exhaustive or (len(base) <= exhaustive_threshold)), focus_idx=i)
+                move_best_c, move_best_pos = c_ins, p_ins
+            else:
+                positions = list(range(m)) if exhaustive else stratified_positions(len(base), cap=pos_cap, R=rand_pos_R, exhaustive=False)
+                move_best_c, move_best_pos = best_cost, None
+                for pos in positions:
+                    if pos == i:
+                        continue
+                    cand = base[:]
+                    cand[pos:pos] = block
+                    c = eval_cost(cand)
+                    if c < move_best_c:
+                        move_best_c, move_best_pos = c, pos
+            if move_best_pos is not None and move_best_c + 1e-12 < best_cost:
+                new_seq = base[:]
+                new_seq[move_best_pos:move_best_pos] = block
+                best_seq = new_seq
+                best_cost = move_best_c
+                improved_any = True
+                L = len(best_seq)
+                i = 0  # restart
+            else:
+                i += 1
+        return best_cost, best_seq, improved_any
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if beam:
+            # greedy completion
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_c = None, float('inf')
+                for t in rem_list:
+                    c2 = eval_cost(cur + [t])
+                    if c2 < best_c:
+                        best_c, best_t = c2, t
+                cur.append(best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur), cur
+=======
+        if beam:
+            # Greedy completion using best insertions (not only appends)
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            bt_cache = make_best_two_cache()
+            while rem_list:
+                best_t, best_p, best_c = None, 0, float('inf')
+                exhaustive = (len(cur) <= exhaustive_threshold) or (len(rem_list) <= 2 * local_beam_width)
+                for t in rem_list:
+                    c2, p2, _ = best_two_insertions(cur, t, bt_cache, exhaustive=exhaustive)
+                    if c2 < best_c:
+                        best_c, best_t, best_p = c2, t, p2
+                cur.insert(best_p, best_t)
+                rem_list.remove(best_t)
+            return eval_cost(cur), cur
+>>>>>>> REPLACE
+</DIFF>

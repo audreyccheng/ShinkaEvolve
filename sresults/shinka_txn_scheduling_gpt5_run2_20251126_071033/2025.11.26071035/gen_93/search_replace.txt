@@ -1,0 +1,154 @@
+<NAME>
+bnb_endgame_pruning
+</NAME>
+
+<DESCRIPTION>
+I add a bounded endgame branch-and-bound (BnB) exact enumerator for the last few transactions and integrate it into the beam search and completion phase. This improves makespan by optimally resolving the tail of the schedule where conflicts become concentrated. Specifically:
+
+- Introduce BNB_K and BNB_TIME_BUDGET parameters to trigger exact completion when the remaining set is small (<= 9) while keeping run time bounded.
+- Implement bnb_complete(prefix, remaining, best_bound) with a small transposition table keyed by (suffix of prefix, sorted remaining) and order expansions by immediate extension cost. It prunes by current best bound and time budget.
+- Use BnB inside beam_search at each layer when remaining <= BNB_K to complete partial sequences exactly and update the best complete found.
+- Use BnB instead of greedy completion when the best beam prefix has few remaining transactions.
+
+These changes target the critical endgame where heuristic insertions may miss optimal arrangements, leading to measurable makespan reductions. The modifications reuse the existing cached cost evaluations and best-two insertions for fast lower-level computations and keep the rest of the pipeline unchanged.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Elites
+    ELITE_CAP = max(4, min(6, 2 + num_seqs // 2))
+=======
+    # Elites
+    ELITE_CAP = max(4, min(6, 2 + num_seqs // 2))
+
+    # Endgame exact enumeration (branch-and-bound)
+    BNB_K = 9
+    BNB_TIME_BUDGET = 0.35
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+    # ------------------------ Beam search with insertion-based expansions ------------------------
+    def beam_search():
+=======
+    # ------------------------ Beam search with insertion-based expansions ------------------------
+    # Endgame exact completion via bounded branch-and-bound
+    def bnb_complete(prefix, remaining, best_bound=float('inf')):
+        start_time = time.time()
+        best_cost = best_bound
+        best_seq = None
+        rem_list = list(remaining)
+
+        # small transposition keyed by (prefix suffix, sorted remaining)
+        memo = {}
+
+        def dfs(cur, rem):
+            nonlocal best_cost, best_seq
+            # Time pruning
+            if time.time() - start_time > BNB_TIME_BUDGET:
+                return
+            if not rem:
+                c = ctx.eval_cost(cur)
+                if c < best_cost:
+                    best_cost = c
+                    best_seq = list(cur)
+                return
+            # Prefix cost bound
+            c_pref = ctx.eval_cost(cur)
+            if c_pref >= best_cost:
+                return
+            key = (tuple(cur[-3:]), tuple(sorted(rem)))
+            prev = memo.get(key)
+            # Prune if we've already reached this subproblem with <= cost
+            if prev is not None and c_pref >= prev - 1e-12:
+                return
+            memo[key] = c_pref
+            # Order by immediate extension cost for faster pruning
+            ordered = sorted(rem, key=lambda t: ctx.eval_cost(cur + [t]))
+            for t in ordered:
+                c1 = ctx.eval_cost(cur + [t])
+                if c1 >= best_cost:
+                    continue
+                nxt = list(cur)
+                nxt.append(t)
+                rem_next = [x for x in rem if x != t]
+                dfs(nxt, rem_next)
+                if time.time() - start_time > BNB_TIME_BUDGET:
+                    break
+
+        dfs(list(prefix), rem_list)
+        if best_seq is None:
+            # Fallback: greedy best-insertion completion
+            cur = list(prefix)
+            rem = list(remaining)
+            while rem:
+                best_t, best_pos, best_c = None, 0, float('inf')
+                for t in rem:
+                    c2, p2, _ = ctx.best_two_insertions(cur, t, force_all=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                    if c2 < best_c:
+                        best_c, best_t, best_pos = c2, t, p2
+                cur.insert(best_pos, best_t)
+                rem.remove(best_t)
+            return ctx.eval_cost(cur), cur
+        return best_cost, best_seq
+
+    def beam_search():
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+            for c_so_far, prefix, rem in beam:
+                if not rem:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    continue
+=======
+            for c_so_far, prefix, rem in beam:
+                if not rem:
+                    if c_so_far < best_complete[0]:
+                        best_complete = (c_so_far, prefix)
+                    continue
+
+                # Endgame exact enumeration if remaining is small
+                if len(rem) <= BNB_K:
+                    c_b, s_b = bnb_complete(prefix, list(rem), best_complete[0])
+                    if c_b < best_complete[0]:
+                        best_complete = (c_b, s_b)
+                    # Push completed sequence to next layer for uniform handling
+                    next_pool.append((c_b, s_b, frozenset()))
+                    continue
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # otherwise greedy complete from best partial using best-insertion
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_pos, best_c = None, 0, float('inf')
+                for t in rem_list:
+                    c2, p2, c22 = ctx.best_two_insertions(cur, t, force_all=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                        best_pos = p2
+                cur.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+            return ctx.eval_cost(cur), cur
+=======
+        # otherwise greedy complete from best partial using best-insertion or BnB if small
+        if beam:
+            c, seq, rem = min(beam, key=lambda x: x[0])
+            if len(rem) <= BNB_K:
+                return bnb_complete(seq, list(rem), float('inf'))
+            cur = list(seq)
+            rem_list = list(rem)
+            while rem_list:
+                best_t, best_pos, best_c = None, 0, float('inf')
+                for t in rem_list:
+                    c2, p2, _ = ctx.best_two_insertions(cur, t, force_all=(len(cur) <= EXHAUSTIVE_THRESHOLD))
+                    if c2 < best_c:
+                        best_c = c2
+                        best_t = t
+                        best_pos = p2
+                cur.insert(best_pos, best_t)
+                rem_list.remove(best_t)
+            return ctx.eval_cost(cur), cur
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,383 @@
+--- a/original.py
++++ b/original.py
+@@ -1,182 +1,293 @@
+ # EVOLVE-BLOCK-START
+ """
+ Network telemetry repair algorithm that detects and corrects inconsistencies
+ in network interface telemetry data using topology relationships.
+ 
+ Takes interface telemetry data and detects/repairs inconsistencies based on
+ network invariants like link symmetry and flow conservation.
+ """
+ from typing import Dict, Any, Tuple, List
+ 
+ 
+ def repair_network_telemetry(telemetry: Dict[str, Dict[str, Any]],
+                              topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+     Repair network interface telemetry by detecting and correcting inconsistencies.
+ 
+     Core principle: Use network invariants to validate and repair telemetry:
+     1. Link Symmetry (R3): my_tx_rate ≈ their_rx_rate for connected interfaces
+     2. Flow Conservation (R1): Sum(incoming traffic) = Sum(outgoing traffic) at each router
+     3. Interface Consistency: Status should be consistent across connected pairs
+ 
+     Args:
+         telemetry: Dictionary where key is interface_id and value contains:
+             - interface_status: "up" or "down"
+             - rx_rate: receive rate in Mbps
+             - tx_rate: transmit rate in Mbps
+             - connected_to: interface_id this interface connects to
+             - local_router: router_id this interface belongs to
+             - remote_router: router_id on the other side
+         topology: Dictionary where key is router_id and value contains a list of interface_ids
+ 
+     Returns:
+         Dictionary with same structure but telemetry values become tuples of:
+         (original_value, repaired_value, confidence_score)
+         where confidence ranges from 0.0 (very uncertain) to 1.0 (very confident)
+     """
+ 
+     # Measurement timing tolerance (from Hodor research: ~2%)
+     HARDENING_THRESHOLD = 0.02
+-
+-    result = {}
+-
+-    # First pass: collect all measurements and check link symmetry
+-    link_symmetry_violations = {}
+-
+-    for interface_id, data in telemetry.items():
+-        interface_status = data.get('interface_status', 'unknown')
+-        rx_rate = data.get('rx_rate', 0.0)
+-        tx_rate = data.get('tx_rate', 0.0)
+-        connected_to = data.get('connected_to')
+-
+-        # Check link symmetry if connected interface exists
+-        if connected_to and connected_to in telemetry:
+-            peer_data = telemetry[connected_to]
+-            peer_rx = peer_data.get('rx_rate', 0.0)
+-            peer_tx = peer_data.get('tx_rate', 0.0)
+-
+-            # My TX should match their RX (within tolerance)
+-            tx_rx_diff = abs(tx_rate - peer_rx) / max(tx_rate, peer_rx, 1.0)
+-            # My RX should match their TX (within tolerance)
+-            rx_tx_diff = abs(rx_rate - peer_tx) / max(rx_rate, peer_tx, 1.0)
+-
+-            link_symmetry_violations[interface_id] = {
+-                'tx_rx_diff': tx_rx_diff,
+-                'rx_tx_diff': rx_tx_diff,
+-                'peer_rx': peer_rx,
+-                'peer_tx': peer_tx
+-            }
+-
+-    # Second pass: repair using redundant signals
+-    for interface_id, data in telemetry.items():
+-        repaired_data = {}
+-
+-        interface_status = data.get('interface_status', 'unknown')
+-        rx_rate = data.get('rx_rate', 0.0)
+-        tx_rate = data.get('tx_rate', 0.0)
+-        connected_to = data.get('connected_to')
+-
+-        # Default: no repair, high confidence
+-        repaired_rx = rx_rate
+-        repaired_tx = tx_rate
+-        repaired_status = interface_status
+-        rx_confidence = 1.0
+-        tx_confidence = 1.0
+-        status_confidence = 1.0
+-
+-        # Check for issues and attempt repair
+-        if interface_id in link_symmetry_violations:
+-            violations = link_symmetry_violations[interface_id]
+-
+-            # Repair RX rate if link symmetry is violated
+-            if violations['rx_tx_diff'] > HARDENING_THRESHOLD:
+-                # Use peer's TX as more reliable signal
+-                repaired_rx = violations['peer_tx']
+-                # Confidence decreases with magnitude of violation
+-                rx_confidence = max(0.0, 1.0 - violations['rx_tx_diff'])
+-
+-            # Repair TX rate if link symmetry is violated
+-            if violations['tx_rx_diff'] > HARDENING_THRESHOLD:
+-                # Use peer's RX as more reliable signal
+-                repaired_tx = violations['peer_rx']
+-                # Confidence decreases with magnitude of violation
+-                tx_confidence = max(0.0, 1.0 - violations['tx_rx_diff'])
+-
+-        # Check status consistency
+-        if connected_to and connected_to in telemetry:
+-            peer_status = telemetry[connected_to].get('interface_status', 'unknown')
+-            # If statuses don't match, lower confidence
+-            if interface_status != peer_status:
+-                status_confidence = 0.5
+-                # If interface is down but has non-zero rates, that's suspicious
+-                if interface_status == 'down' and (rx_rate > 0 or tx_rate > 0):
+-                    repaired_rx = 0.0
+-                    repaired_tx = 0.0
+-                    rx_confidence = 0.3
+-                    tx_confidence = 0.3
+-
+-        # Store repaired values with confidence scores
+-        repaired_data['rx_rate'] = (rx_rate, repaired_rx, rx_confidence)
+-        repaired_data['tx_rate'] = (tx_rate, repaired_tx, tx_confidence)
+-        repaired_data['interface_status'] = (interface_status, repaired_status, status_confidence)
++    # Small traffic level used to infer link up when statuses disagree (Mbps)
++    TRAFFIC_EVIDENCE_MIN = 0.5
++
++    def clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
++        return max(lo, min(hi, x))
++
++    def rel_diff(a: float, b: float) -> float:
++        denom = max(abs(a), abs(b), 1e-9)
++        return abs(a - b) / denom
++
++    # Initialize structures
++    result: Dict[str, Dict[str, Tuple]] = {}
++    # Store interim repaired values and confidences per interface before router-level hardening
++    interim: Dict[str, Dict[str, Any]] = {}
++
++    # Build connected pairs
++    visited = set()
++    pairs: List[Tuple[str, str]] = []
++    for if_id, data in telemetry.items():
++        peer = data.get('connected_to')
++        if peer and peer in telemetry:
++            # Use ordered tuple to avoid duplicates
++            key = tuple(sorted([if_id, peer]))
++            if key not in visited:
++                visited.add(key)
++                pairs.append((key[0], key[1]))
++
++    # Initialize defaults for all interfaces
++    for if_id, data in telemetry.items():
++        interim[if_id] = {
++            'rx': data.get('rx_rate', 0.0),
++            'tx': data.get('tx_rate', 0.0),
++            'rx_conf': 1.0,
++            'tx_conf': 1.0,
++            'status': data.get('interface_status', 'unknown'),
++            'status_conf': 1.0,
++            'connected_to': data.get('connected_to'),
++            'local_router': data.get('local_router'),
++            'remote_router': data.get('remote_router'),
++            # Keep originals for output tuples
++            'orig_rx': data.get('rx_rate', 0.0),
++            'orig_tx': data.get('tx_rate', 0.0),
++            'orig_status': data.get('interface_status', 'unknown'),
++        }
++
++    # Pair-level hardening using link symmetry (R3) and interface consistency
++    for a_id, b_id in pairs:
++        a = telemetry[a_id]
++        b = telemetry[b_id]
++        a_stat = a.get('interface_status', 'unknown')
++        b_stat = b.get('interface_status', 'unknown')
++        a_rx, a_tx = a.get('rx_rate', 0.0), a.get('tx_rate', 0.0)
++        b_rx, b_tx = b.get('rx_rate', 0.0), b.get('tx_rate', 0.0)
++        max_traffic = max(a_rx, a_tx, b_rx, b_tx)
++
++        # Resolve interface status consistency across the link
++        if a_stat == b_stat:
++            resolved_status = a_stat
++            status_conf = 0.95 if resolved_status in ('up', 'down') else 0.7
++        else:
++            # Use traffic evidence: if there is noticeable traffic, link must be up
++            if max_traffic > TRAFFIC_EVIDENCE_MIN:
++                resolved_status = 'up'
++                status_conf = 0.85
++            else:
++                resolved_status = 'down'
++                status_conf = 0.75
++
++        # Apply status to both ends
++        interim[a_id]['status'] = resolved_status
++        interim[b_id]['status'] = resolved_status
++        interim[a_id]['status_conf'] = min(interim[a_id]['status_conf'], status_conf) if interim[a_id]['status_conf'] else status_conf
++        interim[b_id]['status_conf'] = min(interim[b_id]['status_conf'], status_conf) if interim[b_id]['status_conf'] else status_conf
++
++        if resolved_status == 'down':
++            # Down interfaces cannot send or receive
++            # Confidence is high if original values were already near zero, lower otherwise.
++            for if_id, rx0, tx0 in [(a_id, a_rx, a_tx), (b_id, b_rx, b_tx)]:
++                interim[if_id]['rx'] = 0.0
++                interim[if_id]['tx'] = 0.0
++                interim[if_id]['rx_conf'] = clamp(0.9 if rx0 <= TRAFFIC_EVIDENCE_MIN else 0.3)
++                interim[if_id]['tx_conf'] = clamp(0.9 if tx0 <= TRAFFIC_EVIDENCE_MIN else 0.3)
++            continue  # No need to harden rates if link is down
++
++        # Link is up: harden both directions using symmetry
++        # Forward direction: a.tx should match b.rx
++        d_fwd = rel_diff(a_tx, b_rx)
++        if d_fwd <= HARDENING_THRESHOLD:
++            v = 0.5 * (a_tx + b_rx)
++            conf = clamp(1.0 - 0.5 * d_fwd)  # near 1 when very close
++        else:
++            # Choose peer's counterpart as stronger signal
++            v = b_rx if abs(b_rx) > 0 else a_tx
++            conf = clamp(1.0 - d_fwd)  # lower confidence for larger violation
++        interim[a_id]['tx'] = v
++        interim[b_id]['rx'] = v
++        interim[a_id]['tx_conf'] = min(interim[a_id]['tx_conf'], conf)
++        interim[b_id]['rx_conf'] = min(interim[b_id]['rx_conf'], conf)
++
++        # Reverse direction: a.rx should match b.tx
++        d_rev = rel_diff(a_rx, b_tx)
++        if d_rev <= HARDENING_THRESHOLD:
++            v2 = 0.5 * (a_rx + b_tx)
++            conf2 = clamp(1.0 - 0.5 * d_rev)
++        else:
++            v2 = b_tx if abs(b_tx) > 0 else a_rx
++            conf2 = clamp(1.0 - d_rev)
++        interim[a_id]['rx'] = v2
++        interim[b_id]['tx'] = v2
++        interim[a_id]['rx_conf'] = min(interim[a_id]['rx_conf'], conf2)
++        interim[b_id]['tx_conf'] = min(interim[b_id]['tx_conf'], conf2)
++
++    # Router-level dynamic flow conservation (R1)
++    # Build router to interfaces map (use provided topology if available, else derive from telemetry)
++    router_ifaces: Dict[str, List[str]] = {}
++    if topology:
++        router_ifaces = {r: list(if_list) for r, if_list in topology.items()}
++    else:
++        # If topology not provided, derive from telemetry metadata
++        # Note: Topology helps flow conservation; we derive a best-effort map when absent.
++        for if_id, data in telemetry.items():
++            r = data.get('local_router')
++            if r is not None:
++                router_ifaces.setdefault(r, []).append(if_id)
++
++    for router, if_list in router_ifaces.items():
++        # Consider only interfaces present in telemetry
++        interfaces = [i for i in if_list if i in interim]
++        if not interfaces:
++            continue
++
++        # Compute sums over "up" interfaces
++        sum_tx = 0.0
++        sum_rx = 0.0
++        tx_conf_acc = 0.0
++        rx_conf_acc = 0.0
++        up_count_tx = 0
++        up_count_rx = 0
++        for i in interfaces:
++            if interim[i]['status'] == 'up':
++                sum_tx += max(0.0, interim[i]['tx'])
++                sum_rx += max(0.0, interim[i]['rx'])
++                tx_conf_acc += interim[i]['tx_conf']
++                rx_conf_acc += interim[i]['rx_conf']
++                up_count_tx += 1
++                up_count_rx += 1
++
++        if up_count_tx == 0 or up_count_rx == 0:
++            continue
++
++        # Evaluate flow imbalance
++        imbalance = rel_diff(sum_tx, sum_rx)
++        if imbalance <= HARDENING_THRESHOLD * 2:
++            # Within tolerance; no router-level scaling needed
++            continue
++
++        avg_tx_conf = tx_conf_acc / max(1, up_count_tx)
++        avg_rx_conf = rx_conf_acc / max(1, up_count_rx)
++
++        # Decide which direction to scale: scale the less trusted direction
++        scale_rx = avg_tx_conf >= avg_rx_conf  # if TX more trusted, scale RX to match TX
++        if scale_rx and sum_rx > 0.0:
++            s = sum_tx / sum_rx
++        elif (not scale_rx) and sum_tx > 0.0:
++            s = sum_rx / sum_tx
++        else:
++            s = 1.0
++
++        # Bound scaling to avoid extreme corrections
++        s_bounded = max(0.5, min(2.0, s))
++
++        # Apply scaling and update confidences
++        for i in interfaces:
++            if interim[i]['status'] != 'up':
++                continue
++            if scale_rx:
++                old_val = interim[i]['rx']
++                interim[i]['rx'] = old_val * s_bounded
++                # Confidence drops with imbalance and scaling magnitude
++                interim[i]['rx_conf'] = clamp(min(interim[i]['rx_conf'], 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded))))
++            else:
++                old_val = interim[i]['tx']
++                interim[i]['tx'] = old_val * s_bounded
++                interim[i]['tx_conf'] = clamp(min(interim[i]['tx_conf'], 1.0 - min(1.0, imbalance + abs(1.0 - s_bounded))))
++
++    # Assemble final result with (original, repaired, confidence) tuples and unchanged metadata
++    for if_id, data in telemetry.items():
++        repaired_data: Dict[str, Tuple] = {}
++        r = interim[if_id]
++
++        repaired_data['rx_rate'] = (r['orig_rx'], r['rx'], clamp(r['rx_conf']))
++        repaired_data['tx_rate'] = (r['orig_tx'], r['tx'], clamp(r['tx_conf']))
++        repaired_data['interface_status'] = (r['orig_status'], r['status'], clamp(r['status_conf']))
+ 
+         # Copy metadata unchanged
+-        repaired_data['connected_to'] = connected_to
+-        repaired_data['local_router'] = data.get('local_router')
+-        repaired_data['remote_router'] = data.get('remote_router')
+-
+-        result[interface_id] = repaired_data
++        repaired_data['connected_to'] = r['connected_to']
++        repaired_data['local_router'] = r['local_router']
++        repaired_data['remote_router'] = r['remote_router']
++
++        result[if_id] = repaired_data
+ 
+     return result
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ def run_repair(telemetry: Dict[str, Dict[str, Any]], topology: Dict[str, List[str]]) -> Dict[str, Dict[str, Tuple]]:
+     """
+     Main entry point that will be called by the evaluator.
+ 
+     Args:
+         telemetry: Network interface telemetry data
+         topology: Dictionary where key is router_id and value contains a list of interface_ids
+ 
+     Returns:
+         Dictionary containing repaired results with confidence scores
+     """
+     return repair_network_telemetry(telemetry, topology)
+ 
+ 
+ if __name__ == "__main__":
+     # Simple test case
+     test_telemetry = {
+         'if1_to_if2': {
+             'interface_status': 'up',
+             'rx_rate': 100.0,
+             'tx_rate': 95.0,
+             'connected_to': 'if2_to_if1',
+             'local_router': 'router1',
+             'remote_router': 'router2'
+         },
+         'if2_to_if1': {
+             'interface_status': 'up',
+             'rx_rate': 95.0,  # Should match if1's TX
+             'tx_rate': 100.0,  # Should match if1's RX
+             'connected_to': 'if1_to_if2',
+             'local_router': 'router2',
+             'remote_router': 'router1'
+         }
+     }
+ 
+     test_topology = {
+         'router1': ['if1_to_if2'],
+         'router2': ['if2_to_if1']
+     }
+ 
+     result = run_repair(test_telemetry, test_topology)
+ 
+     print("Repair results:")
+     for if_id, data in result.items():
+         print(f"\n{if_id}:")
+         print(f"  RX: {data['rx_rate']}")
+         print(f"  TX: {data['tx_rate']}")
+         print(f"  Status: {data['interface_status']}")

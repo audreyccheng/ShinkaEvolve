@@ -1,0 +1,241 @@
+<NAME>
+randomized_init_and_ruins_perturbation
+</NAME>
+
+<DESCRIPTION>
+1.  **Randomized Linearized Initialization**: Modifies the Binary Search Initialization to include a randomized refinement step. After finding the optimal `K` (KVPR target), the solver runs multiple times with small random noise added to the item weights. This helps find better packing configurations that fit within the same or similar capacity constraints but result in a more balanced distribution, effectively exploring the "basin of attraction".
+2.  **Move Operator Reversion**: Reverts the "Steepest Descent" Move operator back to "First Improvement". Steepest Descent is computationally expensive (O(N*M)) per step and can limit the number of iterations in a time-constrained environment. First Improvement is faster and sufficient for ILS when combined with perturbation.
+3.  **Ruins and Recreate Perturbation**: Replaces the simple "Guided Kick" (moving one model) with a "Ruins and Recreate" strategy. This perturbation completely empties the bottleneck GPU and attempts to redistribute all its models to other GPUs. This provides a much stronger perturbation to escape deep local optima.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Strategy A: Binary Search Linearization
+    def solve_linearized_bin_packing(target_k):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            w = (m.req_rate / m.slo) + target_k * m.model_size
+            items.append((w, m))
+        items.sort(key=lambda x: x[0], reverse=True)
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m in items:
+            best_idx = -1
+            min_rem_linear = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                add_use = (m.req_rate / m.slo) + target_k * m.model_size
+                if lin_use + add_use <= bin_cap:
+                    rem = bin_cap - (lin_use + add_use)
+                    if rem < min_rem_linear:
+                        min_rem_linear = rem
+                        best_idx = i
+            if best_idx != -1: bins[best_idx].add(m)
+            else: return None
+        return bins
+
+    low, high = 0.0, 1000.0
+    if solve_linearized_bin_packing(high) is None: high = 1e9
+    bs_res = None
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bin_packing(mid)
+        if res:
+            bs_res = res
+            high = mid
+        else:
+            low = mid
+    if bs_res: candidates.append(bs_res)
+=======
+    # Strategy A: Binary Search Linearization + Randomized Refinement
+    def solve_linearized_bin_packing(target_k, noise_factor=0.0):
+        bin_cap = target_k * GPU_MEM_SIZE
+        items = []
+        for m in models:
+            # Base weight
+            w = (m.req_rate / m.slo) + target_k * m.model_size
+            # Add noise if requested
+            if noise_factor > 0:
+                w *= random.uniform(1.0 - noise_factor, 1.0 + noise_factor)
+            items.append((w, m))
+        # Best Fit Decreasing based on linearized weight
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        bins = [GPUState(i) for i in range(gpu_num)]
+        for w, m in items:
+            best_idx = -1
+            min_rem_linear = float('inf')
+            for i in range(gpu_num):
+                if not bins[i].can_fit(m.model_size): continue
+                lin_use = bins[i].load + target_k * bins[i].used_mem
+                # Recalculate actual linear usage for constraint check (without noise)
+                real_w = (m.req_rate / m.slo) + target_k * m.model_size
+                if lin_use + real_w <= bin_cap:
+                    rem = bin_cap - (lin_use + real_w)
+                    if rem < min_rem_linear:
+                        min_rem_linear = rem
+                        best_idx = i
+            if best_idx != -1: bins[best_idx].add(m)
+            else: return None
+        return bins
+
+    # Binary Search for K
+    low, high = 0.0, 1000.0
+    if solve_linearized_bin_packing(high) is None: high = 1e9
+
+    best_k = float('inf')
+    bs_res = None
+    for _ in range(20):
+        mid = (low + high) / 2
+        res = solve_linearized_bin_packing(mid)
+        if res:
+            bs_res = res
+            best_k = mid
+            high = mid
+        else:
+            low = mid
+
+    if bs_res:
+        candidates.append(bs_res)
+        # Randomized Refinement around best_k
+        # Run multiple times with noise to find potentially better packings
+        for _ in range(10):
+            res_noise = solve_linearized_bin_packing(best_k, noise_factor=0.05)
+            if res_noise: candidates.append(res_noise)
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- MOVE (Steepest Descent) ---
+        # Scan all moves from bottlenecks and pick the BEST one.
+        best_move = None
+        best_move_vec = current_vector
+
+        for source in sources:
+            for i, model in enumerate(source.models):
+                for dest in current_gpus:
+                    if dest.id == source.id: continue
+                    if dest.can_fit(model.model_size):
+                        source.remove(i)
+                        dest.add(model)
+
+                        new_vec = get_vector(current_gpus)
+                        if new_vec < best_move_vec:
+                            best_move_vec = new_vec
+                            best_move = (source, i, dest, model)
+
+                        dest.remove(len(dest.models)-1)
+                        source.restore_model(i, model)
+
+        if best_move:
+            src, idx, dst, mdl = best_move
+            src.remove(idx)
+            dst.add(mdl)
+            current_vector = best_move_vec
+            improved_step = True
+            if current_vector < best_vector:
+                best_vector = current_vector
+                for k in range(gpu_num): best_gpus[k].copy_from(current_gpus[k])
+
+        if improved_step:
+            iter_cnt += 1
+            continue
+=======
+        # --- MOVE (First Improvement) ---
+        for source in sources:
+            for i, model in enumerate(source.models):
+                for dest in current_gpus:
+                    if dest.id == source.id: continue
+                    if dest.can_fit(model.model_size):
+                        source.remove(i)
+                        dest.add(model)
+
+                        new_vec = get_vector(current_gpus)
+                        if new_vec < current_vector:
+                            current_vector = new_vec
+                            improved_step = True
+                            break
+                        else:
+                            dest.remove(len(dest.models)-1)
+                            source.restore_model(i, model)
+                if improved_step: break
+            if improved_step: break
+
+        if improved_step:
+            if current_vector < best_vector:
+                best_vector = current_vector
+                for k in range(gpu_num): best_gpus[k].copy_from(current_gpus[k])
+            iter_cnt += 1
+            continue
+>>>>>>> REPLACE
+<<<<<<< SEARCH
+        # --- PERTURBATION (Guided Kick) ---
+        # If we reach here, we are at a local optimum.
+        # Apply a kick: Force move a model from the bottleneck GPU to a *promising* feasible GPU.
+
+        iter_cnt += 1
+        if iter_cnt > max_iter - 10: break
+
+        worst_gpu = sorted_gpus[0]
+        if not worst_gpu.models: break
+
+        # Try to move a random model
+        m_idx = random.randint(0, len(worst_gpu.models)-1)
+        model_to_move = worst_gpu.models[m_idx]
+
+        # Find feasible destinations, exclude self
+        feasible_dests = [g for g in current_gpus if g.id != worst_gpu.id and g.can_fit(model_to_move.model_size)]
+
+        if feasible_dests:
+            # Guided: Prefer GPUs with lower KVPR to avoid creating new bottlenecks.
+            # Pick from top 3 lowest KVPR GPUs to maintain some stochasticity.
+            feasible_dests.sort(key=lambda g: g.kvpr())
+            target_candidates = feasible_dests[:3]
+            dest = random.choice(target_candidates)
+
+            worst_gpu.remove(m_idx)
+            dest.add(model_to_move)
+            current_vector = get_vector(current_gpus)
+        else:
+            break
+=======
+        # --- PERTURBATION (Ruins and Recreate) ---
+        iter_cnt += 1
+        if iter_cnt > max_iter - 10: break
+
+        worst_gpu = sorted_gpus[0]
+        if not worst_gpu.models: break
+
+        # Ruin: Remove all models from the bottleneck GPU
+        displaced_models = list(worst_gpu.models)
+        while worst_gpu.models:
+            worst_gpu.remove(0)
+
+        # Shuffle to introduce randomness
+        random.shuffle(displaced_models)
+
+        # Recreate: Try to distribute models to other GPUs
+        other_gpus = [g for g in current_gpus if g.id != worst_gpu.id]
+
+        for m in displaced_models:
+            placed = False
+            # Find feasible other GPUs
+            feasible = [g for g in other_gpus if g.can_fit(m.model_size)]
+            if feasible:
+                # Bias towards lower KVPR
+                feasible.sort(key=lambda g: g.kvpr())
+                # Pick one of the best 3 to disperse load
+                dest = random.choice(feasible[:3])
+                dest.add(m)
+                placed = True
+
+            if not placed:
+                # If cannot fit elsewhere, put back in original GPU
+                if worst_gpu.can_fit(m.model_size):
+                    worst_gpu.add(m)
+                else:
+                    # Should not happen if it fit before, unless weird fragmentation logic
+                    pass
+
+        current_vector = get_vector(current_gpus)
+>>>>>>> REPLACE
+</DIFF>

@@ -1,0 +1,287 @@
+# EVOLVE-BLOCK-START
+"""Model placement algorithm for minimizing maximum KV cache pressure across GPUs"""
+
+GPU_MEM_SIZE = 80  # GB
+
+def compute_model_placement(gpu_num, models):
+    """
+    Compute a model placement that minimizes the maximum KVPR across all GPUs.
+
+    Algorithm:
+    1. Robust Binary Search for optimal max KVPR 'K'.
+       - Checks feasibility with Multi-Strategy Best Fit Decreasing (Linearized Weight, Size).
+    2. Local Search Refinement.
+       - Iteratively improves the bottleneck GPU via Moves and Swaps.
+    """
+
+    model_data = []
+    total_l = 0.0
+    total_s = 0.0
+    for m in models:
+        l = m.req_rate / m.slo
+        s = m.model_size
+        model_data.append({'model': m, 'l': l, 's': s})
+        total_l += l
+        total_s += s
+
+    # 1. Feasibility Check with Best Fit
+    def solve_packing(target_k):
+        capacity = target_k * GPU_MEM_SIZE
+
+        def try_best_fit(items):
+            gpu_l = [0.0] * gpu_num
+            gpu_s = [0.0] * gpu_num
+            gpu_models = [[] for _ in range(gpu_num)]
+
+            for item in items:
+                w = item['l'] + target_k * item['s']
+                s = item['s']
+
+                best_idx = -1
+                min_slack = float('inf')
+
+                for i in range(gpu_num):
+                    # Hard memory constraint
+                    if gpu_s[i] + s >= GPU_MEM_SIZE - 1e-6:
+                        continue
+
+                    # Linearized constraint: sum(L) + K*sum(S) <= K*M
+                    curr_w = gpu_l[i] + target_k * gpu_s[i]
+                    if curr_w + w <= capacity + 1e-9:
+                        # Best Fit: minimize slack in linearized capacity
+                        slack = capacity - (curr_w + w)
+                        if slack < min_slack:
+                            min_slack = slack
+                            best_idx = i
+
+                if best_idx != -1:
+                    gpu_l[best_idx] += item['l']
+                    gpu_s[best_idx] += s
+                    gpu_models[best_idx].append(item['model'])
+                else:
+                    return None
+            return gpu_models
+
+        # Strategy 1: Linearized Weight Descending
+        # Adapts to K: L dominates at low K, S at high K
+        items_1 = sorted(model_data, key=lambda x: x['l'] + target_k * x['s'], reverse=True)
+        res = try_best_fit(items_1)
+        if res: return res
+
+        # Strategy 2: Size Descending
+        # Fallback for tight memory regimes
+        items_2 = sorted(model_data, key=lambda x: x['s'], reverse=True)
+        res = try_best_fit(items_2)
+        if res: return res
+
+        return None
+
+    # 2. Binary Search Initialization
+    # Theoretical lower bound: Total_L / (Total_Mem - Total_S)
+    rem_mem = (gpu_num * GPU_MEM_SIZE) - total_s
+    low = total_l / rem_mem if rem_mem > 0 else 0.0
+    high = max(low * 2, 1.0)
+
+    best_placement_list = None
+
+    # Find valid upper bound
+    for _ in range(20):
+        res = solve_packing(high)
+        if res is not None:
+            best_placement_list = res
+            break
+        low = high
+        high *= 2.0
+    else:
+        high = 1e12 # Fallback
+
+    # Refine K
+    for _ in range(30):
+        mid = (low + high) / 2
+        res = solve_packing(mid)
+        if res is not None:
+            best_placement_list = res
+            high = mid
+        else:
+            low = mid
+
+    if best_placement_list is None:
+        best_placement_list = solve_packing(high)
+        if best_placement_list is None:
+            raise ValueError("Unable to place models.")
+
+    # 3. Local Search Refinement
+    # Construct mutable state
+    gpu_states = []
+    for g in range(gpu_num):
+        m_list = best_placement_list[g]
+        s_l = sum(m.req_rate / m.slo for m in m_list)
+        s_s = sum(m.model_size for m in m_list)
+        gpu_states.append({'models': m_list, 'l': s_l, 's': s_s})
+
+    def get_kvpr(l, s):
+        if s >= GPU_MEM_SIZE - 1e-6: return float('inf')
+        return l / (GPU_MEM_SIZE - s)
+
+    for _ in range(100): # Iteration limit
+        # Find global bottleneck
+        current_max = -1.0
+        max_idx = -1
+        for g in range(gpu_num):
+            val = get_kvpr(gpu_states[g]['l'], gpu_states[g]['s'])
+            if val > current_max:
+                current_max = val
+                max_idx = g
+
+        if current_max <= 1e-9: break
+
+        best_move = None # (type, details...)
+        best_new_max = current_max # We want to reduce strictly below this if possible
+
+        src = gpu_states[max_idx]
+
+        # Try MOVING a model from max_idx -> tgt_idx
+        for m_i, model in enumerate(src['models']):
+            m_l = model.req_rate / model.slo
+            m_s = model.model_size
+
+            # Predict source state
+            ns_l = src['l'] - m_l
+            ns_s = src['s'] - m_s
+            ns_kvpr = get_kvpr(ns_l, ns_s)
+
+            for tgt_idx in range(gpu_num):
+                if tgt_idx == max_idx: continue
+                tgt = gpu_states[tgt_idx]
+
+                # Check memory
+                if tgt['s'] + m_s >= GPU_MEM_SIZE - 1e-6: continue
+
+                # Predict target state
+                nt_l = tgt['l'] + m_l
+                nt_s = tgt['s'] + m_s
+                nt_kvpr = get_kvpr(nt_l, nt_s)
+
+                # Criteria: Both affected GPUs must be better than old global max
+                local_max = max(ns_kvpr, nt_kvpr)
+                if local_max < best_new_max - 1e-6:
+                    best_new_max = local_max
+                    best_move = ('move', m_i, tgt_idx)
+
+        # Try SWAPPING a model from max_idx <-> tgt_idx
+        # Optimization: Only check swaps if move didn't solve it completely or as alternate
+        for m1_i, m1 in enumerate(src['models']):
+            m1_l = m1.req_rate / m1.slo
+            m1_s = m1.model_size
+
+            for tgt_idx in range(gpu_num):
+                if tgt_idx == max_idx: continue
+                tgt = gpu_states[tgt_idx]
+
+                # Optimization: skip if target is already near max
+                # if get_kvpr(tgt['l'], tgt['s']) >= current_max: continue
+
+                for m2_i, m2 in enumerate(tgt['models']):
+                    m2_l = m2.req_rate / m2.slo
+                    m2_s = m2.model_size
+
+                    # Check memory for both
+                    n_src_s = src['s'] - m1_s + m2_s
+                    n_tgt_s = tgt['s'] - m2_s + m1_s
+
+                    if n_src_s >= GPU_MEM_SIZE - 1e-6 or n_tgt_s >= GPU_MEM_SIZE - 1e-6:
+                        continue
+
+                    n_src_l = src['l'] - m1_l + m2_l
+                    n_tgt_l = tgt['l'] - m2_l + m1_l
+
+                    n_src_kvpr = get_kvpr(n_src_l, n_src_s)
+                    n_tgt_kvpr = get_kvpr(n_tgt_l, n_tgt_s)
+
+                    local_max = max(n_src_kvpr, n_tgt_kvpr)
+
+                    if local_max < best_new_max - 1e-6:
+                        best_new_max = local_max
+                        best_move = ('swap', m1_i, tgt_idx, m2_i)
+
+        if best_move:
+            if best_move[0] == 'move':
+                _, m_i, t_idx = best_move
+                m = gpu_states[max_idx]['models'].pop(m_i)
+                gpu_states[max_idx]['l'] -= (m.req_rate/m.slo)
+                gpu_states[max_idx]['s'] -= m.model_size
+
+                gpu_states[t_idx]['models'].append(m)
+                gpu_states[t_idx]['l'] += (m.req_rate/m.slo)
+                gpu_states[t_idx]['s'] += m.model_size
+
+            elif best_move[0] == 'swap':
+                _, m1_i, t_idx, m2_i = best_move
+                m1 = gpu_states[max_idx]['models'][m1_i]
+                m2 = gpu_states[t_idx]['models'][m2_i]
+
+                gpu_states[max_idx]['models'][m1_i] = m2
+                gpu_states[t_idx]['models'][m2_i] = m1
+
+                diff_l = (m2.req_rate/m2.slo) - (m1.req_rate/m1.slo)
+                diff_s = m2.model_size - m1.model_size
+
+                gpu_states[max_idx]['l'] += diff_l
+                gpu_states[max_idx]['s'] += diff_s
+                gpu_states[t_idx]['l'] -= diff_l
+                gpu_states[t_idx]['s'] -= diff_s
+        else:
+            break
+
+    return {i: gpu_states[i]['models'] for i in range(gpu_num)}
+
+# EVOLVE-BLOCK-END
+
+
+def run_placement(gpu_num, models):
+    """
+    Main entry point that will be called by the evaluator.
+
+    Args:
+        gpu_num: Number of GPUs
+        models: List of models to place
+
+    Returns:
+        Dictionary containing GPU placements
+    """
+    return compute_model_placement(gpu_num, models)
+
+
+if __name__ == "__main__":
+    # Test the algorithm
+    import os
+    import sys
+
+    # Add the openevolve_examples directory to the path to import evaluator
+    def find_repo_root(start_path):
+        """Find the repository root by looking for openevolve_examples directory."""
+        current = os.path.abspath(start_path)
+        while current != os.path.dirname(current):  # Stop at filesystem root
+            if os.path.exists(os.path.join(current, 'openevolve_examples', 'prism')):
+                return current
+            current = os.path.dirname(current)
+        raise RuntimeError("Could not find openevolve_examples directory")
+
+    repo_root = find_repo_root(os.path.dirname(__file__))
+    sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'prism'))
+
+    from evaluator import generate_test_gpu_models, calculate_kvcache_pressure, safe_float
+    import numpy as np
+
+    test_cases = generate_test_gpu_models()
+    all_kvpr = []
+    for i, (gpu_num, gpu_models) in enumerate(test_cases):
+        results = compute_model_placement(gpu_num, gpu_models)
+        max_kvpr = calculate_kvcache_pressure(results)
+        all_kvpr.append(safe_float(max_kvpr))
+
+    avg_kvpr = np.mean(all_kvpr)
+    if avg_kvpr != 0:
+        avg_kvpr = 1.0 / avg_kvpr
+
+    print(f"Max KVPR: {avg_kvpr:.3f}")

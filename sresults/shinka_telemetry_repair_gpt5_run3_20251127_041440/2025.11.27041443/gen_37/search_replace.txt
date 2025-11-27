@@ -1,0 +1,486 @@
+<NAME>
+adaptive_router_tiers_and_confidence_tuning
+</NAME>
+
+<DESCRIPTION>
+I propose three focused improvements to boost counter accuracy while keeping confidence calibration reliable:
+
+1) Adaptive router imbalance tolerance and two-tier, targeted scaling:
+   - Replace the fixed router tolerance (TAU_ROUTER) with an adaptive function tau_router(n_active) that tightens or loosens tolerance based on the number of active interfaces at a router.
+   - Adjust router projection to use a two-tier correction strategy that first scales only low-confidence interfaces (<0.70) with slightly wider clip (up to 12%), then, if needed, scales moderate-confidence interfaces (0.70–0.85) with a tighter clip (up to 10%). Each interface’s contribution is capped to ≤50% of the total correction to avoid dominance and improve calibration. Residual imbalance is closed with a small uniform damped scaling if necessary.
+
+2) Safer post-projection re-sync:
+   - Attenuate the nudge factor by local router imbalance to avoid double-adjustments when the router itself is still imbalanced, improving both flow conservation and calibration.
+
+3) Calibration refinements and robust soft-zero:
+   - Apply mild penalties to confidence when a direction is strongly scaled (≥10%), and boost confidence slightly when a direction changes <1% and final symmetry is good.
+   - Gate the soft-zero snap-to-zero rule by adjacent routers’ adaptive imbalance thresholds to prevent incorrect zeroing when routers are still imbalanced.
+
+These changes are minimal, self-contained, and leverage topology to refine flow-conservative repairs while aligning confidence to the magnitude and quality of corrections.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def tau_h_dir(v1: float, v2: float, c1: float = None, c2: float = None) -> float:
+        """
+        Adaptive hardening tolerance:
+        - 1.5% when both directions are high-rate (>100 Mbps) and confidences (if provided) are high (>=0.8)
+        - 3% when either direction is low-rate (<1 Mbps) or any confidence is low (<0.7)
+        - 2% baseline otherwise
+        """
+        high = (v1 > 100.0 and v2 > 100.0)
+        low = (v1 < 1.0 or v2 < 1.0)
+        high_conf = (c1 is not None and c2 is not None and c1 >= 0.8 and c2 >= 0.8)
+        low_conf = (c1 is not None and c2 is not None and (c1 < 0.7 or c2 < 0.7))
+        if high and high_conf:
+            return 0.015
+        if low or low_conf:
+            return 0.03
+        return 0.02
+=======
+    def tau_h_dir(v1: float, v2: float, c1: float = None, c2: float = None) -> float:
+        """
+        Adaptive hardening tolerance:
+        - 1.5% when both directions are high-rate (>100 Mbps) and confidences (if provided) are high (>=0.8)
+        - 3% when either direction is low-rate (<1 Mbps) or any confidence is low (<0.7)
+        - 2% baseline otherwise
+        """
+        high = (v1 > 100.0 and v2 > 100.0)
+        low = (v1 < 1.0 or v2 < 1.0)
+        high_conf = (c1 is not None and c2 is not None and c1 >= 0.8 and c2 >= 0.8)
+        low_conf = (c1 is not None and c2 is not None and (c1 < 0.7 or c2 < 0.7))
+        if high and high_conf:
+            return 0.015
+        if low or low_conf:
+            return 0.03
+        return 0.02
+
+    def tau_router(n_active: int) -> float:
+        """
+        Adaptive router imbalance tolerance based on number of active interfaces.
+        0.05 * sqrt(2 / max(2, n_active)) clamped to [0.03, 0.07].
+        """
+        base = 0.05 * math.sqrt(2.0 / max(2, n_active))
+        return max(0.03, min(0.07, base))
+
+    def router_imbalance(router_id: str) -> float:
+        """
+        Compute current router imbalance using hardened rates.
+        """
+        if not router_id or router_id not in router_ifaces:
+            return 0.0
+        ifs = router_ifaces[router_id]
+        stx = sum(hard_tx.get(i, 0.0) for i in ifs)
+        srx = sum(hard_rx.get(i, 0.0) for i in ifs)
+        return rel_diff(stx, srx)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    for router, if_list in router_ifaces.items():
+        # Ignore trivial routers
+        if len(if_list) <= 1:
+            router_imbalance_before[router] = 0.0
+            continue
+
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        mismatch = rel_diff(sum_tx, sum_rx)
+        router_imbalance_before[router] = mismatch
+
+        if max(sum_tx, sum_rx) < EPS:
+            continue  # nothing to project
+
+        if mismatch > TAU_ROUTER:
+            # Choose side with lower aggregate link confidence to adjust
+            c_tx_total = sum(conf_tx_link.get(i, 0.5) for i in if_list)
+            c_rx_total = sum(conf_rx_link.get(i, 0.5) for i in if_list)
+            adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+
+            if adjust_side == "tx" and sum_tx > 0:
+                # Targeted scaling on low-confidence, active interfaces
+                vals = [hard_tx.get(i, 0.0) for i in if_list]
+                confs = [conf_tx_link.get(i, 0.6) for i in if_list]
+                weights = []
+                for v, c in zip(vals, confs):
+                    # Lower confidence and larger rate => more adjustable
+                    w = max(0.0, (1.0 - clamp01(c)) * (v if v >= ZERO_THRESH else 0.0))
+                    weights.append(w)
+                denom = sum(v * w for v, w in zip(vals, weights))
+                target = sum_rx
+                current = sum_tx
+                delta = target - current
+                if denom < EPS:
+                    # Fallback to uniform damped scaling
+                    alpha = target / max(current, EPS)
+                    alpha = max(0.85, min(1.15, alpha))
+                    alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                    for i in if_list:
+                        hard_tx[i] *= alpha_eff
+                        scaled_tx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_tx[i] = True
+                else:
+                    k = delta / denom
+                    for idx, i in enumerate(if_list):
+                        v = vals[idx]
+                        w = weights[idx]
+                        if v < EPS or w <= 0.0:
+                            continue
+                        # Damped, clipped per-interface scaling
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(1.10, scale_i))
+                        hard_tx[i] = v * scale_i
+                        scaled_tx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_tx[i] = True
+            elif adjust_side == "rx" and sum_rx > 0:
+                vals = [hard_rx.get(i, 0.0) for i in if_list]
+                confs = [conf_rx_link.get(i, 0.6) for i in if_list]
+                weights = []
+                for v, c in zip(vals, confs):
+                    w = max(0.0, (1.0 - clamp01(c)) * (v if v >= ZERO_THRESH else 0.0))
+                    weights.append(w)
+                denom = sum(v * w for v, w in zip(vals, weights))
+                target = sum_tx
+                current = sum_rx
+                delta = target - current
+                if denom < EPS:
+                    alpha = target / max(current, EPS)
+                    alpha = max(0.85, min(1.15, alpha))
+                    alpha_eff = 1.0 + 0.6 * (alpha - 1.0)
+                    for i in if_list:
+                        hard_rx[i] *= alpha_eff
+                        scaled_rx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_rx[i] = True
+                else:
+                    k = delta / denom
+                    for idx, i in enumerate(if_list):
+                        v = vals[idx]
+                        w = weights[idx]
+                        if v < EPS or w <= 0.0:
+                            continue
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(1.10, scale_i))
+                        hard_rx[i] = v * scale_i
+                        scaled_rx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_rx[i] = True
+=======
+    for router, if_list in router_ifaces.items():
+        # Ignore trivial routers
+        if len(if_list) <= 1:
+            router_imbalance_before[router] = 0.0
+            continue
+
+        sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+        sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+        mismatch = rel_diff(sum_tx, sum_rx)
+        router_imbalance_before[router] = mismatch
+
+        if max(sum_tx, sum_rx) < EPS:
+            continue  # nothing to project
+
+        # Adaptive router tolerance based on number of active interfaces
+        n_active_tx = sum(1 for i in if_list if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+        n_active_rx = sum(1 for i in if_list if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+        TAU_ROUTER_LOCAL = tau_router(max(n_active_tx, n_active_rx))
+
+        if mismatch > TAU_ROUTER_LOCAL:
+            # Choose side with lower aggregate link confidence to adjust
+            c_tx_total = sum(conf_tx_link.get(i, 0.5) for i in if_list)
+            c_rx_total = sum(conf_rx_link.get(i, 0.5) for i in if_list)
+            adjust_side = "tx" if c_tx_total < c_rx_total else "rx"
+
+            if adjust_side == "tx" and sum_tx > 0:
+                target = sum_rx
+                current = sum_tx
+                delta = target - current
+
+                # Tiered targeted scaling helpers for TX
+                def apply_tier_tx(conf_lo: float, conf_hi: float, clip_hi: float, delta_in: float) -> float:
+                    elig = []
+                    for i in if_list:
+                        v = hard_tx.get(i, 0.0)
+                        c = clamp01(conf_tx_link.get(i, 0.6))
+                        if v >= ZERO_THRESH and conf_lo <= c < conf_hi:
+                            elig.append(i)
+                    if not elig:
+                        return delta_in
+                    weights = {i: (1.0 - clamp01(conf_tx_link.get(i, 0.6))) * hard_tx.get(i, 0.0) for i in elig}
+                    denom = sum(hard_tx.get(i, 0.0) * weights[i] for i in elig)
+                    if denom < EPS:
+                        return delta_in
+                    k = delta_in / (0.6 * denom)
+                    applied = 0.0
+                    cap_abs = 0.5 * abs(delta_in) if len(elig) >= 2 else None
+                    for i in elig:
+                        v = hard_tx.get(i, 0.0)
+                        w = weights[i]
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(clip_hi, scale_i))
+                        change_i = v * (scale_i - 1.0)
+                        if cap_abs is not None and abs(change_i) > cap_abs:
+                            scale_i = 1.0 + math.copysign(cap_abs, change_i) / max(v, EPS)
+                            change_i = v * (scale_i - 1.0)
+                        hard_tx[i] = v * scale_i
+                        scaled_tx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_tx[i] = True
+                        applied += change_i
+                    return delta_in - applied
+
+                # Tier 1: low confidence < 0.70 with slightly wider clip to 1.12
+                delta = apply_tier_tx(conf_lo=-1.0, conf_hi=0.70, clip_hi=1.12, delta_in=delta)
+                # Recompute residual
+                sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+                sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+                current = sum_tx
+                target = sum_rx
+                side_mag = max(current, target, EPS)
+
+                # Tier 2: moderate confidence [0.70, 0.85) if residual still significant
+                if abs(delta) > 0.5 * TAU_ROUTER_LOCAL * side_mag:
+                    delta = apply_tier_tx(conf_lo=0.70, conf_hi=0.85, clip_hi=1.10, delta_in=delta)
+
+                # Final small uniform damped scaling if imbalance persists
+                sum_tx2 = sum(hard_tx.get(i, 0.0) for i in if_list)
+                sum_rx2 = sum(hard_rx.get(i, 0.0) for i in if_list)
+                if rel_diff(sum_tx2, sum_rx2) > TAU_ROUTER_LOCAL and sum_tx2 > 0:
+                    alpha = sum_rx2 / max(sum_tx2, EPS)
+                    alpha = max(0.95, min(1.05, alpha))
+                    alpha_eff = 1.0 + 0.4 * (alpha - 1.0)
+                    for i in if_list:
+                        v = hard_tx.get(i, 0.0)
+                        if v < ZERO_THRESH:
+                            continue
+                        hard_tx[i] = v * alpha_eff
+                        scaled_tx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_tx_link[i] *= clamp01(1.0 - 0.3 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_tx[i] = True
+
+            elif adjust_side == "rx" and sum_rx > 0:
+                target = sum_tx
+                current = sum_rx
+                delta = target - current
+
+                # Tiered targeted scaling helpers for RX
+                def apply_tier_rx(conf_lo: float, conf_hi: float, clip_hi: float, delta_in: float) -> float:
+                    elig = []
+                    for i in if_list:
+                        v = hard_rx.get(i, 0.0)
+                        c = clamp01(conf_rx_link.get(i, 0.6))
+                        if v >= ZERO_THRESH and conf_lo <= c < conf_hi:
+                            elig.append(i)
+                    if not elig:
+                        return delta_in
+                    weights = {i: (1.0 - clamp01(conf_rx_link.get(i, 0.6))) * hard_rx.get(i, 0.0) for i in elig}
+                    denom = sum(hard_rx.get(i, 0.0) * weights[i] for i in elig)
+                    if denom < EPS:
+                        return delta_in
+                    k = delta_in / (0.6 * denom)
+                    applied = 0.0
+                    cap_abs = 0.5 * abs(delta_in) if len(elig) >= 2 else None
+                    for i in elig:
+                        v = hard_rx.get(i, 0.0)
+                        w = weights[i]
+                        scale_i = 1.0 + 0.6 * (k * w)
+                        scale_i = max(0.90, min(clip_hi, scale_i))
+                        change_i = v * (scale_i - 1.0)
+                        if cap_abs is not None and abs(change_i) > cap_abs:
+                            scale_i = 1.0 + math.copysign(cap_abs, change_i) / max(v, EPS)
+                            change_i = v * (scale_i - 1.0)
+                        hard_rx[i] = v * scale_i
+                        scaled_rx_factor[i] *= scale_i
+                        penalty = clamp01(abs(scale_i - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.4 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_rx[i] = True
+                        applied += change_i
+                    return delta_in - applied
+
+                # Tier 1: low confidence < 0.70 with slightly wider clip to 1.12
+                delta = apply_tier_rx(conf_lo=-1.0, conf_hi=0.70, clip_hi=1.12, delta_in=delta)
+                # Recompute residual
+                sum_tx = sum(hard_tx.get(i, 0.0) for i in if_list)
+                sum_rx = sum(hard_rx.get(i, 0.0) for i in if_list)
+                current = sum_rx
+                target = sum_tx
+                side_mag = max(current, target, EPS)
+
+                # Tier 2: moderate confidence [0.70, 0.85) if residual still significant
+                if abs(delta) > 0.5 * TAU_ROUTER_LOCAL * side_mag:
+                    delta = apply_tier_rx(conf_lo=0.70, conf_hi=0.85, clip_hi=1.10, delta_in=delta)
+
+                # Final small uniform damped scaling if imbalance persists
+                sum_tx2 = sum(hard_tx.get(i, 0.0) for i in if_list)
+                sum_rx2 = sum(hard_rx.get(i, 0.0) for i in if_list)
+                if rel_diff(sum_tx2, sum_rx2) > TAU_ROUTER_LOCAL and sum_rx2 > 0:
+                    alpha = sum_tx2 / max(sum_rx2, EPS)
+                    alpha = max(0.95, min(1.05, alpha))
+                    alpha_eff = 1.0 + 0.4 * (alpha - 1.0)
+                    for i in if_list:
+                        v = hard_rx.get(i, 0.0)
+                        if v < ZERO_THRESH:
+                            continue
+                        hard_rx[i] = v * alpha_eff
+                        scaled_rx_factor[i] *= alpha_eff
+                        penalty = clamp01(abs(alpha_eff - 1.0))
+                        conf_rx_link[i] *= clamp01(1.0 - 0.3 * penalty)
+                        if penalty > 0.08:
+                            strong_scaled_rx[i] = True
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if ca < cb:
+                # Nudge lower-confidence side proportionally to confidence gap
+                f = min(0.4, max(0.0, cb - ca))
+                hard_tx[a] = (1.0 - f) * tx_a + f * mean_ab
+                conf_tx_link[a] *= 0.95
+            elif cb < ca:
+                f = min(0.4, max(0.0, ca - cb))
+                hard_rx[b] = (1.0 - f) * rx_b + f * mean_ab
+                conf_rx_link[b] *= 0.95
+=======
+            if ca < cb:
+                # Nudge lower-confidence side proportionally to confidence gap
+                f = min(0.4, max(0.0, cb - ca))
+                # Attenuate by local router imbalance to avoid double-adjustment
+                att = clamp01(1.0 - router_imbalance(router_of.get(a, "")))
+                f *= att
+                hard_tx[a] = (1.0 - f) * tx_a + f * mean_ab
+                conf_tx_link[a] *= 0.95
+            elif cb < ca:
+                f = min(0.4, max(0.0, ca - cb))
+                att = clamp01(1.0 - router_imbalance(router_of.get(b, "")))
+                f *= att
+                hard_rx[b] = (1.0 - f) * rx_b + f * mean_ab
+                conf_rx_link[b] *= 0.95
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+            if cb_tx < ca_rx:
+                f = min(0.4, max(0.0, ca_rx - cb_tx))
+                hard_tx[b] = (1.0 - f) * tx_b + f * mean_ba
+                conf_tx_link[b] *= 0.95
+            elif ca_rx < cb_tx:
+                f = min(0.4, max(0.0, cb_tx - ca_rx))
+                hard_rx[a] = (1.0 - f) * rx_a + f * mean_ba
+                conf_rx_link[a] *= 0.95
+=======
+            if cb_tx < ca_rx:
+                f = min(0.4, max(0.0, ca_rx - cb_tx))
+                att = clamp01(1.0 - router_imbalance(router_of.get(b, "")))
+                f *= att
+                hard_tx[b] = (1.0 - f) * tx_b + f * mean_ba
+                conf_tx_link[b] *= 0.95
+            elif ca_rx < cb_tx:
+                f = min(0.4, max(0.0, cb_tx - ca_rx))
+                att = clamp01(1.0 - router_imbalance(router_of.get(a, "")))
+                f *= att
+                hard_rx[a] = (1.0 - f) * rx_a + f * mean_ba
+                conf_rx_link[a] *= 0.95
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        if max(tx_a, rx_b, tx_b, rx_a) < 2.0 * ZERO_THRESH:
+            hard_tx[a] = 0.0
+            hard_rx[b] = 0.0
+            hard_tx[b] = 0.0
+            hard_rx[a] = 0.0
+            conf_tx_link[a] = max(conf_tx_link.get(a, 0.6), 0.95)
+            conf_rx_link[b] = max(conf_rx_link.get(b, 0.6), 0.95)
+            conf_tx_link[b] = max(conf_tx_link.get(b, 0.6), 0.95)
+            conf_rx_link[a] = max(conf_rx_link.get(a, 0.6), 0.95)
+=======
+        if max(tx_a, rx_b, tx_b, rx_a) < 2.0 * ZERO_THRESH:
+            ra = router_of.get(a)
+            rb = router_of.get(b)
+
+            def tau_for_router(rid: str) -> float:
+                if rid not in router_ifaces:
+                    return 0.05
+                ifs = router_ifaces[rid]
+                n_tx = sum(1 for i in ifs if hard_tx.get(i, 0.0) >= ZERO_THRESH)
+                n_rx = sum(1 for i in ifs if hard_rx.get(i, 0.0) >= ZERO_THRESH)
+                return tau_router(max(n_tx, n_rx))
+
+            if router_imbalance(ra) <= tau_for_router(ra) and router_imbalance(rb) <= tau_for_router(rb):
+                hard_tx[a] = 0.0
+                hard_rx[b] = 0.0
+                hard_tx[b] = 0.0
+                hard_rx[a] = 0.0
+                conf_tx_link[a] = max(conf_tx_link.get(a, 0.6), 0.95)
+                conf_rx_link[b] = max(conf_rx_link.get(b, 0.6), 0.95)
+                conf_tx_link[b] = max(conf_tx_link.get(b, 0.6), 0.95)
+                conf_rx_link[a] = max(conf_rx_link.get(a, 0.6), 0.95)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        conf_tx_final = clamp01(
+            0.23 * base_tx_conf +
+            0.20 * red_tx +
+            0.27 * fin_sym_tx +
+            0.10 * ch_tx +
+            0.10 * router_factor_after +
+            0.10 * scale_tx_term
+        )
+        conf_rx_final = clamp01(
+            0.23 * base_rx_conf +
+            0.20 * red_rx +
+            0.27 * fin_sym_rx +
+            0.10 * ch_rx +
+            0.10 * router_factor_after +
+            0.10 * scale_rx_term
+        )
+=======
+        conf_tx_final = clamp01(
+            0.23 * base_tx_conf +
+            0.20 * red_tx +
+            0.27 * fin_sym_tx +
+            0.10 * ch_tx +
+            0.10 * router_factor_after +
+            0.10 * scale_tx_term
+        )
+        conf_rx_final = clamp01(
+            0.23 * base_rx_conf +
+            0.20 * red_rx +
+            0.27 * fin_sym_rx +
+            0.10 * ch_rx +
+            0.10 * router_factor_after +
+            0.10 * scale_rx_term
+        )
+
+        # Confidence refinements: clip-hit penalty and untouched boost
+        if abs(scaled_tx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_tx_final *= 0.95
+        if abs(scaled_rx_factor.get(if_id, 1.0) - 1.0) >= 0.10:
+            conf_rx_final *= 0.95
+        if change_tx < 0.01 and fin_sym_tx >= (1.0 - TAU_H):
+            conf_tx_final = min(0.98, conf_tx_final + 0.02)
+        if change_rx < 0.01 and fin_sym_rx >= (1.0 - TAU_H):
+            conf_rx_final = min(0.98, conf_rx_final + 0.02)
+>>>>>>> REPLACE
+</DIFF>

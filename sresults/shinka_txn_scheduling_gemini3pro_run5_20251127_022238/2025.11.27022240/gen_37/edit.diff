@@ -1,0 +1,367 @@
+--- a/original.py
++++ b/original.py
+@@ -1,296 +1,314 @@
+ # EVOLVE-BLOCK-START
+ """Transaction scheduling algorithm for optimizing makespan across multiple workloads"""
+ 
+ import time
+ import random
+ import sys
+ import os
+ import math
+ 
+ # Add the openevolve_examples directory to the path to import txn_simulator and workloads
+ # Find the repository root by looking for the openevolve_examples directory
+ def find_repo_root(start_path):
+     """Find the repository root by looking for openevolve_examples directory."""
+     current = os.path.abspath(start_path)
+     # Search up the directory tree
+     while current != os.path.dirname(current):  # Stop at filesystem root
+         candidate = os.path.join(current, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return current
+         current = os.path.dirname(current)
+ 
+     # If not found by searching up, try common locations relative to known paths
+     # This handles when the program is copied to a results directory
+     script_dir = os.path.dirname(os.path.abspath(__file__))
+     possible_roots = [
+         script_dir,  # Current directory
+         os.path.dirname(script_dir),  # Parent
+         os.path.dirname(os.path.dirname(script_dir)),  # Grandparent
+         '/home/ubuntu/ShinkaEvolve',  # Absolute path fallback for Ubuntu
+         '/Users/audreycc/Documents/Work/LLMTxn/ADRS-Exps/ShinkaEvolve',  # Absolute path fallback for macOS
+     ]
+     for root in possible_roots:
+         candidate = os.path.join(root, 'openevolve_examples', 'txn_scheduling')
+         if os.path.exists(candidate):
+             return root
+ 
+     raise RuntimeError(f"Could not find openevolve_examples directory. Searched from: {start_path}")
+ 
+ repo_root = find_repo_root(os.path.dirname(__file__))
+ sys.path.insert(0, os.path.join(repo_root, 'openevolve_examples', 'txn_scheduling'))
+ 
+ from txn_simulator import Workload
+ from workloads import WORKLOAD_1, WORKLOAD_2, WORKLOAD_3
+ 
+ 
+ def get_best_schedule(workload, num_seqs):
+     """
+     Get optimal schedule using Exhaustive Beam Search followed by
+     Adaptive Simulated Annealing with Stagnation-Triggered Ruin-and-Recreate.
+     """
+     # --- Hyperparameters ---
+     BEAM_WIDTH = 4
+ 
+     # SA Parameters
+     SA_ITERATIONS = 5500
+     SA_COOLING_RATE = 0.9985
+     SA_START_TEMP_RATIO = 0.05
+ 
+     # Ruin-and-Recreate (Kick) Parameters
+     STAGNATION_LIMIT = 400
+     KICK_BLOCK_SIZE_MIN = 3
+     KICK_BLOCK_SIZE_MAX = 8
+ 
+     # Adaptive Operator Weights
+     # Weights: 'insert' is critical for dependency resolution, so it gets higher weight
+     OP_WEIGHTS = {'swap': 2.0, 'insert': 10.0, 'reverse': 1.0, 'block_move': 2.0}
+     OP_MIN_WEIGHT = 1.0
+     OP_ADAPTATION_RATE = 0.2
+ 
+     # --- Cost Cache ---
+     cost_cache = {}
+ 
+     def get_cost(seq):
+         t_seq = tuple(seq)
+         if t_seq in cost_cache:
+             return cost_cache[t_seq]
+         c = workload.get_opt_seq_cost(seq)
+         cost_cache[t_seq] = c
+         return c
+ 
++    # --- Pre-calculation: Transaction Weights ---
++    # Used for tie-breaking in Beam Search (prefer packing heavier txns first)
++    txn_weights = {}
++    for t in range(workload.num_txns):
++        txn_weights[t] = get_cost([t])
++
+     # --- Phase 1: Exhaustive Beam Search Construction ---
+     # Initialize beam
+     candidates = []
+     for t in range(workload.num_txns):
+         seq = [t]
+         cost = get_cost(seq)
+-        # Store rem as set for O(1) removal, though copying takes time.
+-        # Beam is small, so list operations are fine. Using set for clarity in logic.
+-        candidates.append({'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
+-
+-    candidates.sort(key=lambda x: x['cost'])
++        # Score minimizes cost, then maximizes weight (subtracted)
++        score = cost - (1e-5 * txn_weights[t])
++        candidates.append({'score': score, 'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
++
++    candidates.sort(key=lambda x: x['score'])
+     beam = candidates[:BEAM_WIDTH]
+ 
+     # Iteratively build schedule
+     for _ in range(workload.num_txns - 1):
+         next_candidates = []
+ 
+         for node in beam:
+             p_seq = node['seq']
+             p_rem = node['rem']
+ 
+             # Exhaustive expansion
+             for cand in p_rem:
+                 new_seq = p_seq + [cand]
+                 new_cost = get_cost(new_seq)
+-                next_candidates.append((new_cost, new_seq, p_rem, cand))
+-
+-        # Sort by cost to keep best
++
++                # Tie-breaker: prefer heavier transactions if makespan is similar
++                # This prioritizes packing "large rocks" into zero-cost slots
++                score = new_cost - (1e-5 * txn_weights[cand])
++
++                next_candidates.append((score, new_cost, new_seq, p_rem, cand))
++
++        # Sort by score to keep best
+         next_candidates.sort(key=lambda x: x[0])
+ 
+         new_beam = []
+-        for c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
++        for _, c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+             if len(new_beam) >= BEAM_WIDTH:
+                 break
+ 
+             new_rem = c_parent_rem.copy()
+             new_rem.remove(c_cand)
+-            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
++            new_beam.append({'score': _, 'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+ 
+         beam = new_beam
+ 
+     if not beam:
+         return float('inf'), []
+ 
+     current_schedule = beam[0]['seq']
+     current_cost = beam[0]['cost']
+ 
+     # --- Phase 2: Adaptive SA with Ruin-and-Recreate ---
+     best_schedule = list(current_schedule)
+     best_cost = current_cost
+ 
+     T = current_cost * SA_START_TEMP_RATIO
+     ops = list(OP_WEIGHTS.keys())
+ 
+     steps_since_imp = 0
+ 
+     for it in range(SA_ITERATIONS):
+         # 1. Stagnation Check -> Ruin-and-Recreate (Kick)
+         if steps_since_imp > STAGNATION_LIMIT:
+-            # Perform Kick: Remove random block and greedy re-insert
++            # Perform Kick: Multi-Segment Ruin
+             kick_seq = list(best_schedule) # Intensify around best found
+-            n = len(kick_seq)
+-
+-            b_size = random.randint(KICK_BLOCK_SIZE_MIN, KICK_BLOCK_SIZE_MAX)
+-            if n > b_size:
+-                start = random.randint(0, n - b_size)
+-                removed_block = kick_seq[start : start + b_size]
+-                del kick_seq[start : start + b_size]
+-
+-                # Greedy Best-Fit Insertion for each item in the block
+-                for item in removed_block:
+-                    best_pos = -1
+-                    min_c = float('inf')
+-
+-                    # Try all positions
+-                    for i in range(len(kick_seq) + 1):
+-                        kick_seq.insert(i, item)
+-                        c = get_cost(kick_seq)
+-                        if c < min_c:
+-                            min_c = c
+-                            best_pos = i
+-                        kick_seq.pop(i)
+-
+-                    kick_seq.insert(best_pos, item)
+-
+-                # Update current state to the result of the kick
+-                current_schedule = kick_seq
+-                current_cost = min_c
+-
+-                if current_cost < best_cost:
+-                    best_cost = current_cost
+-                    best_schedule = list(current_schedule)
+-                    steps_since_imp = 0
+-                else:
+-                    # Reset counter to give the new state a chance
+-                    steps_since_imp = 0
+-
+-                # Reheat temperature slightly to allow local settling
+-                T = max(T, current_cost * 0.02)
+-                continue
++            removed_items = []
++
++            # Remove 2 disjoint blocks to allow teleporting transactions across the schedule
++            for _ in range(2):
++                n_curr = len(kick_seq)
++                if n_curr > KICK_BLOCK_SIZE_MIN:
++                    b_size = random.randint(KICK_BLOCK_SIZE_MIN, min(n_curr, KICK_BLOCK_SIZE_MAX))
++                    if n_curr > b_size:
++                        start = random.randint(0, n_curr - b_size)
++                        removed_items.extend(kick_seq[start : start + b_size])
++                        del kick_seq[start : start + b_size]
++
++            # Shuffle removed items to avoid bias from original order
++            random.shuffle(removed_items)
++
++            # Greedy Best-Fit Insertion for each removed item
++            for item in removed_items:
++                best_pos = -1
++                min_c = float('inf')
++
++                # Try all positions in the partial schedule
++                for i in range(len(kick_seq) + 1):
++                    kick_seq.insert(i, item)
++                    c = get_cost(kick_seq)
++                    if c < min_c:
++                        min_c = c
++                        best_pos = i
++                    kick_seq.pop(i)
++
++                kick_seq.insert(best_pos, item)
++
++            # Update current state to the result of the kick
++            current_schedule = kick_seq
++            current_cost = min_c
++
++            if current_cost < best_cost:
++                best_cost = current_cost
++                best_schedule = list(current_schedule)
++                steps_since_imp = 0
++            else:
++                # Reset counter to give the new state a chance
++                steps_since_imp = 0
++
++            # Reheat temperature slightly to allow local settling
++            T = max(T, current_cost * 0.02)
++            continue
+ 
+         # 2. Select Operator
+         total_w = sum(OP_WEIGHTS.values())
+         r = random.uniform(0, total_w)
+         cum = 0
+         op = ops[0]
+         for o in ops:
+             cum += OP_WEIGHTS[o]
+             if r <= cum:
+                 op = o
+                 break
+ 
+         neighbor = list(current_schedule)
+         n = len(neighbor)
+ 
+         if op == 'swap':
+             i, j = random.sample(range(n), 2)
+             neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+         elif op == 'insert':
+             i = random.randint(0, n - 1)
+             val = neighbor.pop(i)
+             j = random.randint(0, n - 1)
+             neighbor.insert(j, val)
+         elif op == 'reverse':
+             i, j = sorted(random.sample(range(n), 2))
+             neighbor[i:j+1] = neighbor[i:j+1][::-1]
+         elif op == 'block_move':
+             b_size = random.randint(2, 6)
+             if n > b_size:
+                 i = random.randint(0, n - b_size)
+                 block = neighbor[i:i+b_size]
+                 del neighbor[i:i+b_size]
+                 j = random.randint(0, len(neighbor))
+                 neighbor[j:j] = block
+ 
+         new_cost = get_cost(neighbor)
+         delta = new_cost - current_cost
+ 
+         # 3. Acceptance
+         accept = False
+         if delta < 0:
+             accept = True
+             if new_cost < best_cost:
+                 best_cost = new_cost
+                 best_schedule = list(neighbor)
+                 steps_since_imp = 0
+             else:
+                 steps_since_imp += 1
+         else:
+             steps_since_imp += 1
+             if T > 1e-9 and random.random() < math.exp(-delta / T):
+                 accept = True
+ 
+         if accept:
+             current_schedule = neighbor
+             current_cost = new_cost
+ 
+         # 4. Adapt Weights
+         reward = 0.1
+         if delta < 0:
+             reward = 1.0 if new_cost >= best_cost else 2.0
+ 
+         OP_WEIGHTS[op] = (1 - OP_ADAPTATION_RATE) * OP_WEIGHTS[op] + OP_ADAPTATION_RATE * (OP_MIN_WEIGHT + reward)
+ 
+         # 5. Cooling
+         T *= SA_COOLING_RATE
+ 
+     return best_cost, best_schedule
+ 
+ 
+ def get_random_costs():
+     """
+     Evaluate scheduling algorithm on three different workloads.
+ 
+     Returns:
+         Tuple of (total_makespan, list_of_schedules, execution_time)
+     """
+     start_time = time.time()
+     workload_size = 100
+ 
+     # Workload 1: Complex mixed read/write transactions
+     workload = Workload(WORKLOAD_1)
+     makespan1, schedule1 = get_best_schedule(workload, 10)
+     cost1 = workload.get_opt_seq_cost(schedule1)
+ 
+     # Workload 2: Simple read-then-write pattern
+     workload2 = Workload(WORKLOAD_2)
+     makespan2, schedule2 = get_best_schedule(workload2, 10)
+     cost2 = workload2.get_opt_seq_cost(schedule2)
+ 
+     # Workload 3: Minimal read/write operations
+     workload3 = Workload(WORKLOAD_3)
+     makespan3, schedule3 = get_best_schedule(workload3, 10)
+     cost3 = workload3.get_opt_seq_cost(schedule3)
+ 
+     total_makespan = cost1 + cost2 + cost3
+     schedules = [schedule1, schedule2, schedule3]
+     execution_time = time.time() - start_time
+ 
+     return total_makespan, schedules, execution_time
+ 
+ 
+ # EVOLVE-BLOCK-END
+ 
+ 
+ # This part remains fixed (not evolved)
+ def run_scheduling():
+     """Run the transaction scheduling algorithm for all workloads"""
+     total_makespan, schedules, execution_time = get_random_costs()
+     return total_makespan, schedules, execution_time
+ 
+ 
+ if __name__ == "__main__":
+     total_makespan, schedules, execution_time = run_scheduling()
+     print(f"Total makespan: {total_makespan}, Execution time: {execution_time:.4f}s")
+     print(f"Individual workload costs: {[workload.get_opt_seq_cost(schedule) for workload, schedule in zip([Workload(WORKLOAD_1), Workload(WORKLOAD_2), Workload(WORKLOAD_3)], schedules)]}")

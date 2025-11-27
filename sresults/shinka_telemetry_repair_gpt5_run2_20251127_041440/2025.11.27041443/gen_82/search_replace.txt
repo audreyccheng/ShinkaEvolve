@@ -1,0 +1,360 @@
+<NAME>
+magnitude_aware_pair_and_micro_fix
+</NAME>
+
+<DESCRIPTION>
+I propose three targeted improvements aligned with the Hodor principles to boost counter repair accuracy and confidence calibration without harming status repairs:
+
+1) Magnitude-aware, partial consensus for link pairs:
+   - Add absolute guards and low-rate relative thresholds to prevent over-correction on tiny flows.
+   - Use partial averaging that ramps with violation severity; penalize confidence by applied change magnitude.
+   This improves counter accuracy and calibrates confidence, especially on small or near-threshold discrepancies.
+
+2) Router-level micro-adjustments instead of proportional distribution:
+   - Replace the proportional correction on dangling interfaces with benefit-checked micro-fixes that adjust only the dominant contributor, with guards on internal skew and a possible second mini-step.
+   This better respects flow conservation (R1) while avoiding large, diffuse changes that harm calibration.
+
+3) Direction-aware confidence scaling by router residuals:
+   - Penalize TX more by the local router residual and RX more by the remote residual, improving calibration.
+
+These changes are minimal and localized: constants and helpers added, pairwise hardening refined, router balancing swapped for guarded micro-fixes, and final confidence penalties made direction-aware.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+
+    def norm_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(a, b, 1.0)
+
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (float(d.get('rx_rate', 0.0) or 0.0) > EPS) or (float(d.get('tx_rate', 0.0) or 0.0) > EPS)
+=======
+    # Measurement timing tolerance (from Hodor research: ~2%)
+    HARDENING_THRESHOLD = 0.02
+    # Magnitude-aware thresholds and guards
+    TH_REL_LOW = 0.05       # relaxed tolerance for low-rate links
+    TH_ABS_GUARD = 0.5      # absolute guard (Mbps) to avoid correcting tiny diffs
+    ABS_GUARD_LOW = 0.3     # smaller absolute guard for low-rate links
+    LOW_RATE_CUTOFF = 10.0  # Mbps threshold for low-rate behavior
+    EPS = 1e-6  # small absolute tolerance for "no traffic"
+
+    def to_float(x: Any) -> float:
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
+
+    def norm_diff(a: float, b: float) -> float:
+        return abs(a - b) / max(a, b, 1.0)
+
+    def change_ratio(orig: float, rep: float) -> float:
+        denom = max(abs(orig), abs(rep), 1.0)
+        return abs(rep - orig) / denom
+
+    def has_traffic(d: Dict[str, Any]) -> bool:
+        return (to_float(d.get('rx_rate', 0.0)) > EPS) or (to_float(d.get('tx_rate', 0.0)) > EPS)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        else:
+            # Link is up: enforce link symmetry with hardening threshold
+            if diff_ab > HARDENING_THRESHOLD:
+                avg_ab = 0.5 * (a_tx + b_rx)
+                rep_a_tx = avg_ab
+                rep_b_rx = avg_ab
+            # Confidence decreases with magnitude of violation; if unchanged, slightly boost
+            conf_ab = max(0.0, 1.0 - diff_ab)
+            if diff_ab <= HARDENING_THRESHOLD:
+                conf_ab = min(1.0, max(conf_ab, 0.98))
+            tx_conf_a = conf_ab
+            rx_conf_b = conf_ab
+
+            if diff_ba > HARDENING_THRESHOLD:
+                avg_ba = 0.5 * (b_tx + a_rx)
+                rep_b_tx = avg_ba
+                rep_a_rx = avg_ba
+            conf_ba = max(0.0, 1.0 - diff_ba)
+            if diff_ba <= HARDENING_THRESHOLD:
+                conf_ba = min(1.0, max(conf_ba, 0.98))
+            tx_conf_b = conf_ba
+            rx_conf_a = conf_ba
+=======
+        else:
+            # Link is up: magnitude-aware hardening with partial averaging and confidence calibrated by change magnitude
+            # Direction A->B (A.tx vs B.rx)
+            max_ab = max(a_tx, b_rx)
+            thr_rel_ab = TH_REL_LOW if max_ab < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+            guard_ab = ABS_GUARD_LOW if max_ab < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            abs_ab = abs(a_tx - b_rx)
+
+            if (diff_ab > thr_rel_ab) and (abs_ab > guard_ab):
+                v_ab = 0.5 * (a_tx + b_rx)
+                # Partial averaging near threshold; full consensus beyond 2×thr (1.6× at low rate)
+                partial_upper_ab = (1.6 * thr_rel_ab) if max_ab < LOW_RATE_CUTOFF else (2.0 * thr_rel_ab)
+                if diff_ab <= partial_upper_ab:
+                    k_ab = (diff_ab - thr_rel_ab) / max(thr_rel_ab, 1e-9)
+                    k_ab = min(1.0, max(0.0, k_ab))
+                    if max_ab < LOW_RATE_CUTOFF:
+                        k_ab = k_ab ** 1.2  # slightly steeper ramp at low rates
+                    rep_a_tx = a_tx * (1.0 - k_ab) + v_ab * k_ab
+                    rep_b_rx = b_rx * (1.0 - k_ab) + v_ab * k_ab
+                else:
+                    rep_a_tx = v_ab
+                    rep_b_rx = v_ab
+                # Confidence decreases with violation and applied change magnitude
+                change_a = change_ratio(a_tx, rep_a_tx)
+                change_b = change_ratio(b_rx, rep_b_rx)
+                conf_base_ab = max(0.0, 1.0 - diff_ab)
+                tx_conf_a = min(conf_base_ab, 1.0 - 0.8 * change_a)
+                rx_conf_b = min(conf_base_ab, 1.0 - 0.8 * change_b)
+            else:
+                # Within tolerance or under absolute guard: keep values and set strong confidence floors
+                if max_ab >= LOW_RATE_CUTOFF and diff_ab <= 0.005:
+                    conf_floor_ab = 0.99
+                else:
+                    conf_floor_ab = 0.98 if max_ab >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_a = max(tx_conf_a, conf_floor_ab)
+                rx_conf_b = max(rx_conf_b, conf_floor_ab)
+
+            # Direction B->A (B.tx vs A.rx)
+            max_ba = max(b_tx, a_rx)
+            thr_rel_ba = TH_REL_LOW if max_ba < LOW_RATE_CUTOFF else HARDENING_THRESHOLD
+            guard_ba = ABS_GUARD_LOW if max_ba < LOW_RATE_CUTOFF else TH_ABS_GUARD
+            abs_ba = abs(b_tx - a_rx)
+
+            if (diff_ba > thr_rel_ba) and (abs_ba > guard_ba):
+                v_ba = 0.5 * (b_tx + a_rx)
+                partial_upper_ba = (1.6 * thr_rel_ba) if max_ba < LOW_RATE_CUTOFF else (2.0 * thr_rel_ba)
+                if diff_ba <= partial_upper_ba:
+                    k_ba = (diff_ba - thr_rel_ba) / max(thr_rel_ba, 1e-9)
+                    k_ba = min(1.0, max(0.0, k_ba))
+                    if max_ba < LOW_RATE_CUTOFF:
+                        k_ba = k_ba ** 1.2
+                    rep_b_tx = b_tx * (1.0 - k_ba) + v_ba * k_ba
+                    rep_a_rx = a_rx * (1.0 - k_ba) + v_ba * k_ba
+                else:
+                    rep_b_tx = v_ba
+                    rep_a_rx = v_ba
+                change_b2 = change_ratio(b_tx, rep_b_tx)
+                change_a2 = change_ratio(a_rx, rep_a_rx)
+                conf_base_ba = max(0.0, 1.0 - diff_ba)
+                tx_conf_b = min(conf_base_ba, 1.0 - 0.8 * change_b2)
+                rx_conf_a = min(conf_base_ba, 1.0 - 0.8 * change_a2)
+            else:
+                if max_ba >= LOW_RATE_CUTOFF and diff_ba <= 0.005:
+                    conf_floor_ba = 0.99
+                else:
+                    conf_floor_ba = 0.98 if max_ba >= LOW_RATE_CUTOFF else 0.97
+                tx_conf_b = max(tx_conf_b, conf_floor_ba)
+                rx_conf_a = max(rx_conf_a, conf_floor_ba)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Router-level balancing using dangling interfaces to satisfy flow conservation (R1)
+    # We only adjust interfaces without a known peer to avoid breaking link symmetry.
+    paired_ids = set()
+    for _, (aid, bid) in pairs.items():
+        paired_ids.add(aid)
+        paired_ids.add(bid)
+
+    for router, if_list in topology.items():
+        sum_tx = 0.0
+        sum_rx = 0.0
+        present = [iid for iid in if_list if iid in per_if_repair]
+        if not present:
+            continue
+        for iid in present:
+            rep = per_if_repair[iid]
+            sum_tx += float(rep['repaired_tx'])
+            sum_rx += float(rep['repaired_rx'])
+        scale = max(sum_tx, sum_rx, 1.0)
+        delta = sum_tx - sum_rx  # want delta -> 0
+
+        if abs(delta) <= HARDENING_THRESHOLD * scale:
+            continue
+
+        # Candidate interfaces for adjustment: dangling and up
+        dangling = [iid for iid in present
+                    if (iid not in paired_ids) and (per_if_repair[iid].get('repaired_status', 'up') != 'down')]
+
+        if not dangling:
+            continue
+
+        # Distribute correction proportionally to traffic magnitude to minimize relative change
+        weights = []
+        sum_w = 0.0
+        for iid in dangling:
+            rep = per_if_repair[iid]
+            w = float(rep['repaired_tx']) + float(rep['repaired_rx']) + EPS
+            weights.append((iid, w))
+            sum_w += w
+        if sum_w <= 0.0:
+            sum_w = EPS * len(dangling)
+            weights = [(iid, EPS) for iid in dangling]
+
+        if delta > 0.0:
+            # Too much TX; increase RX on dangling interfaces
+            for iid, w in weights:
+                inc = delta * (w / sum_w)
+                new_rx = float(per_if_repair[iid]['repaired_rx']) + inc
+                per_if_repair[iid]['repaired_rx'] = new_rx
+                # Confidence: penalize by change magnitude from original observation
+                rx_orig = float(telemetry.get(iid, {}).get('rx_rate', 0.0) or 0.0)
+                denom = max(abs(rx_orig), abs(new_rx), 1.0)
+                cr = abs(new_rx - rx_orig) / denom
+                per_if_repair[iid]['rx_conf'] = max(0.0, min(float(per_if_repair[iid].get('rx_conf', 0.6)), 1.0 - cr))
+        else:
+            # Too much RX; increase TX on dangling interfaces
+            need = -delta
+            for iid, w in weights:
+                inc = need * (w / sum_w)
+                new_tx = float(per_if_repair[iid]['repaired_tx']) + inc
+                per_if_repair[iid]['repaired_tx'] = new_tx
+                tx_orig = float(telemetry.get(iid, {}).get('tx_rate', 0.0) or 0.0)
+                denom = max(abs(tx_orig), abs(new_tx), 1.0)
+                cr = abs(new_tx - tx_orig) / denom
+                per_if_repair[iid]['tx_conf'] = max(0.0, min(float(per_if_repair[iid].get('tx_conf', 0.6)), 1.0 - cr))
+=======
+    # Router-level micro-adjustments for flow conservation (R1) using dangling interfaces only
+    # We only adjust interfaces without a known peer to avoid breaking link symmetry.
+    paired_ids = set()
+    for _, (aid, bid) in pairs.items():
+        paired_ids.add(aid)
+        paired_ids.add(bid)
+
+    # Micro-adjustment parameters
+    RESID_MIN = 0.03        # minimum router residual fraction to trigger micro-adjustments
+    IMPROVE_REQ = 0.08      # require ≥8% residual improvement to commit first step
+    SECOND_STEP_REQ = 0.20  # allow second mini-step if improvement ≥20%
+    SECOND_STEP_MAX = 0.01  # second step cap (≤1% of router scale)
+
+    for router, if_list in topology.items():
+        present = [iid for iid in if_list if iid in per_if_repair]
+        if not present:
+            continue
+
+        # Current sums for this router
+        sum_tx = 0.0
+        sum_rx = 0.0
+        for iid in present:
+            rep = per_if_repair[iid]
+            sum_tx += to_float(rep['repaired_tx'])
+            sum_rx += to_float(rep['repaired_rx'])
+        delta = sum_tx - sum_rx  # want to drive toward zero
+        scale = max(sum_tx, sum_rx, 1.0)
+        resid = abs(delta) / scale
+
+        # Trigger only on sufficiently large residuals
+        if resid < RESID_MIN or abs(delta) <= EPS:
+            continue
+
+        # Candidates: dangling, up, sufficient magnitude, and aligned with imbalance
+        candidates: List[Tuple[str, float, float, float]] = []
+        for iid in present:
+            if iid in paired_ids:
+                continue
+            if per_if_repair[iid].get('repaired_status', 'up') == 'down':
+                continue
+            cur_tx = to_float(per_if_repair[iid]['repaired_tx'])
+            cur_rx = to_float(per_if_repair[iid]['repaired_rx'])
+            if max(cur_tx, cur_rx) < LOW_RATE_CUTOFF:
+                continue
+            contrib = cur_tx - cur_rx
+            if (delta > 0 and contrib > 0) or (delta < 0 and contrib < 0):
+                candidates.append((iid, contrib, cur_tx, cur_rx))
+
+        if not candidates:
+            continue
+
+        total_same_dir = sum(abs(c[1]) for c in candidates) or EPS
+        dom_iid, dom_contrib, cur_tx, cur_rx = max(candidates, key=lambda t: abs(t[1]))
+        if abs(dom_contrib) / total_same_dir < 0.6:
+            continue
+
+        # Tentative nudge: reduce the dominant direction on the dominant interface
+        alpha = min(0.02, 0.5 * resid)
+        step = alpha * scale
+        new_tx, new_rx = cur_tx, cur_rx
+        if delta > 0 and dom_contrib > 0:
+            # Too much TX globally; reduce TX on this interface
+            new_tx = max(0.0, cur_tx - min(step, cur_tx))
+        elif delta < 0 and dom_contrib < 0:
+            # Too much RX globally; reduce RX on this interface
+            new_rx = max(0.0, cur_rx - min(step, cur_rx))
+        else:
+            continue
+
+        # Internal TX/RX skew guard (≤3%)
+        new_int = abs(new_tx - new_rx) / max(1.0, max(new_tx, new_rx, 1.0))
+        if new_int > 0.03 + 1e-9:
+            continue
+
+        # Commit only if router residual improves sufficiently
+        sum_tx_new = sum_tx - cur_tx + new_tx
+        sum_rx_new = sum_rx - cur_rx + new_rx
+        resid_new = abs(sum_tx_new - sum_rx_new) / max(sum_tx_new, sum_rx_new, 1.0)
+        if resid_new <= (1.0 - IMPROVE_REQ) * resid:
+            # Commit change
+            per_if_repair[dom_iid]['repaired_tx'] = new_tx
+            per_if_repair[dom_iid]['repaired_rx'] = new_rx
+
+            # Optional second mini-step if strong improvement and residual still meaningful
+            if resid_new <= (1.0 - SECOND_STEP_REQ) * resid and resid_new >= 0.04:
+                alpha2 = min(SECOND_STEP_MAX, 0.5 * resid_new)
+                step2 = alpha2 * scale
+                cur_tx2, cur_rx2 = new_tx, new_rx
+                if delta > 0 and dom_contrib > 0:
+                    cand_tx2 = max(0.0, cur_tx2 - min(step2, cur_tx2))
+                    cand_rx2 = cur_rx2
+                else:
+                    cand_rx2 = max(0.0, cur_rx2 - min(step2, cur_rx2))
+                    cand_tx2 = cur_tx2
+                new_int2 = abs(cand_tx2 - cand_rx2) / max(1.0, max(cand_tx2, cand_rx2, 1.0))
+                sum_tx_new2 = sum_tx - cur_tx + cand_tx2
+                sum_rx_new2 = sum_rx - cur_rx + cand_rx2
+                resid_new2 = abs(sum_tx_new2 - sum_rx_new2) / max(sum_tx_new2, sum_rx_new2, 1.0)
+                if new_int2 <= 0.03 + 1e-9 and resid_new2 < resid_new:
+                    per_if_repair[dom_iid]['repaired_tx'] = cand_tx2
+                    per_if_repair[dom_iid]['repaired_rx'] = cand_rx2
+                    resid_new = resid_new2
+
+            # Confidence penalty proportional to applied change for that interface
+            tx_orig = to_float(telemetry.get(dom_iid, {}).get('tx_rate', 0.0))
+            rx_orig = to_float(telemetry.get(dom_iid, {}).get('rx_rate', 0.0))
+            tx_change = change_ratio(tx_orig, to_float(per_if_repair[dom_iid]['repaired_tx']))
+            rx_change = change_ratio(rx_orig, to_float(per_if_repair[dom_iid]['repaired_rx']))
+            per_if_repair[dom_iid]['tx_conf'] = max(0.0, min(float(per_if_repair[dom_iid].get('tx_conf', 0.6)), 1.0 - 0.8 * tx_change))
+            per_if_repair[dom_iid]['rx_conf'] = max(0.0, min(float(per_if_repair[dom_iid].get('rx_conf', 0.6)), 1.0 - 0.8 * rx_change))
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        penalty = 1.0 - 0.5 * (resid_local + resid_remote)
+        penalty = max(0.0, min(1.0, penalty))
+
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty))
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty))
+        # Status confidence is less sensitive to flow residuals; apply mild scaling
+        status_conf = max(0.0, min(1.0, status_conf * (0.75 + 0.25 * penalty)))
+=======
+        # Direction-aware penalties: TX depends more on local, RX more on remote
+        penalty_tx = 1.0 - (0.6 * resid_local + 0.4 * resid_remote)
+        penalty_rx = 1.0 - (0.6 * resid_remote + 0.4 * resid_local)
+        penalty_tx = max(0.0, min(1.0, penalty_tx))
+        penalty_rx = max(0.0, min(1.0, penalty_rx))
+        min_penalty = min(penalty_tx, penalty_rx)
+
+        tx_conf = max(0.0, min(1.0, tx_conf * penalty_tx))
+        rx_conf = max(0.0, min(1.0, rx_conf * penalty_rx))
+        # Status confidence mildly scaled by the weaker (more conservative) penalty
+        status_conf = max(0.0, min(1.0, status_conf * (0.85 + 0.15 * min_penalty)))
+>>>>>>> REPLACE
+</DIFF>

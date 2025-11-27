@@ -1,0 +1,458 @@
+<NAME>
+restore_sa_with_kick
+</NAME>
+
+<DESCRIPTION>
+Reverts to the high-performing architecture of Exhaustive Beam Search followed by a monolithic Adaptive Simulated Annealing loop with Stagnation-Triggered Ruin-and-Recreate.
+- Replaces the modular ILS loop (which interrupted cooling) with a continuous annealing process.
+- Implements a "Kick" mechanism that triggers only when the search stagnates (no improvement for 400 steps). The kick removes a random block and re-inserts it using a greedy best-fit strategy, effectively jumping to a local optimum in the repair neighborhood.
+- Adds 'block_move' to the standard operator set and increases the weight of 'insert', as single transaction moves are critical for resolving specific dependency conflicts.
+- Tuning: Sets Beam Width to 4, SA iterations to 5500, and cooling rate to 0.9985.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Exhaustive Beam Search followed by
+    Adaptive Simulated Annealing.
+
+    Args:
+        workload: Workload object containing transaction data
+        num_seqs: Parameter affecting the computational budget
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+    # --- Hyperparameters ---
+    # Width 4 provides a good balance between structural exploration and runtime
+    BEAM_WIDTH = 4
+
+    # SA Parameters
+    # High iteration count to refine the beam solution
+    SA_ITERATIONS = 6000
+    SA_START_TEMP_RATIO = 0.05
+    SA_COOLING_RATE = 0.999
+
+    # Adaptive Operator Parameters
+    # Initial weights for [Swap, Insert, Block, Reverse]
+    OP_WEIGHTS = {'swap': 5.0, 'insert': 5.0, 'block': 5.0, 'reverse': 2.0}
+    OP_MIN_WEIGHT = 1.0
+    OP_ADAPTATION_RATE = 0.1
+
+    # --- Cost Cache ---
+    cost_cache = {}
+
+    def get_cost(seq):
+        t_seq = tuple(seq)
+        if t_seq in cost_cache:
+            return cost_cache[t_seq]
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[t_seq] = c
+        return c
+
+    # --- Phase 1: Exhaustive Beam Search Construction ---
+    # Initialize beam with all possible starts
+    initial_candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        initial_candidates.append({
+            'cost': cost,
+            'seq': seq,
+            'rem': [x for x in range(workload.num_txns) if x != t]
+        })
+
+    # Prune
+    initial_candidates.sort(key=lambda x: x['cost'])
+    beam = initial_candidates[:BEAM_WIDTH]
+
+    # Build schedule
+    for _ in range(workload.num_txns - 1):
+        candidates = []
+
+        for node in beam:
+            p_seq = node['seq']
+            p_rem = node['rem']
+
+            # Exhaustive expansion: Check all remaining transactions
+            for cand_txn in p_rem:
+                new_seq = p_seq + [cand_txn]
+                new_cost = get_cost(new_seq)
+
+                candidates.append((new_cost, new_seq, p_rem, cand_txn))
+
+        # Select best global candidates (Greedy step)
+        candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_cost, c_seq, c_parent_rem, c_cand_txn in candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            # Create new remaining list
+            new_rem = list(c_parent_rem)
+            new_rem.remove(c_cand_txn)
+
+            new_beam.append({
+                'cost': c_cost,
+                'seq': c_seq,
+                'rem': new_rem
+            })
+
+        beam = new_beam
+
+    if not beam:
+        return float('inf'), []
+
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+
+    # --- Phase 2: Iterated Local Search (ILS) with Greedy Repair ---
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+
+    # ILS Parameters
+    ILS_ITERS = 20
+    SA_ITERS_PER_ILS = 300
+    REPAIR_BLOCK_SIZE_MIN = 3
+    REPAIR_BLOCK_SIZE_MAX = 6
+
+    # Helper to run Adaptive SA
+    def run_adaptive_sa(start_schedule, start_cost, steps, start_temp):
+        curr_s = list(start_schedule)
+        curr_c = start_cost
+        local_best_s = list(curr_s)
+        local_best_c = curr_c
+
+        ops = list(OP_WEIGHTS.keys())
+        T = start_temp
+
+        for _ in range(steps):
+            # Select Operator
+            total_weight = sum(OP_WEIGHTS.values())
+            r = random.uniform(0, total_weight)
+            cumulative = 0
+            selected_op = ops[-1]
+            for op in ops:
+                cumulative += OP_WEIGHTS[op]
+                if r <= cumulative:
+                    selected_op = op
+                    break
+
+            neighbor = list(curr_s)
+            n = len(neighbor)
+
+            if selected_op == 'swap':
+                i, j = random.sample(range(n), 2)
+                neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+            elif selected_op == 'insert':
+                i = random.randint(0, n - 1)
+                val = neighbor.pop(i)
+                j = random.randint(0, n - 1)
+                neighbor.insert(j, val)
+            elif selected_op == 'block':
+                b_size = random.randint(2, max(3, int(n * 0.10)))
+                if n > b_size:
+                    i = random.randint(0, n - b_size)
+                    block = neighbor[i : i+b_size]
+                    del neighbor[i : i+b_size]
+                    j = random.randint(0, len(neighbor))
+                    neighbor[j:j] = block
+            elif selected_op == 'reverse':
+                i, j = sorted(random.sample(range(n), 2))
+                neighbor[i:j+1] = neighbor[i:j+1][::-1]
+
+            new_c = get_cost(neighbor)
+            delta = new_c - curr_c
+
+            accept = False
+            if delta < 0:
+                accept = True
+            elif T > 1e-9:
+                if random.random() < math.exp(-delta / T):
+                    accept = True
+
+            if accept:
+                curr_s = neighbor
+                curr_c = new_c
+                if curr_c < local_best_c:
+                    local_best_c = curr_c
+                    local_best_s = list(curr_s)
+
+                # Update weights
+                reward = 1.0 if delta < 0 else 0.1
+                OP_WEIGHTS[selected_op] = (1 - OP_ADAPTATION_RATE) * OP_WEIGHTS[selected_op] + OP_ADAPTATION_RATE * (OP_MIN_WEIGHT + reward)
+
+            T *= SA_COOLING_RATE
+
+        return local_best_c, local_best_s
+
+    # ILS Loop
+    temp_base = current_cost * SA_START_TEMP_RATIO
+
+    for loop in range(ILS_ITERS):
+        # 1. Local Search (Adaptive SA)
+        sa_cost, sa_schedule = run_adaptive_sa(current_schedule, current_cost, SA_ITERS_PER_ILS, temp_base)
+
+        # Update global best
+        if sa_cost < best_cost:
+            best_cost = sa_cost
+            best_schedule = list(sa_schedule)
+
+        # 2. Perturbation: Greedy Block Repair
+        pert_schedule = list(sa_schedule)
+        n = len(pert_schedule)
+
+        b_size = random.randint(REPAIR_BLOCK_SIZE_MIN, REPAIR_BLOCK_SIZE_MAX)
+        if n > b_size:
+            start_idx = random.randint(0, n - b_size)
+            removed_block = pert_schedule[start_idx : start_idx + b_size]
+            del pert_schedule[start_idx : start_idx + b_size]
+
+            # Greedy Re-insertion
+            for item in removed_block:
+                best_insert_idx = -1
+                best_insert_cost = float('inf')
+
+                # Scan all valid positions
+                for i in range(len(pert_schedule) + 1):
+                    cand = pert_schedule[:i] + [item] + pert_schedule[i:]
+                    c = get_cost(cand)
+                    if c < best_insert_cost:
+                        best_insert_cost = c
+                        best_insert_idx = i
+
+                pert_schedule.insert(best_insert_idx, item)
+
+            pert_cost = best_insert_cost
+
+            # 3. Acceptance of Perturbation
+            delta = pert_cost - sa_cost
+            accept_pert = False
+
+            T_ils = best_cost * 0.02
+
+            if delta < 0:
+                accept_pert = True
+                if pert_cost < best_cost:
+                    best_cost = pert_cost
+                    best_schedule = list(pert_schedule)
+            elif random.random() < math.exp(-delta / T_ils):
+                accept_pert = True
+
+            if accept_pert:
+                current_schedule = pert_schedule
+                current_cost = pert_cost
+            else:
+                # Revert to SA result to explore other perturbations
+                current_schedule = sa_schedule
+                current_cost = sa_cost
+
+    return best_cost, best_schedule
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Exhaustive Beam Search followed by
+    Adaptive Simulated Annealing with Stagnation-Triggered Ruin-and-Recreate.
+    """
+    # --- Hyperparameters ---
+    BEAM_WIDTH = 4
+
+    # SA Parameters
+    SA_ITERATIONS = 5500
+    SA_COOLING_RATE = 0.9985
+    SA_START_TEMP_RATIO = 0.05
+
+    # Ruin-and-Recreate (Kick) Parameters
+    STAGNATION_LIMIT = 400
+    KICK_BLOCK_SIZE_MIN = 3
+    KICK_BLOCK_SIZE_MAX = 8
+
+    # Adaptive Operator Weights
+    # Weights: 'insert' is critical for dependency resolution, so it gets higher weight
+    OP_WEIGHTS = {'swap': 2.0, 'insert': 10.0, 'reverse': 1.0, 'block_move': 2.0}
+    OP_MIN_WEIGHT = 1.0
+    OP_ADAPTATION_RATE = 0.2
+
+    # --- Cost Cache ---
+    cost_cache = {}
+
+    def get_cost(seq):
+        t_seq = tuple(seq)
+        if t_seq in cost_cache:
+            return cost_cache[t_seq]
+        c = workload.get_opt_seq_cost(seq)
+        cost_cache[t_seq] = c
+        return c
+
+    # --- Phase 1: Exhaustive Beam Search Construction ---
+    # Initialize beam
+    candidates = []
+    for t in range(workload.num_txns):
+        seq = [t]
+        cost = get_cost(seq)
+        # Store rem as set for O(1) removal, though copying takes time.
+        # Beam is small, so list operations are fine. Using set for clarity in logic.
+        candidates.append({'cost': cost, 'seq': seq, 'rem': {x for x in range(workload.num_txns) if x != t}})
+
+    candidates.sort(key=lambda x: x['cost'])
+    beam = candidates[:BEAM_WIDTH]
+
+    # Iteratively build schedule
+    for _ in range(workload.num_txns - 1):
+        next_candidates = []
+
+        for node in beam:
+            p_seq = node['seq']
+            p_rem = node['rem']
+
+            # Exhaustive expansion
+            for cand in p_rem:
+                new_seq = p_seq + [cand]
+                new_cost = get_cost(new_seq)
+                next_candidates.append((new_cost, new_seq, p_rem, cand))
+
+        # Sort by cost to keep best
+        next_candidates.sort(key=lambda x: x[0])
+
+        new_beam = []
+        for c_cost, c_seq, c_parent_rem, c_cand in next_candidates:
+            if len(new_beam) >= BEAM_WIDTH:
+                break
+
+            new_rem = c_parent_rem.copy()
+            new_rem.remove(c_cand)
+            new_beam.append({'cost': c_cost, 'seq': c_seq, 'rem': new_rem})
+
+        beam = new_beam
+
+    if not beam:
+        return float('inf'), []
+
+    current_schedule = beam[0]['seq']
+    current_cost = beam[0]['cost']
+
+    # --- Phase 2: Adaptive SA with Ruin-and-Recreate ---
+    best_schedule = list(current_schedule)
+    best_cost = current_cost
+
+    T = current_cost * SA_START_TEMP_RATIO
+    ops = list(OP_WEIGHTS.keys())
+
+    steps_since_imp = 0
+
+    for it in range(SA_ITERATIONS):
+        # 1. Stagnation Check -> Ruin-and-Recreate (Kick)
+        if steps_since_imp > STAGNATION_LIMIT:
+            # Perform Kick: Remove random block and greedy re-insert
+            kick_seq = list(best_schedule) # Intensify around best found
+            n = len(kick_seq)
+
+            b_size = random.randint(KICK_BLOCK_SIZE_MIN, KICK_BLOCK_SIZE_MAX)
+            if n > b_size:
+                start = random.randint(0, n - b_size)
+                removed_block = kick_seq[start : start + b_size]
+                del kick_seq[start : start + b_size]
+
+                # Greedy Best-Fit Insertion for each item in the block
+                for item in removed_block:
+                    best_pos = -1
+                    min_c = float('inf')
+
+                    # Try all positions
+                    for i in range(len(kick_seq) + 1):
+                        kick_seq.insert(i, item)
+                        c = get_cost(kick_seq)
+                        if c < min_c:
+                            min_c = c
+                            best_pos = i
+                        kick_seq.pop(i)
+
+                    kick_seq.insert(best_pos, item)
+
+                # Update current state to the result of the kick
+                current_schedule = kick_seq
+                current_cost = min_c
+
+                if current_cost < best_cost:
+                    best_cost = current_cost
+                    best_schedule = list(current_schedule)
+                    steps_since_imp = 0
+                else:
+                    # Reset counter to give the new state a chance
+                    steps_since_imp = 0
+
+                # Reheat temperature slightly to allow local settling
+                T = max(T, current_cost * 0.02)
+                continue
+
+        # 2. Select Operator
+        total_w = sum(OP_WEIGHTS.values())
+        r = random.uniform(0, total_w)
+        cum = 0
+        op = ops[0]
+        for o in ops:
+            cum += OP_WEIGHTS[o]
+            if r <= cum:
+                op = o
+                break
+
+        neighbor = list(current_schedule)
+        n = len(neighbor)
+
+        if op == 'swap':
+            i, j = random.sample(range(n), 2)
+            neighbor[i], neighbor[j] = neighbor[j], neighbor[i]
+        elif op == 'insert':
+            i = random.randint(0, n - 1)
+            val = neighbor.pop(i)
+            j = random.randint(0, n - 1)
+            neighbor.insert(j, val)
+        elif op == 'reverse':
+            i, j = sorted(random.sample(range(n), 2))
+            neighbor[i:j+1] = neighbor[i:j+1][::-1]
+        elif op == 'block_move':
+            b_size = random.randint(2, 6)
+            if n > b_size:
+                i = random.randint(0, n - b_size)
+                block = neighbor[i:i+b_size]
+                del neighbor[i:i+b_size]
+                j = random.randint(0, len(neighbor))
+                neighbor[j:j] = block
+
+        new_cost = get_cost(neighbor)
+        delta = new_cost - current_cost
+
+        # 3. Acceptance
+        accept = False
+        if delta < 0:
+            accept = True
+            if new_cost < best_cost:
+                best_cost = new_cost
+                best_schedule = list(neighbor)
+                steps_since_imp = 0
+            else:
+                steps_since_imp += 1
+        else:
+            steps_since_imp += 1
+            if T > 1e-9 and random.random() < math.exp(-delta / T):
+                accept = True
+
+        if accept:
+            current_schedule = neighbor
+            current_cost = new_cost
+
+        # 4. Adapt Weights
+        reward = 0.1
+        if delta < 0:
+            reward = 1.0 if new_cost >= best_cost else 2.0
+
+        OP_WEIGHTS[op] = (1 - OP_ADAPTATION_RATE) * OP_WEIGHTS[op] + OP_ADAPTATION_RATE * (OP_MIN_WEIGHT + reward)
+
+        # 5. Cooling
+        T *= SA_COOLING_RATE
+
+    return best_cost, best_schedule
+>>>>>>> REPLACE
+</DIFF>

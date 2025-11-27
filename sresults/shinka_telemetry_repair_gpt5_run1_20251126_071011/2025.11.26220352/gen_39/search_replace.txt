@@ -1,0 +1,174 @@
+<NAME>
+pair_reconcile_and_conf_calibration
+</NAME>
+
+<DESCRIPTION>
+I propose two targeted improvements to improve confidence calibration without hurting counter repair accuracy:
+
+1) Replace the logistic residual-to-confidence mapping with a two-slope mapping suggested by the research recommendations. It is gentler near the tolerance and more punitive for large residuals, improving calibration (reduces overconfidence when residuals are large, and avoids underconfidence when residuals are within tolerance).
+
+2) Upgrade the post-redistribution pair reconciliation to be tolerance-gated and cap-bounded. We only reconcile when the pair residual exceeds a rate-aware tolerance and pull both endpoints 30% toward each other but clamp the move to 20% of the per-interface value. We also apply a proportional confidence penalty based on normalized residual. This focuses adjustments on genuinely inconsistent pairs and prevents over-correction.
+
+3) Add a no-edit confidence bonus (+0.05) for interfaces whose telemetry wasn’t changed, improving calibration by rewarding stable data.
+
+These changes align with the Hodor principles: dynamic checking with residual-aware tolerances and redundant signal hardening. They should boost confidence_calibration while preserving or slightly improving counter_repair_accuracy.
+
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def conf_from_residual(residual: float, tol: float) -> float:
+        # Logistic decay for smoother, better-calibrated confidence
+        # residual ~ tol -> ~0.5; residual << tol -> close to 1; residual >> tol -> close to 0
+        tol = max(tol, 1e-9)
+        x = residual / tol
+        k = 3.0
+        return clamp(1.0 / (1.0 + exp(k * (x - 1.0))))
+=======
+    def conf_from_residual(residual: float, tol: float) -> float:
+        # Two-slope residual-to-confidence:
+        # - near 0 residual -> ~1
+        # - residual ≈ tol -> ~0.8
+        # - large residuals decay faster to avoid overconfidence
+        tol = max(tol, 1e-9)
+        x = residual / tol
+        conf = 1.0 - min(1.0, x / 5.0)
+        if x > 3.0:
+            conf -= 0.1 * (x - 3.0) / 2.0
+        return clamp(conf)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Limited pair-symmetry reconciliation after router redistribution
+    for a_id, b_id in pairs:
+        if a_id not in interim or b_id not in interim:
+            continue
+        if interim[a_id].get('status') != 'up' or interim[b_id].get('status') != 'up':
+            continue
+
+        # Forward direction: a.tx vs b.rx
+        a_tx_old = interim[a_id]['tx']
+        b_rx_old = interim[b_id]['rx']
+        res_fwd = rel_diff(a_tx_old, b_rx_old)
+        if res_fwd > HARDENING_THRESHOLD:
+            v_mid = 0.5 * (a_tx_old + b_rx_old)
+            a_tx_new = max(0.0, a_tx_old + PAIR_RECONCILE_ALPHA * (v_mid - a_tx_old))
+            b_rx_new = max(0.0, b_rx_old + PAIR_RECONCILE_ALPHA * (v_mid - b_rx_old))
+            if a_tx_new != a_tx_old:
+                drel = rel_diff(a_tx_old, a_tx_new)
+                interim[a_id]['tx'] = a_tx_new
+                interim[a_id]['tx_conf'] = clamp(min(interim[a_id]['tx_conf'], 1.0 - min(1.0, 0.5 * drel)))
+            if b_rx_new != b_rx_old:
+                drel = rel_diff(b_rx_old, b_rx_new)
+                interim[b_id]['rx'] = b_rx_new
+                interim[b_id]['rx_conf'] = clamp(min(interim[b_id]['rx_conf'], 1.0 - min(1.0, 0.5 * drel)))
+
+        # Reverse direction: a.rx vs b.tx
+        a_rx_old = interim[a_id]['rx']
+        b_tx_old = interim[b_id]['tx']
+        res_rev = rel_diff(a_rx_old, b_tx_old)
+        if res_rev > HARDENING_THRESHOLD:
+            v_mid2 = 0.5 * (a_rx_old + b_tx_old)
+            a_rx_new = max(0.0, a_rx_old + PAIR_RECONCILE_ALPHA * (v_mid2 - a_rx_old))
+            b_tx_new = max(0.0, b_tx_old + PAIR_RECONCILE_ALPHA * (v_mid2 - b_tx_old))
+            if a_rx_new != a_rx_old:
+                drel = rel_diff(a_rx_old, a_rx_new)
+                interim[a_id]['rx'] = a_rx_new
+                interim[a_id]['rx_conf'] = clamp(min(interim[a_id]['rx_conf'], 1.0 - min(1.0, 0.5 * drel)))
+            if b_tx_new != b_tx_old:
+                drel = rel_diff(b_tx_old, b_tx_new)
+                interim[b_id]['tx'] = b_tx_new
+                interim[b_id]['tx_conf'] = clamp(min(interim[b_id]['tx_conf'], 1.0 - min(1.0, 0.5 * drel)))
+=======
+    # Targeted, tolerance-gated pair reconciliation after router redistribution
+    for a_id, b_id in pairs:
+        if a_id not in interim or b_id not in interim:
+            continue
+        if interim[a_id].get('status') != 'up' or interim[b_id].get('status') != 'up':
+            continue
+
+        # Forward direction: a.tx vs b.rx
+        a_tx_old = interim[a_id]['tx']
+        b_rx_old = interim[b_id]['rx']
+        traffic_tx = max(a_tx_old, b_rx_old, 1.0)
+        tol_pair_post = max(0.02, 2.5 / traffic_tx)
+        res_fwd = rel_diff(a_tx_old, b_rx_old)
+        if res_fwd > tol_pair_post:
+            v_mid = 0.5 * (a_tx_old + b_rx_old)
+            move_a = PAIR_RECONCILE_ALPHA * (v_mid - a_tx_old)
+            move_b = PAIR_RECONCILE_ALPHA * (v_mid - b_rx_old)
+            cap_a = 0.20 * max(a_tx_old, 1.0)
+            cap_b = 0.20 * max(b_rx_old, 1.0)
+            move_a = max(-cap_a, min(cap_a, move_a))
+            move_b = max(-cap_b, min(cap_b, move_b))
+            a_tx_new = max(0.0, a_tx_old + move_a)
+            b_rx_new = max(0.0, b_rx_old + move_b)
+            if a_tx_new != a_tx_old:
+                interim[a_id]['tx'] = a_tx_new
+                penalty = 1.0 - 0.3 * min(1.0, res_fwd / max(tol_pair_post, 1e-9))
+                interim[a_id]['tx_conf'] = clamp(interim[a_id]['tx_conf'] * penalty)
+            if b_rx_new != b_rx_old:
+                interim[b_id]['rx'] = b_rx_new
+                penalty = 1.0 - 0.3 * min(1.0, res_fwd / max(tol_pair_post, 1e-9))
+                interim[b_id]['rx_conf'] = clamp(interim[b_id]['rx_conf'] * penalty)
+
+        # Reverse direction: a.rx vs b.tx
+        a_rx_old = interim[a_id]['rx']
+        b_tx_old = interim[b_id]['tx']
+        traffic_rx = max(a_rx_old, b_tx_old, 1.0)
+        tol_pair_post2 = max(0.02, 2.5 / traffic_rx)
+        res_rev = rel_diff(a_rx_old, b_tx_old)
+        if res_rev > tol_pair_post2:
+            v_mid2 = 0.5 * (a_rx_old + b_tx_old)
+            move_a2 = PAIR_RECONCILE_ALPHA * (v_mid2 - a_rx_old)
+            move_b2 = PAIR_RECONCILE_ALPHA * (v_mid2 - b_tx_old)
+            cap_a2 = 0.20 * max(a_rx_old, 1.0)
+            cap_b2 = 0.20 * max(b_tx_old, 1.0)
+            move_a2 = max(-cap_a2, min(cap_a2, move_a2))
+            move_b2 = max(-cap_b2, min(cap_b2, move_b2))
+            a_rx_new = max(0.0, a_rx_old + move_a2)
+            b_tx_new = max(0.0, b_tx_old + move_b2)
+            if a_rx_new != a_rx_old:
+                interim[a_id]['rx'] = a_rx_new
+                penalty = 1.0 - 0.3 * min(1.0, res_rev / max(tol_pair_post2, 1e-9))
+                interim[a_id]['rx_conf'] = clamp(interim[a_id]['rx_conf'] * penalty)
+            if b_tx_new != b_tx_old:
+                interim[b_id]['tx'] = b_tx_new
+                penalty = 1.0 - 0.3 * min(1.0, res_rev / max(tol_pair_post2, 1e-9))
+                interim[b_id]['tx_conf'] = clamp(interim[b_id]['tx_conf'] * penalty)
+>>>>>>> REPLACE
+</DIFF>
+
+<DIFF>
+<<<<<<< SEARCH
+        CHANGE_PENALTY_WEIGHT = 0.5
+        final_tx_conf = clamp(base_tx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_rx))
+
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        r['tx_conf'] = final_tx_conf
+        r['rx_conf'] = final_rx_conf
+=======
+        CHANGE_PENALTY_WEIGHT = 0.5
+        final_tx_conf = clamp(base_tx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_tx))
+        final_rx_conf = clamp(base_rx_conf * (1.0 - CHANGE_PENALTY_WEIGHT * pen_rx))
+
+        # No-edit bonus: reward stable counters that didn't require repair
+        if rel_diff(r['orig_tx'], r['tx']) <= 1e-3:
+            final_tx_conf = clamp(final_tx_conf + 0.05)
+        if rel_diff(r['orig_rx'], r['rx']) <= 1e-3:
+            final_rx_conf = clamp(final_rx_conf + 0.05)
+
+        if resolved_status == 'down':
+            final_rx_conf = 0.9 if r['orig_rx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+            final_tx_conf = 0.9 if r['orig_tx'] <= TRAFFIC_EVIDENCE_MIN else 0.3
+
+        r['tx_conf'] = final_tx_conf
+        r['rx_conf'] = final_rx_conf
+>>>>>>> REPLACE
+</DIFF>

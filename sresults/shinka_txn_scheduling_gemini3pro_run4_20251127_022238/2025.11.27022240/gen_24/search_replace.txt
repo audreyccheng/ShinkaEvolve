@@ -1,0 +1,334 @@
+<NAME>
+lahc_block_ops
+</NAME>
+
+<DESCRIPTION>
+Replacing Simulated Annealing with Late Acceptance Hill Climbing (LAHC) which has shown better performance (Gen 14).
+Key features:
+1. Greedy Phase: Selects from 'Big Rocks' (longest txns) and random samples to pack large items early.
+2. Refinement: Uses LAHC with a history of 50.
+3. Operators: Includes 'Block Shift' (moving 2-3 contiguous transactions) to preserve optimized sub-sequences while reordering.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using Multi-Start Greedy Construction followed by Simulated Annealing.
+
+    Algorithm Design:
+    1.  **Metric-Aware Greedy**: Constructs candidates by selecting transactions that minimize
+        makespan increase. Ties are broken by preferring longer transactions (Best Fit Descending).
+    2.  **Local Refinement**: Applies Adjacent Swap Descent to every greedy candidate to
+        ensure we compare local minima.
+    3.  **Simulated Annealing (SA)**: The best candidate undergoes a long SA phase.
+        -   Start Temp: 2.5
+        -   Cooling: 0.98
+        -   Moves:
+            -   Adjacent Swap (40%)
+            -   Insertion/Shift (60%) - Weighted higher as it is structurally more impactful.
+
+    This approach combines the "global" exploration of multiple greedy starts with the
+    "local" hill-climbing capability of Swap Descent and the "basin-hopping" capability of SA.
+
+    Args:
+        workload: Workload object
+        num_seqs: Number of random starts
+
+    Returns:
+        Tuple of (lowest makespan, corresponding schedule)
+    """
+
+    # --- Pre-computation ---
+    # Calculate transaction lengths (operation counts) for tie-breaking
+    txn_lens = {}
+    try:
+        for i in range(workload.num_txns):
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            ops = len(re.findall(r'[rw]-\d+', txn_str))
+            txn_lens[i] = ops
+    except Exception:
+        for i in range(workload.num_txns):
+            txn_lens[i] = 1
+
+    # Constants
+    SAMPLE_SIZE = 15
+    SA_ITERATIONS = 2000
+    SA_TEMP_START = 2.5
+    SA_COOLING = 0.98
+    SA_STOP_TEMP = 0.001
+
+    candidates = []
+
+    # --- Phase 1: Diverse Greedy Starts ---
+    for _ in range(num_seqs):
+        remaining = list(range(workload.num_txns))
+
+        # Random start
+        start_txn = random.choice(remaining)
+        current_seq = [start_txn]
+        remaining.remove(start_txn)
+
+        # Construct
+        while remaining:
+            # Sample subset
+            k = min(len(remaining), SAMPLE_SIZE)
+            sample_txns = random.sample(remaining, k)
+
+            best_t = -1
+            # Minimize (cost, -length)
+            best_score = (float('inf'), 0)
+
+            for t in sample_txns:
+                # Evaluating cost is the bottleneck, keep sample size reasonable
+                cost = workload.get_opt_seq_cost(current_seq + [t])
+                score = (cost, -txn_lens[t])
+
+                if score < best_score:
+                    best_score = score
+                    best_t = t
+
+            current_seq.append(best_t)
+            remaining.remove(best_t)
+
+        # Fast Polish: Adjacent Swap Descent
+        # Necessary to find the true quality of this permutation basin
+        current_cost = workload.get_opt_seq_cost(current_seq)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(current_seq) - 1):
+                # Swap
+                current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+                new_cost = workload.get_opt_seq_cost(current_seq)
+                if new_cost < current_cost:
+                    current_cost = new_cost
+                    improved = True
+                else:
+                    # Revert
+                    current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+
+        candidates.append((current_cost, current_seq))
+
+    # --- Phase 2: Simulated Annealing on Champion ---
+    candidates.sort(key=lambda x: x[0])
+    best_overall_cost, best_overall_seq = candidates[0]
+
+    current_seq = list(best_overall_seq)
+    current_cost = best_overall_cost
+
+    T = SA_TEMP_START
+
+    for _ in range(SA_ITERATIONS):
+        if T < SA_STOP_TEMP:
+            break
+
+        # Clone for mutation
+        neighbor_seq = list(current_seq)
+
+        # Select Move: Shift (Insert) is more powerful for scheduling than Swap
+        # Bias towards Shift (0.6)
+        if random.random() < 0.6:
+            # Shift
+            if len(neighbor_seq) < 2: continue
+            idx_from = random.randint(0, len(neighbor_seq) - 1)
+            idx_to = random.randint(0, len(neighbor_seq) - 1)
+            if idx_from == idx_to: continue
+            txn = neighbor_seq.pop(idx_from)
+            neighbor_seq.insert(idx_to, txn)
+        else:
+            # Swap Adjacent
+            if len(neighbor_seq) < 2: continue
+            idx = random.randint(0, len(neighbor_seq) - 2)
+            neighbor_seq[idx], neighbor_seq[idx+1] = neighbor_seq[idx+1], neighbor_seq[idx]
+
+        # Evaluate
+        neighbor_cost = workload.get_opt_seq_cost(neighbor_seq)
+        delta = neighbor_cost - current_cost
+
+        # Metropolis Acceptance
+        # If better (delta < 0), accept.
+        # If worse, accept with prob exp(-delta/T)
+        if delta < 0 or random.random() < math.exp(-delta / T):
+            current_seq = neighbor_seq
+            current_cost = neighbor_cost
+
+            # Update global best
+            if current_cost < best_overall_cost:
+                best_overall_cost = current_cost
+                best_overall_seq = list(current_seq)
+
+        # Cool down
+        T *= SA_COOLING
+
+    return best_overall_cost, best_overall_seq
+=======
+def get_best_schedule(workload, num_seqs):
+    """
+    Get optimal schedule using "Big Rocks" Greedy Construction and Late Acceptance Hill Climbing.
+
+    Algorithm:
+    1.  **Txn Analysis**: Pre-compute transaction lengths (ops count) and sort for priority.
+    2.  **Greedy Phase**: Generate `num_seqs` candidates.
+        - Sample Strategy: Top K longest remaining ("Big Rocks") + Random sample.
+        - Objective: Minimize `(cost, -length)` (Best Fit Descending).
+        - **Descent**: Apply adjacent swap descent to locally optimize each candidate.
+    3.  **Refinement Phase (LAHC)**:
+        - Select best candidate from greedy phase.
+        - Apply Late Acceptance Hill Climbing (LAHC).
+        - Operators:
+          - Single Shift (Insert): 50%
+          - Block Shift (Move 2-3 txns): 30% - Preserves dependency chains.
+          - Adjacent Swap: 20%
+    """
+    import re
+
+    # --- Pre-computation ---
+    txn_lens = {}
+    try:
+        for i in range(workload.num_txns):
+            raw_txn = workload.txns[i]
+            if isinstance(raw_txn, (list, tuple)):
+                raw_txn = raw_txn[0]
+            txn_str = str(raw_txn)
+            ops = len(re.findall(r'[rw]-\d+', txn_str))
+            txn_lens[i] = ops
+    except Exception:
+        for i in range(workload.num_txns):
+            txn_lens[i] = 1
+
+    # Sorted indices for "Big Rocks" strategy
+    sorted_txns = sorted(range(workload.num_txns), key=lambda i: txn_lens[i], reverse=True)
+
+    SAMPLE_SIZE = 12
+    BIG_ROCKS_COUNT = 4
+
+    candidates = []
+
+    # --- Phase 1: Greedy Construction ---
+    for _ in range(num_seqs):
+        remaining = set(range(workload.num_txns))
+        # Start random
+        start_txn = random.choice(list(remaining))
+        current_seq = [start_txn]
+        remaining.remove(start_txn)
+
+        while remaining:
+            pool = []
+
+            # A. Big Rocks: Include top available longest transactions
+            added = 0
+            for t in sorted_txns:
+                if t in remaining:
+                    pool.append(t)
+                    added += 1
+                    if added >= BIG_ROCKS_COUNT:
+                        break
+
+            # B. Random Sample: Ensure diversity
+            rem_list = list(remaining)
+            if len(rem_list) > SAMPLE_SIZE:
+                pool.extend(random.sample(rem_list, SAMPLE_SIZE))
+            else:
+                pool.extend(rem_list)
+
+            # Deduplicate
+            pool = list(set(pool))
+
+            best_cand = -1
+            best_score = (float('inf'), 0)
+
+            for t in pool:
+                cost = workload.get_opt_seq_cost(current_seq + [t])
+                score = (cost, -txn_lens[t])
+                if score < best_score:
+                    best_score = score
+                    best_cand = t
+
+            current_seq.append(best_cand)
+            remaining.remove(best_cand)
+
+        # Quick Polish (Hill Climbing)
+        current_cost = workload.get_opt_seq_cost(current_seq)
+        improved = True
+        while improved:
+            improved = False
+            for i in range(len(current_seq) - 1):
+                current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+                new_cost = workload.get_opt_seq_cost(current_seq)
+                if new_cost < current_cost:
+                    current_cost = new_cost
+                    improved = True
+                else:
+                    current_seq[i], current_seq[i+1] = current_seq[i+1], current_seq[i]
+
+        candidates.append((current_cost, current_seq))
+
+    # --- Phase 2: Refinement (LAHC) ---
+    candidates.sort(key=lambda x: x[0])
+    best_overall_cost, best_overall_seq = candidates[0]
+
+    current_seq = list(best_overall_seq)
+    current_cost = best_overall_cost
+
+    # LAHC Parameters
+    LAHC_HISTORY_LEN = 50
+    history = [current_cost] * LAHC_HISTORY_LEN
+    MAX_ITER = 2000
+
+    for i in range(MAX_ITER):
+        # Mutation
+        r = random.random()
+        neighbor_seq = list(current_seq)
+        seq_len = len(neighbor_seq)
+
+        if r < 0.5:
+            # Single Shift (Insertion)
+            if seq_len < 2: continue
+            idx_from = random.randint(0, seq_len - 1)
+            idx_to = random.randint(0, seq_len - 1)
+            if idx_from == idx_to: continue
+            txn = neighbor_seq.pop(idx_from)
+            neighbor_seq.insert(idx_to, txn)
+
+        elif r < 0.8:
+            # Block Shift (Move 2-3 items)
+            if seq_len < 5: continue
+            block_size = random.randint(2, 3)
+            idx_from = random.randint(0, seq_len - block_size)
+            # Extract block
+            block = neighbor_seq[idx_from : idx_from + block_size]
+            del neighbor_seq[idx_from : idx_from + block_size]
+            # Insert block
+            idx_to = random.randint(0, len(neighbor_seq))
+            neighbor_seq[idx_to:idx_to] = block
+
+        else:
+            # Swap Adjacent
+            if seq_len < 2: continue
+            idx = random.randint(0, seq_len - 2)
+            neighbor_seq[idx], neighbor_seq[idx+1] = neighbor_seq[idx+1], neighbor_seq[idx]
+
+        # Evaluation
+        neighbor_cost = workload.get_opt_seq_cost(neighbor_seq)
+
+        # LAHC Acceptance
+        history_idx = i % LAHC_HISTORY_LEN
+
+        # Accept if better/equal to current OR better/equal to history
+        if neighbor_cost <= current_cost or neighbor_cost <= history[history_idx]:
+            current_seq = neighbor_seq
+            current_cost = neighbor_cost
+            if current_cost < best_overall_cost:
+                best_overall_cost = current_cost
+                best_overall_seq = list(current_seq)
+
+        # Update history
+        history[history_idx] = current_cost
+
+    return best_overall_cost, best_overall_seq
+>>>>>>> REPLACE
+</DIFF>

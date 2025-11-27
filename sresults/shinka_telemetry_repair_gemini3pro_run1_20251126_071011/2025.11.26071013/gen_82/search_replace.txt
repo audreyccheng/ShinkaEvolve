@@ -1,0 +1,180 @@
+<NAME>
+consensus_clustering_repair
+</NAME>
+
+<DESCRIPTION>
+Replaces the branching consensus logic with a unified "Clustering & Voting" mechanism.
+Collects all estimates (Local Measurement, Peer Measurement, Local Hint, Remote Hint),
+assigns weights (Hints=1.5, Sensors=1.0), and clusters them to find the consensus value.
+This naturally handles symmetry, broken symmetry, double-dead checks, and outlier rejection
+in a single robust pass.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+            # --- Logic to Resolve One Direction ---
+            def resolve_direction(local_val, peer_val, is_rx):
+                # We are solving for the true rate of the link in this direction.
+                # Candidates: local_val, peer_val.
+                # Constraints: Local Router Balance, Remote Router Balance.
+
+                hints = []
+
+                # 1. Local Hint
+                r_id = curr.get('local_router')
+                if r_id and r_id in router_balances:
+                    rb = router_balances[r_id]
+                    if is_rx:
+                        # RX must match Total TX
+                        h = max(0.0, rb['tx'] - (rb['rx'] - local_val))
+                        hints.append(h)
+                    else:
+                        # TX must match Total RX
+                        h = max(0.0, rb['rx'] - (rb['tx'] - local_val))
+                        hints.append(h)
+
+                # 2. Remote Hint (Dual-Sided)
+                # If we are RX, peer is TX. Remote router balance constrains peer TX.
+                rr_id = curr.get('remote_router')
+                if rr_id and rr_id in router_balances:
+                    rb_r = router_balances[rr_id]
+                    if is_rx:
+                        # Link is My_RX / Peer_TX.
+                        # Remote router (Peer's router) sees this as OUT (TX).
+                        # Peer_TX = Remote_RX_Total - (Remote_TX_Total - Peer_TX)
+                        h = max(0.0, rb_r['rx'] - (rb_r['tx'] - peer_val))
+                        hints.append(h)
+                    else:
+                        # Link is My_TX / Peer_RX.
+                        # Remote router sees this as IN (RX).
+                        # Peer_RX = Remote_TX_Total - (Remote_RX_Total - Peer_RX)
+                        h = max(0.0, rb_r['tx'] - (rb_r['rx'] - peer_val))
+                        hints.append(h)
+
+                # Consensus Target from Hints
+                target = None
+                if hints:
+                    target = sum(hints) / len(hints)
+
+                # Decision Logic
+
+                # A. Symmetry Check
+                denom = max(local_val, peer_val, 1.0)
+                diff_sym = abs(local_val - peer_val) / denom
+
+                if diff_sym <= HARDENING_THRESHOLD:
+                    # Symmetry holds.
+                    avg = (local_val + peer_val) / 2.0
+
+                    # Double Dead Check with Hint
+                    if target is not None and avg < TRAFFIC_THRESHOLD and target > 5.0:
+                         return target
+                    return avg
+
+                # B. Symmetry Broken
+                if target is not None:
+                    # We have a trusted target from Flow Conservation.
+
+                    # Double Dead Check
+                    if local_val < TRAFFIC_THRESHOLD and peer_val < TRAFFIC_THRESHOLD:
+                         if target > 5.0: return target
+                         return 0.0
+
+                    # Pick candidate closer to Target
+                    denom_l = max(local_val, target, 1.0)
+                    err_l = abs(local_val - target) / denom_l
+
+                    denom_p = max(peer_val, target, 1.0)
+                    err_p = abs(peer_val - target) / denom_p
+
+                    if err_l < err_p:
+                        return local_val
+                    else:
+                        return peer_val
+
+                else:
+                    # C. No Hint + Broken Symmetry (Partial Topology or multiple failures)
+                    # Use Heuristic: Trust Non-Zero (assuming counters undercount/drop/fail to 0)
+                    if local_val > TRAFFIC_THRESHOLD and peer_val < TRAFFIC_THRESHOLD:
+                        return local_val
+                    if peer_val > TRAFFIC_THRESHOLD and local_val < TRAFFIC_THRESHOLD:
+                        return peer_val
+
+                    # If both non-zero but different, average (reduce variance)
+                    return (local_val + peer_val) / 2.0
+=======
+            # --- Logic to Resolve One Direction (Consensus Clustering) ---
+            def resolve_direction(local_val, peer_val, is_rx):
+                # Gather weighted estimates
+                estimates = []
+
+                # 1. Measurement Signals (Weight 1.0)
+                estimates.append({'val': local_val, 'w': 1.0, 'src': 'sensor'})
+                estimates.append({'val': peer_val, 'w': 1.0, 'src': 'sensor'})
+
+                # 2. Flow Conservation Hints (Weight 1.5 - Higher trust to break ties)
+                # Local Hint
+                r_id = curr.get('local_router')
+                if r_id and r_id in router_balances:
+                    rb = router_balances[r_id]
+                    if is_rx:
+                        h = max(0.0, rb['tx'] - (rb['rx'] - local_val))
+                    else:
+                        h = max(0.0, rb['rx'] - (rb['tx'] - local_val))
+                    estimates.append({'val': max(0.0, h), 'w': 1.5, 'src': 'hint'})
+
+                # Remote Hint (Dual-Sided)
+                rr_id = curr.get('remote_router')
+                if rr_id and rr_id in router_balances:
+                    rb_r = router_balances[rr_id]
+                    if is_rx:
+                        # Link RX = Remote TX
+                        h = max(0.0, rb_r['rx'] - (rb_r['tx'] - peer_val))
+                    else:
+                        # Link TX = Remote RX
+                        h = max(0.0, rb_r['tx'] - (rb_r['rx'] - peer_val))
+                    estimates.append({'val': max(0.0, h), 'w': 1.5, 'src': 'hint'})
+
+                # Cluster estimates
+                sorted_ests = sorted(estimates, key=lambda x: x['val'])
+                clusters = []
+                current_cluster = [sorted_ests[0]]
+
+                for i in range(1, len(sorted_ests)):
+                    prev = current_cluster[-1]['val']
+                    curr_est = sorted_ests[i]
+
+                    # Clustering Criteria: Within 5% or 2 Mbps absolute
+                    diff = curr_est['val'] - prev
+                    denom = max(curr_est['val'], prev, 1.0)
+
+                    if diff < 2.0 or (diff / denom) < 0.05:
+                        current_cluster.append(curr_est)
+                    else:
+                        clusters.append(current_cluster)
+                        current_cluster = [curr_est]
+                clusters.append(current_cluster)
+
+                # Select Best Cluster
+                best_cluster = None
+                best_score = -1.0
+
+                for clust in clusters:
+                    score = sum(e['w'] for e in clust)
+
+                    if score > best_score:
+                        best_score = score
+                        best_cluster = clust
+                    elif abs(score - best_score) < 0.1:
+                        # Tie-breaking: Trust Non-Zero (Magnitude)
+                        curr_avg = sum(e['val'] for e in best_cluster) / len(best_cluster)
+                        new_avg = sum(e['val'] for e in clust) / len(clust)
+                        if new_avg > curr_avg:
+                            best_cluster = clust
+                            best_score = score
+
+                # Calculate centroid of winning cluster
+                final_val = sum(e['val'] for e in best_cluster) / len(best_cluster)
+                return final_val
+>>>>>>> REPLACE
+</DIFF>

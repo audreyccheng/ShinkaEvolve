@@ -1,0 +1,245 @@
+<NAME>
+multi_order_tpacker
+</NAME>
+
+<DESCRIPTION>
+I improved the parametric T-based packer to try multiple item orderings and bin selection rules, which increases the chance of finding a feasible packing at a lower T, thereby reducing the maximum KVPR. The previous bfd_assign_for_T used a single “weight-desc + projected global max” heuristic. The new version tries several strategies:
+- weight-desc with projected global max tie-broken by slack/memory balance,
+- intrinsic pressure ordering (dR/(S - size)) with projected tie-break,
+- weight-desc with direct min-per-GPU-KVPR selection (enforcing the T constraint per placement),
+- density-desc (dR/size),
+- size-desc.
+
+It also enforces the KVPR≤T constraint per placement step, pruning infeasible choices early. The function returns the first successful assignment among these variants, improving feasibility at tighter T and often reducing the final max KVPR. The change is localized to bfd_assign_for_T to keep the program simple and safe.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    def bfd_assign_for_T(T):
+        # Hybrid best-fit using transformed weights: enforce memory and minimize
+        # projected global max KVPR, with a slack/memory-aware tie-break.
+        capacity = T * S
+        if T < 0:
+            return None
+
+        # Build items with transformed weights
+        items = []
+        for m in models:
+            dR = (m.req_rate / m.slo)
+            w = dR + T * m.model_size
+            if w < 0:
+                w = 0.0
+            items.append((w, dR, m.model_size, m))
+        items.sort(key=lambda x: x[0], reverse=True)
+
+        used_w = [0.0] * gpu_num
+        bins_R = [0.0] * gpu_num
+        bins_used_mem = [0.0] * gpu_num
+        assign = {i: [] for i in range(gpu_num)}
+
+        total_used_mem = 0.0
+        alpha = 0.15
+        beta = 0.05
+        eps = 1e-12
+
+        for w, dR, sz, m in items:
+            # Compute current top-1 and top-2 KVPRs to evaluate projected global max quickly
+            top1_val = -1.0
+            top2_val = -1.0
+            top1_id = -1
+            for gid in range(gpu_num):
+                rem = S - bins_used_mem[gid]
+                val = kvpr(bins_R[gid], rem)
+                if val > top1_val:
+                    top2_val = top1_val
+                    top1_val = val
+                    top1_id = gid
+                elif val > top2_val:
+                    top2_val = val
+
+            # Global average memory fraction after placing this item (independent of gid)
+            avg_mem_frac_after = (total_used_mem + sz) / (gpu_num * S) if S > 0 else 0.0
+
+            best_gid = None
+            best_proj = float('inf')
+            best_hybrid = float('inf')
+            best_nw = float('inf')
+            best_rem_after = -1.0
+
+            for gid in range(gpu_num):
+                nw = used_w[gid] + w
+                mem_after = bins_used_mem[gid] + sz
+                if nw <= capacity + 1e-9 and mem_after <= S + 1e-9:
+                    rem_after = S - mem_after
+                    if rem_after <= 0:
+                        continue
+                    new_k = (bins_R[gid] + dR) / rem_after
+                    max_other = top2_val if gid == top1_id else top1_val
+                    projected = new_k if new_k > max_other else max_other
+
+                    # Hybrid tie-break cost
+                    cap = capacity if capacity > 0 else 1.0
+                    k_after_norm = max(0.0, (capacity - nw)) / (cap + eps)
+                    kv_new_norm = new_k / max(T, eps) if T > eps else new_k
+                    mem_imbalance = abs((mem_after / S) - avg_mem_frac_after) if S > 0 else 0.0
+                    hybrid = k_after_norm + alpha * kv_new_norm + beta * mem_imbalance
+
+                    if (projected + 1e-12 < best_proj or
+                        (abs(projected - best_proj) <= 1e-12 and (hybrid < best_hybrid or
+                                                                 (abs(hybrid - best_hybrid) <= 1e-12 and (nw < best_nw or
+                                                                                                         (nw == best_nw and rem_after > best_rem_after)))))):
+                        best_proj = projected
+                        best_hybrid = hybrid
+                        best_nw = nw
+                        best_rem_after = rem_after
+                        best_gid = gid
+
+            if best_gid is None:
+                return None
+
+            used_w[best_gid] += w
+            bins_R[best_gid] += dR
+            bins_used_mem[best_gid] += sz
+            assign[best_gid].append(m)
+            total_used_mem += sz
+
+        # Validate memory and KVPR constraints for this T
+        for gid in range(gpu_num):
+            if bins_used_mem[gid] - S > 1e-6:
+                return None
+            rem = S - bins_used_mem[gid]
+            if rem <= 0:
+                if bins_R[gid] > 1e-12:
+                    return None
+            else:
+                if (bins_R[gid] / rem) - T > 1e-6:
+                    return None
+        return assign
+=======
+    def bfd_assign_for_T(T):
+        # Try multiple item orderings and selection rules to find a feasible packing at target T.
+        capacity = T * S
+        if T < 0:
+            return None
+
+        # Precompute items with transformed weights
+        base_items = []
+        for m in models:
+            dR = (m.req_rate / m.slo)
+            w = dR + T * m.model_size
+            if w < 0:
+                w = 0.0
+            base_items.append([w, dR, float(m.model_size), m])
+
+        alpha = 0.15
+        beta = 0.05
+        eps = 1e-12
+
+        def order_items(order):
+            items = list(base_items)
+            if order == 'w_desc':
+                items.sort(key=lambda x: x[0], reverse=True)
+            elif order == 'intrinsic_desc':
+                items.sort(key=lambda x: (x[1] / max(S - x[2], 1e-9)), reverse=True)
+            elif order == 'density_desc':
+                items.sort(key=lambda x: (x[1] / (x[2] if x[2] > 0 else 1e-9)), reverse=True)
+            elif order == 'size_desc':
+                items.sort(key=lambda x: x[2], reverse=True)
+            else:
+                items.sort(key=lambda x: x[0], reverse=True)
+            return items
+
+        def try_pack(order, select_rule):
+            items = order_items(order)
+            used_w = [0.0] * gpu_num
+            bins_R = [0.0] * gpu_num
+            bins_used_mem = [0.0] * gpu_num
+            assign = {i: [] for i in range(gpu_num)}
+            total_used_mem = 0.0
+
+            for w, dR, sz, m in items:
+                # If selection uses projected global max, compute current top-1 and top-2 KVPRs
+                if select_rule == 'projected':
+                    top1_val = -1.0
+                    top2_val = -1.0
+                    top1_id = -1
+                    for gid in range(gpu_num):
+                        rem = S - bins_used_mem[gid]
+                        val = kvpr(bins_R[gid], rem)
+                        if val > top1_val:
+                            top2_val = top1_val
+                            top1_val = val
+                            top1_id = gid
+                        elif val > top2_val:
+                            top2_val = val
+                    avg_mem_frac_after = (total_used_mem + sz) / (gpu_num * S) if S > 0 else 0.0
+
+                best_gid = None
+                best_key = None  # tuple for comparison depending on rule
+
+                for gid in range(gpu_num):
+                    nw = used_w[gid] + w
+                    mem_after = bins_used_mem[gid] + sz
+                    if nw > capacity + 1e-9 or mem_after > S + 1e-9:
+                        continue
+                    rem_after = S - mem_after
+                    if rem_after <= 0:
+                        continue
+                    new_k = (bins_R[gid] + dR) / rem_after
+                    # Enforce KVPR<=T feasibility at placement time
+                    if new_k - T > 1e-9:
+                        continue
+
+                    if select_rule == 'projected':
+                        max_other = top2_val if gid == top1_id else top1_val
+                        projected = new_k if new_k > max_other else max_other
+                        cap = capacity if capacity > 0 else 1.0
+                        slack_norm = max(0.0, (capacity - nw)) / (cap + eps)
+                        kv_new_norm = new_k / max(T, eps) if T > eps else new_k
+                        mem_imbalance = abs((mem_after / S) - avg_mem_frac_after) if S > 0 else 0.0
+                        hybrid = slack_norm + alpha * kv_new_norm + beta * mem_imbalance
+                        key = (projected, hybrid, nw, -rem_after)
+                    else:  # 'min_kvpr' local rule
+                        key = (new_k, nw, -rem_after)
+
+                    if best_key is None or key < best_key:
+                        best_key = key
+                        best_gid = gid
+
+                if best_gid is None:
+                    return None
+
+                used_w[best_gid] += w
+                bins_R[best_gid] += dR
+                bins_used_mem[best_gid] += sz
+                assign[best_gid].append(m)
+                total_used_mem += sz
+
+            # Final validation (should hold due to local checks)
+            for gid in range(gpu_num):
+                if bins_used_mem[gid] - S > 1e-6:
+                    return None
+                rem = S - bins_used_mem[gid]
+                if rem <= 0:
+                    if bins_R[gid] > 1e-12:
+                        return None
+                else:
+                    if (bins_R[gid] / rem) - T > 1e-6:
+                        return None
+            return assign
+
+        # Try a small portfolio of strategies
+        for order, rule in [
+            ('w_desc', 'projected'),
+            ('intrinsic_desc', 'projected'),
+            ('w_desc', 'min_kvpr'),
+            ('density_desc', 'projected'),
+            ('size_desc', 'projected'),
+        ]:
+            cand = try_pack(order, rule)
+            if cand is not None:
+                return cand
+        return None
+>>>>>>> REPLACE
+
+</DIFF>

@@ -1,0 +1,118 @@
+<NAME>
+add_refine_peak_postprocessing
+</NAME>
+
+<DESCRIPTION>
+I add a lightweight, targeted post-processing step (refine_peak) after selecting the best candidate and before returning the final placement. This refinement repeatedly donates one of the most impactful models from the worst GPU to one of the two best GPUs (by KVPR) if it strictly reduces the global maximum KVPR. It focuses on the top models by demand and size, keeping it fast while addressing common pathological peaks that the general local search sometimes misses. After refine_peak, I run a short second pass of improve_local to polish the new configuration. This combination typically lowers the peak KVPR slightly without materially impacting runtime.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    best_plc = None
+    best_score = None
+    for plc in improved_candidates:
+        st = score_tuple(plc)
+        if best_score is None or st < best_score:
+            best_score = st
+            best_plc = plc
+
+    # Ensure all GPUs are present
+    for g in range(gpu_num):
+        best_plc.setdefault(g, [])
+
+    return best_plc
+=======
+    best_plc = None
+    best_score = None
+    for plc in improved_candidates:
+        st = score_tuple(plc)
+        if best_score is None or st < best_score:
+            best_score = st
+            best_plc = plc
+
+    # Targeted donation-first refinement: move a few impactful models from the worst GPU
+    def refine_peak(plc, passes=2, top_k=12, eps=1e-12):
+        per_g = {g: list(plc.get(g, [])) for g in range(gpu_num)}
+        mem = [sum(getattr(m, "model_size") for m in per_g[g]) for g in range(gpu_num)]
+        num = [sum((getattr(m, "req_rate") / getattr(m, "slo")) for m in per_g[g]) for g in range(gpu_num)]
+
+        def kvpr_g(g, msum=None, nsum=None):
+            msum = mem[g] if msum is None else msum
+            nsum = num[g] if nsum is None else nsum
+            return kvpr(nsum, GPU_MEM_SIZE - msum)
+
+        for _ in range(passes):
+            vals = [kvpr_g(g) for g in range(gpu_num)]
+            worst = max(range(gpu_num), key=lambda g: vals[g])
+            # Identify up to two best GPUs (lowest KVPR) excluding worst
+            best_targets = [g for g in sorted(range(gpu_num), key=lambda x: vals[x]) if g != worst][:2]
+            if not best_targets:
+                break
+
+            # Candidate selection from worst: top by demand and by size
+            def dn_of(m):
+                return float(getattr(m, "req_rate")) / float(getattr(m, "slo"))
+            def sz_of(m):
+                return float(getattr(m, "model_size"))
+
+            worst_list = list(per_g[worst])
+            if not worst_list:
+                break
+            top_by_dn = sorted(worst_list, key=dn_of, reverse=True)[:max(1, top_k // 2)]
+            top_by_sz = sorted(worst_list, key=sz_of, reverse=True)[:max(1, top_k - len(top_by_dn))]
+            cand = list({id(m): m for m in (top_by_dn + top_by_sz)}.values())
+
+            improved = False
+            best_new_max = max(vals)
+            best_action = None
+
+            for mdl in cand:
+                ms = sz_of(mdl)
+                dn = dn_of(mdl)
+                for tgt in best_targets:
+                    if mem[tgt] + ms > GPU_MEM_SIZE + 1e-12:
+                        continue
+
+                    src_mem = mem[worst] - ms
+                    src_num = num[worst] - dn
+                    tgt_mem = mem[tgt] + ms
+                    tgt_num = num[tgt] + dn
+
+                    src_k = kvpr(src_num, GPU_MEM_SIZE - src_mem)
+                    tgt_k = kvpr(tgt_num, GPU_MEM_SIZE - tgt_mem)
+
+                    new_max = max(src_k, tgt_k)
+                    for g in range(gpu_num):
+                        if g != worst and g != tgt and vals[g] > new_max:
+                            new_max = vals[g]
+
+                    if new_max + eps < best_new_max:
+                        best_new_max = new_max
+                        best_action = (mdl, worst, tgt, ms, dn)
+                        improved = True
+
+            if not improved:
+                break
+
+            mdl, src, tgt, ms, dn = best_action
+            per_g[src].remove(mdl)
+            per_g[tgt].append(mdl)
+            mem[src] -= ms
+            num[src] -= dn
+            mem[tgt] += ms
+            num[tgt] += dn
+
+        return {g: per_g.get(g, []) for g in range(gpu_num)}
+
+    # Apply refinement and a short polishing pass
+    best_plc = refine_peak(best_plc, passes=2, top_k=12)
+    best_plc = improve_local(best_plc, max_iters=1500)
+
+    # Ensure all GPUs are present
+    for g in range(gpu_num):
+        best_plc.setdefault(g, [])
+
+    return best_plc
+>>>>>>> REPLACE
+
+</DIFF>

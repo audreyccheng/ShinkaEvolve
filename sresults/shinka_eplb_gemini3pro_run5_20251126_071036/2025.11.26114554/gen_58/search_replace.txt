@@ -1,0 +1,233 @@
+<NAME>
+vectorized_iterative_greedy
+</NAME>
+
+<DESCRIPTION>
+Replaces the sequential, Python-loop-based greedy packing with a fully vectorized "Iterated Greedy" approach.
+1. Implements a vectorized Greedy LPT initialization that runs efficiently on batches of layers.
+2. Adds a `_refine_packing` function that performs vectorized "Max-Pack vs All-Packs" swaps to reduce the maximum load.
+3. Wraps the greedy process in an iterative loop where items in the bottleneck (max-load) pack are re-weighted (virtual weight boost) to be prioritized in the next greedy pass.
+This combination allows the algorithm to learn from previous failures and escape local optima, significantly improving load balance while maintaining high speed via vectorization.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=weight.device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    indices = weight.float().sort(-1, descending=True).indices.cpu()
+    pack_index = torch.full_like(weight,
+                                 fill_value=-1,
+                                 dtype=torch.int64,
+                                 device="cpu")
+    rank_in_pack = torch.full_like(pack_index, fill_value=-1)
+    for i in range(num_layers):
+        pack_weights = [0] * num_packs
+        pack_items = [0] * num_packs
+        for group in indices[i]:
+            pack = min(
+                (i
+                 for i in range(num_packs) if pack_items[i] < groups_per_pack),
+                key=pack_weights.__getitem__,
+            )
+            assert pack_items[pack] < groups_per_pack
+            pack_index[i, group] = pack
+            rank_in_pack[i, group] = pack_items[pack]
+            pack_weights[pack] += weight[i, group]
+            pack_items[pack] += 1
+    return pack_index, rank_in_pack
+=======
+def _refine_packing(weights: torch.Tensor,
+                    pack_indices: torch.Tensor,
+                    pack_weights: torch.Tensor,
+                    num_packs: int,
+                    groups_per_pack: int,
+                    max_iters: int = 20) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Refines packing by swapping items from the heaviest pack to any other pack
+    to minimize the max load. Vectorized over the batch dimension (num_layers).
+    """
+    num_layers = weights.shape[0]
+    batch_idx = torch.arange(num_layers, device=weights.device)
+
+    for _ in range(max_iters):
+        # 1. Identify the max load pack
+        max_load, max_pid = torch.max(pack_weights, dim=1)
+
+        # 2. Gather weights
+        # Items in max pack: [L, G]
+        max_pack_items = pack_indices[batch_idx, max_pid]
+        w_max_items = weights.gather(1, max_pack_items)
+
+        # Items in all packs: [L, M, G]
+        w_all_items = weights.gather(1, pack_indices.view(num_layers, -1)).view(num_layers, num_packs, groups_per_pack)
+
+        # 3. Calculate Deltas: w_u (from max) - w_v (from other)
+        # target shape: [L, M, G_other, G_max]
+        deltas = w_max_items.view(num_layers, 1, 1, groups_per_pack) - w_all_items.view(num_layers, num_packs, groups_per_pack, 1)
+
+        # 4. Prospective loads
+        # New Max = Max - delta, New Other = Other + delta
+        cur_max = max_load.view(num_layers, 1, 1, 1)
+        cur_other = pack_weights.view(num_layers, num_packs, 1, 1)
+
+        new_max_load = cur_max - deltas
+        new_other_load = cur_other + deltas
+
+        # Objective: minimize max(new_max, new_other)
+        metrics = torch.max(new_max_load, new_other_load)
+
+        # Mask self-swaps (pack k == max_pid)
+        mask = (torch.arange(num_packs, device=weights.device).unsqueeze(0) == max_pid.unsqueeze(1))
+        mask = mask.view(num_layers, num_packs, 1, 1)
+        metrics.masked_fill_(mask, float('inf'))
+
+        # 5. Best swap
+        flat_metrics = metrics.view(num_layers, -1)
+        best_metric, best_idx = torch.min(flat_metrics, dim=1)
+
+        # 6. Check for improvement
+        improve_mask = best_metric < (max_load - 1e-5)
+        if not improve_mask.any():
+            break
+
+        active_indices = batch_idx[improve_mask]
+        if len(active_indices) == 0:
+            break
+
+        # 7. Execute swap for active layers
+        idx_flat = best_idx[improve_mask]
+        G = groups_per_pack
+        G2 = G * G
+
+        p_other = idx_flat // G2
+        rem = idx_flat % G2
+        g_other = rem // G
+        g_max = rem % G
+
+        p_max_active = max_pid[active_indices]
+
+        item_max = pack_indices[active_indices, p_max_active, g_max]
+        item_other = pack_indices[active_indices, p_other, g_other]
+
+        pack_indices[active_indices, p_max_active, g_max] = item_other
+        pack_indices[active_indices, p_other, g_other] = item_max
+
+        w_max_val = weights[active_indices, item_max]
+        w_other_val = weights[active_indices, item_other]
+        d_val = w_max_val - w_other_val
+
+        pack_weights[active_indices, p_max_active] -= d_val
+        pack_weights[active_indices, p_other] += d_val
+
+    return pack_indices, pack_weights
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int,
+                     num_attempts: int = 5) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs using Vectorized Iterated Greedy.
+    Combines Greedy LPT with iterative re-weighting and local search refinement.
+    """
+    num_layers, num_groups = weight.shape
+    device = weight.device
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    if groups_per_pack == 1:
+        pack_index = torch.arange(num_groups, dtype=torch.int64,
+                                  device=device).expand(num_layers, -1)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    best_assignment = torch.zeros((num_layers, num_packs, groups_per_pack), dtype=torch.int64, device=device)
+    best_max_loads = torch.full((num_layers,), float('inf'), device=device)
+    virtual_weight = weight.clone().float()
+    batch_idx = torch.arange(num_layers, device=device)
+    inf_tensor = torch.tensor(float('inf'), device=device)
+
+    # Pre-allocate tensors for speed
+    curr_pack_assignment = torch.zeros((num_layers, num_packs, groups_per_pack), dtype=torch.int64, device=device)
+    curr_pack_weights = torch.zeros((num_layers, num_packs), dtype=weight.dtype, device=device)
+    curr_pack_counts = torch.zeros((num_layers, num_packs), dtype=torch.int64, device=device)
+
+    for attempt in range(num_attempts):
+        # 1. Greedy Initialization
+        curr_pack_weights.zero_()
+        curr_pack_counts.zero_()
+
+        sorted_indices = torch.argsort(virtual_weight, dim=1, descending=True)
+
+        for j in range(num_groups):
+            item_idx = sorted_indices[:, j] # [L]
+            w_real = weight[batch_idx, item_idx] # [L]
+
+            is_full = (curr_pack_counts >= groups_per_pack)
+            masked_weights = torch.where(is_full, inf_tensor, curr_pack_weights)
+            best_pack = torch.argmin(masked_weights, dim=1) # [L]
+
+            slot = curr_pack_counts[batch_idx, best_pack]
+            curr_pack_assignment[batch_idx, best_pack, slot] = item_idx
+            curr_pack_weights[batch_idx, best_pack] += w_real
+            curr_pack_counts[batch_idx, best_pack] += 1
+
+        # 2. Refinement
+        curr_pack_assignment, curr_pack_weights = _refine_packing(
+            weight, curr_pack_assignment, curr_pack_weights, num_packs, groups_per_pack
+        )
+
+        # 3. Update Best
+        curr_max_load, curr_max_pid = torch.max(curr_pack_weights, dim=1)
+        improved = curr_max_load < best_max_loads
+
+        if improved.any():
+            mask_exp = improved.view(num_layers, 1, 1)
+            best_assignment = torch.where(mask_exp, curr_pack_assignment, best_assignment)
+            best_max_loads = torch.where(improved, curr_max_load, best_max_loads)
+
+        # 4. Re-weighting
+        if attempt < num_attempts - 1:
+            max_p_items = curr_pack_assignment[batch_idx, curr_max_pid] # [L, G]
+            mults = torch.ones_like(virtual_weight)
+            src = torch.full_like(max_p_items, 1.05, dtype=virtual_weight.dtype)
+            mults.scatter_(1, max_p_items, src)
+            virtual_weight = virtual_weight * mults
+
+    # Construct final outputs
+    pack_index = torch.zeros_like(weight, dtype=torch.int64)
+    rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+
+    flat_assignment = best_assignment.view(num_layers, -1)
+
+    p_ids = torch.arange(num_packs, device=device).unsqueeze(1).expand(-1, groups_per_pack).reshape(1, -1).expand(num_layers, -1)
+    r_ids = torch.arange(groups_per_pack, device=device).unsqueeze(0).expand(num_packs, -1).reshape(1, -1).expand(num_layers, -1)
+
+    pack_index.scatter_(1, flat_assignment, p_ids)
+    rank_in_pack.scatter_(1, flat_assignment, r_ids)
+
+    return pack_index, rank_in_pack
+>>>>>>> REPLACE
+</DIFF>

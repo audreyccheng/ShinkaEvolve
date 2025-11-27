@@ -1,0 +1,221 @@
+<NAME>
+preplace_memory_only_and_adjust_bounds
+</NAME>
+
+<DESCRIPTION>
+I pre-place memory-only models (slo==0) before running the slack-equalization to prevent them from forcing a greedy fallback and to tighten bounds. These models contribute no KVPR but consume memory, so placing them largest-first onto GPUs with the most remaining memory yields better remaining capacities for the actual KVPR optimization. I then:
+- Build the items list only from models with slo>0.
+- Recompute lower bounds using the residual per-GPU free memory (sum_free and cap_max), updating per-item, global, pair, and k-prefix bounds accordingly.
+- Initialize the slack equalization with the pre-placed state by setting assign to the base placement and used_mem to the pre-occupied memory, with KV slack K computed accordingly.
+
+This change follows the recommended “pre-place memory-only models” approach and aligns the feasibility search and packing with the real residual capacities. It should significantly improve the max-KVPR results without complicating the rest of the algorithm.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+    # Extract per-model attributes once
+    items = []
+    total_R = 0.0
+    total_size = 0.0
+    for m in models:
+        slo = float(m.slo)
+        dR = float(m.req_rate) / slo if slo != 0 else float('inf')
+        s = float(m.model_size)
+        items.append({'obj': m, 'dR': dR, 'size': s})
+        total_R += 0.0 if dR == float('inf') else dR
+        total_size += s
+=======
+    # Pre-place memory-only models (slo==0) largest-first onto GPUs with most free memory
+    base_placement = {i: [] for i in range(gpu_num)}
+    rem0 = [S] * gpu_num
+    mem_only = [m for m in models if getattr(m, "slo", 0) == 0]
+    mem_only.sort(key=lambda m: float(m.model_size), reverse=True)
+    for m in mem_only:
+        size = float(m.model_size)
+        # choose GPU with most remaining memory that fits; tie-break by fewest models
+        candidates = [g for g in range(gpu_num) if rem0[g] >= size - 1e-9]
+        if not candidates:
+            # cannot place memory-only model; fall back to greedy baseline on all models
+            return _greedy_fallback_kvpr(gpu_num, models, S)
+        candidates.sort(key=lambda g: (-rem0[g], len(base_placement[g])))
+        gid = candidates[0]
+        base_placement[gid].append(m)
+        rem0[gid] -= size
+
+    # Extract per-model attributes once for demanders (slo>0)
+    items = []
+    for m in models:
+        if getattr(m, "slo", 0) == 0:
+            continue
+        slo = float(m.slo)
+        dR = float(m.req_rate) / slo
+        s = float(m.model_size)
+        items.append({'obj': m, 'dR': dR, 'size': s})
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+    # Lower bounds on optimal T
+    def compute_lower_bound():
+        # Per-item bound: T >= dR / (S - s)
+        lb1 = 0.0
+        infeasible_single = False
+        for it in items:
+            dR = it['dR']; s = it['size']
+            denom = S - s
+            if denom <= 0:
+                if dR > 0 and dR != float('inf'):
+                    infeasible_single = True
+                elif dR == float('inf'):
+                    infeasible_single = True
+                continue
+            if dR > 0 and dR != float('inf'):
+                cand = dR / denom
+                if cand > lb1:
+                    lb1 = cand
+
+        # Global bound: T >= total_R / (gpu_num*S - total_size)
+        denom2 = gpu_num * S - total_size
+        if denom2 <= 0 and total_R > 0:
+            return float('inf'), True, infeasible_single
+        lb2 = 0.0 if total_R <= 0 or denom2 <= 0 else (total_R / denom2)
+
+        # Pair bound: for pairs that cannot co-reside (s_i + s_j > S)
+        lb_pair = 0.0
+        P = min(len(items), 200)
+        by_size = sorted(items, key=lambda x: x['size'], reverse=True)[:P]
+        for i in range(len(by_size)):
+            si = by_size[i]['size']; ri = by_size[i]['dR']
+            for j in range(i + 1, len(by_size)):
+                sj = by_size[j]['size']; rj = by_size[j]['dR']
+                if si + sj > S:
+                    denom = 2 * S - (si + sj)
+                    if denom > 0:
+                        ri_f = 0.0 if ri == float('inf') else ri
+                        rj_f = 0.0 if rj == float('inf') else rj
+                        cand = (ri_f + rj_f) / denom
+                        if cand > lb_pair:
+                            lb_pair = cand
+
+        # k-bin prefix bound for k in {1..min(gpu_num,4)}
+        lb_k = 0.0
+        sorted_by_size = sorted(items, key=lambda x: x['size'], reverse=True)
+        prefix_sizes = []
+        prefix_rates = []
+        cs = 0.0; cr = 0.0
+        for it in sorted_by_size:
+            cs += it['size']; cr += (0.0 if it['dR'] == float('inf') else it['dR'])
+            prefix_sizes.append(cs); prefix_rates.append(cr)
+        for k in range(1, min(gpu_num, 4) + 1):
+            threshold = (k - 1) * S
+            idx = -1
+            for t in range(len(prefix_sizes)):
+                if prefix_sizes[t] > threshold:
+                    idx = t
+                    break
+            if idx >= 0:
+                numer = prefix_rates[idx]
+                denom = k * S - prefix_sizes[idx]
+                if denom > 0 and numer > 0:
+                    cand = numer / denom
+                    if cand > lb_k:
+                        lb_k = cand
+
+        lower = max(0.0, lb1, lb2, lb_pair, lb_k)
+        return lower, False, infeasible_single
+=======
+    # Lower bounds on optimal T after pre-placing memory-only models
+    def compute_lower_bound():
+        # Available memory per GPU after memory-only placement
+        rem_free = list(rem0)
+        sum_free = sum(rem_free)
+        cap_max = max(rem_free) if rem_free else 0.0
+
+        # Totals over remaining demanders
+        total_R = sum((it['dR'] for it in items if it['dR'] != float('inf')), 0.0)
+        total_size = sum((it['size'] for it in items), 0.0)
+
+        # Per-item bound: T >= dR / (cap_max - s)
+        lb1 = 0.0
+        infeasible_single = False
+        for it in items:
+            dR = it['dR']; s = it['size']
+            denom = cap_max - s
+            if denom <= 0:
+                if dR > 0 and dR != float('inf'):
+                    infeasible_single = True
+                continue
+            if dR > 0 and dR != float('inf'):
+                cand = dR / denom
+                if cand > lb1:
+                    lb1 = cand
+
+        # Global bound: T >= total_R / (sum_free - total_size)
+        denom2 = sum_free - total_size
+        if denom2 <= 0 and total_R > 0:
+            return float('inf'), True, infeasible_single
+        lb2 = 0.0 if total_R <= 0 or denom2 <= 0 else (total_R / denom2)
+
+        # Pair bound: for pairs that cannot co-reside on any GPU (approximate with cap_max)
+        lb_pair = 0.0
+        P = min(len(items), 200)
+        by_size = sorted(items, key=lambda x: x['size'], reverse=True)[:P]
+        for i in range(len(by_size)):
+            si = by_size[i]['size']; ri = by_size[i]['dR']
+            for j in range(i + 1, len(by_size)):
+                sj = by_size[j]['size']; rj = by_size[j]['dR']
+                if si + sj > cap_max:
+                    denom = 2 * cap_max - (si + sj)
+                    if denom > 0:
+                        ri_f = 0.0 if ri == float('inf') else ri
+                        rj_f = 0.0 if rj == float('inf') else rj
+                        cand = (ri_f + rj_f) / denom
+                        if cand > lb_pair:
+                            lb_pair = cand
+
+        # k-bin prefix bound for k in {1..min(gpu_num,4)} using cap_max as proxy capacity
+        lb_k = 0.0
+        sorted_by_size = sorted(items, key=lambda x: x['size'], reverse=True)
+        prefix_sizes = []
+        prefix_rates = []
+        cs = 0.0; cr = 0.0
+        for it in sorted_by_size:
+            cs += it['size']; cr += (0.0 if it['dR'] == float('inf') else it['dR'])
+            prefix_sizes.append(cs); prefix_rates.append(cr)
+        for k in range(1, min(gpu_num, 4) + 1):
+            threshold = (k - 1) * cap_max
+            idx = -1
+            for t in range(len(prefix_sizes)):
+                if prefix_sizes[t] > threshold:
+                    idx = t
+                    break
+            if idx >= 0:
+                numer = prefix_rates[idx]
+                denom = k * cap_max - prefix_sizes[idx]
+                if denom > 0 and numer > 0:
+                    cand = numer / denom
+                    if cand > lb_k:
+                        lb_k = cand
+
+        lower = max(0.0, lb1, lb2, lb_pair, lb_k)
+        return lower, False, infeasible_single
+>>>>>>> REPLACE
+
+</DIFF>
+<DIFF>
+<<<<<<< SEARCH
+            # per-GPU states
+            assign = {i: [] for i in range(gpu_num)}
+            used_mem = [0.0] * gpu_num
+            sum_R = [0.0] * gpu_num
+            K = [T * S] * gpu_num  # KV slack
+=======
+            # per-GPU states initialized with memory-only placement
+            assign = {i: list(base_placement.get(i, [])) for i in range(gpu_num)}
+            used_mem = [S - rem0[g] for g in range(gpu_num)]
+            sum_R = [0.0] * gpu_num
+            K = [T * S - (sum_R[g] + T * used_mem[g]) for g in range(gpu_num)]  # KV slack
+>>>>>>> REPLACE
+
+</DIFF>

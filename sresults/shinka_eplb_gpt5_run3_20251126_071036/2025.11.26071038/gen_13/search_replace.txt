@@ -1,0 +1,118 @@
+<NAME>
+replication_fixup_one_step
+</NAME>
+
+<DESCRIPTION>
+We add a lightweight one-step replication “fix-up” after the greedy D’Hondt allocation in replicate_experts. After the initial counts are determined, for each layer we compute per-replica averages (weight/logcnt) and attempt to move one replica from the donor expert with the highest average to the receiver with the lowest average, provided the donor has at least two replicas and the move strictly reduces the global max average. We then rebuild the physical-to-logical mapping and the ranks from the final counts. This preserves the speed profile (O(X*N)) and improves balancedness by correcting occasional over-replication outliers. No other interfaces change.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+=======
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    dtype_i64 = torch.int64
+
+    # Greedy D'Hondt-like allocation of extra replicas
+    logcnt = torch.ones(n, num_log, dtype=dtype_i64, device=device)
+    arangen = torch.arange(n, dtype=dtype_i64, device=device)
+    for _ in range(num_redundant):
+        best = (weight / logcnt).max(dim=-1).indices
+        logcnt[arangen, best] += 1
+
+    # One-step donor->receiver fix-up per layer (optional improvement)
+    # Try moving one replica from the highest avg to the lowest avg if it reduces the max avg.
+    if num_phy > 0 and num_log > 1:
+        eps = 1e-12
+        for i in range(n):
+            ci = logcnt[i]
+            wi = weight[i]
+            # ensure no div by zero
+            avg = wi / ci.clamp_min(1)
+            donor = int(torch.argmax(avg).item())
+            receiver = int(torch.argmin(avg).item())
+            if donor == receiver:
+                continue
+            if int(ci[donor].item()) <= 1:
+                continue
+            current_max = float(avg.max().item())
+            ci_new = ci.clone()
+            ci_new[donor] -= 1
+            ci_new[receiver] += 1
+            # Evaluate new max average only if valid
+            new_avg = wi / ci_new.clamp_min(1)
+            if float(new_avg.max().item()) + eps < current_max:
+                logcnt[i] = ci_new
+
+    # Build phy2log and rank from final counts (deterministic order by logical id)
+    phy2log = torch.empty((n, num_phy), dtype=dtype_i64, device=device)
+    rank = torch.empty((n, num_phy), dtype=dtype_i64, device=device)
+    ar_log = torch.arange(num_log, dtype=dtype_i64, device=device)
+
+    for i in range(n):
+        reps = logcnt[i].to(dtype_i64)
+        # Materialize mapping row
+        phy_row = ar_log.repeat_interleave(reps)
+        # Ranks: for each logical j, 0..reps[j]-1
+        rank_blocks = []
+        for c in reps.tolist():
+            rank_blocks.append(torch.arange(int(c), dtype=dtype_i64, device=device))
+        rank_row = torch.cat(rank_blocks, dim=0) if rank_blocks else torch.empty(0, dtype=dtype_i64, device=device)
+
+        # Store (length must equal num_phy)
+        phy2log[i, :phy_row.numel()] = phy_row
+        rank[i, :rank_row.numel()] = rank_row
+
+    return phy2log, rank, logcnt
+>>>>>>> REPLACE
+
+</DIFF>

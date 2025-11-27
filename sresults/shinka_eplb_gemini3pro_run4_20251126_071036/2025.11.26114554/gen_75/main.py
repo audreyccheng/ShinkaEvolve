@@ -1,0 +1,518 @@
+# EVOLVE-BLOCK-START
+"""
+Expert parallelism load balancer (EPLB) for vLLM.
+
+This module implements the core rearrangement algorithm.
+
+The rearrangement algorithm is adapted from
+[DeepSeek EPLB](https://github.com/deepseek-ai/eplb).
+
+Please find at [#12](https://github.com/deepseek-ai/EPLB/issues/12) an example
+on how the EPLB algorithm works.
+"""
+
+import torch
+import random
+
+
+def refine_two_packs(pack_a_indices, pack_b_indices, weights_list, w_a, w_b):
+    """
+    Iteratively swaps items between two packs to minimize the difference in their weights.
+    Operates in-place on the index lists if possible, or returns new ones.
+    """
+    A = list(pack_a_indices)
+    B = list(pack_b_indices)
+    
+    # Simple descent heuristic
+    # Limit iterations to avoid infinite loops in edge cases
+    max_iters = 50 
+    
+    for _ in range(max_iters):
+        diff = w_a - w_b
+        if abs(diff) < 1e-6:
+            break
+
+        best_gain = -1.0
+        best_pair = None
+        
+        # We want to swap A[i] with B[j]
+        # Let u = weight(A[i]), v = weight(B[j])
+        # delta = u - v
+        # If diff > 0 (A > B), we want u > v (delta > 0).
+        # We want to maximize gain ~ reduction in variance.
+        # A' = A - delta, B' = B + delta.
+        # Target is (A+B)/2. Minimize (A' - avg)^2 + (B' - avg)^2.
+        # Equivalent to minimizing |A' - B'|.
+        
+        for i, u_idx in enumerate(A):
+            u = weights_list[u_idx]
+            for j, v_idx in enumerate(B):
+                v = weights_list[v_idx]
+                delta = u - v
+                
+                gain = -1.0
+                if diff > 0:
+                    # A > B, need to move weight A->B (delta > 0)
+                    if delta > 1e-6 and delta < diff:
+                        # Swap u (heavy) with v (light)
+                        # New diff = (A - delta) - (B + delta) = A - B - 2delta = diff - 2delta.
+                        # We want |diff - 2delta| < diff.
+                        # Since delta > 0, diff - 2delta < diff is trivial.
+                        # We need diff - 2delta > -diff => 2diff > 2delta => delta < diff.
+                        gain = delta * (diff - delta)
+                else: # diff < 0
+                    # B > A, need to move weight B->A (delta < 0)
+                    if delta < -1e-6 and delta > diff:
+                         # Similar logic
+                         gain = - (delta * (delta - diff))
+                
+                if gain > best_gain:
+                    best_gain = gain
+                    best_pair = (i, j, delta)
+        
+        if best_pair:
+            i, j, delta = best_pair
+            # Swap
+            tmp = A[i]
+            A[i] = B[j]
+            B[j] = tmp
+            w_a -= delta
+            w_b += delta
+        else:
+            break
+            
+    return A, B, w_a, w_b
+
+
+def balanced_packing(weight: torch.Tensor,
+                     num_packs: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """
+    Pack n weighted objects to m packs, such that each bin contains exactly
+    n/m objects and the weights of all packs are as balanced as possible.
+
+    Parameters:
+        weight: [X, n], the weight of each item
+        num_packs: number of packs
+
+    Returns:
+        pack_index: [X, n], the pack index of each item
+        rank_in_pack: [X, n], the rank of the item in the pack
+    """
+    num_layers, num_groups = weight.shape
+    assert num_groups % num_packs == 0
+    groups_per_pack = num_groups // num_packs
+
+    device = weight.device
+    if groups_per_pack == 1:
+        pack_index = torch.arange(weight.size(-1),
+                                  dtype=torch.int64,
+                                  device=device).expand(weight.shape)
+        rank_in_pack = torch.zeros_like(weight, dtype=torch.int64)
+        return pack_index, rank_in_pack
+
+    # Use CPU weights for processing
+    weight_cpu = weight.cpu()
+
+    # Outputs on CPU initially
+    pack_index = torch.empty((num_layers, num_groups), dtype=torch.int64)
+    rank_in_pack = torch.empty((num_layers, num_groups), dtype=torch.int64)
+
+    # Pre-allocate helper tensors for scatter
+    flat_packs_base = torch.arange(num_packs).unsqueeze(1).expand(-1, groups_per_pack).reshape(-1)
+    flat_ranks_base = torch.arange(groups_per_pack).unsqueeze(0).expand(num_packs, -1).reshape(-1)
+
+    for i in range(num_layers):
+        layer_w = weight_cpu[i]
+        layer_w_list = layer_w.tolist()
+
+        best_max_load = float('inf')
+        best_ss = float('inf')
+        best_assignment = None
+        best_pack_weights = None
+
+        # --- 1. Initialization (Randomized Greedy) ---
+        NUM_RESTARTS = 20
+        candidates = []
+        
+        # Deterministic
+        candidates.append(sorted(range(num_groups), key=lambda x: layer_w_list[x], reverse=True))
+        # Randomized
+        for _ in range(NUM_RESTARTS - 1):
+             candidates.append(sorted(range(num_groups), 
+                                      key=lambda x: layer_w_list[x] * (0.8 + 0.4 * random.random()), 
+                                      reverse=True))
+
+        for indices in candidates:
+            # Greedy Best Fit (Min Load)
+            packs = [[] for _ in range(num_packs)]
+            pack_weights = [0.0] * num_packs
+            pack_cnt = [0] * num_packs
+
+            for idx in indices:
+                w = layer_w_list[idx]
+                best_p = -1
+                min_w = float('inf')
+                for p in range(num_packs):
+                    if pack_cnt[p] < groups_per_pack:
+                        if pack_weights[p] < min_w:
+                            min_w = pack_weights[p]
+                            best_p = p
+                packs[best_p].append(idx)
+                pack_weights[best_p] += w
+                pack_cnt[best_p] += 1
+            
+            c_max = max(pack_weights)
+            c_ss = sum(x*x for x in pack_weights)
+            
+            if c_max < best_max_load - 1e-6:
+                best_max_load = c_max
+                best_ss = c_ss
+                best_assignment = packs
+                best_pack_weights = pack_weights
+            elif abs(c_max - best_max_load) < 1e-6 and c_ss < best_ss - 1e-6:
+                best_ss = c_ss
+                best_assignment = packs
+                best_pack_weights = pack_weights
+
+        # Convert to tensors for vectorized ops
+        # [num_packs, groups_per_pack]
+        pack_assignment = torch.tensor(best_assignment, dtype=torch.int64)
+        pack_weights = torch.tensor(best_pack_weights, dtype=torch.float32)
+
+        # --- 2. Refinement Loop ---
+        NUM_GLOBAL_ITERS = 5
+        
+        for _ in range(NUM_GLOBAL_ITERS):
+            improved_any = False
+            
+            # Phase A: Vectorized Global Swaps (Max vs All)
+            for _ in range(15):
+                max_pack = torch.argmax(pack_weights).item()
+                max_w = pack_weights[max_pack].item()
+
+                u_indices = pack_assignment[max_pack] # [G]
+                w_u = layer_w[u_indices].view(1, groups_per_pack, 1) # [1, G, 1]
+                w_v = layer_w[pack_assignment].view(num_packs, 1, groups_per_pack) # [M, 1, G]
+
+                diffs = (max_w - pack_weights).view(num_packs, 1, 1) # [M, 1, 1]
+                deltas = w_u - w_v # [M, G, G]
+
+                # Mask: 0 < delta < diff
+                mask = (deltas > 1e-6) & (deltas < diffs)
+
+                if not mask.any():
+                    break
+
+                gains = deltas * (diffs - deltas)
+                gains = torch.where(mask, gains, -1.0)
+                
+                best_val, best_flat = gains.view(-1).max(0)
+                
+                if best_val < 0:
+                    break
+                    
+                best_flat_idx = best_flat.item()
+                p_target = best_flat_idx // (groups_per_pack * groups_per_pack)
+                rem = best_flat_idx % (groups_per_pack * groups_per_pack)
+                u_pos = rem // groups_per_pack
+                v_pos = rem % groups_per_pack
+                
+                val_u = pack_assignment[max_pack, u_pos].item()
+                val_v = pack_assignment[p_target, v_pos].item()
+                delta_val = deltas.view(-1)[best_flat_idx].item()
+                
+                pack_assignment[max_pack, u_pos] = val_v
+                pack_assignment[p_target, v_pos] = val_u
+                pack_weights[max_pack] -= delta_val
+                pack_weights[p_target] += delta_val
+                improved_any = True
+
+            # Phase B: LNS with Pairwise Refinement
+            if num_packs > 1:
+                # More attempts if we haven't improved recently
+                lns_attempts = 3
+                for _ in range(lns_attempts):
+                    # Identify packs
+                    max_p = torch.argmax(pack_weights).item()
+                    min_p = torch.argmin(pack_weights).item()
+                    
+                    if max_p == min_p:
+                        break
+                    
+                    # 1. Pairwise Refinement (Exact-ish solver for 2 packs)
+                    # This is cheap and effective
+                    idxs_a = pack_assignment[max_p].tolist()
+                    idxs_b = pack_assignment[min_p].tolist()
+                    wa = pack_weights[max_p].item()
+                    wb = pack_weights[min_p].item()
+                    
+                    new_a, new_b, new_wa, new_wb = refine_two_packs(idxs_a, idxs_b, layer_w_list, wa, wb)
+                    
+                    if new_wa < wa - 1e-6 or (abs(new_wa - wa) < 1e-6 and abs(new_wa - new_wb) < abs(wa - wb) - 1e-6):
+                         pack_assignment[max_p] = torch.tensor(new_a, dtype=torch.int64)
+                         pack_assignment[min_p] = torch.tensor(new_b, dtype=torch.int64)
+                         pack_weights[max_p] = new_wa
+                         pack_weights[min_p] = new_wb
+                         improved_any = True
+                         # Update indices for next steps if needed
+                         idxs_a = new_a
+                         idxs_b = new_b
+                    
+                    # 2. 3-Way LNS (Ruin & Recreate)
+                    packs_subset = [max_p, min_p]
+                    if num_packs > 2:
+                        rand_p = random.randint(0, num_packs - 1)
+                        while rand_p in packs_subset:
+                            rand_p = random.randint(0, num_packs - 1)
+                        packs_subset.append(rand_p)
+                    
+                    items = []
+                    for p in packs_subset:
+                        items.extend(pack_assignment[p].tolist())
+                        
+                    current_sub_max = max(pack_weights[p].item() for p in packs_subset)
+                    current_sub_ss = sum(pack_weights[p].item()**2 for p in packs_subset)
+                    
+                    best_sub_res = None
+                    item_data = [(layer_w_list[x], x) for x in items]
+                    
+                    # LNS Restarts
+                    for attempt in range(4):
+                        if attempt == 0:
+                            sorted_items = sorted(item_data, key=lambda x: x[0], reverse=True)
+                        else:
+                            sorted_items = sorted(item_data, key=lambda x: x[0] * (1.0 + random.random()*0.1), reverse=True)
+                        
+                        temp_weights = {p: 0.0 for p in packs_subset}
+                        temp_counts = {p: 0 for p in packs_subset}
+                        temp_contents = {p: [] for p in packs_subset}
+                        
+                        possible = True
+                        for w, idx in sorted_items:
+                            # Best Fit
+                            best_local_p = -1
+                            min_local_w = float('inf')
+                            for p in packs_subset:
+                                if temp_counts[p] < groups_per_pack:
+                                    if temp_weights[p] < min_local_w:
+                                        min_local_w = temp_weights[p]
+                                        best_local_p = p
+                            if best_local_p == -1:
+                                possible = False
+                                break
+                            temp_contents[best_local_p].append(idx)
+                            temp_weights[best_local_p] += w
+                            temp_counts[best_local_p] += 1
+                        
+                        if possible:
+                            new_max = max(temp_weights.values())
+                            new_ss = sum(v**2 for v in temp_weights.values())
+                            
+                            if new_max < current_sub_max - 1e-6:
+                                current_sub_max = new_max
+                                current_sub_ss = new_ss
+                                best_sub_res = (temp_contents, temp_weights)
+                            elif abs(new_max - current_sub_max) < 1e-6 and new_ss < current_sub_ss - 1e-6:
+                                current_sub_ss = new_ss
+                                best_sub_res = (temp_contents, temp_weights)
+
+                    if best_sub_res:
+                        new_contents, new_weights_map = best_sub_res
+                        for p in packs_subset:
+                            pack_assignment[p] = torch.tensor(new_contents[p], dtype=torch.int64)
+                            pack_weights[p] = new_weights_map[p]
+                        improved_any = True
+
+            if not improved_any:
+                break
+
+        # Final write to output tensors
+        flat_experts = pack_assignment.view(-1)
+        pack_index[i].scatter_(0, flat_experts, flat_packs_base)
+        rank_in_pack[i].scatter_(0, flat_experts, flat_ranks_base)
+
+    return pack_index.to(device), rank_in_pack.to(device)
+
+
+def replicate_experts(
+        weight: torch.Tensor,
+        num_phy: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Replicate `num_log` experts to `num_phy` replicas, such that the maximum
+    load of all replicas is minimized.
+
+    Parameters:
+        weight: [X, num_log]
+        num_phy: total number of experts after replication
+
+    Returns:
+        phy2log: [X, num_phy], logical expert id of each physical expert
+        rank: [X, num_phy], the replica rank
+        logcnt: [X, num_log], number of replicas for each logical expert
+    """
+    n, num_log = weight.shape
+    num_redundant = num_phy - num_log
+    assert num_redundant >= 0
+    device = weight.device
+    phy2log = torch.arange(num_phy, dtype=torch.int64,
+                           device=device).repeat(n, 1)
+    rank = torch.zeros(n, num_phy, dtype=torch.int64, device=device)
+    logcnt = torch.ones(n, num_log, dtype=torch.int64, device=device)
+    arangen = torch.arange(n, dtype=torch.int64, device=device)
+    for i in range(num_log, num_phy):
+        redundant_indices = (weight / logcnt).max(dim=-1).indices
+        phy2log[:, i] = redundant_indices
+        rank[:, i] = logcnt[arangen, redundant_indices]
+        logcnt[arangen, redundant_indices] += 1
+    return phy2log, rank, logcnt
+
+
+def rebalance_experts_hierarchical(
+    weight: torch.Tensor,
+    num_physical_experts: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+):
+    """
+    Parameters:
+        weight: [num_moe_layers, num_logical_experts]
+        num_physical_experts: number of physical experts after replication
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network
+        (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [num_moe_layers, num_physical_experts]
+        logical_to_physical_map: [num_moe_layers, num_logical_experts, X]
+        logical_count: [num_moe_layers, num_logical_experts]
+    """
+    num_layers, num_logical_experts = weight.shape
+    assert num_logical_experts % num_groups == 0
+    group_size = num_logical_experts // num_groups
+    assert num_groups % num_nodes == 0
+    groups_per_node = num_groups // num_nodes
+    assert num_gpus % num_nodes == 0
+    assert num_physical_experts % num_gpus == 0
+    phy_experts_per_gpu = num_physical_experts // num_gpus
+
+    def inverse(perm: torch.Tensor) -> torch.Tensor:
+        inv = torch.empty_like(perm)
+        inv.scatter_(
+            1,
+            perm,
+            torch.arange(perm.size(1), dtype=torch.int64,
+                         device=perm.device).expand(perm.shape),
+        )
+        return inv
+
+    # Step 1: pack groups to nodes
+    tokens_per_group = weight.unflatten(-1, (num_groups, group_size)).sum(-1)
+    group_pack_index, group_rank_in_pack = balanced_packing(
+        tokens_per_group, num_nodes)
+    log2mlog = (((group_pack_index * groups_per_node + group_rank_in_pack) *
+                 group_size).unsqueeze(-1) +
+                torch.arange(group_size,
+                             dtype=torch.int64,
+                             device=group_pack_index.device)).flatten(-2)
+    mlog2log = inverse(log2mlog)
+
+    # Step 2: construct redundant experts within nodes
+    # [num_layers * num_nodes, num_logical_experts // num_nodes]
+    tokens_per_mlog = weight.gather(-1, mlog2log).view(
+        -1, num_logical_experts // num_nodes)
+    phy2mlog, phyrank, mlogcnt = replicate_experts(
+        tokens_per_mlog, num_physical_experts // num_nodes)
+
+    # Step 3: pack physical_experts to GPUs
+    # [num_layers * num_nodes, num_physical_experts // num_nodes]
+    tokens_per_phy = (tokens_per_mlog / mlogcnt).gather(-1, phy2mlog)
+    pack_index, rank_in_pack = balanced_packing(tokens_per_phy,
+                                                num_gpus // num_nodes)
+    phy2pphy = pack_index * phy_experts_per_gpu + rank_in_pack
+    pphy2phy = inverse(phy2pphy)
+
+    pphy2mlog = phy2mlog.gather(
+        -1, pphy2phy)  # [num_layers * num_nodes, num_log_per_nodes]
+    pphy2mlog = (pphy2mlog.view(num_layers, num_nodes, -1) + torch.arange(
+        0,
+        num_logical_experts,
+        num_logical_experts // num_nodes,
+        device=group_pack_index.device,
+    ).view(1, -1, 1)).flatten(-2)
+    pphy2log = mlog2log.gather(-1, pphy2mlog)
+    pphyrank = phyrank.gather(-1, pphy2phy).view(num_layers, -1)
+    logcnt = mlogcnt.view(num_layers, -1).gather(-1, log2mlog)
+    return pphy2log, pphyrank, logcnt
+
+
+def rebalance_experts(
+    weight: torch.Tensor,
+    num_replicas: int,
+    num_groups: int,
+    num_nodes: int,
+    num_gpus: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Entry point for expert-parallelism load balancer.
+
+    Parameters:
+        weight: [layers, num_logical_experts], the load statistics for all
+            logical experts
+        num_replicas: number of physical experts, must be a multiple of
+            `num_gpus`
+        num_groups: number of expert groups
+        num_nodes: number of server nodes, where the intra-node network
+            (e.g, NVLink) is faster
+        num_gpus: number of GPUs, must be a multiple of `num_nodes`
+
+    Returns:
+        physical_to_logical_map: [layers, num_replicas], the expert index of
+            each replica
+        logical_to_physical_map: [layers, num_logical_experts, X], the replica
+            indices for each expert
+        expert_count: [layers, num_logical_experts], number of physical
+            replicas for each logical expert
+    """
+    num_layers, num_logical_experts = weight.shape
+    weight = weight.float().cpu()
+    if num_groups % num_nodes == 0:
+        # use hierarchical load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, num_groups, num_nodes, num_gpus)
+    else:
+        # use global load-balance policy
+        phy2log, phyrank, logcnt = rebalance_experts_hierarchical(
+            weight, num_replicas, 1, 1, num_gpus)
+    num_redundant_experts = num_replicas - num_logical_experts
+    maxlogcnt = num_redundant_experts + 1
+    log2phy: torch.Tensor = torch.full(
+        (num_layers, num_logical_experts, maxlogcnt),
+        -1,
+        dtype=torch.int64,
+        device=logcnt.device,
+    )
+    log2phy.view(num_layers, -1).scatter_(
+        -1,
+        phy2log * maxlogcnt + phyrank,
+        torch.arange(num_replicas, dtype=torch.int64,
+                     device=log2phy.device).expand(num_layers, -1),
+    )
+    return phy2log, log2phy, logcnt
+
+
+# EVOLVE-BLOCK-END
+
+
+# This part remains fixed (not evolved)
+def run_eplb(weight: torch.Tensor, num_replicas: int, num_groups: int,
+             num_nodes: int, num_gpus: int):
+    """Run the expert parallelism load balancer"""
+    phy2log, log2phy, logcnt = rebalance_experts(
+        weight, num_replicas, num_groups, num_nodes, num_gpus
+    )
+    return phy2log, log2phy, logcnt
+
+
+__all__ = ["rebalance_experts", "run_eplb"]

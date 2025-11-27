@@ -1,0 +1,230 @@
+<NAME>
+add_lns_refinement
+</NAME>
+
+<DESCRIPTION>
+I am introducing a Large Neighborhood Search (LNS) / Ruin-and-Recreate phase after the vectorized swap refinement.
+The vectorized swap is efficient at 1-item swaps but can get stuck in local optima where multi-item exchanges are needed to balance loads (e.g., swapping a large item for two medium items).
+The LNS phase selects the heaviest and lightest packs, pools their items, and attempts to re-partition them into two balanced sets using a randomized greedy heuristic with restarts.
+This strategy allows for deeper exploration of the solution space for the most critical bottlenecks (max load) without the computational cost of a global exhaustive search.
+I also reduced the iterations of the vectorized swap from 50 to 20 to allocate time budget to the LNS phase, as the swap usually converges quickly.
+</DESCRIPTION>
+
+<DIFF>
+<<<<<<< SEARCH
+        # 2. Refinement: Vectorized Local Search
+        # Try to swap items between heaviest pack and others
+
+        # Loop limit prevents infinite loops, though gain check usually suffices
+        for _ in range(50):
+            max_pack = torch.argmax(pack_weights).item()
+            max_w = pack_weights[max_pack].item()
+
+            # Get weights of items in max_pack: [1, G, 1]
+            u_indices = pack_assignment[max_pack]
+            w_u = weight_cpu[i, u_indices].view(1, groups_per_pack, 1)
+
+            # Get weights of items in all packs: [M, 1, G]
+            w_v = weight_cpu[i, pack_assignment].view(num_packs, 1, groups_per_pack)
+
+            # Deltas: [M, G, G] (pack p, item u from max_pack, item v from pack p)
+            deltas = w_u - w_v
+
+            # Diffs: [M, 1, 1]
+            diffs = (max_w - pack_weights).view(num_packs, 1, 1)
+
+            # Mask: we want 0 < delta < diff.
+            # Also exclude swapping with self (diff=0 condition handles this partially, but delta=0 handles w_u=w_v)
+            mask = (deltas > 1e-6) & (deltas < diffs)
+
+            if not mask.any():
+                break
+
+            # Gain = delta * (diff - delta)
+            # Maximizing this drives the new weights closer to the mean of the two packs
+            gains = deltas * (diffs - deltas)
+
+            # Apply mask
+            gains = torch.where(mask, gains, -1.0)
+
+            # Find best swap
+            best_flat = torch.argmax(gains).item()
+            max_gain = gains.view(-1)[best_flat].item()
+
+            if max_gain < 0:
+                break
+
+            # Decode indices
+            # shape [M, G, G]
+            best_p = best_flat // (groups_per_pack * groups_per_pack)
+            rem = best_flat % (groups_per_pack * groups_per_pack)
+            best_u_idx = rem // groups_per_pack
+            best_v_idx = rem % groups_per_pack
+
+            # Execute Swap
+            # Swap indices in assignment tensor
+            u_val = pack_assignment[max_pack, best_u_idx].item()
+            v_val = pack_assignment[best_p, best_v_idx].item()
+
+            pack_assignment[max_pack, best_u_idx] = v_val
+            pack_assignment[best_p, best_v_idx] = u_val
+
+            # Update weights
+            d_val = deltas[best_p, best_u_idx, best_v_idx].item()
+            pack_weights[max_pack] -= d_val
+            pack_weights[best_p] += d_val
+=======
+        # 2. Refinement: Vectorized Local Search
+        # Try to swap items between heaviest pack and others
+
+        # Loop limit prevents infinite loops, though gain check usually suffices
+        for _ in range(20):
+            max_pack = torch.argmax(pack_weights).item()
+            max_w = pack_weights[max_pack].item()
+
+            # Get weights of items in max_pack: [1, G, 1]
+            u_indices = pack_assignment[max_pack]
+            w_u = weight_cpu[i, u_indices].view(1, groups_per_pack, 1)
+
+            # Get weights of items in all packs: [M, 1, G]
+            w_v = weight_cpu[i, pack_assignment].view(num_packs, 1, groups_per_pack)
+
+            # Deltas: [M, G, G] (pack p, item u from max_pack, item v from pack p)
+            deltas = w_u - w_v
+
+            # Diffs: [M, 1, 1]
+            diffs = (max_w - pack_weights).view(num_packs, 1, 1)
+
+            # Mask: we want 0 < delta < diff.
+            # Also exclude swapping with self (diff=0 condition handles this partially, but delta=0 handles w_u=w_v)
+            mask = (deltas > 1e-6) & (deltas < diffs)
+
+            if not mask.any():
+                break
+
+            # Gain = delta * (diff - delta)
+            # Maximizing this drives the new weights closer to the mean of the two packs
+            gains = deltas * (diffs - deltas)
+
+            # Apply mask
+            gains = torch.where(mask, gains, -1.0)
+
+            # Find best swap
+            best_flat = torch.argmax(gains).item()
+            max_gain = gains.view(-1)[best_flat].item()
+
+            if max_gain < 0:
+                break
+
+            # Decode indices
+            # shape [M, G, G]
+            best_p = best_flat // (groups_per_pack * groups_per_pack)
+            rem = best_flat % (groups_per_pack * groups_per_pack)
+            best_u_idx = rem // groups_per_pack
+            best_v_idx = rem % groups_per_pack
+
+            # Execute Swap
+            # Swap indices in assignment tensor
+            u_val = pack_assignment[max_pack, best_u_idx].item()
+            v_val = pack_assignment[best_p, best_v_idx].item()
+
+            pack_assignment[max_pack, best_u_idx] = v_val
+            pack_assignment[best_p, best_v_idx] = u_val
+
+            # Update weights
+            d_val = deltas[best_p, best_u_idx, best_v_idx].item()
+            pack_weights[max_pack] -= d_val
+            pack_weights[best_p] += d_val
+
+        # 3. Refinement: Pairwise Random Re-packing (LNS)
+        # Allows escaping local optima where single swaps are insufficient
+        # We pick the max and min packs, and try to re-distribute their items optimally.
+
+        for _ in range(15):
+            max_pack = torch.argmax(pack_weights).item()
+            min_pack = torch.argmin(pack_weights).item()
+
+            if max_pack == min_pack:
+                break
+
+            current_diff = pack_weights[max_pack] - pack_weights[min_pack]
+            if current_diff < 1e-6:
+                break
+
+            # Extract items from both packs
+            items_max = pack_assignment[max_pack].tolist()
+            items_min = pack_assignment[min_pack].tolist()
+            combined_items = items_max + items_min
+
+            # Values
+            combined_weights = [weight_cpu[i, idx].item() for idx in combined_items]
+
+            # We have 2*groups_per_pack items. We need to split them into 2 sets of size groups_per_pack
+            # to minimize difference in sums.
+
+            best_w1 = pack_weights[max_pack].item()
+            best_w2 = pack_weights[min_pack].item()
+            best_p1_items = None
+            best_p2_items = None
+            improved = False
+
+            # Randomized Greedy with Restarts
+            # Small constant overhead, efficient for small N
+            indices = list(range(len(combined_items)))
+
+            for attempt in range(20):
+                # Shuffle or sort with noise
+                if attempt == 0:
+                    # Deterministic LPT
+                    indices.sort(key=lambda x: combined_weights[x], reverse=True)
+                else:
+                    # Random noise
+                    noise = torch.rand(len(indices)).tolist()
+                    indices.sort(key=lambda x: combined_weights[x] * (1 + 0.05 * noise[x]), reverse=True)
+
+                # Greedy fill
+                w1, w2 = 0.0, 0.0
+                c1, c2 = 0, 0
+                idx1, idx2 = [], []
+
+                for x in indices:
+                    w = combined_weights[x]
+                    item_real_idx = combined_items[x]
+
+                    if c1 < groups_per_pack and c2 < groups_per_pack:
+                        if w1 < w2:
+                            w1 += w; c1 += 1; idx1.append(item_real_idx)
+                        else:
+                            w2 += w; c2 += 1; idx2.append(item_real_idx)
+                    elif c1 < groups_per_pack:
+                         w1 += w; c1 += 1; idx1.append(item_real_idx)
+                    else:
+                         w2 += w; c2 += 1; idx2.append(item_real_idx)
+
+                # Check metric: minimize max(w1, w2) primarily, then diff
+                cur_max = max(w1, w2)
+                prev_max = max(best_w1, best_w2)
+
+                # Check for improvement
+                # We want to reduce the max load of this pair
+                if cur_max < prev_max - 1e-6:
+                    best_w1, best_w2 = w1, w2
+                    best_p1_items, best_p2_items = idx1, idx2
+                    improved = True
+                elif abs(cur_max - prev_max) < 1e-6:
+                     if abs(w1 - w2) < abs(best_w1 - best_w2) - 1e-6:
+                        best_w1, best_w2 = w1, w2
+                        best_p1_items, best_p2_items = idx1, idx2
+                        improved = True
+
+            if improved:
+                # Apply update
+                pack_weights[max_pack] = best_w1
+                pack_weights[min_pack] = best_w2
+                pack_assignment[max_pack] = torch.tensor(best_p1_items, dtype=torch.int64)
+                pack_assignment[min_pack] = torch.tensor(best_p2_items, dtype=torch.int64)
+            else:
+                # If no improvement on the worst pair, unlikely to find easy improvements elsewhere
+                break
+>>>>>>> REPLACE
+</DIFF>
