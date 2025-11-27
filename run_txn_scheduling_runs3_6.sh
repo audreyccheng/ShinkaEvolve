@@ -1,8 +1,8 @@
 #!/bin/bash
-# Run TXN Scheduling experiments - Runs 2-6 (5 new runs)
-# Runs 2-3: GPT-5
+# Run TXN Scheduling experiments - Runs 3-6 (4 new runs)
+# Run 3: GPT-5
 # Runs 4-6: Gemini-3.0
-# Sequential execution, no UCB dynamic selection
+# Parallel execution (all 4 at once), no UCB dynamic selection
 
 set -e
 
@@ -17,8 +17,8 @@ RESULTS_BASE_DIR="/home/ubuntu/zresults"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 
 echo -e "${BLUE}========================================${NC}"
-echo -e "${BLUE}TXN Scheduling - Runs 2-6${NC}"
-echo -e "${BLUE}Runs 2-3: GPT-5 | Runs 4-6: Gemini-3.0${NC}"
+echo -e "${BLUE}TXN Scheduling - Runs 3-6${NC}"
+echo -e "${BLUE}Run 3: GPT-5 | Runs 4-6: Gemini-3.0${NC}"
 echo -e "${BLUE}========================================${NC}"
 echo ""
 
@@ -83,6 +83,7 @@ run_experiment() {
         evo_config.llm_models="[${model_name}]" \
         evo_config.meta_llm_models="[${model_name}]" \
         evo_config.llm_dynamic_selection='null' \
+        job_config.time=600 \
         results_dir="${RESULTS_BASE_DIR}" \
         exp_name="shinka_txn_scheduling_${config_name}_run${run_number}_${TIMESTAMP}" \
         variant_suffix="" \
@@ -99,22 +100,48 @@ run_experiment() {
     echo ""
 }
 
-# Run experiments sequentially (1 at a time)
-echo -e "${BLUE}Phase 1: GPT-5 Configuration (Runs 2-3)${NC}"
-run_experiment 2 "gpt-5" "gpt5"
-run_experiment 3 "gpt-5" "gpt5"
+# Run all 4 experiments in parallel
+echo -e "${BLUE}Running all 4 experiments in parallel...${NC}"
+echo -e "${BLUE}Run 3: GPT-5 | Runs 4-6: Gemini-3.0${NC}"
+echo ""
 
-echo -e "${BLUE}Phase 2: Gemini-3.0 Configuration (Runs 4-6)${NC}"
+# Start GPT-5 run
+run_experiment 3 "gpt-5" "gpt5" &
+PID1=$!
+
+# Start Gemini-3.0 runs
 echo -e "${YELLOW}Note: Using GEMINI_API_KEY for Gemini experiments${NC}"
 echo "Current GEMINI_API_KEY: ${GEMINI_API_KEY:0:10}..."
 echo ""
-run_experiment 4 "gemini-3-pro-preview" "gemini3pro"
-run_experiment 5 "gemini-3-pro-preview" "gemini3pro"
-run_experiment 6 "gemini-3-pro-preview" "gemini3pro"
+run_experiment 4 "gemini-3-pro-preview" "gemini3pro" &
+PID2=$!
+run_experiment 5 "gemini-3-pro-preview" "gemini3pro" &
+PID3=$!
+run_experiment 6 "gemini-3-pro-preview" "gemini3pro" &
+PID4=$!
+
+echo -e "${YELLOW}Waiting for all 4 experiments to complete...${NC}"
+wait $PID1
+EXIT1=$?
+wait $PID2
+EXIT2=$?
+wait $PID3
+EXIT3=$?
+wait $PID4
+EXIT4=$?
+
+if [ $EXIT1 -ne 0 ] || [ $EXIT2 -ne 0 ] || [ $EXIT3 -ne 0 ] || [ $EXIT4 -ne 0 ]; then
+    echo -e "${RED}One or more parallel runs failed${NC}"
+    echo -e "${RED}Run 3 (GPT-5): exit code $EXIT1${NC}"
+    echo -e "${RED}Run 4 (Gemini): exit code $EXIT2${NC}"
+    echo -e "${RED}Run 5 (Gemini): exit code $EXIT3${NC}"
+    echo -e "${RED}Run 6 (Gemini): exit code $EXIT4${NC}"
+    exit 1
+fi
 
 echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}All TXN Scheduling runs completed!${NC}"
-echo -e "${GREEN}Runs 2-3: GPT-5${NC}"
+echo -e "${GREEN}Run 3: GPT-5${NC}"
 echo -e "${GREEN}Runs 4-6: Gemini-3.0${NC}"
 echo -e "${GREEN}========================================${NC}"
 
