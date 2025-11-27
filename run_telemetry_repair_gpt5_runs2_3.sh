@@ -51,6 +51,7 @@ run_experiment() {
         evo_config.llm_models='["gpt-5"]' \
         evo_config.meta_llm_models='["gpt-5"]' \
         evo_config.llm_dynamic_selection=null \
+        +job_config.time="00:10:00" \
         results_dir="${RESULTS_BASE_DIR}" \
         exp_name="shinka_telemetry_repair_gpt5_run${run_number}_${TIMESTAMP}" \
         variant_suffix="" \
