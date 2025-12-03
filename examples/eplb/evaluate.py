@@ -5,10 +5,16 @@ Evaluator for EPLB (Expert Parallelism Load Balancer) example
 import os
 import argparse
 import sys
+import time
+import json
+import importlib.util
 import torch
 from typing import Tuple, Optional, List, Dict, Any
 
 from shinka.core import run_shinka_eval
+
+# Global list to store execution times during evaluation
+_execution_times: List[float] = []
 
 # Add the openevolve_examples directory to the path to import evaluator utilities
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', '..', 'openevolve_examples', 'eplb'))
@@ -172,13 +178,33 @@ def get_eplb_kwargs(run_index: int) -> Dict[str, Any]:
     }
 
 
+def timed_experiment_wrapper(experiment_fn):
+    """
+    Wraps an experiment function to measure and record execution time.
+    Times are stored in the global _execution_times list.
+    """
+    def wrapper(*args, **kwargs):
+        global _execution_times
+        start_time = time.perf_counter()
+        result = experiment_fn(*args, **kwargs)
+        end_time = time.perf_counter()
+        _execution_times.append(end_time - start_time)
+        return result
+    return wrapper
+
+
 def aggregate_eplb_metrics(
     results: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]], 
     results_dir: str
 ) -> Dict[str, Any]:
     """
     Aggregates metrics for EPLB across multiple workload runs.
+    
+    Uses actual execution times from _execution_times global to compute speed_score.
+    Speed score formula matches OpenEvolve: speed_score = 0.02 / avg_time
     """
+    global _execution_times
+    
     if not results:
         return {"combined_score": 0.0, "error": "No results to aggregate"}
 
@@ -195,14 +221,24 @@ def aggregate_eplb_metrics(
         
         avg_balancedness = sum(balancedness_scores) / len(balancedness_scores) if balancedness_scores else 0.0
         
-        # Speed score based on dummy timing (actual timing done in validation)
-        speed_score = 1.0  # Placeholder, real timing happens during execution
+        # Calculate speed_score from actual execution times
+        # Formula matches OpenEvolve: speed_score = 0.02 / avg_time
+        if _execution_times:
+            avg_time = sum(_execution_times) / len(_execution_times)
+            speed_score = 0.02 / avg_time if avg_time > 0 else 0.0
+            print(f'avg_time: {avg_time:.6f}s, speed_score: {speed_score:.6f}')
+        else:
+            # Fallback if no times recorded (shouldn't happen normally)
+            print("Warning: No execution times recorded, using speed_score = 0.0")
+            speed_score = 0.0
+            avg_time = 0.0
         
         combined_score = (avg_balancedness + speed_score) / 2
         
         public_metrics = {
             "results_str": format_results_string(avg_balancedness, speed_score),
             "num_workloads_evaluated": len(balancedness_scores),
+            "avg_execution_time": float(avg_time) if _execution_times else None,
         }
         private_metrics = {
             "avg_balancedness_score": float(avg_balancedness),
@@ -211,8 +247,8 @@ def aggregate_eplb_metrics(
     else:
         # Dummy metrics if workload file not available
         avg_balancedness = 0.5
-        speed_score = 1.0
-        combined_score = 0.75
+        speed_score = 0.0  # Changed from 1.0 - no valid speed without real workload
+        combined_score = avg_balancedness / 2  # Only count balancedness
         
         public_metrics = {
             "results_str": "Workload file not available for evaluation",
@@ -233,31 +269,89 @@ def aggregate_eplb_metrics(
 
 
 def main(program_path: str, results_dir: str):
-    """Runs the EPLB evaluation using shinka.eval."""
+    """Runs the EPLB evaluation with proper timing measurement."""
+    global _execution_times
+    
     print(f"Evaluating program: {program_path}")
     print(f"Saving results to: {results_dir}")
     os.makedirs(results_dir, exist_ok=True)
 
+    # Clear execution times from any previous runs
+    _execution_times = []
+
     # Number of workload samples to evaluate
     num_experiment_runs = 5 if WORKLOAD_PATH and os.path.exists(WORKLOAD_PATH) else 1
 
-    # Define a nested function to pass results_dir to the aggregator
-    def _aggregator_with_context(
-        r: List[Tuple[torch.Tensor, torch.Tensor, torch.Tensor]],
-    ) -> Dict[str, Any]:
-        return aggregate_eplb_metrics(r, results_dir)
+    # Load the program and get the experiment function
+    spec = importlib.util.spec_from_file_location("program", program_path)
+    if spec is None or spec.loader is None:
+        print(f"Error: Could not load program from {program_path}")
+        return
+    
+    program = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(program)
+    
+    if not hasattr(program, "run_eplb"):
+        # Try rebalance_experts as fallback
+        if hasattr(program, "rebalance_experts"):
+            # Create a wrapper that matches expected interface
+            def run_eplb_wrapper(**kwargs):
+                return program.rebalance_experts(
+                    kwargs["weight"],
+                    kwargs["num_replicas"],
+                    kwargs["num_groups"],
+                    kwargs["num_nodes"],
+                    kwargs["num_gpus"],
+                )
+            experiment_fn = run_eplb_wrapper
+        else:
+            print("Error: Program does not have 'run_eplb' or 'rebalance_experts' function")
+            return
+    else:
+        experiment_fn = program.run_eplb
+    
+    # Run experiments with timing
+    results = []
+    all_valid = True
+    error_msg = None
+    
+    for run_idx in range(num_experiment_runs):
+        kwargs = get_eplb_kwargs(run_idx)
+        
+        # Measure execution time
+        start_time = time.perf_counter()
+        try:
+            result = experiment_fn(**kwargs)
+            end_time = time.perf_counter()
+            _execution_times.append(end_time - start_time)
+            
+            # Validate result
+            is_valid, validation_msg = adapted_validate_eplb(result)
+            if not is_valid:
+                all_valid = False
+                error_msg = validation_msg
+                print(f"Run {run_idx}: Validation failed - {validation_msg}")
+            else:
+                results.append(result)
+                print(f"Run {run_idx}: Success (time: {end_time - start_time:.4f}s)")
+                
+        except Exception as e:
+            end_time = time.perf_counter()
+            all_valid = False
+            error_msg = str(e)
+            print(f"Run {run_idx}: Error - {e}")
+    
+    # Aggregate metrics
+    metrics = aggregate_eplb_metrics(results, results_dir)
+    
+    # Save results
+    with open(os.path.join(results_dir, "metrics.json"), "w") as f:
+        json.dump(metrics, f, indent=2)
+    
+    with open(os.path.join(results_dir, "correct.json"), "w") as f:
+        json.dump({"correct": all_valid, "error": error_msg}, f, indent=2)
 
-    metrics, correct, error_msg = run_shinka_eval(
-        program_path=program_path,
-        results_dir=results_dir,
-        experiment_fn_name="run_eplb",
-        num_runs=num_experiment_runs,
-        get_experiment_kwargs=get_eplb_kwargs,
-        validate_fn=adapted_validate_eplb,
-        aggregate_metrics_fn=_aggregator_with_context,
-    )
-
-    if correct:
+    if all_valid:
         print("Evaluation and Validation completed successfully.")
     else:
         print(f"Evaluation or Validation failed: {error_msg}")
